@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve historical whitespace in compatibility data during diff checks.
+# The archive is also excluded from language statistics.
+archive/python-legacy/** linguist-vendored linguist-detectable=false -whitespace
+rust/config/** -whitespace

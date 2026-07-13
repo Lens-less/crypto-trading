@@ -4,8 +4,10 @@
 
 Replace the Python-first runtime with a Rust-first, testable trading engine while
 preserving the existing YAML configuration files and the observable behavior of
-the main command-line entry points. The Python tree remains available as a
-read-only compatibility reference until the Rust replacement passes its gates.
+the main command-line entry points. The original Python tree is frozen at
+`../archive/python-legacy/` as a read-only compatibility reference. The active
+Rust runtime owns its independent configuration copy under `config/` and never
+reads files from the archive.
 
 ## Baseline
 
@@ -60,9 +62,9 @@ The migration is verified through these public seams:
 4. Run formatting, compilation, Clippy with warnings denied, unit tests,
    integration tests, and offline CLI smoke tests.
 5. Review the diff against both repository standards and this plan.
-6. Remove the Python runtime and backup files only after feature-parity gates can
-   be demonstrated. Until then, Rust is the default runtime and Python is marked
-   legacy rather than silently deleted.
+6. Move the Python runtime and backup files into a commit-addressed, verified
+   archive after the Rust gates pass. The archived tree must not participate in
+   the active build, tests, configuration, or runtime.
 
 ## Acceptance gates
 

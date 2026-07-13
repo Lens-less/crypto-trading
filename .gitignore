@@ -1,5 +1,5 @@
 # Rust build artifacts
-/target/
+/rust/target/
 **/*.rs.bk
 
 # Python compatibility runtime artifacts
@@ -18,7 +18,7 @@ credentials/
 
 # Runtime output
 logs/
-/var/
+/rust/var/
 *.log
 *.jsonl.tmp
 *.db
@@ -29,3 +29,8 @@ logs/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# The frozen legacy snapshot must reproduce every blob from its source commit,
+# including files that would normally be ignored in active development.
+!archive/python-legacy/
+!archive/python-legacy/**

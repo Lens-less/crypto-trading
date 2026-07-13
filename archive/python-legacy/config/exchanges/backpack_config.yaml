@@ -1,0 +1,261 @@
+backpack:
+  # 基础配置
+  name: "Backpack"
+  exchange_id: "backpack"
+  enabled: true  # 🔥 启用Backpack交易所
+  type: "spot"
+  
+  # 📡 订阅模式配置 - 支持硬编码和动态两种模式
+  subscription_mode:
+    # 订阅模式选择
+    # "predefined" - 硬编码模式：使用配置文件中预定义的交易对
+    # "dynamic" - 动态模式：从市场获取交易对后订阅
+    mode: "dynamic"  # 🔥 使用动态模式从市场获取交易对
+    
+    # 硬编码模式配置
+    predefined:
+      # 要订阅的交易对列表
+      symbols:
+        # 主流现货交易对
+        - "SOL_USDC"
+        - "BTC_USDC"
+        - "ETH_USDC"
+        - "AVAX_USDC"
+        - "DOGE_USDC"
+        - "WIF_USDC"
+        - "BONK_USDC"
+        - "JUP_USDC"
+        - "PYTH_USDC"
+        - "JTO_USDC"
+        
+      # 要订阅的数据类型
+      data_types:
+        ticker: true         # 🔥 订阅行情数据获取价格
+        orderbook: false     # 🔥 不订阅订单簿数据
+        trades: false        # 成交数据
+        user_data: false     # 用户数据
+        
+      # 批量订阅配置
+      batch_subscription:
+        enabled: true        # 是否启用批量订阅
+        batch_size: 5        # 批量大小
+        delay_between_batches: 1  # 批次间延迟(秒)
+        
+    # 动态模式配置
+    dynamic:
+      # 市场发现配置
+      discovery:
+        enabled: true
+        # 过滤条件
+        filter_criteria:
+          market_types: ["perpetual"]       # 🔥 只获取永续合约，不获取现货
+          volume_threshold: 500000           # 最小交易量过滤
+          max_symbols: 1000                  # 🔥 修改：大幅提高限制，订阅所有可用的永续合约
+          exclude_symbols: []                # 排除的交易对
+          include_patterns: ["*_PERP"]       # 🔥 只包含永续合约模式
+          exclude_patterns: ["*SPOT*", "*TEST*"]  # 🔥 排除现货和测试交易对
+          
+      # 要订阅的数据类型
+      data_types:
+        ticker: true         # 🔥 订阅行情数据获取价格
+        orderbook: true      # 🔥 ✅ 启用订单簿数据订阅
+        trades: false        # 成交数据
+        user_data: false     # 用户数据
+        
+      # 动态订阅配置
+      dynamic_subscription:
+        auto_discovery_interval: 600  # 自动发现间隔(秒)
+        max_retry_attempts: 3         # 最大重试次数
+        retry_delay: 5                # 重试延迟(秒)
+        
+  # 🎯 自定义订阅组合配置
+  custom_subscriptions:
+    # 预定义的订阅组合
+    combinations:
+      # 主流币种组合
+      major_coins:
+        description: "🔥 主流币种永续合约价格数据订阅"
+        symbols:
+          - "SOL_USDC_PERP"   # 🔥 改为永续合约格式
+          - "BTC_USDC_PERP"
+          - "ETH_USDC_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false
+          
+      # 全量数据组合
+      full_data:
+        description: "🔥 永续合约价格数据订阅"
+        symbols:
+          - "SOL_USDC_PERP"   # 🔥 改为永续合约格式
+          - "BTC_USDC_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false        # 🔥 不订阅trades
+          user_data: false     # 🔥 不订阅用户数据
+          
+      # 仅价格数据组合
+      price_only:
+        description: "🔥 永续合约价格数据订阅"
+        symbols:
+          - "SOL_USDC_PERP"   # 🔥 改为永续合约格式
+          - "BTC_USDC_PERP"
+          - "ETH_USDC_PERP"
+          - "AVAX_USDC_PERP"
+          - "DOGE_USDC_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false
+          
+      # Solana生态币种组合
+      solana_ecosystem:
+        description: "🔥 Solana生态永续合约价格数据订阅"
+        symbols:
+          - "SOL_USDC_PERP"   # 🔥 改为永续合约格式
+          - "WIF_USDC_PERP"
+          - "BONK_USDC_PERP"
+          - "JUP_USDC_PERP"
+          - "PYTH_USDC_PERP"
+          - "JTO_USDC_PERP"
+        data_types:
+          ticker: true         # 🔥 订阅ticker获取价格
+          orderbook: false     # 🔥 不订阅订单簿数据
+          trades: false
+          
+    # 活动的订阅组合
+    active_combination: "solana_ecosystem"  # 可选值: "major_coins", "full_data", "price_only", "solana_ecosystem", "custom"
+    
+    # 自定义组合配置 (当active_combination为"custom"时使用)
+    custom:
+      symbols: []
+      data_types:
+        ticker: true         # 🔥 订阅ticker获取价格
+        orderbook: false     # 🔥 不订阅订单簿数据
+        trades: false
+        user_data: false
+        
+  # API配置
+  api:
+    base_url: "https://api.backpack.exchange"
+    ws_url: "wss://ws.backpack.exchange"
+    version: "v1"
+    timeout: 30
+    
+  # 认证配置
+  # 📌 密钥已迁移到环境变量（.env 文件）：
+  #    BACKPACK_API_KEY - API Key (Base58格式)
+  #    BACKPACK_PRIVATE_KEY - ED25519 私钥 (Base58格式)
+  authentication:
+    method: "ed25519"
+    api_key: ""           # 留空，使用环境变量 BACKPACK_API_KEY
+    private_key: ""       # 留空，使用环境变量 BACKPACK_PRIVATE_KEY
+    
+  # 频率限制
+  rate_limits:
+    rest_api: 100         # 每秒REST API请求数
+    websocket: 10         # 每秒WebSocket订阅数
+    
+  # 精度配置
+  precision:
+    price:
+      default: 6
+      "SOL_USDC": 4
+      "BTC_USDC": 2
+      "ETH_USDC": 2
+      "AVAX_USDC": 4
+      "DOGE_USDC": 6
+      
+    quantity:
+      default: 6
+      "SOL_USDC": 3
+      "BTC_USDC": 5
+      "ETH_USDC": 4
+      "AVAX_USDC": 3
+      "DOGE_USDC": 0
+      
+  # 符号映射
+  symbol_mapping:
+    "SOL/USDC": "SOL_USDC"
+    "BTC/USDC": "BTC_USDC"
+    "ETH/USDC": "ETH_USDC"
+    "AVAX/USDC": "AVAX_USDC"
+    "DOGE/USDC": "DOGE_USDC"
+    "WIF/USDC": "WIF_USDC"
+    "BONK/USDC": "BONK_USDC"
+    "JUP/USDC": "JUP_USDC"
+    "PYTH/USDC": "PYTH_USDC"
+    "JTO/USDC": "JTO_USDC"
+    
+  # 手续费配置
+  fees:
+    maker: 0.0000      # 0%
+    taker: 0.0010      # 0.10%
+    
+  # 交易配置
+  trading:
+    min_order_size: 0.001
+    max_order_size: 10000
+    
+  # 市场数据配置
+  market_data:
+    orderbook_limit: 50
+    ticker_interval: 1000
+    trade_history_limit: 500
+    
+  # WebSocket配置
+  websocket:
+    enabled: true
+    auto_reconnect: true
+    max_reconnect_attempts: 5
+    reconnect_delay: 5
+    ping_interval: 30
+    
+    # 订阅黑名单
+    blacklisted_symbols:
+      - "TEST_USDC"
+      - "DEMO_USDC"
+      
+  # 错误处理配置
+  error_handling:
+    max_retries: 3
+    retry_delay: 1
+    retry_backoff: 2
+    
+  # 日志配置
+  logging:
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+  # 健康检查配置
+  health_check:
+    enabled: true
+    interval: 60
+    timeout: 10
+    
+  # 开发配置
+  development:
+    sandbox: false
+    debug: false
+    mock_data: false
+    
+# 使用示例:
+# 
+# 1. 硬编码模式 + 主流币种:
+#    subscription_mode.mode = "predefined"
+#    custom_subscriptions.active_combination = "major_coins"
+#
+# 2. 动态模式 + 全量数据:
+#    subscription_mode.mode = "dynamic"
+#    custom_subscriptions.active_combination = "full_data"
+#
+# 3. 硬编码模式 + Solana生态:
+#    subscription_mode.mode = "predefined"
+#    custom_subscriptions.active_combination = "solana_ecosystem"
+#
+# 4. 动态模式 + 自定义过滤:
+#    subscription_mode.mode = "dynamic"
+#    subscription_mode.dynamic.discovery.filter_criteria.max_symbols = 30
+#    subscription_mode.dynamic.discovery.filter_criteria.volume_threshold = 1000000 
