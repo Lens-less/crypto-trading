@@ -1,0 +1,24 @@
+[package]
+name = "crypto-trading-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+crypto-trading-domain = { path = "../domain" }
+crypto-trading-exchange = { path = "../exchange" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+crypto-trading-strategy = { path = "../strategy" }
+rust_decimal.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

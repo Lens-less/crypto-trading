@@ -1,4 +1,66 @@
-# 多交易所策略自动化系统
+# crypto-trading — Rust 主线
+
+本仓库正在把原有 Python 多交易所交易系统重构为 Rust。当前默认实现位于
+Cargo workspace，保留现有 YAML 配置格式，并以 Decimal、纯策略状态机、
+类型化交易所 seam 和安全默认值替代旧的巨型接口与重复调度器。
+
+## 快速开始
+
+```bash
+# 构建与完整验证
+cargo build --workspace
+cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# 验证旧配置
+cargo run -p crypto-trading-apps -- config-check \
+  config/grid/lighter-long-perp-btc.yaml \
+  config/arbitrage/monitor_v2.yaml
+
+# 完整离线纵向切片：配置 -> 网格策略 -> paper 撮合 -> receipt
+cargo run -p crypto-trading-apps -- grid \
+  config/grid/lighter-long-perp-btc.yaml \
+  --price 100000 --once
+
+# 双交易所套利 paper 纵向切片（显式行情，输出 JSONL history）
+cargo run -p crypto-trading-apps -- arbitrage --once \
+  --left-bid 99.9 --left-ask 100 \
+  --right-bid 101 --right-ask 101.1
+```
+
+统一二进制为 `crypto-trading`，提供 `grid`、`arbitrage`、`monitor`、
+`volume-maker`、`price-alert`、`scanner` 和 `config-check` 子命令。
+
+## 安全边界
+
+- 默认仅使用 paper 或 monitor 模式。
+- Live 模式必须显式传入
+  `--acknowledge-risk I_UNDERSTAND_LIVE_TRADING`。
+- 当前构建即使确认风险也会继续拒绝 live 下单；只有 mandatory risk、签名、
+  testnet 与 reconciliation 门禁全部接入后才会开放。
+- 未经签名黄金向量、testnet 和 reconciliation 验证的交易所实现会明确返回
+  `Unsupported`，不会伪装成功或静默降级。
+- API 密钥加载遵循“环境变量 > YAML”，Debug 输出自动脱敏。
+- Python 与 Rust 不应同时拥有同一账户/交易对的下单权。
+
+## Rust workspace
+
+| Crate | 职责 |
+|---|---|
+| `crypto-trading-domain` | Decimal 金融类型、行情、订单与持仓不变量 |
+| `crypto-trading-config` | 旧 YAML/环境变量兼容、校验、符号转换与密钥脱敏 |
+| `crypto-trading-strategy` | 网格、分段套利、风控、价格提醒、刷量和波动率扫描纯状态机 |
+| `crypto-trading-exchange` | 类型化交易所接口、bounded backpressure、PaperExchange、只读 Binance 公共行情与失败关闭的 live adapter |
+| `crypto-trading-runtime` | 执行授权、adapter 预检、partial outcome、交易所路由、JSONL 历史和 paper 闭环 |
+| `crypto-trading-apps` | 唯一 CLI composition root |
+
+详细范围、兼容 seam、验收门禁和剩余风险见
+[`RUST_REFACTOR_PLAN.md`](RUST_REFACTOR_PLAN.md)。旧 Python 源码暂时作为迁移参考保留；
+在所有真实交易 adapter 通过 replay、testnet 和 shadow 验证前不会被冒险删除。
+
+---
+
+# Python 旧版说明（迁移参考）
 
 **Multi-Exchange Strategy Automation System**
 

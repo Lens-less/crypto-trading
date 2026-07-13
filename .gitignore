@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Python compatibility runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local credentials and operator state
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+*.pem
+*.key
+
+# Runtime output
+logs/
+/var/
+*.log
+*.jsonl.tmp
+*.db
+*.sqlite*
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

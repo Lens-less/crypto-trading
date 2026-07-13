@@ -1,0 +1,20 @@
+[package]
+name = "crypto-trading-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rust_decimal = { workspace = true, features = ["serde-with-arbitrary-precision"] }
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[lints]
+workspace = true
