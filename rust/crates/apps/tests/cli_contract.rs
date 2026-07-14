@@ -28,6 +28,40 @@ fn grid_keeps_the_legacy_positional_config_and_debug_flag() {
 }
 
 #[test]
+fn grid_price_and_once_are_an_atomic_cli_contract() {
+    assert!(
+        Cli::try_parse_from([
+            "crypto-trading",
+            "grid",
+            "config/grid/lighter-long-perp-btc.yaml",
+            "--price",
+            "100000",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "crypto-trading",
+            "grid",
+            "config/grid/lighter-long-perp-btc.yaml",
+            "--once",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "crypto-trading",
+            "grid",
+            "config/grid/lighter-long-perp-btc.yaml",
+            "--price",
+            "100000",
+            "--once",
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
 fn arbitrage_defaults_match_main_unified() {
     let cli = Cli::try_parse_from(["crypto-trading", "arbitrage"]).unwrap();
     let Command::Arbitrage(args) = cli.command else {
@@ -48,7 +82,7 @@ fn arbitrage_defaults_match_main_unified() {
 }
 
 #[test]
-fn arbitrage_once_requires_a_complete_explicit_price_pair() {
+fn arbitrage_once_requires_complete_explicit_price_and_depth_pairs() {
     assert!(
         Cli::try_parse_from([
             "crypto-trading",
@@ -60,6 +94,8 @@ fn arbitrage_once_requires_a_complete_explicit_price_pair() {
             "100",
             "--right-bid",
             "101",
+            "--right-ask",
+            "102",
         ])
         .is_err()
     );
@@ -77,8 +113,51 @@ fn arbitrage_once_requires_a_complete_explicit_price_pair() {
             "101",
             "--right-ask",
             "102",
+            "--left-bid-quantity",
+            "1",
+            "--left-ask-quantity",
+            "1",
+            "--right-bid-quantity",
+            "1",
+            "--right-ask-quantity",
+            "1",
         ])
         .is_ok()
+    );
+}
+
+#[test]
+fn arbitrage_accepts_an_explicit_strategy_key_for_different_legs() {
+    let cli = Cli::try_parse_from([
+        "crypto-trading",
+        "arbitrage",
+        "--once",
+        "--strategy-key",
+        "LIGHTER_ETH_SPOT_PERP",
+        "--left-bid",
+        "99",
+        "--left-ask",
+        "100",
+        "--right-bid",
+        "101",
+        "--right-ask",
+        "102",
+        "--left-bid-quantity",
+        "1",
+        "--left-ask-quantity",
+        "1",
+        "--right-bid-quantity",
+        "1",
+        "--right-ask-quantity",
+        "1",
+    ])
+    .unwrap();
+    let Command::Arbitrage(args) = cli.command else {
+        panic!("expected arbitrage command");
+    };
+    assert_eq!(
+        args.market.strategy_key.as_deref(),
+        Some("LIGHTER_ETH_SPOT_PERP")
     );
 }
 

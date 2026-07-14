@@ -7,8 +7,8 @@ use crypto_trading_config::{
 };
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_strategy::{
-    AlertKind, AlertState, AlertStrategy, ArbitrageStrategy, GridDirection, GridPlanner,
-    VolumeMakerMode, VolumeMakerPlanConfig,
+    AlertKind, AlertState, AlertStrategy, ArbitrageState, ArbitrageStrategy, GridDirection,
+    GridPlanner, PairStrategyMachine, VolumeMakerMode, VolumeMakerPlanConfig,
 };
 use rust_decimal::Decimal;
 
@@ -45,6 +45,11 @@ martingale_increment: 0.1
 
     let arbitrage_config = load_arbitrage_config_from_str(
         r"
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [BTC]
 default_config:
   grid_config:
     initial_spread_threshold: 0.5
@@ -67,6 +72,107 @@ default_config:
         [decimal("0.20"), decimal("0.5"), decimal("0.7")]
     );
     assert_eq!(arbitrage.config().base_quantity.as_decimal(), decimal("2"));
+}
+
+#[test]
+fn arbitrage_public_conversion_enforces_operator_controls_mode_and_allowlists() {
+    for yaml in [
+        r"
+mode: segmented
+enabled: false
+system_mode:
+  monitor_only: false
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+",
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: true
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+",
+        r"
+mode: unified
+enabled: true
+system_mode:
+  monitor_only: false
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+",
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: []
+symbols: [BTC]
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+",
+    ] {
+        let config = load_arbitrage_config_from_str(yaml).unwrap();
+        assert!(ArbitrageStrategy::try_from(&config).is_err(), "{yaml}");
+    }
+}
+
+#[test]
+fn arbitrage_config_conversion_enforces_snapshot_allowlists() {
+    let config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [BTC]
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+",
+    )
+    .unwrap();
+    let strategy = ArbitrageStrategy::try_from(&config).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 7, 14, 2, 0, 0).unwrap();
+    let snapshot = |exchange: &str, symbol: &str, bid: &str, ask: &str| {
+        MarketSnapshot::new(
+            exchange,
+            Symbol::new(symbol).unwrap(),
+            MarketType::Perpetual,
+            price(bid),
+            price(ask),
+            now,
+        )
+        .unwrap()
+    };
+    let left = snapshot("left", "BTC", "99", "100");
+    let right = snapshot("right", "BTC", "102", "103");
+
+    strategy
+        .evaluate_pair(&ArbitrageState::default(), &left, &right)
+        .unwrap();
+
+    let unknown_exchange = snapshot("third", "BTC", "99", "100");
+    let error = strategy
+        .evaluate_pair(&ArbitrageState::default(), &unknown_exchange, &right)
+        .unwrap_err();
+    assert!(error.to_string().contains("exchange third"), "{error}");
+
+    let unknown_symbol = snapshot("left", "ETH", "99", "100");
+    let error = strategy
+        .evaluate_pair(&ArbitrageState::default(), &unknown_symbol, &right)
+        .unwrap_err();
+    assert!(error.to_string().contains("symbol ETH"), "{error}");
 }
 
 #[test]
@@ -118,6 +224,7 @@ volume_maker:
   market_type: perpetual
   order_quantity: 0.25
   order_mode: market
+  emergency_stop: false
   reverse_trading: true
   advanced:
     use_post_only: true

@@ -1,6 +1,9 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
-use crate::{ConfigError, ConfigResult};
+use crate::{
+    ConfigError, ConfigResult,
+    input::{parse_yaml, read_config_file},
+};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SymbolConversions {
@@ -42,10 +45,7 @@ impl SymbolConversions {
 /// Returns an error if the file cannot be read or its mappings are malformed.
 pub fn load_symbol_conversions(path: impl AsRef<Path>) -> ConfigResult<SymbolConversions> {
     let path = path.as_ref();
-    let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let yaml = read_config_file(path)?;
     load_symbol_conversions_from_str(&yaml)
 }
 
@@ -55,7 +55,7 @@ pub fn load_symbol_conversions(path: impl AsRef<Path>) -> ConfigResult<SymbolCon
 ///
 /// Returns an error if YAML mappings do not contain string pairs.
 pub fn load_symbol_conversions_from_str(yaml: &str) -> ConfigResult<SymbolConversions> {
-    let document: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    let document: serde_yaml::Value = parse_yaml(yaml)?;
     let mut conversions = SymbolConversions::default();
 
     if let Some(value) = at(&document, &["symbol_mappings", "standard_to_exchange"]) {

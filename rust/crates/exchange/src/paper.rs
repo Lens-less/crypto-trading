@@ -1,4 +1,9 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex as StdMutex},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11,9 +16,127 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     BoundedExchangeHandle, CancellationDisposition, ExchangeAvailability, ExchangeError,
-    ExchangeHandle, ExchangeStatus, MarketSubscription, ReconcileReceipt, ReconcileScope,
+    ExchangeHandle, ExchangeStatus, InstrumentRuleCatalog, InstrumentRulesMode,
+    InstrumentRulesStatus, MarketSubscription, ReconcileReceipt, ReconcileScope,
     SubmissionDisposition, SubscriptionReceipt, TradingCommand, TradingReceipt,
 };
+
+const DEFAULT_MAX_MARKET_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+const DEFAULT_MAX_FUTURE_SKEW: chrono::TimeDelta = chrono::TimeDelta::seconds(1);
+const MAX_EVENT_CAPACITY: usize = 65_536;
+const MAX_PAPER_SNAPSHOTS: usize = 10_000;
+const MAX_PAPER_ORDERS: usize = 100_000;
+const MAX_PAPER_POSITIONS: usize = 10_000;
+
+type PaperClock = dyn Fn() -> DateTime<Utc> + Send + Sync;
+type PositionIndex = HashMap<(Symbol, MarketType), usize>;
+
+#[derive(Clone, Copy)]
+struct PaperFill {
+    quantity: Decimal,
+    price: Price,
+    mark: Price,
+    at: DateTime<Utc>,
+}
+
+fn advance_clock_high_water(
+    observed: &mut DateTime<Utc>,
+    monotonic_candidate: DateTime<Utc>,
+    wall_candidate: DateTime<Utc>,
+) -> DateTime<Utc> {
+    *observed = (*observed).max(monotonic_candidate).max(wall_candidate);
+    *observed
+}
+
+fn anchored_paper_clock() -> impl Fn() -> DateTime<Utc> + Send + Sync + 'static {
+    let utc_anchor = Utc::now();
+    let monotonic_anchor = Instant::now();
+    let high_water = StdMutex::new(utc_anchor);
+    move || {
+        let monotonic_candidate = match chrono::TimeDelta::from_std(monotonic_anchor.elapsed()) {
+            Ok(elapsed) => utc_anchor
+                .checked_add_signed(elapsed)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+            Err(_) => DateTime::<Utc>::MAX_UTC,
+        };
+        // Wall time accounts for system suspend on platforms whose monotonic
+        // clock pauses; taking the high-water mark also fails closed on wall
+        // clock rollback.
+        let wall_candidate = Utc::now();
+        let mut observed = high_water
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        advance_clock_high_water(&mut observed, monotonic_candidate, wall_candidate)
+    }
+}
+
+/// Conservative, caller-lowerable caps for the in-memory paper ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaperLedgerLimits {
+    snapshots: usize,
+    orders: usize,
+    positions: usize,
+}
+
+impl PaperLedgerLimits {
+    /// Builds caller-lowered paper ledger caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::ResourceLimit`] when a cap exceeds its hard maximum.
+    pub fn new(
+        max_snapshots: NonZeroUsize,
+        max_orders: NonZeroUsize,
+        max_positions: NonZeroUsize,
+    ) -> Result<Self, ExchangeError> {
+        for (resource, requested, hard_limit) in [
+            (
+                "paper snapshot ledger",
+                max_snapshots.get(),
+                MAX_PAPER_SNAPSHOTS,
+            ),
+            ("paper order ledger", max_orders.get(), MAX_PAPER_ORDERS),
+            (
+                "paper position ledger",
+                max_positions.get(),
+                MAX_PAPER_POSITIONS,
+            ),
+        ] {
+            if requested > hard_limit {
+                return Err(ExchangeError::resource_limit(
+                    resource, hard_limit, requested,
+                ));
+            }
+        }
+        Ok(Self {
+            snapshots: max_snapshots.get(),
+            orders: max_orders.get(),
+            positions: max_positions.get(),
+        })
+    }
+
+    pub const fn max_snapshots(self) -> usize {
+        self.snapshots
+    }
+
+    pub const fn max_orders(self) -> usize {
+        self.orders
+    }
+
+    pub const fn max_positions(self) -> usize {
+        self.positions
+    }
+}
+
+impl Default for PaperLedgerLimits {
+    fn default() -> Self {
+        Self {
+            snapshots: MAX_PAPER_SNAPSHOTS,
+            orders: MAX_PAPER_ORDERS,
+            positions: MAX_PAPER_POSITIONS,
+        }
+    }
+}
 
 /// Deterministic in-memory exchange used for paper execution and contract tests.
 #[derive(Clone)]
@@ -21,8 +144,15 @@ pub struct PaperExchange {
     exchange: Arc<str>,
     state: Arc<Mutex<PaperState>>,
     market_sender: broadcast::Sender<MarketSnapshot>,
+    clock: Arc<PaperClock>,
+    max_market_age: chrono::TimeDelta,
+    max_future_skew: chrono::TimeDelta,
+    instrument_rules: Arc<InstrumentRuleCatalog>,
+    instrument_rules_mode: InstrumentRulesMode,
+    ledger_limits: PaperLedgerLimits,
 }
 
+#[derive(Clone)]
 struct PaperState {
     snapshots: Vec<MarketSnapshot>,
     orders: Vec<Order>,
@@ -32,15 +162,15 @@ struct PaperState {
     observed_at: DateTime<Utc>,
 }
 
-impl Default for PaperState {
-    fn default() -> Self {
+impl PaperState {
+    fn new(observed_at: DateTime<Utc>) -> Self {
         Self {
             snapshots: Vec::new(),
             orders: Vec::new(),
             positions: Vec::new(),
             next_order_id: 1,
             next_subscription_id: 1,
-            observed_at: DateTime::<Utc>::UNIX_EPOCH,
+            observed_at,
         }
     }
 }
@@ -55,21 +185,215 @@ impl PaperExchange {
         exchange: impl Into<String>,
         event_capacity: NonZeroUsize,
     ) -> Result<Self, ExchangeError> {
+        Self::with_clock_and_freshness(
+            exchange,
+            event_capacity,
+            anchored_paper_clock(),
+            DEFAULT_MAX_MARKET_AGE,
+            DEFAULT_MAX_FUTURE_SKEW,
+        )
+    }
+
+    /// Creates a paper adapter with an injected clock and safe default quote freshness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid exchange, freshness, or capacity configuration.
+    pub fn with_clock<F>(
+        exchange: impl Into<String>,
+        event_capacity: NonZeroUsize,
+        clock: F,
+    ) -> Result<Self, ExchangeError>
+    where
+        F: Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    {
+        Self::with_clock_and_freshness(
+            exchange,
+            event_capacity,
+            clock,
+            DEFAULT_MAX_MARKET_AGE,
+            DEFAULT_MAX_FUTURE_SKEW,
+        )
+    }
+
+    /// Creates a paper adapter with an injected clock and explicit quote freshness bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid exchange, freshness, or capacity configuration.
+    pub fn with_clock_and_freshness<F>(
+        exchange: impl Into<String>,
+        event_capacity: NonZeroUsize,
+        clock: F,
+        max_market_age: chrono::TimeDelta,
+        max_future_skew: chrono::TimeDelta,
+    ) -> Result<Self, ExchangeError>
+    where
+        F: Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    {
+        Self::with_clock_freshness_and_rules(
+            exchange,
+            event_capacity,
+            clock,
+            max_market_age,
+            max_future_skew,
+            InstrumentRulesMode::Permissive,
+            InstrumentRuleCatalog::default(),
+        )
+    }
+
+    /// Creates a paper adapter with an adapter-owned instrument-rule catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid exchange or capacity configuration.
+    pub fn with_instrument_rules(
+        exchange: impl Into<String>,
+        event_capacity: NonZeroUsize,
+        instrument_rules_mode: InstrumentRulesMode,
+        instrument_rules: InstrumentRuleCatalog,
+    ) -> Result<Self, ExchangeError> {
+        Self::with_clock_freshness_and_rules(
+            exchange,
+            event_capacity,
+            anchored_paper_clock(),
+            DEFAULT_MAX_MARKET_AGE,
+            DEFAULT_MAX_FUTURE_SKEW,
+            instrument_rules_mode,
+            instrument_rules,
+        )
+    }
+
+    /// Creates a fully configurable paper adapter for deterministic simulation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid exchange, freshness, or capacity configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_clock_freshness_and_rules<F>(
+        exchange: impl Into<String>,
+        event_capacity: NonZeroUsize,
+        clock: F,
+        max_market_age: chrono::TimeDelta,
+        max_future_skew: chrono::TimeDelta,
+        instrument_rules_mode: InstrumentRulesMode,
+        instrument_rules: InstrumentRuleCatalog,
+    ) -> Result<Self, ExchangeError>
+    where
+        F: Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    {
+        Self::with_clock_freshness_rules_and_limits(
+            exchange,
+            event_capacity,
+            clock,
+            max_market_age,
+            max_future_skew,
+            instrument_rules_mode,
+            instrument_rules,
+            PaperLedgerLimits::default(),
+        )
+    }
+
+    /// Creates a paper adapter with lower custom ledger caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid exchange or capacity configuration.
+    pub fn with_ledger_limits(
+        exchange: impl Into<String>,
+        event_capacity: NonZeroUsize,
+        ledger_limits: PaperLedgerLimits,
+    ) -> Result<Self, ExchangeError> {
+        Self::with_clock_freshness_rules_and_limits(
+            exchange,
+            event_capacity,
+            anchored_paper_clock(),
+            DEFAULT_MAX_MARKET_AGE,
+            DEFAULT_MAX_FUTURE_SKEW,
+            InstrumentRulesMode::Permissive,
+            InstrumentRuleCatalog::default(),
+            ledger_limits,
+        )
+    }
+
+    /// Creates a fully configurable paper adapter including lower ledger caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid exchange, freshness, or capacity configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_clock_freshness_rules_and_limits<F>(
+        exchange: impl Into<String>,
+        event_capacity: NonZeroUsize,
+        clock: F,
+        max_market_age: chrono::TimeDelta,
+        max_future_skew: chrono::TimeDelta,
+        instrument_rules_mode: InstrumentRulesMode,
+        instrument_rules: InstrumentRuleCatalog,
+        ledger_limits: PaperLedgerLimits,
+    ) -> Result<Self, ExchangeError>
+    where
+        F: Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    {
         let exchange = exchange.into();
         let exchange = exchange.trim();
         if exchange.is_empty() {
             return Err(ExchangeError::invalid("exchange name must not be empty"));
         }
+        if max_market_age < chrono::TimeDelta::zero() {
+            return Err(ExchangeError::invalid(
+                "maximum market age must not be negative",
+            ));
+        }
+        if max_future_skew < chrono::TimeDelta::zero() {
+            return Err(ExchangeError::invalid(
+                "maximum future market skew must not be negative",
+            ));
+        }
+        if event_capacity.get() > MAX_EVENT_CAPACITY {
+            return Err(ExchangeError::resource_limit(
+                "paper event capacity",
+                MAX_EVENT_CAPACITY,
+                event_capacity.get(),
+            ));
+        }
+        let clock: Arc<PaperClock> = Arc::new(clock);
+        let observed_at = clock();
         let (market_sender, _) = broadcast::channel(event_capacity.get());
         Ok(Self {
             exchange: Arc::from(exchange),
-            state: Arc::new(Mutex::new(PaperState::default())),
+            state: Arc::new(Mutex::new(PaperState::new(observed_at))),
             market_sender,
+            clock,
+            max_market_age,
+            max_future_skew,
+            instrument_rules: Arc::new(instrument_rules),
+            instrument_rules_mode,
+            ledger_limits,
         })
     }
 
+    /// Reports whether missing instrument rules fail closed or use simulator compatibility.
+    pub fn instrument_rules_status(&self) -> InstrumentRulesStatus {
+        InstrumentRulesStatus {
+            mode: self.instrument_rules_mode,
+            rule_count: self.instrument_rules.len(),
+        }
+    }
+
+    pub const fn ledger_limits(&self) -> PaperLedgerLimits {
+        self.ledger_limits
+    }
+
     /// Wraps this adapter in a bounded actor handle suitable for runtime use.
-    pub fn bounded(&self, command_capacity: NonZeroUsize) -> BoundedExchangeHandle {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::ResourceLimit`] when command capacity exceeds its hard cap.
+    pub fn bounded(
+        &self,
+        command_capacity: NonZeroUsize,
+    ) -> Result<BoundedExchangeHandle, ExchangeError> {
         BoundedExchangeHandle::spawn(Arc::new(self.clone()), command_capacity)
     }
 
@@ -79,58 +403,118 @@ impl PaperExchange {
     ///
     /// Returns an error when the snapshot belongs to another exchange, is stale,
     /// or would violate an internal paper-ledger invariant.
+    #[allow(clippy::too_many_lines)]
     pub async fn publish_snapshot(&self, snapshot: MarketSnapshot) -> Result<(), ExchangeError> {
         self.ensure_exchange(snapshot.exchange())?;
-
         let mut state = self.state.lock().await;
+        let now = self.effective_now(&state);
+        if let Some(reason) = self.freshness_violation(&snapshot, now) {
+            return Err(ExchangeError::invalid(reason));
+        }
+        let is_new_snapshot = !state.snapshots.iter().any(|existing| {
+            existing.symbol == snapshot.symbol && existing.market_type == snapshot.market_type
+        });
+        if is_new_snapshot && state.snapshots.len() >= self.ledger_limits.snapshots {
+            return Err(ExchangeError::resource_limit(
+                "paper snapshot ledger",
+                self.ledger_limits.snapshots,
+                state.snapshots.len().saturating_add(1),
+            ));
+        }
         if let Some(existing) = state.snapshots.iter().find(|existing| {
             existing.symbol == snapshot.symbol && existing.market_type == snapshot.market_type
         }) {
-            if snapshot.timestamp < existing.timestamp {
+            if snapshot.timestamp <= existing.timestamp {
                 return Err(ExchangeError::invalid(format!(
-                    "stale snapshot for {}: {} is before {}",
+                    "stale or duplicate snapshot for {}: {} is not after {}",
                     snapshot.symbol, snapshot.timestamp, existing.timestamp
                 )));
             }
         }
 
-        if let Some(existing) = state.snapshots.iter_mut().find(|existing| {
+        let mut candidate = state.clone();
+        let snapshot_index = if let Some(index) = candidate.snapshots.iter().position(|existing| {
             existing.symbol == snapshot.symbol && existing.market_type == snapshot.market_type
         }) {
-            *existing = snapshot.clone();
+            candidate.snapshots[index] = snapshot.clone();
+            index
         } else {
-            state.snapshots.push(snapshot.clone());
-        }
-        state.observed_at = state.observed_at.max(snapshot.timestamp);
+            candidate.snapshots.push(snapshot.clone());
+            candidate.snapshots.len() - 1
+        };
+        candidate.observed_at = now;
+        let mut position_indexes = build_position_index(&candidate.positions)?;
 
-        let mut candidates = Vec::new();
-        for (index, order) in state.orders.iter().enumerate() {
-            if order.status != OrderStatus::Open
-                || order.intent.symbol != snapshot.symbol
+        for index in 0..candidate.orders.len() {
+            let order = &candidate.orders[index];
+            if !matches!(
+                order.status,
+                OrderStatus::Open | OrderStatus::PartiallyFilled
+            ) || order.intent.symbol != snapshot.symbol
                 || order.intent.market_type != snapshot.market_type
             {
                 continue;
             }
-            if let Some(fill_price) = crossing_price(&order.intent, &snapshot)? {
-                candidates.push((index, fill_price));
-            }
-        }
-        for (index, fill_price) in candidates {
-            let intent = state.orders[index].intent.clone();
-            if intent.reduce_only && !reduces_position(&state, &intent) {
-                let order = &mut state.orders[index];
+            let intent = candidate.orders[index].intent.clone();
+            let Some(fill_price) = crossing_price(&intent, &candidate.snapshots[snapshot_index])?
+            else {
+                continue;
+            };
+            let remaining = remaining_quantity(&candidate.orders[index])?;
+            if intent.reduce_only
+                && !reduces_position_by(&candidate, &intent, remaining, Some(&position_indexes))
+            {
+                let order = &mut candidate.orders[index];
                 order.status = OrderStatus::Cancelled;
-                order.updated_at = snapshot.timestamp;
-            } else {
-                let order = &mut state.orders[index];
-                order.status = OrderStatus::Filled;
-                order.filled_quantity = order.intent.quantity;
-                order.average_fill_price = Some(fill_price);
-                order.updated_at = snapshot.timestamp;
-                apply_fill(&mut state, &intent, fill_price, snapshot.timestamp)?;
+                order.updated_at = now;
+                continue;
             }
+            if intent.market_type == MarketType::Spot
+                && intent.side == Side::Sell
+                && spot_inventory_quantity(&candidate, &intent, Some(&position_indexes)).is_zero()
+            {
+                let order = &mut candidate.orders[index];
+                order.status = OrderStatus::Cancelled;
+                order.updated_at = now;
+                continue;
+            }
+            let fill_quantity = executable_quantity(
+                &candidate,
+                &intent,
+                remaining,
+                &candidate.snapshots[snapshot_index],
+                Some(&position_indexes),
+            );
+            if fill_quantity.is_zero() {
+                continue;
+            }
+            record_order_fill(&mut candidate.orders[index], fill_price, fill_quantity, now)?;
+            consume_depth(
+                &mut candidate.snapshots[snapshot_index],
+                intent.side,
+                fill_quantity,
+            )?;
+            apply_fill(
+                &mut candidate,
+                &intent,
+                PaperFill {
+                    quantity: fill_quantity,
+                    price: fill_price,
+                    mark: mark_price(&snapshot),
+                    at: now,
+                },
+                self.ledger_limits.positions,
+                Some(&mut position_indexes),
+            )?;
+            let order = &mut candidate.orders[index];
+            order.status = if order.filled_quantity == order.intent.quantity {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            };
         }
-        refresh_mark(&mut state, &snapshot);
+        refresh_mark(&mut candidate, &snapshot, now)?;
+        *state = candidate;
         drop(state);
 
         let _ignored_no_subscribers = self.market_sender.send(snapshot);
@@ -173,11 +557,68 @@ impl PaperExchange {
         }
     }
 
+    fn now(&self) -> DateTime<Utc> {
+        (self.clock)()
+    }
+
+    fn effective_now(&self, state: &PaperState) -> DateTime<Utc> {
+        self.now().max(state.observed_at)
+    }
+
+    fn freshness_violation(&self, snapshot: &MarketSnapshot, now: DateTime<Utc>) -> Option<String> {
+        let age = now.signed_duration_since(snapshot.timestamp);
+        if age > self.max_market_age {
+            return Some(format!(
+                "snapshot for {} is too old: age {} ms exceeds {} ms",
+                snapshot.symbol,
+                age.num_milliseconds(),
+                self.max_market_age.num_milliseconds()
+            ));
+        }
+        let future_skew = snapshot.timestamp.signed_duration_since(now);
+        if future_skew > self.max_future_skew {
+            return Some(format!(
+                "snapshot for {} is too far in the future: skew {} ms exceeds {} ms",
+                snapshot.symbol,
+                future_skew.num_milliseconds(),
+                self.max_future_skew.num_milliseconds()
+            ));
+        }
+        None
+    }
+
+    fn validate_instrument_rules(
+        &self,
+        intent: &OrderIntent,
+        snapshot: Option<&MarketSnapshot>,
+    ) -> Result<(), ExchangeError> {
+        let Some(rules) =
+            self.instrument_rules
+                .find(&intent.exchange, &intent.symbol, intent.market_type)
+        else {
+            return match self.instrument_rules_mode {
+                InstrumentRulesMode::Permissive => Ok(()),
+                InstrumentRulesMode::Strict => Err(ExchangeError::rejected(format!(
+                    "strict instrument rules are missing for {}:{}:{:?}",
+                    intent.exchange, intent.symbol, intent.market_type
+                ))),
+            };
+        };
+        let reference_price = intent.price.or_else(|| {
+            snapshot.map(|snapshot| match intent.side {
+                Side::Buy => snapshot.ask(),
+                Side::Sell => snapshot.bid(),
+            })
+        });
+        rules.validate(intent, reference_price)
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn submit(&self, intent: OrderIntent) -> Result<TradingReceipt, ExchangeError> {
         self.ensure_exchange(&intent.exchange)?;
         validate_intent(&intent)?;
-
         let mut state = self.state.lock().await;
+        let now = self.effective_now(&state);
         if let Some(existing) = state
             .orders
             .iter()
@@ -194,50 +635,129 @@ impl PaperExchange {
                 disposition: SubmissionDisposition::AlreadyProcessed,
             });
         }
-        if intent.reduce_only && !reduces_position(&state, &intent) {
+        if state.orders.len() >= self.ledger_limits.orders {
+            return Err(ExchangeError::resource_limit(
+                "paper order ledger",
+                self.ledger_limits.orders,
+                state.orders.len().saturating_add(1),
+            ));
+        }
+        if intent.reduce_only
+            && !reduces_position_by(&state, &intent, intent.quantity.as_decimal(), None)
+        {
             return Err(ExchangeError::rejected(
                 "reduce-only order would increase or reverse the position",
             ));
         }
+        if intent.market_type == MarketType::Spot
+            && intent.side == Side::Sell
+            && spot_inventory_quantity(&state, &intent, None).is_zero()
+        {
+            return Err(ExchangeError::rejected(
+                "spot sell requires available long inventory",
+            ));
+        }
 
-        let latest_snapshot = state
-            .snapshots
-            .iter()
-            .find(|snapshot| {
-                snapshot.symbol == intent.symbol && snapshot.market_type == intent.market_type
-            })
-            .cloned();
-        let (status, fill_price, disposition, at) =
-            submission_outcome(&intent, latest_snapshot.as_ref(), state.observed_at)?;
+        let snapshot_index = state.snapshots.iter().position(|snapshot| {
+            snapshot.symbol == intent.symbol && snapshot.market_type == intent.market_type
+        });
+        if let Some(snapshot) = snapshot_index.map(|index| &state.snapshots[index]) {
+            if let Some(reason) = self.freshness_violation(snapshot, now) {
+                return Err(ExchangeError::rejected(reason));
+            }
+        }
+        self.validate_instrument_rules(
+            &intent,
+            snapshot_index.map(|index| &state.snapshots[index]),
+        )?;
+        if intent.order_type == OrderType::Market && snapshot_index.is_none() {
+            return Err(ExchangeError::rejected(format!(
+                "no market snapshot is available for {}",
+                intent.symbol
+            )));
+        }
+        let immediate_fill_price = snapshot_index
+            .map(|index| crossing_price(&intent, &state.snapshots[index]))
+            .transpose()?
+            .flatten();
+        if intent.time_in_force == TimeInForce::PostOnly && immediate_fill_price.is_some() {
+            return Err(ExchangeError::rejected(
+                "post-only order would take liquidity",
+            ));
+        }
 
-        let sequence = state.next_order_id;
-        state.next_order_id = sequence
+        let mut candidate = state.clone();
+        let sequence = candidate.next_order_id;
+        candidate.next_order_id = sequence
             .checked_add(1)
             .ok_or_else(|| ExchangeError::invariant("paper order sequence overflowed"))?;
-        let order = Order {
+        let mut order = Order {
             id: format!("{}-{sequence:016}", self.exchange),
             intent: intent.clone(),
-            filled_quantity: if status == OrderStatus::Filled {
-                intent.quantity
-            } else {
-                Quantity::default()
-            },
-            average_fill_price: fill_price,
-            status,
-            created_at: at,
-            updated_at: at,
+            filled_quantity: Quantity::default(),
+            average_fill_price: None,
+            status: OrderStatus::Open,
+            created_at: now,
+            updated_at: now,
         };
-        state.orders.push(order.clone());
-        if let Some(fill_price) = fill_price {
-            apply_fill(&mut state, &intent, fill_price, at)?;
+        let mut disposition = SubmissionDisposition::Open;
+        if let Some(snapshot_index) = snapshot_index {
+            let snapshot = candidate.snapshots[snapshot_index].clone();
+            if let Some(fill_price) = immediate_fill_price {
+                let requested = intent.quantity.as_decimal();
+                let fill_quantity =
+                    executable_quantity(&candidate, &intent, requested, &snapshot, None);
+                if !fill_quantity.is_zero() {
+                    record_order_fill(&mut order, fill_price, fill_quantity, now)?;
+                    consume_depth(
+                        &mut candidate.snapshots[snapshot_index],
+                        intent.side,
+                        fill_quantity,
+                    )?;
+                    apply_fill(
+                        &mut candidate,
+                        &intent,
+                        PaperFill {
+                            quantity: fill_quantity,
+                            price: fill_price,
+                            mark: mark_price(&snapshot),
+                            at: now,
+                        },
+                        self.ledger_limits.positions,
+                        None,
+                    )?;
+                }
+                if fill_quantity == requested {
+                    order.status = OrderStatus::Filled;
+                    disposition = SubmissionDisposition::Filled;
+                } else if intent.order_type == OrderType::Market
+                    || matches!(intent.time_in_force, TimeInForce::Ioc | TimeInForce::Fok)
+                {
+                    order.status = OrderStatus::Cancelled;
+                    disposition = SubmissionDisposition::Cancelled;
+                } else if fill_quantity.is_zero() {
+                    order.status = OrderStatus::Open;
+                } else {
+                    order.status = OrderStatus::PartiallyFilled;
+                }
+            } else if matches!(intent.time_in_force, TimeInForce::Ioc | TimeInForce::Fok) {
+                order.status = OrderStatus::Cancelled;
+                disposition = SubmissionDisposition::Cancelled;
+            }
+        } else if matches!(intent.time_in_force, TimeInForce::Ioc | TimeInForce::Fok) {
+            order.status = OrderStatus::Cancelled;
+            disposition = SubmissionDisposition::Cancelled;
         }
+        candidate.orders.push(order.clone());
+        candidate.observed_at = now;
+        *state = candidate;
 
         Ok(TradingReceipt::Submitted { order, disposition })
     }
 
     async fn cancel(&self, order_id: &str) -> Result<TradingReceipt, ExchangeError> {
         let mut state = self.state.lock().await;
-        let observed_at = state.observed_at;
+        let now = self.effective_now(&state);
         let order = state
             .orders
             .iter_mut()
@@ -247,7 +767,7 @@ impl PaperExchange {
         let disposition = match order.status {
             OrderStatus::Pending | OrderStatus::Open | OrderStatus::PartiallyFilled => {
                 order.status = OrderStatus::Cancelled;
-                order.updated_at = observed_at;
+                order.updated_at = now;
                 CancellationDisposition::Cancelled
             }
             OrderStatus::Cancelled => CancellationDisposition::AlreadyCancelled,
@@ -258,8 +778,10 @@ impl PaperExchange {
                 )));
             }
         };
+        let order = order.clone();
+        state.observed_at = now;
         Ok(TradingReceipt::Cancelled {
-            orders: vec![order.clone()],
+            orders: vec![order],
             disposition,
         })
     }
@@ -270,7 +792,7 @@ impl PaperExchange {
         market_type: Option<MarketType>,
     ) -> Result<TradingReceipt, ExchangeError> {
         let mut state = self.state.lock().await;
-        let observed_at = state.observed_at;
+        let now = self.effective_now(&state);
         let mut cancelled = Vec::new();
         for order in &mut state.orders {
             let active = matches!(
@@ -282,7 +804,7 @@ impl PaperExchange {
                 market_type.is_none_or(|candidate| order.intent.market_type == candidate);
             if active && symbol_matches && market_matches {
                 order.status = OrderStatus::Cancelled;
-                order.updated_at = observed_at;
+                order.updated_at = now;
                 cancelled.push(order.clone());
             }
         }
@@ -291,6 +813,7 @@ impl PaperExchange {
         } else {
             CancellationDisposition::Cancelled
         };
+        state.observed_at = now;
         Ok(TradingReceipt::Cancelled {
             orders: cancelled,
             disposition,
@@ -312,7 +835,9 @@ impl ExchangeHandle for PaperExchange {
     }
 
     async fn reconcile(&self, scope: ReconcileScope) -> Result<ReconcileReceipt, ExchangeError> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        let observed_at = self.effective_now(&state);
+        state.observed_at = observed_at;
         let (orders, positions) = match &scope {
             ReconcileScope::All => (state.orders.clone(), state.positions.clone()),
             ReconcileScope::Orders { symbol } => (
@@ -346,7 +871,7 @@ impl ExchangeHandle for PaperExchange {
             scope,
             orders,
             positions,
-            observed_at: state.observed_at,
+            observed_at,
         })
     }
 
@@ -410,65 +935,6 @@ fn validate_intent(intent: &OrderIntent) -> Result<(), ExchangeError> {
     Ok(())
 }
 
-fn submission_outcome(
-    intent: &OrderIntent,
-    snapshot: Option<&MarketSnapshot>,
-    fallback_time: DateTime<Utc>,
-) -> Result<
-    (
-        OrderStatus,
-        Option<Price>,
-        SubmissionDisposition,
-        DateTime<Utc>,
-    ),
-    ExchangeError,
-> {
-    let at = snapshot.map_or(fallback_time, |snapshot| snapshot.timestamp);
-    if intent.order_type == OrderType::Market {
-        let snapshot = snapshot.ok_or_else(|| {
-            ExchangeError::rejected(format!(
-                "no market snapshot is available for {}",
-                intent.symbol
-            ))
-        })?;
-        let fill_price = crossing_price(intent, snapshot)?
-            .ok_or_else(|| ExchangeError::invariant("market order did not produce a fill price"))?;
-        return Ok((
-            OrderStatus::Filled,
-            Some(fill_price),
-            SubmissionDisposition::Filled,
-            at,
-        ));
-    }
-
-    let fill_price = snapshot
-        .and_then(|snapshot| crossing_price(intent, snapshot).transpose())
-        .transpose()?;
-    if let Some(fill_price) = fill_price {
-        if intent.time_in_force == TimeInForce::PostOnly {
-            return Err(ExchangeError::rejected(
-                "post-only order would take liquidity",
-            ));
-        }
-        return Ok((
-            OrderStatus::Filled,
-            Some(fill_price),
-            SubmissionDisposition::Filled,
-            at,
-        ));
-    }
-    if matches!(intent.time_in_force, TimeInForce::Ioc | TimeInForce::Fok) {
-        Ok((
-            OrderStatus::Cancelled,
-            None,
-            SubmissionDisposition::Cancelled,
-            at,
-        ))
-    } else {
-        Ok((OrderStatus::Open, None, SubmissionDisposition::Open, at))
-    }
-}
-
 fn crossing_price(
     intent: &OrderIntent,
     snapshot: &MarketSnapshot,
@@ -494,18 +960,161 @@ fn crossing_price(
     }
 }
 
-fn reduces_position(state: &PaperState, intent: &OrderIntent) -> bool {
-    let Some(position) = state.positions.iter().find(|position| {
-        position.symbol == intent.symbol && position.market_type == intent.market_type
-    }) else {
+fn remaining_quantity(order: &Order) -> Result<Decimal, ExchangeError> {
+    order
+        .intent
+        .quantity
+        .as_decimal()
+        .checked_sub(order.filled_quantity.as_decimal())
+        .ok_or_else(|| ExchangeError::invariant("paper order filled quantity exceeds requested"))
+}
+
+fn executable_quantity(
+    state: &PaperState,
+    intent: &OrderIntent,
+    requested: Decimal,
+    snapshot: &MarketSnapshot,
+    position_indexes: Option<&PositionIndex>,
+) -> Decimal {
+    let depth = match intent.side {
+        Side::Buy => snapshot.ask_quantity,
+        Side::Sell => snapshot.bid_quantity,
+    }
+    .map_or(Decimal::ZERO, Quantity::as_decimal);
+    let available = if intent.market_type == MarketType::Spot && intent.side == Side::Sell {
+        depth.min(spot_inventory_quantity(state, intent, position_indexes))
+    } else {
+        depth
+    };
+    if intent.time_in_force == TimeInForce::Fok && available < requested {
+        Decimal::ZERO
+    } else {
+        requested.min(available)
+    }
+}
+
+fn consume_depth(
+    snapshot: &mut MarketSnapshot,
+    side: Side,
+    filled: Decimal,
+) -> Result<(), ExchangeError> {
+    let depth = match side {
+        Side::Buy => &mut snapshot.ask_quantity,
+        Side::Sell => &mut snapshot.bid_quantity,
+    };
+    let Some(current) = *depth else {
+        return Ok(());
+    };
+    let remaining = current
+        .as_decimal()
+        .checked_sub(filled)
+        .ok_or_else(|| ExchangeError::invariant("paper top-of-book depth was over-consumed"))?;
+    *depth = Some(
+        Quantity::new(remaining).map_err(|error| ExchangeError::invariant(error.to_string()))?,
+    );
+    Ok(())
+}
+
+fn record_order_fill(
+    order: &mut Order,
+    fill_price: Price,
+    filled: Decimal,
+    at: DateTime<Utc>,
+) -> Result<(), ExchangeError> {
+    let previous = order.filled_quantity.as_decimal();
+    let total = previous
+        .checked_add(filled)
+        .ok_or_else(|| ExchangeError::invariant("paper order filled quantity overflowed"))?;
+    if total > order.intent.quantity.as_decimal() {
+        return Err(ExchangeError::invariant(
+            "paper order filled quantity exceeds requested quantity",
+        ));
+    }
+    let average = if previous.is_zero() {
+        fill_price
+    } else {
+        let old_average = order.average_fill_price.ok_or_else(|| {
+            ExchangeError::invariant("partially filled order is missing an average fill price")
+        })?;
+        let old_weight = old_average
+            .as_decimal()
+            .checked_mul(previous)
+            .ok_or_else(|| ExchangeError::invariant("paper order fill value overflowed"))?;
+        let new_weight = fill_price
+            .as_decimal()
+            .checked_mul(filled)
+            .ok_or_else(|| ExchangeError::invariant("paper order fill value overflowed"))?;
+        let weighted = old_weight
+            .checked_add(new_weight)
+            .and_then(|value| value.checked_div(total))
+            .ok_or_else(|| ExchangeError::invariant("paper average fill price overflowed"))?;
+        Price::new(weighted).map_err(|error| ExchangeError::invariant(error.to_string()))?
+    };
+    order.filled_quantity =
+        Quantity::new(total).map_err(|error| ExchangeError::invariant(error.to_string()))?;
+    order.average_fill_price = Some(average);
+    order.updated_at = at;
+    Ok(())
+}
+
+fn spot_inventory_quantity(
+    state: &PaperState,
+    intent: &OrderIntent,
+    position_indexes: Option<&PositionIndex>,
+) -> Decimal {
+    position_for_intent(state, intent, position_indexes)
+        .filter(|position| {
+            position.market_type == MarketType::Spot && position.side == PositionSide::Long
+        })
+        .map_or(Decimal::ZERO, |position| position.quantity.as_decimal())
+}
+
+fn reduces_position_by(
+    state: &PaperState,
+    intent: &OrderIntent,
+    requested: Decimal,
+    position_indexes: Option<&PositionIndex>,
+) -> bool {
+    let Some(position) = position_for_intent(state, intent, position_indexes) else {
         return false;
     };
     let signed = signed_quantity(position);
-    let requested = intent.quantity.as_decimal();
     match intent.side {
         Side::Buy => signed.is_sign_negative() && requested <= signed.abs(),
         Side::Sell => signed.is_sign_positive() && requested <= signed.abs(),
     }
+}
+
+fn build_position_index(positions: &[Position]) -> Result<PositionIndex, ExchangeError> {
+    let mut indexes = PositionIndex::new();
+    indexes
+        .try_reserve(positions.len())
+        .map_err(|_| ExchangeError::unavailable("failed to allocate paper position index"))?;
+    for (index, position) in positions.iter().enumerate() {
+        let key = (position.symbol.clone(), position.market_type);
+        if indexes.insert(key, index).is_some() {
+            return Err(ExchangeError::invariant(format!(
+                "duplicate paper position for {} {:?}",
+                position.symbol, position.market_type
+            )));
+        }
+    }
+    Ok(indexes)
+}
+
+fn position_for_intent<'a>(
+    state: &'a PaperState,
+    intent: &OrderIntent,
+    position_indexes: Option<&PositionIndex>,
+) -> Option<&'a Position> {
+    if let Some(indexes) = position_indexes {
+        return indexes
+            .get(&(intent.symbol.clone(), intent.market_type))
+            .and_then(|index| state.positions.get(*index));
+    }
+    state.positions.iter().find(|position| {
+        position.symbol == intent.symbol && position.market_type == intent.market_type
+    })
 }
 
 fn signed_quantity(position: &Position) -> Decimal {
@@ -519,19 +1128,40 @@ fn signed_quantity(position: &Position) -> Decimal {
 fn apply_fill(
     state: &mut PaperState,
     intent: &OrderIntent,
-    fill_price: Price,
-    at: DateTime<Utc>,
+    fill: PaperFill,
+    max_positions: usize,
+    position_indexes: Option<&mut PositionIndex>,
 ) -> Result<(), ExchangeError> {
-    let position_index = state.positions.iter().position(|position| {
-        position.symbol == intent.symbol && position.market_type == intent.market_type
-    });
+    let PaperFill {
+        quantity: fill_quantity,
+        price: fill_price,
+        mark,
+        at,
+    } = fill;
+    let position_key = (intent.symbol.clone(), intent.market_type);
+    let position_index = if let Some(indexes) = position_indexes.as_ref() {
+        indexes.get(&position_key).copied()
+    } else {
+        state.positions.iter().position(|position| {
+            position.symbol == intent.symbol && position.market_type == intent.market_type
+        })
+    };
+    if position_index.is_none() && state.positions.len() >= max_positions {
+        return Err(ExchangeError::resource_limit(
+            "paper position ledger",
+            max_positions,
+            state.positions.len().saturating_add(1),
+        ));
+    }
     let existing = position_index.map(|index| state.positions[index].clone());
     let old_signed = existing.as_ref().map_or(Decimal::ZERO, signed_quantity);
     let delta = match intent.side {
-        Side::Buy => intent.quantity.as_decimal(),
-        Side::Sell => -intent.quantity.as_decimal(),
+        Side::Buy => fill_quantity,
+        Side::Sell => -fill_quantity,
     };
-    let new_signed = old_signed + delta;
+    let new_signed = old_signed
+        .checked_add(delta)
+        .ok_or_else(|| ExchangeError::invariant("paper position quantity overflowed"))?;
     let old_entry = existing.as_ref().and_then(|position| position.entry_price);
     let entry = calculate_entry(old_signed, old_entry, delta, fill_price, new_signed)?;
     let side = if new_signed.is_zero() {
@@ -541,14 +1171,7 @@ fn apply_fill(
     } else {
         PositionSide::Short
     };
-    let mark = state
-        .snapshots
-        .iter()
-        .find(|snapshot| {
-            snapshot.symbol == intent.symbol && snapshot.market_type == intent.market_type
-        })
-        .map(mark_price)
-        .or(Some(fill_price));
+    let mark = Some(mark);
     let position = Position {
         exchange: intent.exchange.clone(),
         symbol: intent.symbol.clone(),
@@ -558,13 +1181,21 @@ fn apply_fill(
             .map_err(|error| ExchangeError::invariant(error.to_string()))?,
         entry_price: entry,
         mark_price: mark,
-        unrealized_pnl: unrealized_pnl(side, new_signed.abs(), entry, mark),
+        unrealized_pnl: unrealized_pnl(side, new_signed.abs(), entry, mark)?,
         updated_at: at,
     };
     if let Some(index) = position_index {
         state.positions[index] = position;
     } else {
+        let new_position_index = state.positions.len();
         state.positions.push(position);
+        if let Some(indexes) = position_indexes {
+            if indexes.insert(position_key, new_position_index).is_some() {
+                return Err(ExchangeError::invariant(
+                    "paper position index unexpectedly replaced an entry",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -587,9 +1218,22 @@ fn calculate_entry(
     }
     let old_entry = old_entry
         .ok_or_else(|| ExchangeError::invariant("non-flat position is missing an entry price"))?;
-    let total = old_signed.abs() + delta.abs();
-    let weighted =
-        (old_entry.as_decimal() * old_signed.abs() + fill_price.as_decimal() * delta.abs()) / total;
+    let old_weight = old_entry
+        .as_decimal()
+        .checked_mul(old_signed.abs())
+        .ok_or_else(|| ExchangeError::invariant("paper weighted entry value overflowed"))?;
+    let fill_weight = fill_price
+        .as_decimal()
+        .checked_mul(delta.abs())
+        .ok_or_else(|| ExchangeError::invariant("paper weighted fill value overflowed"))?;
+    let total = old_signed
+        .abs()
+        .checked_add(delta.abs())
+        .ok_or_else(|| ExchangeError::invariant("paper weighted quantity overflowed"))?;
+    let weighted = old_weight
+        .checked_add(fill_weight)
+        .and_then(|value| value.checked_div(total))
+        .ok_or_else(|| ExchangeError::invariant("paper weighted entry calculation overflowed"))?;
     Price::new(weighted)
         .map(Some)
         .map_err(|error| ExchangeError::invariant(error.to_string()))
@@ -599,7 +1243,11 @@ fn mark_price(snapshot: &MarketSnapshot) -> Price {
     snapshot.last.unwrap_or_else(|| snapshot.mid_price())
 }
 
-fn refresh_mark(state: &mut PaperState, snapshot: &MarketSnapshot) {
+fn refresh_mark(
+    state: &mut PaperState,
+    snapshot: &MarketSnapshot,
+    at: DateTime<Utc>,
+) -> Result<(), ExchangeError> {
     let mark = mark_price(snapshot);
     for position in &mut state.positions {
         if position.symbol == snapshot.symbol && position.market_type == snapshot.market_type {
@@ -609,10 +1257,11 @@ fn refresh_mark(state: &mut PaperState, snapshot: &MarketSnapshot) {
                 position.quantity.as_decimal(),
                 position.entry_price,
                 position.mark_price,
-            );
-            position.updated_at = snapshot.timestamp;
+            )?;
+            position.updated_at = at;
         }
     }
+    Ok(())
 }
 
 fn unrealized_pnl(
@@ -620,14 +1269,55 @@ fn unrealized_pnl(
     quantity: Decimal,
     entry: Option<Price>,
     mark: Option<Price>,
-) -> Money {
+) -> Result<Money, ExchangeError> {
     let Some((entry, mark)) = entry.zip(mark) else {
-        return Money::default();
+        return Ok(Money::default());
     };
     let pnl = match side {
-        PositionSide::Long => (mark.as_decimal() - entry.as_decimal()) * quantity,
-        PositionSide::Short => (entry.as_decimal() - mark.as_decimal()) * quantity,
-        PositionSide::Flat => Decimal::ZERO,
-    };
-    Money::new(pnl)
+        PositionSide::Long => mark
+            .as_decimal()
+            .checked_sub(entry.as_decimal())
+            .and_then(|difference| difference.checked_mul(quantity)),
+        PositionSide::Short => entry
+            .as_decimal()
+            .checked_sub(mark.as_decimal())
+            .and_then(|difference| difference.checked_mul(quantity)),
+        PositionSide::Flat => Some(Decimal::ZERO),
+    }
+    .ok_or_else(|| ExchangeError::invariant("paper unrealized PnL overflowed"))?;
+    Ok(Money::new(pnl))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+
+    use super::advance_clock_high_water;
+
+    fn timestamp(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("test timestamp must be valid")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn clock_high_water_uses_wall_progress_after_suspend_and_never_rewinds() {
+        let mut observed = timestamp("2026-07-14T00:00:00Z");
+        assert_eq!(
+            advance_clock_high_water(
+                &mut observed,
+                timestamp("2026-07-14T00:00:10Z"),
+                timestamp("2026-07-14T01:00:00Z"),
+            ),
+            timestamp("2026-07-14T01:00:00Z")
+        );
+        assert_eq!(
+            advance_clock_high_water(
+                &mut observed,
+                timestamp("2026-07-14T00:00:20Z"),
+                timestamp("2026-07-14T00:30:00Z"),
+            ),
+            timestamp("2026-07-14T01:00:00Z")
+        );
+    }
 }

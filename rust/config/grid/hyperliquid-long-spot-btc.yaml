@@ -136,8 +136,8 @@ grid_system:
 #    - 永续符号: BTC/USDC:USDC (市场ID: 0)
 #    ⚠️ 注意：UBTC是Hyperliquid的BTC现货代号，不是其他代币
 # 
-# 2. 启动命令
-#    python run_grid_trading.py config/grid/hyperliquid_btc_spot_long.yaml
+# 2. 当前 Rust paper one-shot
+#    cargo run -- grid config/grid/hyperliquid-long-spot-btc.yaml --once --price <显式价格>
 # 
 # 3. 风险提示
 #    - 现货无杠杆，但需要足够的USDC余额来挂买单

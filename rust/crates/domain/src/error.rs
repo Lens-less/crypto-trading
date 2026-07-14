@@ -8,8 +8,8 @@ pub enum DomainError {
     EmptySymbol,
     #[error("exchange must not be empty")]
     EmptyExchange,
-    #[error("price must not be negative: {0}")]
-    NegativePrice(Decimal),
+    #[error("price must be greater than zero: {0}")]
+    NonPositivePrice(Decimal),
     #[error("quantity must not be negative: {0}")]
     NegativeQuantity(Decimal),
     #[error("invalid decimal value: {0}")]

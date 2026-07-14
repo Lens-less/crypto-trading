@@ -1,10 +1,13 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use crypto_trading_domain::{MarketType, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::{ConfigError, ConfigResult};
+use crate::{
+    ConfigError, ConfigResult,
+    input::{parse_yaml, read_config_file},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceAlertConfig {
@@ -92,9 +95,9 @@ struct RawPriceThreshold {
     #[serde(default)]
     enabled: bool,
     #[serde(default, alias = "upper_price")]
-    upper_limit: Option<Price>,
+    upper_limit: Option<Decimal>,
     #[serde(default, alias = "lower_price")]
-    lower_limit: Option<Price>,
+    lower_limit: Option<Decimal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +147,23 @@ pub struct VolumeMakerConfig {
     pub use_post_only: bool,
 }
 
+impl VolumeMakerConfig {
+    /// Verifies operator controls that must hold before a volume strategy can
+    /// construct or submit orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while the emergency stop is active.
+    pub fn validate_execution_controls(&self) -> ConfigResult<()> {
+        if self.emergency_stop {
+            return Err(ConfigError::Validation(
+                "volume maker emergency stop is active".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawVolumeDocument {
     #[serde(alias = "volume_system")]
@@ -178,7 +198,7 @@ struct RawVolumeMaker {
     post_trade_delay: Option<Decimal>,
     #[serde(default)]
     max_cycles: Option<u64>,
-    #[serde(default)]
+    #[serde(default = "yes")]
     emergency_stop: bool,
     #[serde(default = "default_order_mode")]
     order_mode: String,
@@ -221,10 +241,7 @@ fn default_order_mode() -> String {
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_price_alert_config(path: impl AsRef<Path>) -> ConfigResult<PriceAlertConfig> {
     let path = path.as_ref();
-    let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let yaml = read_config_file(path)?;
     load_price_alert_config_from_str(&yaml)
 }
 
@@ -234,27 +251,29 @@ pub fn load_price_alert_config(path: impl AsRef<Path>) -> ConfigResult<PriceAler
 ///
 /// Returns an error if the YAML shape or a typed value is invalid.
 pub fn load_price_alert_config_from_str(yaml: &str) -> ConfigResult<PriceAlertConfig> {
-    let raw: RawPriceAlertDocument = serde_yaml::from_str(yaml)?;
+    let raw: RawPriceAlertDocument = parse_yaml(yaml)?;
     let symbols = raw
         .price_alert
         .symbols
         .into_iter()
-        .map(|symbol| PriceAlertSymbolConfig {
-            symbol: symbol.symbol,
-            market_type: symbol.market_type,
-            enabled: symbol.enabled,
-            volatility_alert: VolatilityAlertConfig {
-                enabled: symbol.volatility_alert.enabled,
-                time_window_seconds: symbol.volatility_alert.time_window,
-                threshold_percent: symbol.volatility_alert.threshold_percent,
-            },
-            price_alert: PriceThresholdConfig {
-                enabled: symbol.price_alert.enabled,
-                upper_price: nonzero_price(symbol.price_alert.upper_limit),
-                lower_price: nonzero_price(symbol.price_alert.lower_limit),
-            },
+        .map(|symbol| {
+            Ok(PriceAlertSymbolConfig {
+                symbol: symbol.symbol,
+                market_type: symbol.market_type,
+                enabled: symbol.enabled,
+                volatility_alert: VolatilityAlertConfig {
+                    enabled: symbol.volatility_alert.enabled,
+                    time_window_seconds: symbol.volatility_alert.time_window,
+                    threshold_percent: symbol.volatility_alert.threshold_percent,
+                },
+                price_alert: PriceThresholdConfig {
+                    enabled: symbol.price_alert.enabled,
+                    upper_price: nonzero_price(symbol.price_alert.upper_limit)?,
+                    lower_price: nonzero_price(symbol.price_alert.lower_limit)?,
+                },
+            })
         })
-        .collect();
+        .collect::<ConfigResult<Vec<_>>>()?;
 
     Ok(PriceAlertConfig {
         exchange: raw.price_alert.exchange,
@@ -271,10 +290,7 @@ pub fn load_price_alert_config_from_str(yaml: &str) -> ConfigResult<PriceAlertCo
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_volume_maker_config(path: impl AsRef<Path>) -> ConfigResult<VolumeMakerConfig> {
     let path = path.as_ref();
-    let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let yaml = read_config_file(path)?;
     load_volume_maker_config_from_str(&yaml)
 }
 
@@ -284,7 +300,12 @@ pub fn load_volume_maker_config(path: impl AsRef<Path>) -> ConfigResult<VolumeMa
 ///
 /// Returns an error for invalid YAML or a non-positive order quantity.
 pub fn load_volume_maker_config_from_str(yaml: &str) -> ConfigResult<VolumeMakerConfig> {
-    let raw: RawVolumeDocument = serde_yaml::from_str(yaml)?;
+    let raw: RawVolumeDocument = parse_yaml(yaml)?;
+    if raw.volume_maker.exchange.trim().is_empty() {
+        return Err(ConfigError::Validation(
+            "volume maker exchange must not be empty".to_owned(),
+        ));
+    }
     if raw.volume_maker.order_quantity.as_decimal().is_zero() {
         return Err(ConfigError::Validation(
             "volume maker order quantity must be positive".to_owned(),
@@ -297,6 +318,33 @@ pub fn load_volume_maker_config_from_str(yaml: &str) -> ConfigResult<VolumeMaker
         .or(raw.volume_maker.check_interval)
         .or(raw.volume_maker.post_trade_delay)
         .unwrap_or(Decimal::ZERO);
+    if interval_seconds < Decimal::ZERO {
+        return Err(ConfigError::Validation(
+            "volume maker interval must not be negative".to_owned(),
+        ));
+    }
+    if !matches!(
+        raw.volume_maker
+            .order_mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "limit" | "market"
+    ) {
+        return Err(ConfigError::Validation(
+            "volume maker order mode must be limit or market".to_owned(),
+        ));
+    }
+    if raw
+        .volume_maker
+        .min_quantity
+        .zip(raw.volume_maker.max_quantity)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        return Err(ConfigError::Validation(
+            "volume maker min_quantity must not exceed max_quantity".to_owned(),
+        ));
+    }
     Ok(VolumeMakerConfig {
         exchange: raw.volume_maker.exchange,
         symbol: raw.volume_maker.symbol,
@@ -316,6 +364,12 @@ pub fn load_volume_maker_config_from_str(yaml: &str) -> ConfigResult<VolumeMaker
     })
 }
 
-fn nonzero_price(price: Option<Price>) -> Option<Price> {
-    price.filter(|price| !price.as_decimal().is_zero())
+fn nonzero_price(price: Option<Decimal>) -> ConfigResult<Option<Price>> {
+    match price {
+        None => Ok(None),
+        Some(value) if value.is_zero() => Ok(None),
+        Some(value) => Price::new(value).map(Some).map_err(|error| {
+            ConfigError::Validation(format!("invalid price-alert threshold: {error}"))
+        }),
+    }
 }

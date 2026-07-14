@@ -2,9 +2,9 @@
 # 套利系统统一配置文件
 # ============================================================================
 # 
-# 所属系统: 套利执行终端 V3（基础模式 / 传统套利）
-# 使用模块: core/services/arbitrage_monitor_v2/config/unified_config_manager.py
-# 说明: 涵盖价差&资金费率决策、执行/风险配置，UI 为 V3 终端
+# 历史来源: 套利执行终端 V3（基础模式 / 传统套利）
+# 当前状态: Rust 仅作 legacy 配置兼容检查；连续执行、UI 和 live 均未实现
+# 检查: cargo run -- config-check config/arbitrage/arbitrage_unified.yaml
 # ============================================================================
 
 # ============================================================================
@@ -12,9 +12,9 @@
 # ============================================================================
 system_mode:
   # 监控模式开关（Monitor Only Mode）
-  # true:  只监控，不执行真实订单（所有套利流程正常运行，但不下单）
-  # false: 正常模式，执行真实订单
-  monitor_only: false  # 🔥 实盘模式：执行真实订单
+  # true:  禁止进入任何提交边界
+  # false: 仅允许继续接受其他 Rust paper 门禁检查；不代表 live 可用
+  monitor_only: false
   
   # 🔥 数据新鲜度配置（Data Freshness）
   # 说明：在进行价差分析时，只使用新鲜度在此阈值内的交易所数据
@@ -131,7 +131,7 @@ arbitrage_execution:
       use_tick_precision: true          # 🔥 ✅ Tick优先：开启后强制按“买单=卖一-1tick、卖单=买一+1tick”的被动方式下单，并自动忽略 symbol_config 里的绝对/百分比偏移；只有把此开关设为 false，才会回到激进偏移模式
     
     paradex:
-      order_mode: "limit"               # Paradex 使用限价单 + SDK 签名（共用）
+      order_mode: "limit"               # 历史 Paradex 下单偏好；当前 Rust 不签名或下单
       priority: 2                       # 与 Backpack 同级，优先跟随高速交易所（共用）
       limit_price_offset_pct: 0         # 价格偏移万分之5，保证挂单在盘口内（共用）
       use_tick_precision: true          # 🔥 ✅ Tick优先：开启后强制按“买单=卖一-1tick、卖单=买一+1tick”的被动方式下单，并自动忽略 symbol_config 里的绝对/百分比偏移；只有把此开关设为 false，才会回到激进偏移模式

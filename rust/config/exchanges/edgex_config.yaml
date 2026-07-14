@@ -179,14 +179,14 @@ edgex:
     #
     # ========================================
     
-    # 📌 密钥已迁移到环境变量（.env 文件）：
+    # 📌 密钥只从启动进程的环境变量读取；Rust 不会自动加载 .env：
     #    EDGEX_ACCOUNT_ID - 账户ID
     #    EDGEX_STARK_PRIVATE_KEY - Stark 私钥
     account_id: ""           # 留空，使用环境变量 EDGEX_ACCOUNT_ID
     stark_private_key: ""    # 留空，使用环境变量 EDGEX_STARK_PRIVATE_KEY
     
     # SDK配置
-    use_official_sdk: true   # 使用EdgeX官方SDK处理签名
+    use_official_sdk: true   # 未消费的历史字段；当前 Rust 不处理 EdgeX 私有签名
     # EdgeX官方SDK会自动处理：
     # - ECDSA签名算法
     # - SHA3哈希

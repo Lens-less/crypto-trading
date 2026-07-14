@@ -3,11 +3,11 @@
 # ============================================================================
 # 
 # 所属系统: 套利监控系统 V2（仅监控 / 无执行）
-# 使用脚本: run_arbitrage_monitor_v2.py, run_arbitrage_monitor_simple.py
-# 模块路径: core/services/arbitrage_monitor_v2/
+# 当前 Rust 状态: 配置可校验，连续 monitor runtime 尚未实现
+# 检查: cargo run -- config-check config/arbitrage/monitor_v2.yaml
 # ============================================================================
 
-# 交易所配置（当前使用 EdgeX、Backpack、Lighter、Paradex 四个交易所）
+# 历史 monitor universe；当前 Rust 只校验并在 strict one-shot companion 中使用 allowlist
 exchanges:
   - edgex
 # - backpack

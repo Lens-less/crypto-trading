@@ -14,6 +14,7 @@ use crate::{
 const EXCHANGE: &str = "binance";
 const DEFAULT_BASE_URL: &str = "https://data-api.binance.vision";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
 /// Read-only Binance Spot public-market-data adapter.
 #[derive(Debug, Clone)]
@@ -86,7 +87,7 @@ impl BinancePublicExchange {
     /// HTTP responses, and [`ExchangeError::InvalidResponse`] for malformed or
     /// mismatched response data.
     pub async fn fetch_snapshot(&self, symbol: &Symbol) -> Result<MarketSnapshot, ExchangeError> {
-        let response = self
+        let mut response = self
             .client
             .get(self.book_ticker_url.clone())
             .query(&[("symbol", symbol.as_str())])
@@ -101,9 +102,39 @@ impl BinancePublicExchange {
                 status.canonical_reason().unwrap_or("HTTP request failed"),
             ));
         }
-        let payload = response.bytes().await.map_err(|error| {
+        if let Some(content_length) = response.content_length() {
+            let requested = usize::try_from(content_length).unwrap_or(usize::MAX);
+            if requested > MAX_RESPONSE_BODY_BYTES {
+                return Err(ExchangeError::resource_limit(
+                    "Binance response body",
+                    MAX_RESPONSE_BODY_BYTES,
+                    requested,
+                ));
+            }
+        }
+        let mut payload = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), error.to_string())
-        })?;
+        })? {
+            let requested = payload.len().checked_add(chunk.len()).ok_or_else(|| {
+                ExchangeError::resource_limit(
+                    "Binance response body",
+                    MAX_RESPONSE_BODY_BYTES,
+                    usize::MAX,
+                )
+            })?;
+            if requested > MAX_RESPONSE_BODY_BYTES {
+                return Err(ExchangeError::resource_limit(
+                    "Binance response body",
+                    MAX_RESPONSE_BODY_BYTES,
+                    requested,
+                ));
+            }
+            payload.try_reserve(chunk.len()).map_err(|_| {
+                ExchangeError::unavailable("unable to reserve bounded Binance response storage")
+            })?;
+            payload.extend_from_slice(&chunk);
+        }
         let snapshot = Self::parse_book_ticker(&payload, Utc::now())?;
         if snapshot.symbol != *symbol {
             return Err(ExchangeError::invalid_response(

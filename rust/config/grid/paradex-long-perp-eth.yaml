@@ -2,18 +2,18 @@
 # Paradex ETH 永续合约做多网格配置
 # ==============================================================================
 #
-# 🎯 目标：使用 Paradex 官方 SDK（GTC 限价单 + 自动签名）运行稳健型做多网格
+# 历史目标：Paradex 稳健型做多网格；当前文件仅可作 legacy 配置检查
 # ✨ 特性：
 #    - Maker 0 手续费，鼓励使用限价单
 #    - 0.05% Taker 费率（仅止损/急速撤退时触发）
 #    - WebSocket 私有频道实时跟单，避免 REST 轮询延迟
 #
-# 使用方法：
-#   python run_grid_trading.py --config config/grid/paradex-long-perp-eth.yaml
+# 当前 Rust paper one-shot：
+#   cargo run -- grid config/grid/paradex-long-perp-eth.yaml --once --price <显式价格>
 #
 # 风险提示：
-#   - 请先确认 .env 中 PARADEX_API_KEY / PARADEX_L2_ADDRESS / PARADEX_WALLET_ADDRESS /
-#     PARADEX_JWT_TOKEN 均已配置（缺任一项都会导致交易失败）
+#   - 当前 paper one-shot 不需要凭证；Rust 不会自动加载 .env
+#   - live 私有适配器尚未开放；后续所需凭证必须从进程环境变量读取
 #   - Paradex 下单默认 GTC，可通过 grid_system.order_instruction 修改为 IOC/FOK/POST_ONLY
 #
 # ==============================================================================
@@ -89,8 +89,7 @@ grid_system:
   # ============================================================================
   # 风险提示
   # ============================================================================
-  # 1. Paradex SDK 会自动签名，请勿在脚本中保存明文私钥
-  # 2. Maker 0 手续费的前提是订单必须挂在盘口 ≥3 秒，频繁撤单可能变成 taker
-  # 3. 若 JWT 为只读，将无法订阅私有频道，网格也无法侦测成交 → 请务必填写 trading JWT
-  # 4. 建议搭配 `demo/test_paradex_trading_flow.py` 完整测试后再运行网格
+  # 1. 当前 Rust 只支持 placement-only paper one-shot，不读取 Paradex 凭证
+  # 2. 本文件包含未接入的历史保护字段，因此必须由 config-check 标为 legacy-parseable
+  # 3. 私有 live adapter、签名、testnet 下单和对账未验收前，不得把此文件用于真实订单
 

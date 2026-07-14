@@ -3,24 +3,22 @@
 # ============================================================================
 # 
 # 用途: Lighter 交易所内 ETH 现货 ↔ ETH 合约同所多腿套利
-# 启动: python main_unified.py --monitor-config config/arbitrage/monitor_lighter_eth_spot.yaml
-# 虚拟环境: source .venv-lighter-spot/bin/activate
+# 当前状态: symbols 为空，Rust 会将此文件分类为 unsupported；补齐真实 universe 前不可运行
+# 检查: cargo run -- config-check config/arbitrage/monitor_lighter_eth_spot.yaml
 # ============================================================================
 
-# ✅ 交易所配置（unified_orchestrator.py:631 使用）
+# Rust 可解析的交易所 allowlist
 exchanges:
   - lighter
 
-# ✅ 监控的交易对（unified_orchestrator.py:632,831,2699 使用）
-# 💡 不需要在这里配置 ETH 和 ETH/USDC，它们通过 extra_symbols.yaml 自动订阅
+# Rust 要求显式非空的交易对 allowlist；不会从其他文件自动补全
 symbols: []
 
-# ✅ UI刷新配置（unified_orchestrator.py:640 使用）
+# 以下历史 UI 字段未接入 Rust runtime
 performance:
   ui_refresh_interval_ms: 1000  # UI刷新间隔（毫秒）
 
-# ✅ Debug CLI 模式配置（unified_orchestrator.py:619,650 使用）
-# 注意：启用后会关闭富UI，改用CLI输出
+# 历史 Debug CLI 字段同样未接入
 debug_cli:
   enabled: false                # 是否启用CLI调试模式（false=使用富UI）
   interval_seconds: 1.0         # CLI打印间隔（秒）

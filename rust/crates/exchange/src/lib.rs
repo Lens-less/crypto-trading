@@ -3,6 +3,7 @@
 mod binance;
 mod bounded;
 mod error;
+mod instrument;
 mod model;
 mod paper;
 mod unsupported;
@@ -10,15 +11,19 @@ mod unsupported;
 pub use binance::BinancePublicExchange;
 pub use bounded::BoundedExchangeHandle;
 pub use error::{ExchangeError, ExchangeOperation};
+pub use instrument::{
+    InstrumentRuleCatalog, InstrumentRules, InstrumentRulesMode, InstrumentRulesStatus,
+};
 pub use model::{
-    CancellationDisposition, ExchangeAvailability, ExchangeMode, ExchangeStatus,
-    MarketSubscription, ReconcileReceipt, ReconcileScope, SubmissionDisposition,
+    CancellationDisposition, ExchangeAvailability, ExchangeMode, ExchangeOperationKey,
+    ExchangeStatus, MarketSubscription, ReconcileReceipt, ReconcileScope, SubmissionDisposition,
     SubscriptionReceipt, TradingCommand, TradingReceipt,
 };
-pub use paper::PaperExchange;
+pub use paper::{PaperExchange, PaperLedgerLimits};
 pub use unsupported::UnsupportedLiveExchange;
 
 use async_trait::async_trait;
+use tokio::time::Instant;
 
 /// Object-safe boundary consumed by runtimes and strategies.
 #[async_trait]
@@ -26,7 +31,34 @@ pub trait ExchangeHandle: Send + Sync {
     /// Executes a typed trading command.
     async fn execute(&self, command: TradingCommand) -> Result<TradingReceipt, ExchangeError>;
 
-    /// Returns an authoritative point-in-time view for the requested scope.
+    /// Executes a command only if the adapter can begin dispatch before the
+    /// caller's absolute monotonic deadline.
+    ///
+    /// Wrappers that queue work must override this method and carry the same
+    /// deadline through to the point immediately before they poll the wrapped
+    /// adapter. The default is appropriate for direct adapters without an
+    /// internal queue.
+    async fn execute_before(
+        &self,
+        command: TradingCommand,
+        deadline: Instant,
+    ) -> Result<TradingReceipt, ExchangeError> {
+        if Instant::now() >= deadline {
+            return Err(ExchangeError::rejected(
+                "trading command expired before adapter dispatch",
+            ));
+        }
+        self.execute(command).await
+    }
+
+    /// Returns an authoritative point-in-time view sampled during this call for
+    /// the requested scope.
+    ///
+    /// `observed_at` is an adapter-relative logical watermark. Successful calls
+    /// from the same adapter must never move it backwards, and implementations
+    /// must not reuse a cached view that predates the current reconciliation
+    /// request. Wrappers may compare this watermark with earlier receipts from
+    /// the same adapter, but must not compare it with an independent wall clock.
     async fn reconcile(&self, scope: ReconcileScope) -> Result<ReconcileReceipt, ExchangeError>;
 
     /// Creates a bounded market-data subscription.

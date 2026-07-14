@@ -140,3 +140,71 @@ async fn one_shot_fetch_uses_only_the_public_book_ticker_endpoint() {
     assert!(!lower_request.contains("x-mbx-apikey"));
     assert!(!lower_request.contains("signature"));
 }
+
+#[tokio::test]
+async fn oversized_content_length_is_rejected_before_reading_the_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n";
+        stream.write_all(response).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ExchangeError::ResourceLimit {
+                resource: "Binance response body",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn oversized_chunked_body_is_stopped_at_the_streaming_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let body = vec![b'x'; 1_048_577];
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&body);
+        let _ = stream.write_all(b"\r\n0\r\n\r\n");
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ExchangeError::ResourceLimit {
+                resource: "Binance response body",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.join().unwrap();
+}

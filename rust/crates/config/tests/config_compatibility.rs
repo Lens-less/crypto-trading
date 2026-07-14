@@ -4,7 +4,7 @@ use crypto_trading_config::{
     EnvProvider, GridMode, load_arbitrage_config_from_str, load_exchange_auth_from_str_with_env,
     load_grid_config_from_str, load_monitor_config_from_str,
 };
-use crypto_trading_domain::MarketType;
+use crypto_trading_domain::{MarketType, Symbol};
 use rust_decimal::Decimal;
 
 #[derive(Default)]
@@ -158,11 +158,13 @@ fn checked_in_monitor_and_arbitrage_documents_load() {
     for relative in [
         "config/arbitrage/monitor.yaml",
         "config/arbitrage/monitor_v2.yaml",
-        "config/arbitrage/monitor_lighter_gold.yaml",
     ] {
         let yaml = fs::read_to_string(root.join(relative)).unwrap();
         load_monitor_config_from_str(&yaml).unwrap_or_else(|error| panic!("{relative}: {error}"));
     }
+    let legacy_empty_monitor =
+        fs::read_to_string(root.join("config/arbitrage/monitor_lighter_gold.yaml")).unwrap();
+    assert!(load_monitor_config_from_str(&legacy_empty_monitor).is_err());
     for relative in [
         "config/arbitrage/arbitrage_unified.yaml",
         "config/arbitrage/arbitrage_segmented.yaml",
@@ -174,6 +176,269 @@ fn checked_in_monitor_and_arbitrage_documents_load() {
             assert_eq!(config.grid_step_pct, Decimal::from_str("0.03").unwrap());
             assert_eq!(config.max_segments, 5);
         }
+    }
+}
+
+#[test]
+fn arbitrage_rejects_mistyped_operator_controls() {
+    let error = load_arbitrage_config_from_str(
+        r#"
+arbitrage_decision:
+  enabled: "false"
+system_mode:
+  monitor_only: false
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.1
+    grid_step: 0.1
+    max_segments: 2
+  quantity_config:
+    base_quantity: 1
+"#,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("enabled must be a boolean"));
+
+    let error = load_arbitrage_config_from_str(
+        r"
+system_mode:
+  monitor_only: false
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.1
+    grid_step: 0.1
+    max_segments: 2
+  quantity_config:
+    base_quantity: 1
+symbol_configs:
+  BTC-USDC-PERP:
+    grid_config:
+      grid_step: 0.2
+",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("enabled is required"));
+}
+
+#[test]
+fn arbitrage_execution_controls_are_explicit_and_fail_closed() {
+    for (yaml, expected) in [
+        (
+            r"
+mode: segmented
+system_mode:
+  monitor_only: false
+",
+            "disabled",
+        ),
+        (
+            r"
+mode: segmented
+enabled: false
+system_mode:
+  monitor_only: false
+",
+            "disabled",
+        ),
+        (
+            r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: true
+",
+            "monitor-only",
+        ),
+        (
+            r"
+mode: unified
+enabled: true
+system_mode:
+  monitor_only: false
+",
+            "expected segmented",
+        ),
+    ] {
+        let config = load_arbitrage_config_from_str(yaml).unwrap();
+        let error = config.validate_execution_controls().unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}: {yaml}");
+    }
+}
+
+#[test]
+fn arbitrage_execution_controls_require_non_empty_operator_allowlists() {
+    for (yaml, expected) in [
+        (
+            r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: []
+symbols: [BTC-USDC-PERP]
+",
+            "exchange allowlist must not be empty",
+        ),
+        (
+            r#"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [lighter, "   "]
+symbols: [BTC-USDC-PERP]
+"#,
+            "exchange allowlist entries must not be blank",
+        ),
+        (
+            r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [lighter]
+symbols: []
+",
+            "symbol allowlist must not be empty",
+        ),
+    ] {
+        let config = load_arbitrage_config_from_str(yaml).unwrap();
+        let error = config.validate_execution_controls().unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}: {yaml}");
+    }
+}
+
+#[test]
+fn symbol_resolution_cannot_bypass_disabled_top_level_controls() {
+    let config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: false
+system_mode:
+  monitor_only: false
+symbol_configs:
+  BTC-USDC-PERP:
+    enabled: true
+",
+    )
+    .unwrap();
+
+    let error = config
+        .resolve_for_strategy(&Symbol::new("BTC-USDC-PERP").unwrap())
+        .unwrap_err();
+
+    assert!(error.to_string().contains("disabled"), "{error}");
+}
+
+#[test]
+fn arbitrage_resolves_enabled_symbol_overrides_for_the_strategy() {
+    let config = load_arbitrage_config_from_str(
+        r"
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [lighter, paradex]
+symbols: [PAXG-USD-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.10
+    grid_step: 0.10
+    max_segments: 2
+  quantity_config:
+    base_quantity: 1
+  risk_config:
+    max_position_value: 1000
+symbol_configs:
+  PAXG-USD-PERP:
+    enabled: true
+    grid_config:
+      initial_spread_threshold: 0.03
+      grid_step: 0.04
+      max_segments: 5
+    quantity_config:
+      base_quantity: 0.04
+    risk_config:
+      max_position_value: 250
+",
+    )
+    .unwrap();
+    let key = Symbol::new("PAXG-USD-PERP").unwrap();
+
+    let effective = config.resolve_for_strategy(&key).unwrap();
+
+    assert_eq!(effective.min_spread_pct, Decimal::from_str("0.03").unwrap());
+    assert_eq!(effective.grid_step_pct, Decimal::from_str("0.04").unwrap());
+    assert_eq!(effective.max_segments, 5);
+    assert_eq!(
+        effective.base_quantity.as_decimal(),
+        Decimal::from_str("0.04").unwrap()
+    );
+    assert_eq!(effective.max_position_value, Some(Decimal::from(250)));
+}
+
+#[test]
+fn arbitrage_rejects_non_positive_position_value_limits() {
+    for value in ["0", "-1"] {
+        let yaml = format!(
+            r"
+default_config:
+  risk_config:
+    max_position_value: {value}
+"
+        );
+        let error = load_arbitrage_config_from_str(&yaml).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max_position_value must be positive"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn arbitrage_rejects_missing_and_disabled_strategy_keys() {
+    let config = load_arbitrage_config_from_str(
+        r"
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [lighter, paradex]
+symbols: [PAXG-USD-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.10
+    grid_step: 0.10
+    max_segments: 2
+  quantity_config:
+    base_quantity: 1
+symbol_configs:
+  PAXG-USD-PERP:
+    enabled: false
+",
+    )
+    .unwrap();
+
+    let disabled = config
+        .resolve_for_strategy(&Symbol::new("PAXG-USD-PERP").unwrap())
+        .unwrap_err();
+    assert!(disabled.to_string().contains("disabled"));
+
+    let missing = config
+        .resolve_for_strategy(&Symbol::new("BTC-USDC-PERP").unwrap())
+        .unwrap_err();
+    assert!(missing.to_string().contains("not configured"));
+}
+
+#[test]
+fn monitor_rejects_empty_universes_and_zero_intervals() {
+    for yaml in [
+        "exchanges: []\nsymbols: [BTC-USDC-PERP]\n",
+        "exchanges: [lighter]\nsymbols: []\n",
+        "exchanges: [lighter]\nsymbols: [BTC-USDC-PERP]\nperformance:\n  analysis_interval_ms: 0\n",
+    ] {
+        assert!(load_monitor_config_from_str(yaml).is_err(), "{yaml}");
     }
 }
 

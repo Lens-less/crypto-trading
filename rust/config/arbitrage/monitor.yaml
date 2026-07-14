@@ -2,9 +2,8 @@
 # 套利监控系统配置 V1
 # ============================================================================
 # 
-# 所属系统: 套利监控系统 V1（旧版本）
-# 使用脚本: run_arbitrage_monitor.py
-# 模块路径: core/services/arbitrage_monitor/
+# 所属系统: 历史 monitor 配置（当前 Rust 仅校验，连续 runtime 尚未实现）
+# 检查: cargo run -- config-check config/arbitrage/monitor.yaml
 # ============================================================================
 
 # 交易所配置（当前专注开发 Lighter、EdgeX、Paradex）

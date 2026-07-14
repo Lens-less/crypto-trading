@@ -6,8 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use crate::DomainError;
 
 macro_rules! decimal_value {
-    ($name:ident, $negative_error:ident) => {
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    ($name:ident, $validation_error:ident, $is_invalid:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub(crate) Decimal);
 
         impl $name {
@@ -15,10 +15,10 @@ macro_rules! decimal_value {
             ///
             /// # Errors
             ///
-            /// Returns an error when `value` is negative.
+            /// Returns an error when `value` violates this value type's domain.
             pub fn new(value: Decimal) -> Result<Self, DomainError> {
-                if value.is_sign_negative() {
-                    return Err(DomainError::$negative_error(value));
+                if ($is_invalid)(value) {
+                    return Err(DomainError::$validation_error(value));
                 }
                 Ok(Self(value))
             }
@@ -83,8 +83,16 @@ macro_rules! decimal_value {
     };
 }
 
-decimal_value!(Price, NegativePrice);
-decimal_value!(Quantity, NegativeQuantity);
+decimal_value!(Price, NonPositivePrice, |value: Decimal| value
+    <= Decimal::ZERO);
+decimal_value!(Quantity, NegativeQuantity, |value: Decimal| value
+    .is_sign_negative());
+
+impl Default for Quantity {
+    fn default() -> Self {
+        Self(Decimal::ZERO)
+    }
+}
 
 /// A signed monetary amount, for balances and profit/loss.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

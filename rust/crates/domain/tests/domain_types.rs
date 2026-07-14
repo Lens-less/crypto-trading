@@ -19,6 +19,17 @@ fn financial_types_preserve_decimal_text_without_binary_rounding() {
 }
 
 #[test]
+fn price_rejects_zero_at_every_domain_boundary() {
+    assert!(Price::new(Decimal::ZERO).is_err());
+    assert!(serde_json::from_str::<Price>(r#""0""#).is_err());
+    assert!(serde_yaml::from_str::<Price>("0\n").is_err());
+
+    // Zero remains a valid quantity representation for flat positions and
+    // unfilled orders; order validation is responsible for requiring > 0.
+    assert!(Quantity::new(Decimal::ZERO).is_ok());
+}
+
+#[test]
 fn market_snapshot_reports_exact_spread_and_rejects_crossed_quotes() {
     let snapshot = MarketSnapshot::new(
         "lighter",

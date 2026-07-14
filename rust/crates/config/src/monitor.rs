@@ -1,10 +1,13 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use crypto_trading_domain::Symbol;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::{ConfigError, ConfigResult};
+use crate::{
+    ConfigError, ConfigResult,
+    input::{parse_yaml, read_config_file},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorConfig {
@@ -151,10 +154,7 @@ const fn default_data_timeout() -> u64 {
 /// Returns an error if the file cannot be read or parsed.
 pub fn load_monitor_config(path: impl AsRef<Path>) -> ConfigResult<MonitorConfig> {
     let path = path.as_ref();
-    let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let yaml = read_config_file(path)?;
     load_monitor_config_from_str(&yaml)
 }
 
@@ -164,7 +164,12 @@ pub fn load_monitor_config(path: impl AsRef<Path>) -> ConfigResult<MonitorConfig
 ///
 /// Returns an error if YAML values are malformed or fail validation.
 pub fn load_monitor_config_from_str(yaml: &str) -> ConfigResult<MonitorConfig> {
-    let raw: RawMonitorConfig = serde_yaml::from_str(yaml)?;
+    let raw: RawMonitorConfig = parse_yaml(yaml)?;
+    if raw.exchanges.is_empty() {
+        return Err(ConfigError::Validation(
+            "monitor must configure at least one exchange".to_owned(),
+        ));
+    }
     if raw
         .exchanges
         .iter()
@@ -173,6 +178,38 @@ pub fn load_monitor_config_from_str(yaml: &str) -> ConfigResult<MonitorConfig> {
         return Err(ConfigError::Validation(
             "monitor exchange names must not be empty".to_owned(),
         ));
+    }
+    if raw.symbols.is_empty() {
+        return Err(ConfigError::Validation(
+            "monitor must configure at least one symbol".to_owned(),
+        ));
+    }
+    if raw.thresholds.min_spread_pct < Decimal::ZERO
+        || raw.thresholds.min_funding_rate_diff < Decimal::ZERO
+    {
+        return Err(ConfigError::Validation(
+            "monitor thresholds must not be negative".to_owned(),
+        ));
+    }
+    for (name, value) in [
+        ("websocket.ping_interval", raw.websocket.ping_interval),
+        ("websocket.reconnect_delay", raw.websocket.reconnect_delay),
+        (
+            "performance.analysis_interval_ms",
+            raw.performance.analysis_interval_ms,
+        ),
+        (
+            "performance.ui_refresh_interval_ms",
+            raw.performance.ui_refresh_interval_ms,
+        ),
+        ("health_check.interval", raw.health_check.interval),
+        ("health_check.data_timeout", raw.health_check.data_timeout),
+    ] {
+        if value == 0 {
+            return Err(ConfigError::Validation(format!(
+                "monitor {name} must be positive"
+            )));
+        }
     }
 
     Ok(MonitorConfig {

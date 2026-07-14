@@ -21,8 +21,7 @@ paradex:
   # 
   # 📌 配置优先级：环境变量 > YAML配置 > 默认值
   # 
-  # ⭐ 推荐：使用环境变量（更安全）
-  #   - 创建 .env 文件（参考 docs/ENV_CONFIG_TEMPLATE.md）
+  # ⭐ 推荐：使用启动进程的环境变量（Rust 不会自动加载 .env）
   #   - 配置环境变量：
   #       PARADEX_API_KEY="0x..."
   #       PARADEX_L2_ADDRESS="0x..."

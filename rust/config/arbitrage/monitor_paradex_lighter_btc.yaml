@@ -3,8 +3,8 @@
 # ============================================================================
 # 
 # 用途: Paradex 与 Lighter 交易所 BTC 分段网格套利
-# 启动: python main_unified.py --config config/arbitrage/arbitrage_segmented.yaml \
-#       --monitor-config config/arbitrage/monitor_paradex_lighter_btc.yaml
+# 当前 Rust 仅校验此 monitor 配置，连续监控尚未实现：
+#   cargo run -- config-check config/arbitrage/monitor_paradex_lighter_btc.yaml
 # ============================================================================
 
 # 交易所配置（Lighter ↔ Paradex）

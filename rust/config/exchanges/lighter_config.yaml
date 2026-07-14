@@ -25,7 +25,7 @@ api_config:
     # 设置为 true 时，需要配置下面的 api_key_private_key、account_index 和 api_key_index
     enabled: true
     
-    # 📌 密钥已迁移到环境变量（.env 文件）：
+    # 📌 密钥只从启动进程的环境变量读取；Rust 不会自动加载 .env：
     #    LIGHTER_API_KEY_PRIVATE_KEY - API Key 私钥
     #    LIGHTER_ACCOUNT_INDEX - 账户索引
     #    LIGHTER_API_KEY_INDEX - API Key 索引
@@ -33,9 +33,6 @@ api_config:
     account_index: 0         # 留空，使用环境变量 LIGHTER_ACCOUNT_INDEX
     api_key_index: 0         # 留空，使用环境变量 LIGHTER_API_KEY_INDEX
   
-  # SDK安装说明
-  sdk_install_command: "pip install git+https://github.com/elliottech/lighter-python.git"
-
 # 订阅模式配置
 subscription_mode:
   # 模式: "predefined" (预定义符号列表) 或 "discovery" (自动发现)
@@ -200,16 +197,14 @@ monitoring:
 # 使用说明
 usage:
   setup_steps:
-    - "1. 访问 https://app.lighter.xyz 注册账户"
-    - "2. 在前端创建API Key，保存Private Key"
-    - "3. 安装Lighter SDK: pip install git+https://github.com/elliottech/lighter-python.git"
-    - "4. 配置本文件中的api_key_private_key、account_index和api_key_index"
-    - "5. 在程序中使用LighterAdapter"
+    - "1. 当前 Rust 只校验此 legacy exchange 配置，不提供 Lighter 私有下单 adapter"
+    - "2. 使用 cargo run -- config-check config/exchanges/lighter_config.yaml 检查分类"
+    - "3. 未来私有 adapter 必须从进程环境变量读取凭证并先通过签名与 testnet 验收"
   
   important_notes:
     - "Lighter使用zkRollup技术，交易需要签名"
     - "API Key私钥必须保密，不要提交到代码仓库"
-    - "测试时建议先使用testnet: true"
+    - "testnet 字段当前未驱动 Rust 私有 adapter，不能视为已连接测试网"
     - "市场索引(market_index)对应交易对，需要通过API获取"
 
 # 示例配置

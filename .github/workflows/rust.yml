@@ -8,6 +8,7 @@ on:
       - "rust/rust-toolchain.toml"
       - "rust/crates/**"
       - "rust/config/**"
+      - "rust/README.md"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
@@ -16,27 +17,70 @@ on:
       - "rust/rust-toolchain.toml"
       - "rust/crates/**"
       - "rust/config/**"
+      - "rust/README.md"
       - ".github/workflows/rust.yml"
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   verify:
+    name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        toolchain: ["1.85.0", stable]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "rust -> target"
+          key: ${{ matrix.toolchain }}
+      - run: cargo +${{ matrix.toolchain }} check --workspace --all-targets --all-features --locked
+      - run: cargo +${{ matrix.toolchain }} test --workspace --all-targets --all-features --locked
+
+  quality:
+    name: Formatting, linting, and release build
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
+          toolchain: stable
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: "rust -> target"
-      - run: rustup toolchain install 1.85.0 --profile minimal
-      - run: cargo +1.85.0 check --workspace --all-targets --all-features
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-targets --all-features
+          key: stable-quality
+      - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo +stable build --release --workspace --all-features --locked
+
+  audit:
+    name: RustSec advisory audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: rust

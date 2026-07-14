@@ -33,7 +33,7 @@ grid_system:
   # ⚠️ 重要：由于 Lighter SDK Bug，以下参数仅作参考，需在网页端手动设置
   margin_mode: "cross"             # 保证金模式：cross(全仓) | isolated(逐仓) 【请在网页端设置】
   leverage: 20                      # 杠杆倍数（1-20倍）【请在网页端设置】
-  # 详见：docs/fixes/lighter_margin_mode_sdk_bug.md
+  # 当前 Rust paper 路径不设置远端保证金模式；live 适配器尚未开放
   
   # martingale_increment: 0.0001     # 马丁递增（仅martingale模式生效）
   

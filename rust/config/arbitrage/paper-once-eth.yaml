@@ -1,0 +1,28 @@
+# Strict Rust paper one-shot profile.
+# Legacy persistence, fee, retry, notification and live controls are deliberately absent.
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges:
+  - paper-left
+  - paper-right
+symbols:
+  - ETH-USDC-PERP
+min_spread_pct: 0.02
+base_quantity: 0.04
+grid_step: 0.03
+max_segments: 5
+first_close_ratio: 0.4
+max_position_value: 5000
+symbol_configs:
+  ETH-USDC-PERP:
+    enabled: true
+    grid_config:
+      initial_spread_threshold: 0.02
+      grid_step: 0.03
+      max_segments: 5
+    quantity_config:
+      base_quantity: 0.04
+    risk_config:
+      max_position_value: 5000

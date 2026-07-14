@@ -6,6 +6,9 @@ use rust_decimal::Decimal;
 
 use crate::StrategyError;
 
+const MAX_ALERT_HISTORY_POINTS: usize = 100_000;
+const MAX_ALERT_DURATION_SECONDS: i64 = 366 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolatilityAlertConfig {
     pub window: Duration,
@@ -61,6 +64,14 @@ impl AlertState {
                 "alert price history must be chronological",
             ));
         }
+        if self.history.len() >= MAX_ALERT_HISTORY_POINTS {
+            return Err(StrategyError::InvalidConfig(
+                "alert price history exceeds the business limit",
+            ));
+        }
+        self.history
+            .try_reserve(1)
+            .map_err(|_| StrategyError::InvalidConfig("alert price history allocation failed"))?;
         self.history.push_back(PricePoint { timestamp, price });
         Ok(())
     }
@@ -152,11 +163,23 @@ impl AlertStrategy {
                 "alert cooldown must not be negative",
             ));
         }
+        if config.cooldown > Duration::seconds(MAX_ALERT_DURATION_SECONDS) {
+            return Err(StrategyError::InvalidConfig(
+                "alert cooldown exceeds the business limit",
+            ));
+        }
         if config.volatility.as_ref().is_some_and(|volatility| {
             volatility.window <= Duration::zero() || volatility.threshold_percent <= Decimal::ZERO
         }) {
             return Err(StrategyError::InvalidConfig(
                 "volatility window and threshold must be positive",
+            ));
+        }
+        if config.volatility.as_ref().is_some_and(|volatility| {
+            volatility.window > Duration::seconds(MAX_ALERT_DURATION_SECONDS)
+        }) {
+            return Err(StrategyError::InvalidConfig(
+                "volatility window exceeds the business limit",
             ));
         }
         Ok(Self {
@@ -187,16 +210,17 @@ impl AlertStrategy {
                 "price-alert symbol is disabled",
             ));
         }
-        let volatility = symbol_config
-            .volatility_alert
-            .enabled
-            .then(|| VolatilityAlertConfig {
-                window: Duration::seconds(
-                    i64::try_from(symbol_config.volatility_alert.time_window_seconds)
-                        .unwrap_or(i64::MAX),
-                ),
+        let volatility = if symbol_config.volatility_alert.enabled {
+            Some(VolatilityAlertConfig {
+                window: Self::bounded_duration(
+                    symbol_config.volatility_alert.time_window_seconds,
+                    "volatility window exceeds the business limit",
+                )?,
                 threshold_percent: symbol_config.volatility_alert.threshold_percent,
-            });
+            })
+        } else {
+            None
+        };
         let (upper_limit, lower_limit) = if symbol_config.price_alert.enabled {
             (
                 symbol_config.price_alert.upper_price,
@@ -205,8 +229,10 @@ impl AlertStrategy {
         } else {
             (None, None)
         };
-        let cooldown =
-            Duration::seconds(i64::try_from(config.cooldown_seconds).unwrap_or(i64::MAX));
+        let cooldown = Self::bounded_duration(
+            config.cooldown_seconds,
+            "alert cooldown exceeds the business limit",
+        )?;
         let mut strategy = Self::new(AlertConfig {
             upper_limit,
             lower_limit,
@@ -252,7 +278,12 @@ impl AlertStrategy {
         let mut alerts = Vec::new();
 
         if let Some(volatility) = &self.config.volatility {
-            let window_start = snapshot.timestamp - volatility.window;
+            let window_start = snapshot
+                .timestamp
+                .checked_sub_signed(volatility.window)
+                .ok_or(StrategyError::InvalidConfig(
+                    "volatility window precedes representable time",
+                ))?;
             let baseline = state
                 .history
                 .iter()
@@ -261,9 +292,14 @@ impl AlertStrategy {
             if let Some(baseline) =
                 baseline.filter(|point| point.price.as_decimal() > Decimal::ZERO)
             {
-                let change = (current.as_decimal() - baseline.price.as_decimal())
-                    / baseline.price.as_decimal()
-                    * Decimal::ONE_HUNDRED;
+                let change = current
+                    .as_decimal()
+                    .checked_sub(baseline.price.as_decimal())
+                    .and_then(|value| value.checked_div(baseline.price.as_decimal()))
+                    .and_then(|value| value.checked_mul(Decimal::ONE_HUNDRED))
+                    .ok_or(StrategyError::InvalidFinancialValue(
+                        "alert volatility percentage",
+                    ))?;
                 if change.abs() >= volatility.threshold_percent {
                     let kind = if change.is_sign_positive() {
                         AlertKind::VolatilityUp
@@ -298,9 +334,17 @@ impl AlertStrategy {
     }
 
     fn can_emit(&self, state: &AlertState, kind: AlertKind, now: DateTime<Utc>) -> bool {
-        state
-            .last_alert_at(kind)
-            .is_none_or(|last| now - last >= self.config.cooldown)
+        state.last_alert_at(kind).is_none_or(|last| {
+            last <= now && now.signed_duration_since(last) >= self.config.cooldown
+        })
+    }
+
+    fn bounded_duration(seconds: u64, error: &'static str) -> Result<Duration, StrategyError> {
+        let seconds = i64::try_from(seconds).map_err(|_| StrategyError::InvalidConfig(error))?;
+        if seconds > MAX_ALERT_DURATION_SECONDS {
+            return Err(StrategyError::InvalidConfig(error));
+        }
+        Duration::try_seconds(seconds).ok_or(StrategyError::InvalidConfig(error))
     }
 
     fn alert(

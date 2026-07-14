@@ -1,5 +1,6 @@
 # ==============================================================================
 # Lighter市价刷量配置文件（支持Backpack/Hyperliquid信号源）
+# LEGACY-PARSEABLE ONLY：当前 Rust volume-maker runtime 失败关闭，以下实时/adapter 说明未接入。
 # ==============================================================================
 # 
 # 🎯 功能说明：在Lighter上执行市价刷量（基于Backpack或Hyperliquid价格信号）
@@ -45,7 +46,6 @@
 # ==============================================================================
 
 volume_maker:
-  # ============================================================================
   # 基础配置
   # ============================================================================
   exchange: "lighter"              # 执行交易所（Lighter）
@@ -54,11 +54,11 @@ volume_maker:
   # 🔥 双交易所符号配置（新增）
   signal_exchange: "hyperliquid"   # 信号源交易所：backpack（默认）或 hyperliquid
                                    # - backpack   : 使用 REST API 获取订单簿（传统方式）
-                                   # - hyperliquid: 使用 WebSocket 获取订单簿（低延迟，推荐）✅ 当前使用
+                                   # - hyperliquid: 历史配置选择；当前 Rust runtime 未接入
   
   signal_symbol: "BTC/USDC:USDC"   # 信号源符号（根据交易所格式配置）
                                    # - backpack   : BTC_USDC_PERP
-                                   # - hyperliquid: BTC/USDC:USDC（永续合约标准格式）✅ 当前使用
+                                   # - hyperliquid: BTC/USDC:USDC（历史符号格式示例）
   
   execution_symbol: "BTC"          # Lighter执行端符号（用于订单簿订阅，自动解析成正确格式）
   

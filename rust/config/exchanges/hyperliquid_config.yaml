@@ -14,7 +14,7 @@ hyperliquid:
     
   # 认证配置 - 用于私有API调用
   # 💡 说明：Hyperliquid使用钱包签名认证，只需要2个字段
-  # 📌 密钥已迁移到环境变量（.env 文件）：
+  # 📌 密钥只从启动进程的环境变量读取；Rust 不会自动加载 .env：
   #    HYPERLIQUID_PRIVATE_KEY - 钱包私钥
   #    HYPERLIQUID_WALLET_ADDRESS - 钱包地址
   authentication:
@@ -289,11 +289,8 @@ hyperliquid:
     #     ✅ 更好的兼容性
     #     ✅ 丰富的功能支持
     #     ✅ 完整的订单实时监听（watch_orders）
-    # 切换方法:
-    #   1. 使用脚本: python3 switch_hyperliquid_websocket.py [native|ccxt]
-    #   2. 手动修改: 直接改变下面的值
-    #   3. 重启监控程序使配置生效
-    # 🔥 使用 ccxt 实现（需要 ccxt >= 4.4.x）✅ 当前使用
+    # 当前 Rust 连续 WebSocket 运行面尚未开放；此历史切换项仅供配置迁移对照
+    # 历史配置选择 ccxt；当前 Rust 不加载 ccxt，也没有连续私有 adapter
     implementation: ccxt
     
     # 连接管理配置

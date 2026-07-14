@@ -1,9 +1,9 @@
 use std::{num::NonZeroUsize, str::FromStr, sync::Arc};
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Quantity, Symbol};
 use crypto_trading_exchange::{ExchangeHandle, PaperExchange, ReconcileScope};
-use crypto_trading_runtime::{ExchangeRouter, ExecutionMode, RuntimeError};
+use crypto_trading_runtime::{ExchangeRouter, ExecutionMode, ExecutionPolicy, RuntimeError};
 use crypto_trading_strategy::{
     ArbitrageState, ArbitrageStrategy, PairStrategyMachine, SegmentedArbitrageConfig,
 };
@@ -47,7 +47,15 @@ async fn segmented_arbitrage_routes_both_legs_to_paper_adapters() {
         .unwrap();
     assert_eq!(decision.intents.len(), 2);
 
-    let mut router = ExchangeRouter::new(ExecutionMode::Paper);
+    let policy = ExecutionPolicy::new(
+        true,
+        false,
+        Utc::now(),
+        Duration::seconds(5),
+        vec![left_quote, right_quote],
+    )
+    .unwrap();
+    let mut router = ExchangeRouter::new(ExecutionMode::Paper, policy);
     router.register("left", left.clone());
     router.register("right", right.clone());
     let receipts = router.execute_all(decision.intents).await.unwrap();
@@ -78,7 +86,15 @@ async fn router_preflights_every_leg_before_submitting_the_first_order() {
         .evaluate_pair(&ArbitrageState::default(), &left_quote, &right_quote)
         .unwrap();
 
-    let mut router = ExchangeRouter::new(ExecutionMode::Paper);
+    let policy = ExecutionPolicy::new(
+        true,
+        false,
+        Utc::now(),
+        Duration::seconds(5),
+        vec![left_quote, right_quote],
+    )
+    .unwrap();
+    let mut router = ExchangeRouter::new(ExecutionMode::Paper, policy);
     router.register("left", Arc::clone(&left));
     let error = router.execute_all(decision.intents).await.unwrap_err();
     assert!(matches!(error, RuntimeError::UnknownExchange(name) if name == "right"));

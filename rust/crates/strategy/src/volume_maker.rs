@@ -25,6 +25,9 @@ impl TryFrom<&crypto_trading_config::VolumeMakerConfig> for VolumeMakerPlanConfi
     type Error = StrategyError;
 
     fn try_from(config: &crypto_trading_config::VolumeMakerConfig) -> Result<Self, Self::Error> {
+        config
+            .validate_execution_controls()
+            .map_err(|_| StrategyError::InvalidConfig("volume maker emergency stop is active"))?;
         let mode = match config.order_mode.trim().to_ascii_lowercase().as_str() {
             "limit" => VolumeMakerMode::LimitBoth,
             "market" => VolumeMakerMode::MarketImbalance,
@@ -50,6 +53,9 @@ impl TryFrom<&crypto_trading_config::VolumeMakerConfig> for VolumeMakerStrategy 
     type Error = StrategyError;
 
     fn try_from(config: &crypto_trading_config::VolumeMakerConfig) -> Result<Self, Self::Error> {
+        config
+            .validate_execution_controls()
+            .map_err(|_| StrategyError::InvalidConfig("volume maker emergency stop is active"))?;
         Self::new(VolumeMakerPlanConfig::try_from(config)?)
     }
 }
@@ -95,13 +101,18 @@ impl VolumeMakerStrategy {
     }
 
     fn validate_snapshot(&self, snapshot: &MarketSnapshot) -> Result<(), StrategyError> {
-        if snapshot.exchange() != self.config.exchange || snapshot.symbol != self.config.symbol {
+        if snapshot.exchange() != self.config.exchange
+            || snapshot.symbol != self.config.symbol
+            || snapshot.market_type != self.config.market_type
+        {
             return Err(StrategyError::SnapshotMismatch(format!(
-                "expected {}/{}, got {}/{}",
+                "expected {}/{}/{:?}, got {}/{}/{:?}",
                 self.config.exchange,
                 self.config.symbol,
+                self.config.market_type,
                 snapshot.exchange(),
-                snapshot.symbol
+                snapshot.symbol,
+                snapshot.market_type
             )));
         }
         Ok(())

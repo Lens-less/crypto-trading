@@ -1,6 +1,9 @@
-use std::{fmt, fs, path::Path};
+use std::{fmt, path::Path};
 
-use crate::{ConfigError, ConfigResult};
+use crate::{
+    ConfigError, ConfigResult,
+    input::{parse_yaml, read_config_file},
+};
 
 pub trait EnvProvider {
     fn get(&self, key: &str) -> Option<String>;
@@ -105,10 +108,7 @@ pub fn load_exchange_auth_with_env(
     env: &impl EnvProvider,
 ) -> ConfigResult<ExchangeAuth> {
     let path = path.as_ref();
-    let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let yaml = read_config_file(path)?;
     load_exchange_auth_from_str_with_env(exchange, &yaml, env)
 }
 
@@ -131,7 +131,7 @@ pub fn load_exchange_auth_from_str_with_env(
     yaml: &str,
     env: &impl EnvProvider,
 ) -> ConfigResult<ExchangeAuth> {
-    let document: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    let document: serde_yaml::Value = parse_yaml(yaml)?;
     let exchange_key = exchange.to_ascii_lowercase();
     let root = child(&document, &exchange_key).unwrap_or(&document);
     let prefix = exchange.to_ascii_uppercase().replace('-', "_");

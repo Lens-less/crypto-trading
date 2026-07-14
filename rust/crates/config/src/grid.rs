@@ -1,10 +1,13 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use crypto_trading_domain::{MarketType, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{ConfigError, ConfigResult};
+use crate::{
+    ConfigError, ConfigResult,
+    input::{parse_yaml, read_config_file},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,10 +160,7 @@ fn default_fee_rate() -> Decimal {
 /// Returns an error if the file cannot be read, parsed, or validated.
 pub fn load_grid_config(path: impl AsRef<Path>) -> ConfigResult<GridConfig> {
     let path = path.as_ref();
-    let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let yaml = read_config_file(path)?;
     load_grid_config_from_str(&yaml)
 }
 
@@ -170,7 +170,7 @@ pub fn load_grid_config(path: impl AsRef<Path>) -> ConfigResult<GridConfig> {
 ///
 /// Returns an error for invalid YAML, missing fields, or inconsistent grid bounds.
 pub fn load_grid_config_from_str(yaml: &str) -> ConfigResult<GridConfig> {
-    let document: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    let document: serde_yaml::Value = parse_yaml(yaml)?;
     let content = mapping_value(&document, "grid_system")
         .or_else(|| mapping_value(&document, "grid"))
         .unwrap_or(&document)

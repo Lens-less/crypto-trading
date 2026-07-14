@@ -49,10 +49,10 @@ pub struct GridArgs {
     #[arg(long)]
     pub debug: bool,
     /// Evaluate one paper-mode tick at this exact decimal price.
-    #[arg(long)]
+    #[arg(long, requires = "once")]
     pub price: Option<Decimal>,
     /// Process one snapshot and exit.
-    #[arg(long)]
+    #[arg(long, requires = "price")]
     pub once: bool,
     /// Append paper decisions and receipt summaries to this JSONL file.
     #[arg(long, default_value = "var/history/grid-paper.jsonl")]
@@ -96,13 +96,25 @@ pub struct ArbitrageBehaviorArgs {
     pub no_ui: bool,
     #[arg(
         long,
-        requires_all = ["left_bid", "left_ask", "right_bid", "right_ask"]
+        requires_all = [
+            "left_bid",
+            "left_ask",
+            "left_bid_quantity",
+            "left_ask_quantity",
+            "right_bid",
+            "right_ask",
+            "right_bid_quantity",
+            "right_ask_quantity"
+        ]
     )]
     pub once: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ArbitrageMarketArgs {
+    /// `symbol_configs` key used when the two legs have different symbols.
+    #[arg(long, requires = "once")]
+    pub strategy_key: Option<String>,
     /// Left exchange identity; defaults to the monitor config's first exchange.
     #[arg(long, requires = "once")]
     pub left_exchange: Option<String>,
@@ -115,6 +127,12 @@ pub struct ArbitrageMarketArgs {
     /// Explicit left best ask for the one-shot paper snapshot.
     #[arg(long, requires = "once")]
     pub left_ask: Option<Decimal>,
+    /// Explicit quantity available at the left best bid.
+    #[arg(long, requires = "once", allow_hyphen_values = true)]
+    pub left_bid_quantity: Option<Decimal>,
+    /// Explicit quantity available at the left best ask.
+    #[arg(long, requires = "once", allow_hyphen_values = true)]
+    pub left_ask_quantity: Option<Decimal>,
     /// Right exchange identity; defaults to the monitor config's second exchange.
     #[arg(long, requires = "once")]
     pub right_exchange: Option<String>,
@@ -127,6 +145,12 @@ pub struct ArbitrageMarketArgs {
     /// Explicit right best ask for the one-shot paper snapshot.
     #[arg(long, requires = "once")]
     pub right_ask: Option<Decimal>,
+    /// Explicit quantity available at the right best bid.
+    #[arg(long, requires = "once", allow_hyphen_values = true)]
+    pub right_bid_quantity: Option<Decimal>,
+    /// Explicit quantity available at the right best ask.
+    #[arg(long, requires = "once", allow_hyphen_values = true)]
+    pub right_ask_quantity: Option<Decimal>,
 }
 
 #[derive(Debug, Args)]

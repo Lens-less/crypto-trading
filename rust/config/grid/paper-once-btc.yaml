@@ -1,0 +1,11 @@
+# Strict Rust paper one-shot profile.
+# Only fields consumed by the current fixed-grid planner are present.
+grid_system:
+  exchange: paper-grid
+  symbol: BTC-USDC-PERP
+  market_type: perpetual
+  mode: fixed
+  grid_interval: 10
+  order_amount: 1
+  lower_price: 100
+  upper_price: 120

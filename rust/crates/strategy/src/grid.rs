@@ -6,6 +6,9 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::{StrategyError, StrategyMachine};
 
+const MAX_GRID_LEVELS: u32 = 10_000;
+const MAX_GRID_OFFSET_LEVELS: u32 = 100_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridDirection {
     Long,
@@ -83,7 +86,15 @@ impl GridPlanner {
                         "fixed grid lower price must be below upper price",
                     ));
                 }
-                let count = ((upper.as_decimal() - lower.as_decimal()) / config.interval)
+                let span = upper
+                    .as_decimal()
+                    .checked_sub(lower.as_decimal())
+                    .ok_or(StrategyError::InvalidFinancialValue("fixed grid range"))?;
+                let count = span
+                    .checked_div(config.interval)
+                    .ok_or(StrategyError::InvalidFinancialValue(
+                        "fixed grid level count",
+                    ))?
                     .floor()
                     .to_u32()
                     .unwrap_or(0);
@@ -92,13 +103,32 @@ impl GridPlanner {
                         "fixed grid range must contain at least one level",
                     ));
                 }
+                if count > MAX_GRID_LEVELS {
+                    return Err(StrategyError::InvalidConfig(
+                        "grid level count exceeds the business limit",
+                    ));
+                }
             }
             GridRange::Follow { level_count: 0, .. } => {
                 return Err(StrategyError::InvalidConfig(
                     "follow grid must contain at least one level",
                 ));
             }
-            GridRange::Follow { .. } => {}
+            GridRange::Follow {
+                level_count,
+                price_offset_levels,
+            } => {
+                if level_count > MAX_GRID_LEVELS {
+                    return Err(StrategyError::InvalidConfig(
+                        "grid level count exceeds the business limit",
+                    ));
+                }
+                if price_offset_levels > MAX_GRID_OFFSET_LEVELS {
+                    return Err(StrategyError::InvalidConfig(
+                        "grid price offset exceeds the business limit",
+                    ));
+                }
+            }
         }
 
         Ok(Self { config })
@@ -146,16 +176,34 @@ impl GridPlanner {
                     .last
                     .unwrap_or_else(|| snapshot.mid_price())
                     .as_decimal();
-                let width = self.config.interval * Decimal::from(level_count);
-                let offset = self.config.interval * Decimal::from(price_offset_levels);
+                let width = self
+                    .config
+                    .interval
+                    .checked_mul(Decimal::from(level_count))
+                    .ok_or(StrategyError::InvalidFinancialValue("follow grid width"))?;
+                let offset = self
+                    .config
+                    .interval
+                    .checked_mul(Decimal::from(price_offset_levels))
+                    .ok_or(StrategyError::InvalidFinancialValue("follow grid offset"))?;
                 let (lower, upper) = match self.config.direction {
                     GridDirection::Long => {
-                        let upper = anchor + offset;
-                        (upper - width, upper)
+                        let upper = anchor.checked_add(offset).ok_or(
+                            StrategyError::InvalidFinancialValue("follow grid upper price"),
+                        )?;
+                        let lower = upper.checked_sub(width).ok_or(
+                            StrategyError::InvalidFinancialValue("follow grid lower price"),
+                        )?;
+                        (lower, upper)
                     }
                     GridDirection::Short => {
-                        let lower = anchor - offset;
-                        (lower, lower + width)
+                        let lower = anchor.checked_sub(offset).ok_or(
+                            StrategyError::InvalidFinancialValue("follow grid lower price"),
+                        )?;
+                        let upper = lower.checked_add(width).ok_or(
+                            StrategyError::InvalidFinancialValue("follow grid upper price"),
+                        )?;
+                        (lower, upper)
                     }
                 };
                 if lower <= Decimal::ZERO {
@@ -174,19 +222,22 @@ impl GridPlanner {
     ///
     /// Propagates errors from [`Self::levels`].
     pub fn intents(&self, snapshot: &MarketSnapshot) -> Result<Vec<OrderIntent>, StrategyError> {
-        self.levels(snapshot)?
-            .into_iter()
-            .map(|level| {
-                Ok(OrderIntent::limit(
-                    self.config.exchange.clone(),
-                    self.config.symbol.clone(),
-                    self.config.market_type,
-                    level.side,
-                    level.quantity,
-                    level.price,
-                ))
-            })
-            .collect()
+        let levels = self.levels(snapshot)?;
+        let mut intents = Vec::new();
+        intents
+            .try_reserve_exact(levels.len())
+            .map_err(|_| StrategyError::InvalidConfig("grid intent allocation failed"))?;
+        for level in levels {
+            intents.push(OrderIntent::limit(
+                self.config.exchange.clone(),
+                self.config.symbol.clone(),
+                self.config.market_type,
+                level.side,
+                level.quantity,
+                level.price,
+            ));
+        }
+        Ok(intents)
     }
 
     fn validate_snapshot(&self, snapshot: &MarketSnapshot) -> Result<(), StrategyError> {
@@ -203,6 +254,12 @@ impl GridPlanner {
                 self.config.symbol, snapshot.symbol
             )));
         }
+        if snapshot.market_type != self.config.market_type {
+            return Err(StrategyError::SnapshotMismatch(format!(
+                "expected market type {:?}, got {:?}",
+                self.config.market_type, snapshot.market_type
+            )));
+        }
         Ok(())
     }
 
@@ -211,7 +268,12 @@ impl GridPlanner {
         lower: Decimal,
         upper: Decimal,
     ) -> Result<Vec<GridLevel>, StrategyError> {
-        let count = ((upper - lower) / self.config.interval)
+        let span = upper
+            .checked_sub(lower)
+            .ok_or(StrategyError::InvalidFinancialValue("grid range"))?;
+        let count = span
+            .checked_div(self.config.interval)
+            .ok_or(StrategyError::InvalidFinancialValue("grid level count"))?
             .floor()
             .to_u32()
             .ok_or(StrategyError::InvalidConfig(
@@ -222,36 +284,61 @@ impl GridPlanner {
                 "grid range must contain at least one level",
             ));
         }
+        if count > MAX_GRID_LEVELS {
+            return Err(StrategyError::InvalidConfig(
+                "grid level count exceeds the business limit",
+            ));
+        }
 
-        (1..=count)
-            .map(|index| {
-                let price_value = match self.config.direction {
-                    GridDirection::Long => lower + self.config.interval * Decimal::from(index - 1),
-                    GridDirection::Short => upper - self.config.interval * Decimal::from(index - 1),
-                };
-                let increment_count = match self.config.direction {
-                    GridDirection::Long => count - index,
-                    GridDirection::Short => index - 1,
-                };
-                let quantity_value = self.config.quantity.as_decimal()
-                    + self.config.martingale_increment.unwrap_or_default()
-                        * Decimal::from(increment_count);
-                let price = Price::new(price_value)
-                    .map_err(|_| StrategyError::InvalidFinancialValue("grid level price"))?;
-                let quantity = Quantity::new(quantity_value)
-                    .map_err(|_| StrategyError::InvalidFinancialValue("grid level quantity"))?;
+        let mut levels = Vec::new();
+        levels
+            .try_reserve_exact(count as usize)
+            .map_err(|_| StrategyError::InvalidConfig("grid level allocation failed"))?;
+        for index in 1..=count {
+            let level_offset = self
+                .config
+                .interval
+                .checked_mul(Decimal::from(index - 1))
+                .ok_or(StrategyError::InvalidFinancialValue("grid level offset"))?;
+            let price_value = match self.config.direction {
+                GridDirection::Long => lower.checked_add(level_offset),
+                GridDirection::Short => upper.checked_sub(level_offset),
+            }
+            .ok_or(StrategyError::InvalidFinancialValue("grid level price"))?;
+            let increment_count = match self.config.direction {
+                GridDirection::Long => count - index,
+                GridDirection::Short => index - 1,
+            };
+            let quantity_increment = self
+                .config
+                .martingale_increment
+                .unwrap_or_default()
+                .checked_mul(Decimal::from(increment_count))
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "grid level quantity increment",
+                ))?;
+            let quantity_value = self
+                .config
+                .quantity
+                .as_decimal()
+                .checked_add(quantity_increment)
+                .ok_or(StrategyError::InvalidFinancialValue("grid level quantity"))?;
+            let price = Price::new(price_value)
+                .map_err(|_| StrategyError::InvalidFinancialValue("grid level price"))?;
+            let quantity = Quantity::new(quantity_value)
+                .map_err(|_| StrategyError::InvalidFinancialValue("grid level quantity"))?;
 
-                Ok(GridLevel {
-                    index,
-                    price,
-                    quantity,
-                    side: match self.config.direction {
-                        GridDirection::Long => Side::Buy,
-                        GridDirection::Short => Side::Sell,
-                    },
-                })
-            })
-            .collect()
+            levels.push(GridLevel {
+                index,
+                price,
+                quantity,
+                side: match self.config.direction {
+                    GridDirection::Long => Side::Buy,
+                    GridDirection::Short => Side::Sell,
+                },
+            });
+        }
+        Ok(levels)
     }
 }
 

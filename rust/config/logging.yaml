@@ -197,15 +197,6 @@ loggers:
     enabled: true
     include_context: true
 
-  # 🔥 健康检查日志（注意：此配置暂未生效，实际配置在代码中）
-  # 健康检查使用自定义日志配置，直接在 order_health_checker.py 中实现
-  core.services.grid.implementations.order_health_checker:
-    level: "DEBUG"
-    handlers: ["main_file"]  # 只使用文件处理器，不使用console
-    propagate: false
-    enabled: true
-    include_context: true
-
   # Socket.IO服务器日志
   socketio:
     level: "INFO"

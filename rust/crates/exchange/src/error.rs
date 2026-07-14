@@ -2,6 +2,8 @@ use uuid::Uuid;
 
 use thiserror::Error;
 
+use crate::model::ExchangeOperationKey;
+
 /// Operations whose failure semantics matter to callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExchangeOperation {
@@ -47,10 +49,20 @@ pub enum ExchangeError {
     #[error("exchange request queue is full (capacity {capacity})")]
     Backpressure { capacity: usize },
 
-    #[error("outcome of {operation} is ambiguous for client order {client_order_id:?}: {reason}")]
+    #[error("{resource} exceeds hard limit {limit} (requested {requested})")]
+    ResourceLimit {
+        resource: &'static str,
+        limit: usize,
+        requested: usize,
+    },
+
+    #[error(
+        "outcome of {operation} is ambiguous for operation key {operation_key:?} (client order {client_order_id:?}): {reason}"
+    )]
     AmbiguousOutcome {
         operation: ExchangeOperation,
         client_order_id: Option<Uuid>,
+        operation_key: Option<ExchangeOperationKey>,
         reason: String,
     },
 
@@ -90,6 +102,18 @@ impl ExchangeError {
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self::Unavailable {
             reason: reason.into(),
+        }
+    }
+
+    pub(crate) const fn resource_limit(
+        resource: &'static str,
+        limit: usize,
+        requested: usize,
+    ) -> Self {
+        Self::ResourceLimit {
+            resource,
+            limit,
+            requested,
         }
     }
 

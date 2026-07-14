@@ -6,6 +6,20 @@ use uuid::Uuid;
 
 use crate::{ExchangeError, ExchangeOperation};
 
+/// Stable identifier retained when an accepted trading operation has an unknown outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExchangeOperationKey {
+    ClientOrderId {
+        client_order_id: Uuid,
+    },
+    OrderId(String),
+    CancelAll {
+        symbol: Option<Symbol>,
+        market_type: Option<MarketType>,
+    },
+}
+
 /// A command with explicit order and cancellation semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -33,6 +47,22 @@ impl TradingCommand {
         match self {
             Self::Submit(intent) => Some(intent.client_order_id),
             Self::Cancel { .. } | Self::CancelAll { .. } => None,
+        }
+    }
+
+    pub(crate) fn operation_key(&self) -> ExchangeOperationKey {
+        match self {
+            Self::Submit(intent) => ExchangeOperationKey::ClientOrderId {
+                client_order_id: intent.client_order_id,
+            },
+            Self::Cancel { order_id } => ExchangeOperationKey::OrderId(order_id.clone()),
+            Self::CancelAll {
+                symbol,
+                market_type,
+            } => ExchangeOperationKey::CancelAll {
+                symbol: symbol.clone(),
+                market_type: *market_type,
+            },
         }
     }
 }

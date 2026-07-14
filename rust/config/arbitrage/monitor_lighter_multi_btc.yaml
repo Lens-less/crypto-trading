@@ -1,9 +1,7 @@
 # ============================================================================
 # Lighter中心多交易所 BTC 监控配置（分段网格 v2）
-# 运行方式（监控模式）：
-#   python main_unified.py \
-#       --config config/arbitrage/arbitrage_segmented.yaml \
-#       --monitor-config config/arbitrage/monitor_lighter_multi_btc.yaml
+# 当前 Rust 仅校验此 monitor 配置，连续监控尚未实现：
+#   cargo run -- config-check config/arbitrage/monitor_lighter_multi_btc.yaml
 # ============================================================================
 
 exchanges:

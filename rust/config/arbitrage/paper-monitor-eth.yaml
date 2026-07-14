@@ -1,0 +1,8 @@
+# Strict allowlist and freshness profile consumed by arbitrage paper one-shot.
+exchanges:
+  - paper-left
+  - paper-right
+symbols:
+  - ETH-USDC-PERP
+health_check:
+  data_timeout: 30

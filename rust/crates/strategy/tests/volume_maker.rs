@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use chrono::{TimeZone, Utc};
+use crypto_trading_config::load_volume_maker_config_from_str;
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Price, Quantity, Side, Symbol, TimeInForce,
 };
@@ -97,5 +98,39 @@ fn market_mode_follows_book_imbalance_and_open_state_closes_reduce_only() {
             .unwrap()[0]
             .side,
         Side::Sell
+    );
+}
+
+#[test]
+fn volume_maker_rejects_a_snapshot_for_another_market_type() {
+    let strategy = VolumeMakerStrategy::new(config(VolumeMakerMode::LimitBoth, false)).unwrap();
+    let mut spot = snapshot();
+    spot.market_type = MarketType::Spot;
+
+    assert!(strategy.evaluate(&VolumeMakerState::Flat, &spot).is_err());
+}
+
+#[test]
+fn public_volume_maker_constructor_enforces_emergency_stop() {
+    let config = load_volume_maker_config_from_str(
+        r"
+volume_maker:
+  exchange: paper
+  symbol: BTC-USDC-PERP
+  market_type: perpetual
+  order_mode: limit
+  order_size: 0.5
+  emergency_stop: true
+",
+    )
+    .unwrap();
+
+    let error = VolumeMakerStrategy::try_from(&config).unwrap_err();
+    let plan_error = VolumeMakerPlanConfig::try_from(&config).unwrap_err();
+
+    assert!(error.to_string().contains("emergency stop"), "{error}");
+    assert!(
+        plan_error.to_string().contains("emergency stop"),
+        "{plan_error}"
     );
 }
