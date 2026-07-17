@@ -16,7 +16,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 authors = ["crypto-trading contributors"]
-repository = "https://github.com/cryptocj520/crypto-trading-open"
+repository = "https://github.com/Lens-less/crypto-trading"
 
 [workspace.dependencies]
 anyhow = "1"

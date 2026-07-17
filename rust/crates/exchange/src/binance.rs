@@ -66,7 +66,7 @@ impl BinancePublicExchange {
             .map_err(|error| ExchangeError::invalid(error.to_string()))?;
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
-            .user_agent("crypto-trading-open/0.1 public-market-data")
+            .user_agent("crypto-trading/0.1 public-market-data")
             .build()
             .map_err(|error| ExchangeError::unavailable(error.to_string()))?;
         Ok(Self {

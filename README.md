@@ -1,6 +1,6 @@
 # crypto-trading
 
-[![Rust quality gates](https://github.com/cryptocj520/crypto-trading-open/actions/workflows/rust.yml/badge.svg)](https://github.com/cryptocj520/crypto-trading-open/actions/workflows/rust.yml)
+[![Rust quality gates](https://github.com/Lens-less/crypto-trading/actions/workflows/rust.yml/badge.svg)](https://github.com/Lens-less/crypto-trading/actions/workflows/rust.yml)
 ![MSRV](https://img.shields.io/badge/Rust-1.85.0%2B-000000?logo=rust)
 ![Execution status](https://img.shields.io/badge/execution-paper%20only-orange)
 
@@ -67,8 +67,8 @@
 ### 克隆与构建
 
 ```bash
-git clone https://github.com/cryptocj520/crypto-trading-open.git
-cd crypto-trading-open/rust
+git clone https://github.com/Lens-less/crypto-trading.git
+cd crypto-trading/rust
 cargo build --workspace --locked
 cargo run --locked -- --help
 ```
