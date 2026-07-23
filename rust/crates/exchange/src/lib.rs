@@ -1,16 +1,27 @@
 //! Typed exchange boundary with deterministic paper execution.
 
 mod binance;
+mod binance_testnet;
 mod bounded;
+mod endpoint;
 mod error;
+mod hyperliquid_testnet;
 mod instrument;
 mod model;
 mod paper;
+mod remote;
+mod symbol;
 mod unsupported;
 
 pub use binance::BinancePublicExchange;
+pub use binance_testnet::{BinanceRequestSigner, BinanceTestnetProtocol};
 pub use bounded::BoundedExchangeHandle;
+pub use endpoint::{BinanceProduct, BinanceTestnetEndpoints, HyperliquidTestnetEndpoint};
 pub use error::{ExchangeError, ExchangeOperation};
+pub use hyperliquid_testnet::{
+    HyperliquidAction, HyperliquidAsset, HyperliquidAssetCatalog, HyperliquidRequestSigner,
+    HyperliquidSignature, HyperliquidTestnetProtocol,
+};
 pub use instrument::{
     InstrumentRuleCatalog, InstrumentRules, InstrumentRulesMode, InstrumentRulesStatus,
 };
@@ -20,6 +31,11 @@ pub use model::{
     SubscriptionReceipt, TradingCommand, TradingReceipt,
 };
 pub use paper::{PaperExchange, PaperLedgerLimits};
+pub use remote::{
+    RemoteHttpMethod, RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport,
+    ReqwestHttpTransport,
+};
+pub use symbol::{ExchangeSymbol, ExchangeSymbolCatalog};
 pub use unsupported::UnsupportedLiveExchange;
 
 use async_trait::async_trait;

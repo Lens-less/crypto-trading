@@ -158,13 +158,12 @@ fn checked_in_monitor_and_arbitrage_documents_load() {
     for relative in [
         "config/arbitrage/monitor.yaml",
         "config/arbitrage/monitor_v2.yaml",
+        "config/arbitrage/monitor_lighter_eth_spot.yaml",
+        "config/arbitrage/monitor_lighter_gold.yaml",
     ] {
         let yaml = fs::read_to_string(root.join(relative)).unwrap();
         load_monitor_config_from_str(&yaml).unwrap_or_else(|error| panic!("{relative}: {error}"));
     }
-    let legacy_empty_monitor =
-        fs::read_to_string(root.join("config/arbitrage/monitor_lighter_gold.yaml")).unwrap();
-    assert!(load_monitor_config_from_str(&legacy_empty_monitor).is_err());
     for relative in [
         "config/arbitrage/arbitrage_unified.yaml",
         "config/arbitrage/arbitrage_segmented.yaml",

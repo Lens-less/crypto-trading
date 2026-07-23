@@ -3,7 +3,7 @@
 # ============================================================================
 # 
 # 用途: Lighter 交易所内 PAXG ↔ XAU 同所多腿套利
-# 当前状态: symbols 为空，Rust 会将此文件分类为 unsupported；补齐真实 universe 前不可运行
+# 当前状态: 显式列出 Rust monitor universe；连续 runtime 仍保持 fail-closed
 # 检查: cargo run -- config-check config/arbitrage/monitor_lighter_gold.yaml
 # ============================================================================
 
@@ -11,9 +11,10 @@
 exchanges:
   - lighter
 
-# 监控的交易对（空列表，仅依赖 extra_symbols.yaml）
-# 💡 不需要在这里配置 PAXG 和 XAU，它们通过 extra_symbols.yaml 自动订阅
-symbols: []
+# Rust 不会隐式合并 extra_symbols.yaml，因此此处保留权威 allowlist
+symbols:
+  - PAXG-USD-PERP
+  - XAU-USD-PERP
 
 # 套利阈值配置
 thresholds:

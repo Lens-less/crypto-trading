@@ -212,6 +212,32 @@ impl InstrumentRuleCatalog {
         self.rules.is_empty()
     }
 
+    /// Validates an order against an exact exchange, symbol, and market rule.
+    ///
+    /// Remote adapters use this fail-closed surface before constructing an
+    /// authenticated request. A missing exact rule is rejected instead of
+    /// silently accepting exchange defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::Rejected`] when no exact rule exists or when
+    /// quantity, price, or notional constraints are violated.
+    pub fn validate_order(
+        &self,
+        intent: &OrderIntent,
+        reference_price: Option<Price>,
+    ) -> Result<(), ExchangeError> {
+        let rules = self
+            .find(&intent.exchange, &intent.symbol, intent.market_type)
+            .ok_or_else(|| {
+                ExchangeError::rejected(format!(
+                    "missing exact instrument rules for {}/{}/{:?}",
+                    intent.exchange, intent.symbol, intent.market_type
+                ))
+            })?;
+        rules.validate(intent, reference_price.or(intent.price))
+    }
+
     pub(crate) fn find(
         &self,
         exchange: &str,

@@ -1,0 +1,35 @@
+# Offline/testnet-only profile consumed by the Rust exchange protocol.
+# Credentials stay empty here and are supplied through BINANCE_API_KEY and
+# BINANCE_API_SECRET only when a real testnet run is intentionally enabled.
+binance:
+  exchange_id: binance
+  environment: testnet
+  enabled: true
+
+  api:
+    spot_rest_url: https://testnet.binance.vision
+    spot_ws_url: wss://stream.testnet.binance.vision
+    usdm_rest_url: https://demo-fapi.binance.com
+    usdm_ws_url: wss://demo-fstream.binance.com
+    timeout_seconds: 10
+    recv_window_ms: 5000
+
+  authentication:
+    api_key: ""
+    api_secret: ""
+
+  markets:
+    spot:
+      enabled: true
+    perpetual:
+      enabled: true
+      margin_asset: USDT
+
+  symbols:
+    spot:
+      BTC-USDC-SPOT: BTCUSDT
+      ETH-USDC-SPOT: ETHUSDT
+    perpetual:
+      BTC-USDC-PERP: BTCUSDT
+      ETH-USDC-PERP: ETHUSDT
+

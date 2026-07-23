@@ -86,6 +86,23 @@ symbol_mappings:
       "DOGE-USDC-PERP": "DOGE/USDC:USDC"
       "ADA-USDC-PERP": "ADA/USDC:USDC"
       "LINK-USDC-PERP": "LINK/USDC:USDC"
+      "BTC-USDC-SPOT": "BTC/USDC"
+      "ETH-USDC-SPOT": "ETH/USDC"
+      "SOL-USDC-SPOT": "SOL/USDC"
+
+    binance:
+      perpetual:
+        "BTC-USDC-PERP": "BTCUSDT"
+        "ETH-USDC-PERP": "ETHUSDT"
+        "SOL-USDC-PERP": "SOLUSDT"
+        "AVAX-USDC-PERP": "AVAXUSDT"
+        "DOGE-USDC-PERP": "DOGEUSDT"
+      spot:
+        "BTC-USDC-SPOT": "BTCUSDT"
+        "ETH-USDC-SPOT": "ETHUSDT"
+        "SOL-USDC-SPOT": "SOLUSDT"
+        "AVAX-USDC-SPOT": "AVAXUSDT"
+        "DOGE-USDC-SPOT": "DOGEUSDT"
     
     backpack:
       "BTC-USDC-PERP": "BTC_USDC_PERP"
@@ -195,11 +212,30 @@ symbol_mappings:
       "EIGEN_USDC_PERP": "EIGEN-USDC-PERP"
     
     binance:
-      "BTC-USDC-PERP": "BTCUSDT"
-      "ETH-USDC-PERP": "ETHUSDT"
-      "SOL-USDC-PERP": "SOLUSDT"
-      "AVAX-USDC-PERP": "AVAXUSDT"
-      "DOGE-USDC-PERP": "DOGEUSDT"
+      perpetual:
+        "BTCUSDT": "BTC-USDC-PERP"
+        "ETHUSDT": "ETH-USDC-PERP"
+        "SOLUSDT": "SOL-USDC-PERP"
+        "AVAXUSDT": "AVAX-USDC-PERP"
+        "DOGEUSDT": "DOGE-USDC-PERP"
+      spot:
+        "BTCUSDT": "BTC-USDC-SPOT"
+        "ETHUSDT": "ETH-USDC-SPOT"
+        "SOLUSDT": "SOL-USDC-SPOT"
+        "AVAXUSDT": "AVAX-USDC-SPOT"
+        "DOGEUSDT": "DOGE-USDC-SPOT"
+
+    hyperliquid:
+      "BTC/USDC:USDC": "BTC-USDC-PERP"
+      "ETH/USDC:USDC": "ETH-USDC-PERP"
+      "SOL/USDC:USDC": "SOL-USDC-PERP"
+      "AVAX/USDC:USDC": "AVAX-USDC-PERP"
+      "DOGE/USDC:USDC": "DOGE-USDC-PERP"
+      "ADA/USDC:USDC": "ADA-USDC-PERP"
+      "LINK/USDC:USDC": "LINK-USDC-PERP"
+      "BTC/USDC": "BTC-USDC-SPOT"
+      "ETH/USDC": "ETH-USDC-SPOT"
+      "SOL/USDC": "SOL-USDC-SPOT"
 
 # 验证规则
 validation:

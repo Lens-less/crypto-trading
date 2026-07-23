@@ -1,0 +1,27 @@
+# Offline/testnet-only profile consumed by the Rust exchange protocol.
+# The private key and actual account address are supplied only through
+# HYPERLIQUID_PRIVATE_KEY and HYPERLIQUID_WALLET_ADDRESS.
+hyperliquid:
+  exchange_id: hyperliquid
+  environment: testnet
+  enabled: true
+
+  api:
+    rest_url: https://api.hyperliquid-testnet.xyz
+    ws_url: wss://api.hyperliquid-testnet.xyz/ws
+    timeout_seconds: 10
+
+  authentication:
+    private_key: ""
+    wallet_address: ""
+
+  markets:
+    spot:
+      enabled: true
+    perpetual:
+      enabled: true
+
+  # Asset IDs are metadata, not stable symbol hashes. Refresh them from
+  # spotMeta/meta before a real testnet run and fail closed on any mismatch.
+  assets: {}
+

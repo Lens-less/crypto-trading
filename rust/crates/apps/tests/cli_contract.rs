@@ -1,7 +1,15 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use crypto_trading_cli::{Cli, Command, ExchangeChoice, LogLevel};
+
+#[test]
+fn top_level_help_has_readable_utf8_product_text() {
+    let help = Cli::command().render_help().to_string();
+
+    assert!(help.contains("多交易所策略自动化系统"), "{help}");
+    assert!(!help.contains('�'), "{help}");
+}
 
 #[test]
 fn grid_keeps_the_legacy_positional_config_and_debug_flag() {
