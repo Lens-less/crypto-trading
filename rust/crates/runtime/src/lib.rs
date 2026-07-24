@@ -6,6 +6,7 @@ mod history;
 mod mode;
 
 pub use capability::{
+    AdapterFacet, AdapterFacetSupport, AdapterSupport, AdapterSupportLevel,
     CAPABILITY_SCHEMA_VERSION, Capability, CapabilityAccess, CapabilityArea, CapabilityEnvironment,
     CapabilityError, CapabilityLevel, CapabilityManifest, CapabilityScope, ReleaseStage,
     current_capability_manifest,

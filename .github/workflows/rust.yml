@@ -9,6 +9,9 @@ on:
       - "rust/crates/**"
       - "rust/config/**"
       - "rust/README.md"
+      - "docs/adapter-support.md"
+      - "docs/plans/2026-07-24-project-alignment-web-goal-plan.md"
+      - "docs/research/upstream-repository-alignment.md"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
@@ -18,6 +21,9 @@ on:
       - "rust/crates/**"
       - "rust/config/**"
       - "rust/README.md"
+      - "docs/adapter-support.md"
+      - "docs/plans/2026-07-24-project-alignment-web-goal-plan.md"
+      - "docs/research/upstream-repository-alignment.md"
       - ".github/workflows/rust.yml"
 
 concurrency:
@@ -71,6 +77,30 @@ jobs:
       - run: cargo +stable fmt --all -- --check
       - run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo +stable build --release --workspace --all-features --locked
+
+  clean-build:
+    name: Isolated MSRV quality gates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/crypto-trading-clean-target
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.85.0"
+          components: rustfmt, clippy
+      - name: Assert the isolated target directory starts absent
+        shell: bash
+        run: test ! -e "$CARGO_TARGET_DIR"
+      - run: cargo +1.85.0 fmt --all -- --check
+      - run: cargo +1.85.0 check --workspace --all-targets --all-features --locked
+      - run: cargo +1.85.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo +1.85.0 test --workspace --all-targets --all-features --locked
+      - run: cargo +1.85.0 test --doc --workspace --all-features --locked
+      - run: cargo +1.85.0 build --release --workspace --all-features --locked
 
   audit:
     name: RustSec advisory audit

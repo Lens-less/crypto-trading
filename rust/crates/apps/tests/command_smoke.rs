@@ -54,9 +54,18 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
 
     assert!(output.status.success(), "{output:?}");
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["schema_version"], 2);
     assert_eq!(payload["release_stage"], "paper-only");
     assert_eq!(payload["live_trading_enabled"], false);
+    let adapters = payload["adapters"].as_array().unwrap();
+    assert_eq!(adapters.len(), 10);
+    assert!(adapters.iter().any(|entry| {
+        entry["id"] == "binance"
+            && entry["public_data"]["level"] == "implemented"
+            && entry["testnet_protocol"]["level"] == "protocol-only"
+            && entry["reconcile"]["level"] == "request-only"
+            && entry["live"]["level"] == "unavailable"
+    }));
     let capabilities = payload["capabilities"].as_array().unwrap();
     assert!(capabilities.iter().any(|entry| {
         entry["id"] == "runtime.live"
@@ -66,6 +75,41 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
                 .as_array()
                 .is_some_and(|environments| environments.iter().any(|mode| mode == "mainnet"))
     }));
+}
+
+#[test]
+fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("capabilities")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("capabilities schema=2")
+            && stdout.contains("release=paper-only live-trading=false"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("adapter\tpublic-data\ttestnet-protocol\tauthenticated\treconcile\tlive"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "binance\timplemented\tprotocol-only\tprotocol-only\trequest-only\tunavailable"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("capability\tarea\tlevel\taccess\tenvironments\tsummary"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("runtime.live\truntime\tunavailable\tmainnet-trading\tmainnet\t"),
+        "{stdout}"
+    );
 }
 
 #[test]

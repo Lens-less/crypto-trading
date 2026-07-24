@@ -6,6 +6,7 @@
 
 | 命令 | 配置检查 | Paper 单次执行 | 连续运行 | Live 执行 | 当前行为 |
 | --- | --- | --- | --- | --- | --- |
+| `capabilities [--json]` | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
 | `config-check` | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
 | `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
 | `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、风险上限、监控白名单和 `symbol_configs` 策略键 |
@@ -28,6 +29,17 @@ cargo +1.85.0 test --workspace --all-targets --all-features --locked
 ```
 
 ## 命令示例
+
+查询运行时能力单一事实源（Web Integrations 页也必须消费同一 manifest）：
+
+```powershell
+cargo run -- capabilities
+cargo run -- capabilities --json
+```
+
+人类可读的 adapter 投影见
+[`../docs/adapter-support.md`](../docs/adapter-support.md)。`implemented` 不等于生产可用；
+当前外部交易所 Live 权限仍全部为 `unavailable`。
 
 只检查配置：
 

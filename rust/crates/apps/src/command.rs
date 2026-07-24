@@ -72,6 +72,19 @@ fn run_capabilities(args: &CapabilitiesArgs) -> Result<()> {
         manifest.release_stage,
         manifest.live_trading_enabled
     );
+    println!("adapter\tpublic-data\ttestnet-protocol\tauthenticated\treconcile\tlive");
+    for adapter in &manifest.adapters {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            adapter.id,
+            adapter.public_data.level,
+            adapter.testnet_protocol.level,
+            adapter.authenticated.level,
+            adapter.reconcile.level,
+            adapter.live.level
+        );
+    }
+    println!("capability\tarea\tlevel\taccess\tenvironments\tsummary");
     for capability in manifest.capabilities {
         let environments = capability
             .scope

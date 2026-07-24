@@ -1,6 +1,9 @@
+use std::fmt::Write as _;
+use std::path::Path;
+
 use crypto_trading_runtime::{
-    CapabilityAccess, CapabilityArea, CapabilityEnvironment, CapabilityLevel, CapabilityManifest,
-    ReleaseStage, current_capability_manifest,
+    AdapterFacet, AdapterSupportLevel, CapabilityAccess, CapabilityArea, CapabilityEnvironment,
+    CapabilityLevel, CapabilityManifest, ReleaseStage, current_capability_manifest,
 };
 
 #[test]
@@ -8,7 +11,7 @@ fn current_manifest_is_deterministic_valid_and_live_closed() {
     let manifest = current_capability_manifest();
 
     manifest.validate().unwrap();
-    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.release_stage, ReleaseStage::PaperOnly);
     assert!(!manifest.live_trading_enabled);
 
@@ -96,11 +99,205 @@ fn mainnet_market_data_does_not_grant_live_trading_authority() {
 }
 
 #[test]
+fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
+    let manifest = current_capability_manifest();
+    let ids = manifest
+        .adapters
+        .iter()
+        .map(|adapter| adapter.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "backpack",
+            "binance",
+            "edgex",
+            "grvt",
+            "hyperliquid",
+            "lighter",
+            "okx",
+            "paper",
+            "paradex",
+            "variational",
+        ]
+    );
+
+    let binance = manifest.adapter("binance").unwrap();
+    assert_eq!(binance.public_data.level, AdapterSupportLevel::Implemented);
+    assert_eq!(
+        binance.testnet_protocol.level,
+        AdapterSupportLevel::ProtocolOnly
+    );
+    assert_eq!(
+        binance.authenticated.level,
+        AdapterSupportLevel::ProtocolOnly
+    );
+    assert_eq!(binance.reconcile.level, AdapterSupportLevel::RequestOnly);
+    assert_eq!(binance.live.level, AdapterSupportLevel::Unavailable);
+    assert_eq!(
+        manifest
+            .capability("exchange.binance-public")
+            .unwrap()
+            .evidence,
+        binance.public_data.evidence
+    );
+    assert_eq!(
+        manifest
+            .capability("exchange.binance-testnet-protocol")
+            .unwrap()
+            .blockers,
+        binance.testnet_protocol.blockers
+    );
+
+    let hyperliquid = manifest.adapter("hyperliquid").unwrap();
+    assert_eq!(
+        hyperliquid.public_data.level,
+        AdapterSupportLevel::Unavailable
+    );
+    assert_eq!(
+        hyperliquid.testnet_protocol.level,
+        AdapterSupportLevel::ProtocolOnly
+    );
+    assert_eq!(
+        hyperliquid.reconcile.level,
+        AdapterSupportLevel::RequestOnly
+    );
+
+    let backpack = manifest.adapter("backpack").unwrap();
+    assert_eq!(backpack.public_data.level, AdapterSupportLevel::ConfigOnly);
+    assert_eq!(
+        backpack.authenticated.level,
+        AdapterSupportLevel::ConfigOnly
+    );
+    assert_eq!(backpack.reconcile.level, AdapterSupportLevel::Unavailable);
+
+    let paper = manifest.adapter("paper").unwrap();
+    assert_eq!(paper.public_data.level, AdapterSupportLevel::NotApplicable);
+    assert_eq!(paper.reconcile.level, AdapterSupportLevel::Implemented);
+    assert_eq!(paper.live.level, AdapterSupportLevel::NotApplicable);
+    assert_eq!(
+        manifest.capability("exchange.paper").unwrap().evidence,
+        paper.reconcile.evidence
+    );
+
+    for adapter in manifest
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.id != "paper")
+    {
+        assert_eq!(
+            adapter.live.level,
+            AdapterSupportLevel::Unavailable,
+            "{} must not advertise live support",
+            adapter.id
+        );
+    }
+}
+
+#[test]
+fn every_adapter_cell_has_checked_in_evidence_and_incomplete_cells_explain_the_gap() {
+    let manifest = current_capability_manifest();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .canonicalize()
+        .unwrap();
+    let facets = [
+        AdapterFacet::PublicData,
+        AdapterFacet::TestnetProtocol,
+        AdapterFacet::Authenticated,
+        AdapterFacet::Reconcile,
+        AdapterFacet::Live,
+    ];
+
+    for adapter in &manifest.adapters {
+        for facet in facets {
+            let support = adapter.facet(facet);
+            assert!(
+                !support.evidence.is_empty(),
+                "{}/{} lacks evidence",
+                adapter.id,
+                facet
+            );
+            for evidence in &support.evidence {
+                assert!(
+                    repository.join(evidence).is_file(),
+                    "{}/{} evidence path does not exist: {evidence}",
+                    adapter.id,
+                    facet
+                );
+            }
+            if support.level != AdapterSupportLevel::Implemented {
+                assert!(
+                    !support.blockers.is_empty(),
+                    "{}/{} must explain incomplete support",
+                    adapter.id,
+                    facet
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn adapter_matrix_validation_fails_closed_for_live_or_evidence_drift() {
+    let mut live = current_capability_manifest();
+    live.adapters
+        .iter_mut()
+        .find(|adapter| adapter.id == "binance")
+        .unwrap()
+        .live
+        .level = AdapterSupportLevel::Implemented;
+    assert!(live.validate().is_err());
+
+    let mut evidence = current_capability_manifest();
+    evidence
+        .adapters
+        .iter_mut()
+        .find(|adapter| adapter.id == "binance")
+        .unwrap()
+        .public_data
+        .evidence
+        .clear();
+    assert!(evidence.validate().is_err());
+
+    let mut drift = current_capability_manifest();
+    drift
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "exchange.binance-public")
+        .unwrap()
+        .evidence
+        .push("docs/adapter-support.md".to_owned());
+    assert!(drift.validate().is_err());
+}
+
+#[test]
+fn checked_in_adapter_markdown_is_generated_from_the_manifest_contract() {
+    const START: &str = "<!-- adapter-matrix:start -->";
+    const END: &str = "<!-- adapter-matrix:end -->";
+    let document = include_str!("../../../../docs/adapter-support.md");
+    let checked_in = document
+        .split_once(START)
+        .unwrap()
+        .1
+        .split_once(END)
+        .unwrap()
+        .0
+        .trim()
+        .replace("\r\n", "\n");
+
+    assert_eq!(
+        checked_in,
+        render_adapter_matrix(&current_capability_manifest())
+    );
+}
+
+#[test]
 fn manifest_serialization_is_a_stable_machine_contract() {
     let manifest = current_capability_manifest();
     let value = serde_json::to_value(&manifest).unwrap();
 
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["release_stage"], "paper-only");
     assert_eq!(value["live_trading_enabled"], false);
     assert_eq!(
@@ -112,8 +309,38 @@ fn manifest_serialization_is_a_stable_machine_contract() {
             .unwrap()["level"],
         "read-only"
     );
+    assert_eq!(
+        value["adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "binance")
+            .unwrap()["testnet_protocol"]["level"],
+        "protocol-only"
+    );
 
     let mut invalid_stage = value;
     invalid_stage["release_stage"] = serde_json::json!("live-ready");
     assert!(serde_json::from_value::<CapabilityManifest>(invalid_stage).is_err());
+}
+
+fn render_adapter_matrix(manifest: &CapabilityManifest) -> String {
+    let mut output = String::from(
+        "| Adapter | Public data | Testnet protocol | Authenticated | Reconcile | Live |\n\
+         | --- | --- | --- | --- | --- | --- |",
+    );
+    for adapter in &manifest.adapters {
+        write!(
+            output,
+            "\n| {} | {} | {} | {} | {} | {} |",
+            adapter.name,
+            adapter.public_data.level,
+            adapter.testnet_protocol.level,
+            adapter.authenticated.level,
+            adapter.reconcile.level,
+            adapter.live.level
+        )
+        .unwrap();
+    }
+    output
 }

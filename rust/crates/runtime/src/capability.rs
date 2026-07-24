@@ -3,8 +3,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 1;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
 const MAX_CAPABILITIES: usize = 64;
+const MAX_ADAPTERS: usize = 16;
 const MAX_CAPABILITY_TEXT_BYTES: usize = 512;
 
 /// Product release stage used by capability consumers.
@@ -125,6 +126,98 @@ pub struct CapabilityScope {
     pub access: CapabilityAccess,
 }
 
+/// One column in the operator-facing exchange adapter support matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterFacet {
+    PublicData,
+    TestnetProtocol,
+    Authenticated,
+    Reconcile,
+    Live,
+}
+
+impl fmt::Display for AdapterFacet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PublicData => "public-data",
+            Self::TestnetProtocol => "testnet-protocol",
+            Self::Authenticated => "authenticated",
+            Self::Reconcile => "reconcile",
+            Self::Live => "live",
+        })
+    }
+}
+
+/// Strength of the evidence behind one adapter facet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterSupportLevel {
+    Implemented,
+    ProtocolOnly,
+    RequestOnly,
+    ConfigOnly,
+    Unavailable,
+    NotApplicable,
+}
+
+impl fmt::Display for AdapterSupportLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Implemented => "implemented",
+            Self::ProtocolOnly => "protocol-only",
+            Self::RequestOnly => "request-only",
+            Self::ConfigOnly => "config-only",
+            Self::Unavailable => "unavailable",
+            Self::NotApplicable => "not-applicable",
+        })
+    }
+}
+
+/// Evidence and limitations for one cell in the adapter support matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterFacetSupport {
+    pub level: AdapterSupportLevel,
+    pub blockers: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
+/// One exchange row consumed by CLI and the future Integrations page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterSupport {
+    pub id: String,
+    pub name: String,
+    pub public_data: AdapterFacetSupport,
+    pub testnet_protocol: AdapterFacetSupport,
+    pub authenticated: AdapterFacetSupport,
+    pub reconcile: AdapterFacetSupport,
+    pub live: AdapterFacetSupport,
+}
+
+impl AdapterSupport {
+    /// Returns the evidence cell for one matrix facet.
+    #[must_use]
+    pub fn facet(&self, facet: AdapterFacet) -> &AdapterFacetSupport {
+        match facet {
+            AdapterFacet::PublicData => &self.public_data,
+            AdapterFacet::TestnetProtocol => &self.testnet_protocol,
+            AdapterFacet::Authenticated => &self.authenticated,
+            AdapterFacet::Reconcile => &self.reconcile,
+            AdapterFacet::Live => &self.live,
+        }
+    }
+
+    fn facets(&self) -> [(AdapterFacet, &AdapterFacetSupport); 5] {
+        [
+            (AdapterFacet::PublicData, &self.public_data),
+            (AdapterFacet::TestnetProtocol, &self.testnet_protocol),
+            (AdapterFacet::Authenticated, &self.authenticated),
+            (AdapterFacet::Reconcile, &self.reconcile),
+            (AdapterFacet::Live, &self.live),
+        ]
+    }
+}
+
 /// One stable capability record consumed by CLI and future control-plane adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capability {
@@ -144,10 +237,19 @@ pub struct CapabilityManifest {
     pub product_version: String,
     pub release_stage: ReleaseStage,
     pub live_trading_enabled: bool,
+    pub adapters: Vec<AdapterSupport>,
     pub capabilities: Vec<Capability>,
 }
 
 impl CapabilityManifest {
+    /// Finds an adapter row by its stable ID.
+    pub fn adapter(&self, id: &str) -> Option<&AdapterSupport> {
+        self.adapters
+            .binary_search_by_key(&id, |adapter| adapter.id.as_str())
+            .ok()
+            .map(|index| &self.adapters[index])
+    }
+
     /// Finds a capability by its stable ID.
     pub fn capability(&self, id: &str) -> Option<&Capability> {
         self.capabilities
@@ -173,6 +275,7 @@ impl CapabilityManifest {
         if self.capabilities.is_empty() || self.capabilities.len() > MAX_CAPABILITIES {
             return Err(CapabilityError::InvalidCount(self.capabilities.len()));
         }
+        validate_adapters(self)?;
 
         let mut previous_id: Option<&str> = None;
         for capability in &self.capabilities {
@@ -205,16 +308,17 @@ impl CapabilityManifest {
                 ));
             }
         }
-        Ok(())
+        validate_adapter_capability_alignment(self)
     }
 }
 
 /// Returns the single operator-facing capability source for this build.
 #[must_use]
 pub fn current_capability_manifest() -> CapabilityManifest {
+    let adapters = adapter_support_matrix();
     let capabilities = [
         foundation_capabilities(),
-        exchange_capabilities(),
+        exchange_capabilities(&adapters),
         state_and_risk_capabilities(),
         runtime_execution_capabilities(),
         runtime_validation_capabilities(),
@@ -228,10 +332,245 @@ pub fn current_capability_manifest() -> CapabilityManifest {
         product_version: env!("CARGO_PKG_VERSION").to_owned(),
         release_stage: ReleaseStage::PaperOnly,
         live_trading_enabled: false,
+        adapters,
         capabilities,
     };
     debug_assert!(manifest.validate().is_ok());
     manifest
+}
+
+fn adapter_support_matrix() -> Vec<AdapterSupport> {
+    vec![
+        config_only_adapter(
+            "backpack",
+            "Backpack",
+            "rust/config/exchanges/backpack_config.yaml",
+        ),
+        binance_adapter(),
+        config_only_adapter("edgex", "EdgeX", "rust/config/exchanges/edgex_config.yaml"),
+        config_only_adapter("grvt", "GRVT", "rust/config/exchanges/grvt_config.yaml"),
+        hyperliquid_adapter(),
+        config_only_adapter(
+            "lighter",
+            "Lighter",
+            "rust/config/exchanges/lighter_config.yaml",
+        ),
+        legacy_only_adapter("okx", "OKX"),
+        paper_adapter(),
+        config_only_adapter(
+            "paradex",
+            "Paradex",
+            "rust/config/exchanges/paradex_config.yaml",
+        ),
+        legacy_only_adapter("variational", "Variational"),
+    ]
+}
+
+fn binance_adapter() -> AdapterSupport {
+    let protocol_evidence = [
+        "rust/crates/exchange/src/binance_testnet.rs",
+        "rust/crates/exchange/tests/binance_testnet_protocol.rs",
+    ];
+    AdapterSupport {
+        id: "binance".to_owned(),
+        name: "Binance".to_owned(),
+        public_data: adapter_facet(
+            AdapterSupportLevel::Implemented,
+            &[],
+            &[
+                "rust/crates/exchange/src/binance.rs",
+                "rust/crates/exchange/tests/binance_public_contract.rs",
+            ],
+        ),
+        testnet_protocol: adapter_facet(
+            AdapterSupportLevel::ProtocolOnly,
+            &[
+                "Only deterministic request/response contracts are verified; no credentialed testnet lifecycle has run.",
+            ],
+            &protocol_evidence,
+        ),
+        authenticated: adapter_facet(
+            AdapterSupportLevel::ProtocolOnly,
+            &[
+                "The injectable signer seam is tested, but real credentials and official signing vectors are not verified.",
+            ],
+            &protocol_evidence,
+        ),
+        reconcile: adapter_facet(
+            AdapterSupportLevel::RequestOnly,
+            &[
+                "Open-order and position request routes are covered, but response parsing and authoritative reconciliation receipts are not implemented.",
+            ],
+            &protocol_evidence,
+        ),
+        live: external_live_unavailable(),
+    }
+}
+
+fn hyperliquid_adapter() -> AdapterSupport {
+    let protocol_evidence = [
+        "rust/crates/exchange/src/hyperliquid_testnet.rs",
+        "rust/crates/exchange/tests/hyperliquid_testnet_protocol.rs",
+    ];
+    AdapterSupport {
+        id: "hyperliquid".to_owned(),
+        name: "Hyperliquid".to_owned(),
+        public_data: adapter_facet(
+            AdapterSupportLevel::Unavailable,
+            &["No Rust market-data adapter emits Hyperliquid domain snapshots."],
+            &[
+                "rust/crates/exchange/src/hyperliquid_testnet.rs",
+                "docs/research/upstream-repository-alignment.md",
+            ],
+        ),
+        testnet_protocol: adapter_facet(
+            AdapterSupportLevel::ProtocolOnly,
+            &[
+                "Only deterministic request/response contracts are verified; no credentialed testnet lifecycle has run.",
+            ],
+            &protocol_evidence,
+        ),
+        authenticated: adapter_facet(
+            AdapterSupportLevel::ProtocolOnly,
+            &[
+                "The injectable signer seam is tested, but real credentials and official signing vectors are not verified.",
+            ],
+            &protocol_evidence,
+        ),
+        reconcile: adapter_facet(
+            AdapterSupportLevel::RequestOnly,
+            &[
+                "Account request routes are covered, but response parsing and authoritative reconciliation receipts are not implemented.",
+            ],
+            &protocol_evidence,
+        ),
+        live: external_live_unavailable(),
+    }
+}
+
+fn paper_adapter() -> AdapterSupport {
+    let paper_evidence = ["rust/crates/exchange/src/paper.rs"];
+    AdapterSupport {
+        id: "paper".to_owned(),
+        name: "PaperExchange".to_owned(),
+        public_data: adapter_facet(
+            AdapterSupportLevel::NotApplicable,
+            &["PaperExchange consumes explicitly injected market snapshots."],
+            &paper_evidence,
+        ),
+        testnet_protocol: adapter_facet(
+            AdapterSupportLevel::NotApplicable,
+            &["PaperExchange has no remote protocol or testnet endpoint."],
+            &paper_evidence,
+        ),
+        authenticated: adapter_facet(
+            AdapterSupportLevel::NotApplicable,
+            &["PaperExchange is process-local and does not authenticate to a venue."],
+            &paper_evidence,
+        ),
+        reconcile: adapter_facet(
+            AdapterSupportLevel::Implemented,
+            &[],
+            &[
+                "rust/crates/exchange/src/paper.rs",
+                "rust/crates/exchange/tests/paper_exchange_contract.rs",
+            ],
+        ),
+        live: adapter_facet(
+            AdapterSupportLevel::NotApplicable,
+            &["PaperExchange cannot create mainnet authority."],
+            &paper_evidence,
+        ),
+    }
+}
+
+fn config_only_adapter(id: &str, name: &str, config_path: &str) -> AdapterSupport {
+    let config_evidence = [
+        "rust/crates/config/src/auth.rs",
+        config_path,
+        "rust/crates/config/tests/config_compatibility.rs",
+    ];
+    let unavailable_evidence = [
+        config_path,
+        "docs/research/upstream-repository-alignment.md",
+    ];
+    AdapterSupport {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        public_data: adapter_facet(
+            AdapterSupportLevel::ConfigOnly,
+            &["Rust can parse venue configuration, but no market-data adapter is implemented."],
+            &config_evidence,
+        ),
+        testnet_protocol: adapter_facet(
+            AdapterSupportLevel::Unavailable,
+            &["No Rust testnet request/response protocol is implemented."],
+            &unavailable_evidence,
+        ),
+        authenticated: adapter_facet(
+            AdapterSupportLevel::ConfigOnly,
+            &["Credential fields can be loaded and redacted, but no private API consumes them."],
+            &config_evidence,
+        ),
+        reconcile: adapter_facet(
+            AdapterSupportLevel::Unavailable,
+            &["No Rust open-order, position, or balance reconciliation is implemented."],
+            &unavailable_evidence,
+        ),
+        live: external_live_unavailable(),
+    }
+}
+
+fn legacy_only_adapter(id: &str, name: &str) -> AdapterSupport {
+    let evidence = [
+        "docs/research/upstream-repository-alignment.md",
+        "docs/plans/2026-07-24-project-alignment-web-goal-plan.md",
+    ];
+    let unavailable = || {
+        adapter_facet(
+            AdapterSupportLevel::Unavailable,
+            &[
+                "Only the frozen Python adapter exists; no current Rust adapter or configuration contract is implemented.",
+            ],
+            &evidence,
+        )
+    };
+    AdapterSupport {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        public_data: unavailable(),
+        testnet_protocol: unavailable(),
+        authenticated: unavailable(),
+        reconcile: unavailable(),
+        live: external_live_unavailable(),
+    }
+}
+
+fn external_live_unavailable() -> AdapterFacetSupport {
+    adapter_facet(
+        AdapterSupportLevel::Unavailable,
+        &[
+            "Mainnet authority is disabled until signing, testnet, account-risk, reconciliation, and recovery gates pass.",
+        ],
+        &[
+            "rust/crates/runtime/src/mode.rs",
+            "rust/crates/runtime/tests/execution_contract.rs",
+            "rust/crates/exchange/src/unsupported.rs",
+            "rust/crates/apps/tests/command_smoke.rs",
+        ],
+    )
+}
+
+fn adapter_facet(
+    level: AdapterSupportLevel,
+    blockers: &[&str],
+    evidence: &[&str],
+) -> AdapterFacetSupport {
+    AdapterFacetSupport {
+        level,
+        blockers: blockers.iter().map(|value| (*value).to_owned()).collect(),
+        evidence: evidence.iter().map(|value| (*value).to_owned()).collect(),
+    }
 }
 
 fn foundation_capabilities() -> Vec<Capability> {
@@ -257,79 +596,62 @@ fn foundation_capabilities() -> Vec<Capability> {
     ]
 }
 
-fn exchange_capabilities() -> Vec<Capability> {
+fn exchange_capabilities(adapters: &[AdapterSupport]) -> Vec<Capability> {
+    let binance_public = adapter_cell(adapters, "binance", AdapterFacet::PublicData);
+    let binance_testnet = adapter_cell(adapters, "binance", AdapterFacet::TestnetProtocol);
+    let hyperliquid_testnet = adapter_cell(adapters, "hyperliquid", AdapterFacet::TestnetProtocol);
+    let paper_reconcile = adapter_cell(adapters, "paper", AdapterFacet::Reconcile);
+    let external_live = adapter_cell(adapters, "binance", AdapterFacet::Live);
     vec![
-        capability(
+        adapter_capability(
             "exchange.binance-public",
-            CapabilityArea::Exchange,
             CapabilityLevel::ReadOnly,
             scope(
                 &[CapabilityEnvironment::Mainnet],
                 CapabilityAccess::MarketData,
             ),
             "One-shot Binance Spot public book-ticker snapshots.",
-            &[],
-            &[
-                "rust/crates/exchange/src/binance.rs",
-                "rust/crates/exchange/tests/binance_public_contract.rs",
-            ],
+            binance_public,
         ),
-        capability(
+        adapter_capability(
             "exchange.binance-testnet-protocol",
-            CapabilityArea::Exchange,
             CapabilityLevel::ContractOnly,
             scope(
                 &[CapabilityEnvironment::Testnet],
                 CapabilityAccess::TestnetTrading,
             ),
             "Injectable-signer Binance Spot and USD-M testnet request contracts.",
-            &["Real signing and credentialed testnet lifecycle are not verified."],
-            &[
-                "rust/crates/exchange/src/binance_testnet.rs",
-                "rust/crates/exchange/tests/binance_testnet_protocol.rs",
-            ],
+            binance_testnet,
         ),
-        capability(
+        adapter_capability(
             "exchange.hyperliquid-testnet-protocol",
-            CapabilityArea::Exchange,
             CapabilityLevel::ContractOnly,
             scope(
                 &[CapabilityEnvironment::Testnet],
                 CapabilityAccess::TestnetTrading,
             ),
             "Injectable-signer Hyperliquid Spot and perpetual testnet request contracts.",
-            &["Real signing and credentialed testnet lifecycle are not verified."],
-            &[
-                "rust/crates/exchange/src/hyperliquid_testnet.rs",
-                "rust/crates/exchange/tests/hyperliquid_testnet_protocol.rs",
-            ],
+            hyperliquid_testnet,
         ),
-        capability(
+        adapter_capability(
             "exchange.paper",
-            CapabilityArea::Exchange,
             CapabilityLevel::Available,
             scope(
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
             "Deterministic process-local order, fill, reservation, cancel, and reconcile model.",
-            &[],
-            &[
-                "rust/crates/exchange/src/paper.rs",
-                "rust/crates/exchange/tests/paper_exchange_contract.rs",
-            ],
+            paper_reconcile,
         ),
-        capability(
+        adapter_capability(
             "exchange.private-live",
-            CapabilityArea::Exchange,
             CapabilityLevel::Unavailable,
             scope(
                 &[CapabilityEnvironment::Mainnet],
                 CapabilityAccess::MainnetTrading,
             ),
             "Authenticated private exchange market, account, and trading adapters.",
-            &["No private adapter has passed signing, testnet, account, and reconcile gates."],
-            &["rust/crates/exchange/src/unsupported.rs"],
+            external_live,
         ),
     ]
 }
@@ -558,6 +880,36 @@ fn strategy_capabilities() -> Vec<Capability> {
     ]
 }
 
+fn adapter_cell<'a>(
+    adapters: &'a [AdapterSupport],
+    id: &str,
+    facet: AdapterFacet,
+) -> &'a AdapterFacetSupport {
+    adapters
+        .binary_search_by_key(&id, |adapter| adapter.id.as_str())
+        .ok()
+        .map(|index| adapters[index].facet(facet))
+        .expect("the static adapter matrix must contain every derived capability row")
+}
+
+fn adapter_capability(
+    id: &str,
+    level: CapabilityLevel,
+    scope: CapabilityScope,
+    summary: &str,
+    support: &AdapterFacetSupport,
+) -> Capability {
+    Capability {
+        id: id.to_owned(),
+        area: CapabilityArea::Exchange,
+        level,
+        scope,
+        summary: summary.to_owned(),
+        blockers: support.blockers.clone(),
+        evidence: support.evidence.clone(),
+    }
+}
+
 fn capability(
     id: &str,
     area: CapabilityArea,
@@ -619,6 +971,121 @@ fn validate_environments(capability: &Capability) -> Result<(), CapabilityError>
     Ok(())
 }
 
+fn validate_adapters(manifest: &CapabilityManifest) -> Result<(), CapabilityError> {
+    if manifest.adapters.is_empty() || manifest.adapters.len() > MAX_ADAPTERS {
+        return Err(CapabilityError::InvalidAdapterCount(
+            manifest.adapters.len(),
+        ));
+    }
+
+    let mut previous_id: Option<&str> = None;
+    for adapter in &manifest.adapters {
+        validate_capability_id(&adapter.id)?;
+        if previous_id.is_some_and(|previous| previous >= adapter.id.as_str()) {
+            return Err(CapabilityError::UnstableAdapterOrdering(adapter.id.clone()));
+        }
+        previous_id = Some(&adapter.id);
+        validate_text("adapter name", &adapter.name)?;
+
+        for (facet, support) in adapter.facets() {
+            if support.evidence.is_empty() {
+                return Err(CapabilityError::AdapterMissingEvidence {
+                    adapter: adapter.id.clone(),
+                    facet,
+                });
+            }
+            for evidence in &support.evidence {
+                validate_text("adapter evidence", evidence)?;
+            }
+            for blocker in &support.blockers {
+                validate_text("adapter blocker", blocker)?;
+            }
+            if matches!(
+                support.level,
+                AdapterSupportLevel::ProtocolOnly
+                    | AdapterSupportLevel::RequestOnly
+                    | AdapterSupportLevel::ConfigOnly
+                    | AdapterSupportLevel::Unavailable
+                    | AdapterSupportLevel::NotApplicable
+            ) && support.blockers.is_empty()
+            {
+                return Err(CapabilityError::AdapterMissingBlocker {
+                    adapter: adapter.id.clone(),
+                    facet,
+                });
+            }
+        }
+
+        if !manifest.live_trading_enabled
+            && !matches!(
+                adapter.live.level,
+                AdapterSupportLevel::Unavailable | AdapterSupportLevel::NotApplicable
+            )
+        {
+            return Err(CapabilityError::AdapterLiveAuthorityAdvertised(
+                adapter.id.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_adapter_capability_alignment(
+    manifest: &CapabilityManifest,
+) -> Result<(), CapabilityError> {
+    let alignments = [
+        (
+            "exchange.binance-public",
+            "binance",
+            AdapterFacet::PublicData,
+            CapabilityLevel::ReadOnly,
+        ),
+        (
+            "exchange.binance-testnet-protocol",
+            "binance",
+            AdapterFacet::TestnetProtocol,
+            CapabilityLevel::ContractOnly,
+        ),
+        (
+            "exchange.hyperliquid-testnet-protocol",
+            "hyperliquid",
+            AdapterFacet::TestnetProtocol,
+            CapabilityLevel::ContractOnly,
+        ),
+        (
+            "exchange.paper",
+            "paper",
+            AdapterFacet::Reconcile,
+            CapabilityLevel::Available,
+        ),
+        (
+            "exchange.private-live",
+            "binance",
+            AdapterFacet::Live,
+            CapabilityLevel::Unavailable,
+        ),
+    ];
+
+    for (capability_id, adapter_id, facet, expected_level) in alignments {
+        let capability = manifest
+            .capability(capability_id)
+            .ok_or_else(|| CapabilityError::AdapterCapabilityDrift(capability_id.to_owned()))?;
+        let support = manifest
+            .adapter(adapter_id)
+            .map(|adapter| adapter.facet(facet))
+            .ok_or_else(|| CapabilityError::AdapterCapabilityDrift(capability_id.to_owned()))?;
+        if capability.level != expected_level
+            || capability.blockers != support.blockers
+            || capability.evidence != support.evidence
+        {
+            return Err(CapabilityError::AdapterCapabilityDrift(
+                capability_id.to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CapabilityError {
     #[error("unsupported capability schema version {0}")]
@@ -641,4 +1108,22 @@ pub enum CapabilityError {
     InvalidEnvironments(String),
     #[error("capability {0} advertises live authority while live is disabled")]
     LiveAuthorityAdvertised(String),
+    #[error("adapter count {0} must be between 1 and {MAX_ADAPTERS}")]
+    InvalidAdapterCount(usize),
+    #[error("adapter IDs must be unique and sorted; found {0:?} out of order")]
+    UnstableAdapterOrdering(String),
+    #[error("adapter {adapter} facet {facet} must contain at least one evidence path")]
+    AdapterMissingEvidence {
+        adapter: String,
+        facet: AdapterFacet,
+    },
+    #[error("adapter {adapter} facet {facet} must explain its incomplete support level")]
+    AdapterMissingBlocker {
+        adapter: String,
+        facet: AdapterFacet,
+    },
+    #[error("adapter {0} advertises live authority while live is disabled")]
+    AdapterLiveAuthorityAdvertised(String),
+    #[error("derived exchange capability {0} drifted from its adapter matrix cell")]
+    AdapterCapabilityDrift(String),
 }

@@ -39,7 +39,10 @@
 | `price-alert` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验后失败关闭 |
 | `scanner` | 检查显式配置路径 | 不可用 | 不可用 | 不可用 | 报告 scanner 运行时尚未实现 |
 
-仓库内出现的 Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX 或 GRVT 配置，表示配置兼容或历史迁移范围，不表示对应私有交易适配器已经可以实盘下单。
+Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Variational
+出现在配置或冻结的 Python tree 中，只表示兼容/迁移范围，不表示对应私有交易适配器已经可以实盘下单。
+权威状态来自 `cargo run --locked -- capabilities --json`；人类可读投影见
+[`docs/adapter-support.md`](docs/adapter-support.md)，其表格由合约测试与同一 manifest 保持一致。
 
 ## 核心特性
 
@@ -141,6 +144,7 @@ cargo run --locked -- <COMMAND> --help
 常用命令：
 
 ```text
+crypto-trading capabilities [--json]
 crypto-trading grid <CONFIG> [OPTIONS]
 crypto-trading arbitrage [OPTIONS]
 crypto-trading monitor [OPTIONS]
