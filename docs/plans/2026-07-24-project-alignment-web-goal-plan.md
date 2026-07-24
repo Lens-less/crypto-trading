@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：M1 执行中（M0 已完成）
+> 状态：M2 准备中（M0、M1 已完成）
 >
 > 日期：2026-07-24
 >
@@ -215,8 +215,8 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 交付：
 
 - [x] 稳定版本化事件 envelope 与 cursor。
-- [ ] 从现有 execution JSONL 构建 bounded read model。
-- [ ] 处理损坏尾行、重复事件、超限记录、游标过期和跨进程读取。
+- [x] 从现有 execution JSONL 构建 bounded read model。
+- [x] 处理损坏尾行、重复事件、超限记录、游标过期和跨进程读取。
 - [x] snapshot/history interface 的 deterministic adapter 与 fixture。
 
 退出条件：
@@ -231,8 +231,14 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   FNV-1a64 损坏检测。
 - [x] `JournalCursor` v1 固化 generation、last sequence/event 与 next byte offset，
   不编码路径、inode 或 wall clock；FNV 只检测意外变更，reader 仍必须验证边界锚点。
-- [ ] 下一条 tracer-bullet：实现 bounded file/in-memory reader、legacy JSONL 映射与
-  cursor anchor 验证，再投影 Operator Read Model。
+- [x] bounded file/in-memory reader 在读取前冻结快照长度，以稀疏 checkpoint 限制
+  cursor anchor 恢复扫描；跨进程追加可恢复，改写锚点、损坏中段和超限记录失败关闭。
+- [x] `OperatorReadModel` 将 planned/completed/partial/incomplete/failed 映射为稳定恢复
+  状态；冲突冻结首个可信终态事实，不暴露原始错误文本，也不生成“直接重试”建议。
+- [x] 容量窗口只淘汰日志序列最老的 completed 批次；所有未决与冲突批次必须保留，
+  无安全淘汰候选时明确失败。
+- [ ] 下一条 tracer-bullet：建立只读 Control Plane snapshot/events interface 与
+  HTTP/SSE contract；正式 Web 实现前先生成四个设计方向并等待选择。
 
 ### M2：Control Plane 与只读 Web 切片
 

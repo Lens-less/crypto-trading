@@ -6,6 +6,7 @@ mod history;
 mod journal;
 mod journal_reader;
 mod mode;
+mod read_model;
 
 pub use capability::{
     AdapterFacet, AdapterFacetSupport, AdapterSupport, AdapterSupportLevel,
@@ -33,3 +34,8 @@ pub use journal_reader::{
     MemoryJournalSnapshotSource,
 };
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
+pub use read_model::{
+    ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,
+    MAX_OPERATOR_READ_MODEL_WARNINGS, OPERATOR_READ_MODEL_SCHEMA_VERSION, OperatorReadModel,
+    ProjectionStatus, ReadModelError, ReadModelWarning, ReadModelWarningCode, RecoveryDirective,
+};
