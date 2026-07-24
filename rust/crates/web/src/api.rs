@@ -17,7 +17,7 @@ use axum::{
 use crypto_trading_control_plane::{
     ArbitrageMonitorReadModel, CapabilityManifest, ControlPlaneEventsPage, ControlPlaneSnapshot,
     ExecutionBatchState, OperatorReadModel, PriceAlertReadModel, ProjectionStatus,
-    ReadControlPlane, ReadFailureKind, RecoveryDirective, ReleaseStage,
+    ReadControlPlane, ReadFailureKind, ReadOnlyTaskReadModel, RecoveryDirective, ReleaseStage,
 };
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,7 @@ pub(crate) fn api_routes(control_plane: Arc<ReadControlPlane>, access: WebAccess
         .route("/capabilities", get(capabilities))
         .route("/monitor", get(monitor))
         .route("/alerts", get(alerts))
+        .route("/tasks", get(tasks))
         .route("/executions", get(executions))
         .route("/events", get(events))
         .layer(middleware::from_fn_with_state(access, authorize))
@@ -161,6 +162,11 @@ async fn monitor(
 async fn alerts(State(state): State<ApiState>) -> Result<Json<PriceAlertReadModel>, ApiError> {
     let snapshot = load_snapshot(state.control_plane).await?;
     Ok(Json(snapshot.alerts))
+}
+
+async fn tasks(State(state): State<ApiState>) -> Result<Json<ReadOnlyTaskReadModel>, ApiError> {
+    let snapshot = load_snapshot(state.control_plane).await?;
+    Ok(Json(snapshot.tasks))
 }
 
 async fn executions(

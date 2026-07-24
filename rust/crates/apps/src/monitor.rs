@@ -231,6 +231,11 @@ impl ReadOnlyArbitrageMonitor {
         &self.book
     }
 
+    /// Returns the exact ordered pair bound to this monitor.
+    pub const fn legs(&self) -> (&MarketInstrument, &MarketInstrument) {
+        (&self.left, &self.right)
+    }
+
     /// Applies one source event and emits exactly one operator-visible monitor
     /// event. Missing, stale, future, duplicate, out-of-order, lagged, and
     /// disconnected inputs become waiting outcomes rather than being hidden.

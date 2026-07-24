@@ -63,11 +63,41 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
     );
     assert_eq!(grid_runtime.scope.access, CapabilityAccess::PaperTrading);
 
+    let web = manifest.capability("control-plane.web").unwrap();
+    assert_eq!(web.level, CapabilityLevel::ReadOnly);
+    assert_eq!(web.scope.environments, vec![CapabilityEnvironment::Offline]);
+    assert_eq!(web.scope.access, CapabilityAccess::Local);
+    assert!(web.blockers.is_empty());
+
+    let live_runtime = manifest.capability("runtime.live").unwrap();
+    assert_eq!(live_runtime.level, CapabilityLevel::Unavailable);
+    assert_eq!(
+        live_runtime.scope.environments,
+        vec![CapabilityEnvironment::Mainnet]
+    );
+    assert_eq!(live_runtime.scope.access, CapabilityAccess::MainnetTrading);
+}
+
+#[test]
+fn continuous_read_only_facts_do_not_advertise_trading_authority() {
+    let manifest = current_capability_manifest();
+
     let monitor_runtime = manifest.capability("runtime.monitor").unwrap();
     assert_eq!(monitor_runtime.level, CapabilityLevel::ReadOnly);
     assert_eq!(
         monitor_runtime.scope.environments,
         vec![CapabilityEnvironment::Offline]
+    );
+    assert!(
+        monitor_runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("without automatically resuming external sources"))
+    );
+    assert!(
+        monitor_runtime
+            .evidence
+            .contains(&"rust/crates/web/tests/ui_contract.rs".to_owned())
     );
 
     let price_alert = manifest.capability("runtime.price-alert").unwrap();
@@ -86,7 +116,7 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
         price_alert
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("No CLI or market-source supervisor composition"))
+            .any(|blocker| blocker.contains("not yet registered in the durable task lifecycle"))
     );
 
     let market_data = manifest.capability("runtime.market-data").unwrap();
@@ -109,7 +139,12 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
         market_data
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("Only Binance Spot public polling"))
+            .any(|blocker| blocker.contains("no second real venue or executable bootstrap"))
+    );
+    assert!(
+        market_data
+            .evidence
+            .contains(&"rust/crates/apps/src/continuous_monitor.rs".to_owned())
     );
 
     let continuous = manifest.capability("runtime.continuous").unwrap();
@@ -119,22 +154,13 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
         continuous
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("Only a read-only market-source supervisor"))
+            .any(|blocker| blocker.contains("no executable bootstrap, automatic restart"))
     );
-
-    let web = manifest.capability("control-plane.web").unwrap();
-    assert_eq!(web.level, CapabilityLevel::ReadOnly);
-    assert_eq!(web.scope.environments, vec![CapabilityEnvironment::Offline]);
-    assert_eq!(web.scope.access, CapabilityAccess::Local);
-    assert!(web.blockers.is_empty());
-
-    let live_runtime = manifest.capability("runtime.live").unwrap();
-    assert_eq!(live_runtime.level, CapabilityLevel::Unavailable);
-    assert_eq!(
-        live_runtime.scope.environments,
-        vec![CapabilityEnvironment::Mainnet]
+    assert!(
+        continuous
+            .evidence
+            .contains(&"rust/crates/runtime/src/task_read_model.rs".to_owned())
     );
-    assert_eq!(live_runtime.scope.access, CapabilityAccess::MainnetTrading);
 }
 
 #[test]

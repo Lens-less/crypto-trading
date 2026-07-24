@@ -88,6 +88,23 @@ for (const [token, label] of [
   ["source_gap", "数据缺口"],
   ["duplicate", "重复"],
   ["out_of_order", "乱序"],
+  ["registered", "已登记"],
+  ["running", "最后记录：运行中"],
+  ["stopping", "最后记录：停止中"],
+  ["stopped", "已停止"],
+  ["starting", "最后记录：启动中"],
+  ["healthy", "健康"],
+  ["unknown", "未知"],
+  ["stop_requested", "收到停止请求"],
+  ["source_ended", "数据源结束"],
+  ["shutdown_timed_out", "停止超时"],
+  ["startup_failed", "启动失败"],
+  ["source_contract", "数据源契约失败"],
+  ["monitor_contract", "监控契约失败"],
+  ["journal_unavailable", "日志不可用"],
+  ["task_panicked", "任务异常终止"],
+  ["task_cancelled", "任务被取消"],
+  ["arbitrage_monitor", "套利监控"],
 ]) {
   TOKEN_LABELS.set(token, label);
 }
@@ -115,6 +132,7 @@ const state = {
   system: null,
   monitor: null,
   alerts: null,
+  tasks: null,
   capabilities: null,
   executions: null,
   lastPage: null,
@@ -129,6 +147,7 @@ const state = {
     system: "idle",
     monitor: "idle",
     alerts: "idle",
+    tasks: "idle",
     capabilities: "idle",
     executions: "idle",
   },
@@ -136,6 +155,7 @@ const state = {
     system: null,
     monitor: null,
     alerts: null,
+    tasks: null,
     capabilities: null,
     executions: null,
   },
@@ -181,6 +201,7 @@ async function bootstrap() {
     loadSystem(),
     loadMonitor(),
     loadAlerts(),
+    loadTasks(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -255,6 +276,7 @@ function clearProtectedState() {
   state.system = null;
   state.monitor = null;
   state.alerts = null;
+  state.tasks = null;
   state.capabilities = null;
   state.executions = null;
   state.lastPage = null;
@@ -266,6 +288,7 @@ function clearProtectedState() {
     system: "idle",
     monitor: "idle",
     alerts: "idle",
+    tasks: "idle",
     capabilities: "idle",
     executions: "idle",
   };
@@ -273,6 +296,7 @@ function clearProtectedState() {
     system: null,
     monitor: null,
     alerts: null,
+    tasks: null,
     capabilities: null,
     executions: null,
   };
@@ -314,6 +338,7 @@ function replaceAuthToken(nextToken) {
     loadSystem(),
     loadMonitor(),
     loadAlerts(),
+    loadTasks(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -399,6 +424,32 @@ async function loadAlerts() {
   render();
 }
 
+async function loadTasks() {
+  const generation = state.sessionGeneration;
+  state.loads.tasks = "loading";
+  state.errors.tasks = null;
+  render();
+  try {
+    const tasks = await fetchJson("/api/v1/tasks");
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    state.tasks = tasks;
+    state.lastSnapshotAt = Date.now();
+    state.loads.tasks = "ready";
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    if (!markAuthenticationRequired(problem)) {
+      state.loads.tasks = "error";
+      state.errors.tasks = problem;
+    }
+  }
+  render();
+}
+
 async function loadCapabilities() {
   const generation = state.sessionGeneration;
   state.loads.capabilities = "loading";
@@ -466,7 +517,13 @@ async function refreshOperationalTruth() {
   state.isRefreshing = true;
   render();
   try {
-    await Promise.all([loadSystem(), loadMonitor(), loadAlerts(), loadExecutions()]);
+    await Promise.all([
+      loadSystem(),
+      loadMonitor(),
+      loadAlerts(),
+      loadTasks(),
+      loadExecutions(),
+    ]);
   } finally {
     state.isRefreshing = false;
     render();
@@ -946,6 +1003,7 @@ function renderOverviewView() {
   const leftColumn = el("div", { className: "view-stack" }, [
     renderRibbon(),
     renderMonitorRegion(),
+    renderTasksRegion(),
     renderAlertsSummaryRegion(),
     renderExecutionsSummaryRegion(),
     renderRecentNoticesRegion(),
@@ -955,6 +1013,162 @@ function renderOverviewView() {
     renderCapabilityPulseRegion(),
   ]);
   return el("section", { className: "overview-grid" }, [leftColumn, rightColumn]);
+}
+
+function renderTasksRegion() {
+  const model = state.tasks;
+  if (state.loads.tasks === "error" && !model) {
+    return renderRegion({
+      title: "只读连续任务",
+      subtitle: "这里只呈现持久生命周期事实，不提供启动、停止或重连权限。",
+      body: renderError(state.errors.tasks),
+    });
+  }
+  if (state.loads.tasks === "loading" && !model) {
+    return renderRegion({
+      title: "只读连续任务",
+      subtitle: "正在读取任务登记、源健康与最后持久终态。",
+      body: renderSkeleton(5),
+    });
+  }
+  if (!model || !Array.isArray(model.tasks) || model.tasks.length === 0) {
+    return renderRegion({
+      title: "只读连续任务",
+      subtitle: "任务投影从 journal 冷启动重建；不会自动恢复外部连接。",
+      body: renderEmpty(
+        "尚未投影出连续任务登记。",
+        "已检查 /api/v1/tasks；没有运行按钮，也不会把缺失事实解释成健康。",
+      ),
+    });
+  }
+
+  const rows = [...model.tasks]
+    .sort((left, right) => (right.last_sequence || 0) - (left.last_sequence || 0))
+    .slice(0, 8);
+  const table = el("div", {
+    className: "table-wrap",
+    attrs: {
+      role: "region",
+      tabindex: "0",
+      "aria-label": "只读连续任务明细，可横向滚动",
+    },
+  }, [
+    el("table", { className: "task-table" }, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "任务 / 最后事实" }),
+          el("th", { attrs: { scope: "col" }, text: "阶段" }),
+          el("th", { attrs: { scope: "col" }, text: "数据源" }),
+          el("th", { attrs: { scope: "col" }, text: "恢复判断" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        rows.map((task) =>
+          el("tr", {}, [
+            el("td", {}, [
+              el("div", { className: "mono", text: task.task_id || "--" }),
+              el("div", {
+                className: "muted mono",
+                text: `#${task.last_sequence ?? "--"} · ${formatDateTime(task.updated_at)}`,
+              }),
+              el("div", {
+                className: "muted",
+                text: `${humanizeToken(task.kind)} · ${task.processed_event_count ?? 0} 个事件`,
+              }),
+            ]),
+            el("td", {}, [
+              buildTag(humanizeToken(task.phase), taskTone(task)),
+              task.exit
+                ? el("div", { className: "muted", text: humanizeToken(task.exit) })
+                : null,
+              task.failure
+                ? el("div", { className: "muted", text: humanizeToken(task.failure) })
+                : null,
+            ]),
+            el(
+              "td",
+              {},
+              (task.sources || []).map((source) =>
+                el("div", { className: "task-source-line" }, [
+                  el("span", {
+                    className: "mono",
+                    text: `${source.source_id} #${source.event_sequence}`,
+                  }),
+                  buildTag(
+                    humanizeToken(source.health),
+                    source.health === "healthy"
+                      ? "success"
+                      : source.health === "degraded"
+                        ? "warning"
+                        : "neutral",
+                  ),
+                ]),
+              ),
+            ),
+            el("td", {}, [
+              buildTag(
+                humanizeToken(task.recovery),
+                task.recovery === "none" ? "success" : "warning",
+              ),
+              el("div", {
+                className: "muted",
+                text:
+                  task.recovery === "none"
+                    ? "持久终态已闭合"
+                    : "仅有历史事实；需核对进程",
+              }),
+            ]),
+          ]),
+        ),
+      ),
+    ]),
+  ]);
+
+  return renderRegion({
+    title: "只读连续任务",
+    subtitle:
+      "显示最后持久阶段、双源健康与事件计数。running / stopping 只代表 journal 最后记录，不证明进程仍存活。",
+    body: el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, [
+        detailStat("任务投影", humanizeToken(model.projection_status)),
+        detailStat("任务数", model.tasks.length),
+        detailStat("无效事件", model.invalid_event_count ?? "--"),
+        detailStat("日志头", model.journal_head_sequence ?? "--"),
+      ]),
+      model.projection_status !== "complete"
+        ? el("p", {
+            className: "muted",
+            text: "任务投影已降级；保留行是最后通过校验的历史事实，不能据此判断当前 liveness。",
+          })
+        : null,
+      table,
+      model.tasks.length > rows.length
+        ? el("p", {
+            className: "muted",
+            text: `总览仅显示最近 ${rows.length} / ${model.tasks.length} 个有界任务。`,
+          })
+        : null,
+      el("p", {
+        className: "muted",
+        text: "本页没有启动、停止、重连或自动恢复入口；进程重启后只重建投影，不重放网络任务。",
+      }),
+    ]),
+  });
+}
+
+function taskTone(task) {
+  if (task.failure || task.phase === "failed") {
+    return "danger";
+  }
+  if (task.recovery !== "none" || task.exit === "shutdown_timed_out") {
+    return "warning";
+  }
+  if (task.phase === "stopped") {
+    return "success";
+  }
+  return "info";
 }
 
 function renderMonitorRegion() {
@@ -2132,6 +2346,35 @@ function collectBands() {
         "最后一个有效监控结果已停止展示；无效事件或不完整尾记录修复前，不把旧机会提升为可信状态。",
     });
   }
+  if (state.tasks && state.tasks.projection_status !== "complete") {
+    bands.push({
+      title: "任务投影已降级",
+      tag: "最后有效事实",
+      tone: "danger",
+      message:
+        "无效任务生命周期事实不会覆盖最后一个通过校验的状态；修复 journal 前，所有任务 liveness 都需要人工核对。",
+    });
+  }
+  const taskInvestigationCount = (state.tasks?.tasks || []).filter(
+    (task) => task.recovery === "investigate",
+  ).length;
+  if (taskInvestigationCount > 0) {
+    bands.push({
+      title: "任务存活性未验证",
+      tag: "历史事实 / 不自动重放",
+      tone: "warning",
+      message: `${taskInvestigationCount} 个任务的最后持久阶段尚未形成可安全闭合的正常终态。页面不会把 running 解释为当前进程存活，也不会在重启后自动重连数据源。`,
+    });
+  }
+  if (state.loads.tasks === "error" && state.tasks) {
+    bands.push({
+      title: "任务快照刷新失败",
+      tag: "保留旧快照",
+      tone: "warning",
+      message:
+        "最后一个通过生命周期校验的任务快照仍然可见；重新读取成功前，不把其中的阶段或源健康解释为当前状态。",
+    });
+  }
   const alertProjectionStatus = state.alerts?.projection_status;
   if (alertProjectionStatus === "windowed" && isTrustedAlertProjection(state.alerts)) {
     bands.push({
@@ -2190,6 +2433,7 @@ function collectBands() {
     state.errors.system?.code === "authentication_required" ||
     state.errors.monitor?.code === "authentication_required" ||
     state.errors.alerts?.code === "authentication_required" ||
+    state.errors.tasks?.code === "authentication_required" ||
     state.errors.capabilities?.code === "authentication_required" ||
     state.errors.executions?.code === "authentication_required";
   if (authProblem) {
@@ -2513,9 +2757,10 @@ function errorDescription(problem) {
 
 function hasAnyData() {
   return Boolean(
-    state.system ||
+      state.system ||
       state.monitor ||
       state.alerts ||
+      state.tasks ||
       state.capabilities ||
       state.executions,
   );

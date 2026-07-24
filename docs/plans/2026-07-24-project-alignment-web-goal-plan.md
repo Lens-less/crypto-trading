@@ -301,7 +301,8 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 交付：
 
 - [x] 统一 market-data provider 能力与 freshness。
-- [ ] Arbitrage monitor 连续只读事件。
+- [x] Arbitrage monitor 连续只读事件（exact-pair library owner 与 durable task projection；
+  CLI/service bootstrap、第二个真实 venue 和自动重启仍是显式阻塞项）。
 - [x] Price alert 冷却、去重、确认和持久化。
 - [ ] Virtual-grid scanner 的确定性排行。
 - [x] 非阻塞通知 adapter；至少一个本地 adapter 和一个 deterministic adapter。
@@ -332,9 +333,10 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] source-neutral `MarketSupervisor` 隐藏 task/watch/select 细节，只暴露
   `start / next_event / status / stop`；latest-value retention 为 O(1)，慢消费者先收到显式
   `SourceGap` 再收到最新事件，请求进行中和长退避均可在 bounded grace 内取消。
-- [ ] 后续 tracer：把真实 source 组合进可审计的多 venue monitor 与 durable task projection，
-  再完成 Virtual-grid Scanner；Price Alert 仍缺 CLI/source composition、durable task lifecycle、
-  journal rotation/compaction、sound 与 remote acknowledgement，完成这些之前 M3 保持未退出。
+- [x] 后续 tracer 已把 credential-free Binance polling 与第二个 source adapter 组合进
+  exact-pair monitor owner，并同批持久化 monitor fact 与 source-status checkpoint；独立 durable
+  task projection 已接入 Control Plane 与 Web。它仍不是“两个真实 venue 已交付”：第二个真实
+  public adapter、CLI/service bootstrap 和自动重启均保持阻塞。
 
 第三条 tracer 证据（仍不等同于 M3 全部完成）：
 
@@ -349,10 +351,11 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] 独立 `PriceAlertReadModel` 最多保留 256 个 occurrence，严格验证 schema、identity、
   delivery transition、failure enum、时间顺序、ack 与引用；unknown field、orphan、矛盾状态或
   partial tail 均把投影降级并清空 occurrence，避免展示不可信 latest。Control Plane snapshot
-  schema v3 与受相同鉴权保护的只读 `GET /api/v1/alerts` 只暴露该安全投影，不存在 Web ack/write
+  schema v4 与受相同鉴权保护的只读 `GET /api/v1/alerts` 只暴露该安全投影，不存在 Web ack/write
   路由。
 - [x] capability 单一事实源把 `runtime.price-alert` 提升为 `read-only / offline / local`，并保留
-  CLI/source composition、durable task、journal 运维与 sound/remote ack 阻塞项；
+  CLI/source composition、尚未注册到 durable task lifecycle、journal 运维与 sound/remote ack
+  阻塞项；
   `runtime.continuous`、`runtime.live` 与所有 mainnet trading authority 均未扩大。
 
 第四条 tracer 证据（Price Alert 的 Web/audit 闭环，仍不等同于 M3 全部完成）：
@@ -370,6 +373,36 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] journal recovery 保留 adapter、delivery phase 与时间并验证 `pending -> terminal`、唯一终态和
   adapter 上限；worker panic 被隔离为 typed `worker_failed` 终态，关闭并排空该 adapter 的已排队项，
   当前项、排队项和后续项均不会永久显示为 pending，原始 panic 文本不会写入 journal。
+
+第五条 tracer 证据（真实 source composition 与 durable task projection；仍不等同于 M3 全部完成）：
+
+- [x] `ContinuousMonitorTask` 是 apps 层 exact-pair 深模块，只暴露异步
+  `start / status / stop`；内部独占两个 `MarketSupervisor`、公平 `select!`、一个
+  `ReadOnlyArbitrageMonitor` 与 `JsonlHistory`。source ID 必须按顺序匹配两条 monitor leg 且互异，
+  校验失败发生在 durable registration 之前；没有 exchange execution handle、order intent 或
+  write authority。
+- [x] registration 在 source task 启动前完成 `sync_data`；每个 market event 的 monitor fact 与
+  task checkpoint 在同一个 append batch 中完成持久化后才发布 durable status 字段；journal
+  失败只在独立的 process-local `runtime_failure` 中暴露，计数、source 状态和 phase 保留最后一个
+  已持久 checkpoint。stop 先写 stopping fact、并发停止双源、再写唯一 terminal；source contract
+  失败先停止 sibling，再只记录 bounded failure enum。owner shutdown 与 fallback terminal write
+  共用有界总 deadline，任一子源 `shutdown_timed_out` 都提升为 aggregate timeout，不能降格成正常
+  terminal。credential-free Binance public polling 已通过本地 HTTP contract 与第二个 source
+  adapter 真实组合到同一 journal。
+- [x] `ReadOnlyTaskReadModel` 对 task/source identity、双源基数、phase transition、source task UUID、
+  sequence、health 与 exit/failure enum 做严格校验；最多表示 64 个 task。partial tail 保留最后完整
+  事实并降级，orphan/conflict/状态回退不伪造新状态，正常 terminal 必须同时证明双源均已 stopped，
+  超限映射为 bounded resource failure。冷启动只重建最后持久事实：registered/running/stopping、
+  failed 与 shutdown timeout 均要求 `investigate`，不会自动恢复网络任务。
+- [x] Control Plane snapshot schema v4 从同一冻结 journal generation 同时生成
+  operator/monitor/alerts/tasks；受同一 Bearer policy 保护的 `GET /api/v1/tasks` 与 Overview
+  “只读连续任务”区域只展示阶段、双源健康、事件计数、最后事实与恢复判断。页面没有 start/stop/
+  reconnect/auto-resume 控件，SSE 仍只作为 payload-free 变化通知触发重新读取。
+- [x] capability 真相只关闭了 composition core 与 durable projection 两项差距：
+  `runtime.monitor` 仍是 `read-only / offline / local`；`runtime.continuous` 与 `runtime.live`
+  仍为 unavailable，所有 mainnet trading authority 保持关闭。下一条 tracer 是 Virtual-grid
+  Scanner；第二个真实 venue、CLI/service bootstrap、自动重启，以及 Price Alert 的 source/task
+  接线和 journal 运维仍未完成。
 
 退出条件：
 

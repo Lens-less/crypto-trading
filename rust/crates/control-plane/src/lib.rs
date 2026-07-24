@@ -26,10 +26,13 @@ pub use crypto_trading_runtime::{
     ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState, MonitorContinuityState,
     MonitorFreshnessState, MonitorLegView, MonitorProjectionState, OperatorReadModel,
     PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PriceAlertReadModel, ProjectionStatus,
-    RecoveryDirective, ReleaseStage,
+    READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit, ReadOnlyTaskFailure,
+    ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
+    ReadOnlyTaskSourceExit, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
+    ReadOnlyTaskSourceView, ReadOnlyTaskView, RecoveryDirective, ReleaseStage,
 };
 
-pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
 
 /// Stable transport-independent classification for safe public error mapping.
@@ -89,12 +92,14 @@ impl ReadControlPlane {
         let operator = OperatorReadModel::from_legacy_snapshot(&journal)?;
         let monitor = ArbitrageMonitorReadModel::from_legacy_snapshot(&journal)?;
         let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)?;
+        let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)?;
         Ok(ControlPlaneSnapshot {
             schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
             capabilities: self.capabilities.clone(),
             operator,
             monitor,
             alerts,
+            tasks,
         })
     }
 
@@ -158,6 +163,8 @@ impl ReadControlPlane {
             .map_err(ControlPlaneReadError::Projection)?;
         let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)
             .map_err(ControlPlaneReadError::Projection)?;
+        let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)
+            .map_err(ControlPlaneReadError::Projection)?;
         Ok(ControlPlaneRead {
             snapshot: ControlPlaneSnapshot {
                 schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
@@ -165,6 +172,7 @@ impl ReadControlPlane {
                 operator,
                 monitor,
                 alerts,
+                tasks,
             },
             events: control_plane_events_page(&page),
         })
@@ -201,6 +209,7 @@ pub struct ControlPlaneSnapshot {
     pub operator: OperatorReadModel,
     pub monitor: ArbitrageMonitorReadModel,
     pub alerts: PriceAlertReadModel,
+    pub tasks: ReadOnlyTaskReadModel,
 }
 
 /// Payload-free notification that tells an adapter which snapshot fact changed.
@@ -271,9 +280,10 @@ impl ControlPlaneSnapshotError {
             Self::Journal(source) | Self::Projection(ReadModelError::Journal(source)) => {
                 journal_failure_kind(source)
             }
-            Self::Projection(ReadModelError::BatchLimitExceeded { .. }) => {
-                ReadFailureKind::ResourceLimit
-            }
+            Self::Projection(
+                ReadModelError::BatchLimitExceeded { .. }
+                | ReadModelError::TaskLimitExceeded { .. },
+            ) => ReadFailureKind::ResourceLimit,
             Self::Projection(ReadModelError::NonAdvancingPage) => ReadFailureKind::InvalidJournal,
         }
     }
@@ -315,9 +325,10 @@ impl ControlPlaneReadError {
             Self::Journal(source) | Self::Projection(ReadModelError::Journal(source)) => {
                 journal_failure_kind(source)
             }
-            Self::Projection(ReadModelError::BatchLimitExceeded { .. }) => {
-                ReadFailureKind::ResourceLimit
-            }
+            Self::Projection(
+                ReadModelError::BatchLimitExceeded { .. }
+                | ReadModelError::TaskLimitExceeded { .. },
+            ) => ReadFailureKind::ResourceLimit,
             Self::Projection(ReadModelError::NonAdvancingPage) => ReadFailureKind::InvalidJournal,
         }
     }

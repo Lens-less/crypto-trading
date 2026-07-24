@@ -3,6 +3,7 @@
 pub mod alert;
 pub mod cli;
 pub mod command;
+pub mod continuous_monitor;
 pub mod monitor;
 
 pub use cli::{Cli, Command, ExchangeChoice, LogLevel};

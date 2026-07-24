@@ -605,6 +605,31 @@ code,
   overflow-wrap: anywhere;
 }
 
+.task-table {
+  min-width: 760px;
+}
+
+.task-table th {
+  white-space: nowrap;
+}
+
+.task-table th:first-child,
+.task-table td:first-child {
+  width: 220px;
+}
+
+.task-source-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 190px;
+}
+
+.task-source-line + .task-source-line {
+  margin-top: 8px;
+}
+
 .table-wrap::-webkit-scrollbar,
 .scroll-region::-webkit-scrollbar {
   width: 10px;

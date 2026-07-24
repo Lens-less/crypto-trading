@@ -194,6 +194,25 @@ pub struct MarketSupervisor {
 }
 
 impl MarketSupervisor {
+    /// Starts one source task with a fresh opaque process task identity.
+    ///
+    /// This is intended for owner modules that expose their own stable durable
+    /// identity and should not force callers to depend on UUID generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketSupervisorError::SourceContract`] if the source
+    /// identity is invalid.
+    pub fn start_new<S>(
+        source: S,
+        config: MarketSupervisorConfig,
+    ) -> Result<Self, MarketSupervisorError>
+    where
+        S: MarketDataEventSource,
+    {
+        Self::start(Uuid::new_v4(), source, config)
+    }
+
     /// Starts one source task on the current Tokio runtime.
     ///
     /// # Errors

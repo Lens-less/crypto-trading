@@ -146,6 +146,7 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     for endpoint in [
         "/api/v1/system",
         "/api/v1/alerts",
+        "/api/v1/tasks",
         "/api/v1/capabilities",
         "/api/v1/executions",
         "/api/v1/events",
@@ -167,6 +168,7 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     assert!(javascript.contains("market_data_freshness"));
     assert_monitor_surface_contract(&javascript, &css);
     assert_alert_surface_contract(&javascript, &css);
+    assert_task_surface_contract(&javascript, &css);
     assert!(javascript.contains("kill_switch"));
     assert_protected_state_contract(&javascript);
 }
@@ -239,11 +241,45 @@ fn assert_alert_surface_contract(javascript: &str, css: &str) {
     assert!(css.contains("grid-template-columns: repeat(4, minmax(0, 1fr));"));
 }
 
+fn assert_task_surface_contract(javascript: &str, css: &str) {
+    for required in [
+        "function loadTasks()",
+        "function renderTasksRegion()",
+        "function taskTone(task)",
+        "/api/v1/tasks",
+        "只读连续任务",
+        "最后持久阶段、双源健康与事件计数",
+        "不证明进程仍存活",
+        "任务存活性未验证",
+        "历史事实 / 不自动重放",
+        "不会在重启后自动重连数据源",
+        "任务快照刷新失败",
+        "保留旧快照",
+        "没有启动、停止、重连或自动恢复入口",
+        "仅有历史事实；需核对进程",
+        "持久终态已闭合",
+    ] {
+        assert!(
+            javascript.contains(required),
+            "browser asset is missing task-surface contract {required}"
+        );
+    }
+    assert!(css.contains(".task-table {\n  min-width: 760px;"));
+    assert!(css.contains(".task-source-line {\n  display: flex;"));
+    for forbidden in ["startTask(", "stopTask(", "restartTask(", "reconnectTask("] {
+        assert!(
+            !javascript.contains(forbidden),
+            "task surface must remain read-only: {forbidden}"
+        );
+    }
+}
+
 fn assert_protected_state_contract(javascript: &str) {
     for required in [
         "function clearProtectedState()",
         "state.system = null;",
         "state.alerts = null;",
+        "state.tasks = null;",
         "state.capabilities = null;",
         "state.executions = null;",
         "state.lastPage = null;",
@@ -319,6 +355,7 @@ async fn app_router_remains_read_only_and_unknown_routes_fail_closed() {
         "/api/v1/system",
         "/api/v1/monitor",
         "/api/v1/alerts",
+        "/api/v1/tasks",
         "/api/v1/capabilities",
         "/api/v1/executions",
         "/api/v1/events",

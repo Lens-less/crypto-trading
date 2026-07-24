@@ -1199,6 +1199,8 @@ pub enum ReadModelError {
     Journal(#[from] JournalReadError),
     #[error("operator read model cannot represent more than {limit} execution batches")]
     BatchLimitExceeded { limit: usize },
+    #[error("task read model cannot represent more than {limit} distinct task identities")]
+    TaskLimitExceeded { limit: usize },
     #[error("journal reader returned a non-advancing page")]
     NonAdvancingPage,
 }

@@ -734,11 +734,15 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
             ),
             "Supervised continuous strategy lifecycle with cancellation and restart recovery.",
             &[
-                "Only a read-only market-source supervisor exists; strategy lifecycle, durable task registration, and restart recovery are not implemented.",
+                "A durable read-only monitor task owner now exists, but no executable bootstrap, automatic restart, or continuous trading strategy lifecycle is implemented.",
             ],
             &[
                 "rust/crates/runtime/src/market_supervisor.rs",
                 "rust/crates/runtime/tests/market_supervisor_contract.rs",
+                "rust/crates/apps/src/continuous_monitor.rs",
+                "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
+                "rust/crates/runtime/src/task_read_model.rs",
+                "rust/crates/runtime/tests/task_read_model_contract.rs",
             ],
         ),
         capability(
@@ -792,7 +796,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             ),
             "Bounded exact-universe market book with freshness, continuity, deterministic replay, subscription gaps, and credential-free Binance Spot polling.",
             &[
-                "Only Binance Spot public polling is implemented; multi-venue composition and durable supervisor status projection remain unavailable.",
+                "Only Binance Spot public polling is implemented; the exact-pair composer accepts two source adapters, but no second real venue or executable bootstrap is available.",
             ],
             &[
                 "rust/crates/runtime/src/market_data.rs",
@@ -800,6 +804,10 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/runtime/src/market_supervisor.rs",
                 "rust/crates/runtime/tests/market_data_contract.rs",
                 "rust/crates/runtime/tests/market_supervisor_contract.rs",
+                "rust/crates/apps/src/continuous_monitor.rs",
+                "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
+                "rust/crates/runtime/src/task_read_model.rs",
+                "rust/crates/runtime/tests/task_read_model_contract.rs",
             ],
         ),
         capability(
@@ -807,18 +815,24 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             CapabilityArea::Runtime,
             CapabilityLevel::ReadOnly,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Finite continuous read-only arbitrage replay with one event per market input and a bounded operator projection.",
+            "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, bounded stop, and a Web-visible task projection.",
             &[
-                "The Binance polling supervisor is not yet composed with a second real venue, the arbitrage monitor journal, or durable restart recovery.",
+                "The composition core has no CLI or service bootstrap, only Binance has a real public adapter, and restart recovery projects prior facts without automatically resuming external sources.",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
                 "rust/crates/apps/src/monitor.rs",
+                "rust/crates/apps/src/continuous_monitor.rs",
                 "rust/crates/apps/tests/monitor_contract.rs",
                 "rust/crates/apps/tests/monitor_replay_cli.rs",
+                "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
                 "rust/crates/runtime/src/monitor_read_model.rs",
+                "rust/crates/runtime/src/task_read_model.rs",
+                "rust/crates/runtime/tests/task_read_model_contract.rs",
                 "rust/crates/control-plane/tests/monitor_projection_contract.rs",
+                "rust/crates/control-plane/tests/task_projection_contract.rs",
                 "rust/crates/web/tests/http_contract.rs",
+                "rust/crates/web/tests/ui_contract.rs",
             ],
         ),
         capability(
@@ -828,7 +842,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Bounded multi-symbol price-alert evaluation with durable samples, cooldowns, acknowledgements, a stable read model, and isolated local delivery adapters.",
             &[
-                "No CLI or market-source supervisor composition and no durable task lifecycle are available.",
+                "No CLI or market-source supervisor composition is available for Price Alert, and it is not yet registered in the durable task lifecycle.",
                 "The JSONL alert journal has no rotation or compaction; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
             ],
             &[

@@ -168,6 +168,94 @@ async fn alerts_endpoint_exposes_only_the_bounded_read_model_and_no_write_author
 }
 
 #[tokio::test]
+async fn tasks_endpoint_exposes_durable_lifecycle_without_control_authority() {
+    let bytes = jsonl(&[
+        json!({
+            "timestamp": "2026-07-25T00:00:00Z",
+            "strategy": "read_only_task",
+            "symbol": "control-plane",
+            "decision": "task_registered",
+            "details": {
+                "schema_version": 1,
+                "task_id": "arb-btc-usdt",
+                "task_kind": "arbitrage_monitor",
+                "phase": "registered",
+                "processed_event_count": 0,
+                "sources": [
+                    task_source(&Value::Null, "left", "starting", "unknown", 0),
+                    task_source(&Value::Null, "right", "starting", "unknown", 0),
+                ],
+                "exit": Value::Null,
+                "failure": Value::Null,
+            },
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:00:01Z",
+            "strategy": "read_only_task",
+            "symbol": "control-plane",
+            "decision": "task_running",
+            "details": {
+                "schema_version": 1,
+                "task_id": "arb-btc-usdt",
+                "task_kind": "arbitrage_monitor",
+                "phase": "running",
+                "processed_event_count": 0,
+                "sources": [
+                    task_source(
+                        &json!("00000000-0000-0000-0000-000000000301"),
+                        "left",
+                        "running",
+                        "healthy",
+                        1,
+                    ),
+                    task_source(
+                        &json!("00000000-0000-0000-0000-000000000302"),
+                        "right",
+                        "running",
+                        "degraded",
+                        1,
+                    ),
+                ],
+                "exit": Value::Null,
+                "failure": Value::Null,
+            },
+        }),
+    ]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.clone().oneshot(get("/api/v1/tasks")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    let tasks = response_json(response).await;
+    assert_eq!(tasks["projection_status"], "complete");
+    assert_eq!(tasks["tasks"][0]["task_id"], "arb-btc-usdt");
+    assert_eq!(tasks["tasks"][0]["phase"], "running");
+    assert_eq!(tasks["tasks"][0]["recovery"], "investigate");
+    assert_eq!(tasks["tasks"][0]["sources"][0]["health"], "healthy");
+    assert_eq!(tasks["tasks"][0]["sources"][1]["health"], "degraded");
+    let encoded = serde_json::to_string(&tasks).unwrap();
+    for forbidden in ["orders", "intents", "api_key", "authorization", "raw_error"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "{forbidden} leaked in {encoded}"
+        );
+    }
+
+    let write = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn executions_use_cursor_as_a_change_watermark_without_exposing_payloads() {
     let bytes = jsonl(&[decision_record(&json!({
         "api_key": "super-secret",
@@ -405,6 +493,30 @@ fn decision_record(details: &Value) -> Value {
         "symbol": "BTC-USDT",
         "decision": "hold",
         "details": details,
+    })
+}
+
+fn task_source(
+    task_id: &Value,
+    source_id: &str,
+    phase: &str,
+    health: &str,
+    event_sequence: u64,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "task_id": task_id,
+        "source_id": source_id,
+        "phase": phase,
+        "health": health,
+        "event_sequence": event_sequence,
+        "consecutive_source_failures": u32::from(health == "degraded"),
+        "last_event_at": if event_sequence == 0 {
+            Value::Null
+        } else {
+            json!("2026-07-25T00:00:01Z")
+        },
+        "exit": Value::Null,
     })
 }
 

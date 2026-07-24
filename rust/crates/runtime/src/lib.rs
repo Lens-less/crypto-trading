@@ -12,6 +12,7 @@ mod market_supervisor;
 mod mode;
 mod monitor_read_model;
 mod read_model;
+mod task_read_model;
 
 pub use alert_read_model::{
     AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
@@ -67,4 +68,10 @@ pub use read_model::{
     ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,
     MAX_OPERATOR_READ_MODEL_WARNINGS, OPERATOR_READ_MODEL_SCHEMA_VERSION, OperatorReadModel,
     ProjectionStatus, ReadModelError, ReadModelWarning, ReadModelWarningCode, RecoveryDirective,
+};
+pub use task_read_model::{
+    MAX_READ_ONLY_TASKS, READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit,
+    ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel,
+    ReadOnlyTaskRecovery, ReadOnlyTaskSourceExit, ReadOnlyTaskSourceHealth,
+    ReadOnlyTaskSourcePhase, ReadOnlyTaskSourceView, ReadOnlyTaskView,
 };
