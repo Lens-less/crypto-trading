@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -11,18 +12,21 @@ use uuid::Uuid;
 
 use crate::history::{MAX_HISTORY_FILE_BYTES, stable_history_path_for_read};
 use crate::{
-    AggregateRef, CursorError, DecisionRecord, EventContractError, JournalCursor,
-    MAX_HISTORY_RECORD_BYTES, OperationEventEnvelope,
+    AggregateRef, CursorError, EventContractError, JournalCursor, MAX_HISTORY_RECORD_BYTES,
+    OperationEventEnvelope,
 };
 
 pub const MAX_JOURNAL_SOURCE_BYTES: u64 = MAX_HISTORY_FILE_BYTES;
 pub const MAX_JOURNAL_PAGE_EVENTS: usize = 256;
 pub const MAX_JOURNAL_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+pub const MAX_CURSOR_ANCHOR_SCAN_BYTES: usize =
+    CURSOR_ANCHOR_CHECKPOINT_INTERVAL_BYTES + MAX_HISTORY_RECORD_BYTES + 1;
 
 const LEGACY_EVENT_PRODUCER: &str = "legacy_jsonl";
 const LEGACY_FALLBACK_KIND: &str = "legacy_decision";
 const EXECUTION_AGGREGATE_KIND: &str = "execution_batch";
 const LEGACY_AGGREGATE_KIND: &str = "legacy_record";
+const CURSOR_ANCHOR_CHECKPOINT_INTERVAL_BYTES: usize = 256 * 1_024;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -31,6 +35,13 @@ const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 pub struct JournalSnapshot {
     journal_id: Uuid,
     bytes: Vec<u8>,
+    anchor_checkpoints: Vec<AnchorCheckpoint>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AnchorCheckpoint {
+    offset: usize,
+    sequence: u64,
 }
 
 impl JournalSnapshot {
@@ -43,7 +54,12 @@ impl JournalSnapshot {
     pub fn new(journal_id: Uuid, bytes: Vec<u8>) -> Result<Self, JournalReadError> {
         validate_journal_id(journal_id)?;
         validate_source_len(bytes.len())?;
-        Ok(Self { journal_id, bytes })
+        let anchor_checkpoints = build_anchor_checkpoints(&bytes);
+        Ok(Self {
+            journal_id,
+            bytes,
+            anchor_checkpoints,
+        })
     }
 
     #[must_use]
@@ -331,8 +347,22 @@ fn verify_cursor_anchor(
 ) -> Result<(), JournalReadError> {
     let target_offset = usize::try_from(cursor.next_offset())
         .map_err(|_| JournalReadError::Cursor(CursorError::Expired))?;
-    let mut offset = 0usize;
-    let mut sequence = 0u64;
+    let checkpoint = snapshot
+        .anchor_checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.offset < target_offset)
+        .copied()
+        .unwrap_or(AnchorCheckpoint {
+            offset: 0,
+            sequence: 0,
+        });
+    if target_offset.saturating_sub(checkpoint.offset) > MAX_CURSOR_ANCHOR_SCAN_BYTES {
+        return Err(JournalReadError::Cursor(CursorError::Expired));
+    }
+
+    let mut offset = checkpoint.offset;
+    let mut sequence = checkpoint.sequence;
     let mut last_event_id = None;
 
     while offset < target_offset {
@@ -371,7 +401,7 @@ fn parse_legacy_event(
     offset: usize,
     line: &[u8],
 ) -> Result<OperationEventEnvelope, JournalReadError> {
-    let record = serde_json::from_slice::<DecisionRecord>(line).map_err(|source| {
+    let record = serde_json::from_slice::<LegacyDecisionRecord>(line).map_err(|source| {
         JournalReadError::MalformedRecord {
             sequence,
             offset: to_u64(offset),
@@ -409,7 +439,17 @@ fn parse_legacy_event(
     .map_err(|source| JournalReadError::EventContract { sequence, source })
 }
 
-fn legacy_batch_id(record: &DecisionRecord) -> Option<Uuid> {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDecisionRecord {
+    timestamp: DateTime<Utc>,
+    strategy: String,
+    symbol: String,
+    decision: String,
+    details: serde_json::Value,
+}
+
+fn legacy_batch_id(record: &LegacyDecisionRecord) -> Option<Uuid> {
     if !is_execution_decision(&record.decision) {
         return None;
     }
@@ -456,6 +496,27 @@ fn fnv1a64_parts(parts: &[&[u8]]) -> u64 {
             (hash ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
         })
     })
+}
+
+fn build_anchor_checkpoints(bytes: &[u8]) -> Vec<AnchorCheckpoint> {
+    let mut checkpoints = vec![AnchorCheckpoint {
+        offset: 0,
+        sequence: 0,
+    }];
+    let mut sequence = 0u64;
+    let mut checkpoint_offset = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        sequence = sequence.saturating_add(1);
+        let offset = index.saturating_add(1);
+        if offset.saturating_sub(checkpoint_offset) >= CURSOR_ANCHOR_CHECKPOINT_INTERVAL_BYTES {
+            checkpoints.push(AnchorCheckpoint { offset, sequence });
+            checkpoint_offset = offset;
+        }
+    }
+    checkpoints
 }
 
 fn trim_carriage_return(line: &[u8]) -> &[u8] {

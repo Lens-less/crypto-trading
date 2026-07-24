@@ -184,6 +184,14 @@ fn malformed_middle_records_and_oversized_records_fail_closed() {
         JournalReadError::MalformedRecord { sequence: 2, .. }
     ));
 
+    let mut drifted = decision_record("execution_planned", fixed_uuid(51), 0, "BTC-USDC");
+    drifted["unexpected_top_level"] = json!(true);
+    let drifted = JournalSnapshot::new(journal_id, jsonl(&[drifted], LineEnding::Lf)).unwrap();
+    assert!(matches!(
+        LegacyJsonlJournalReader::read_page(&drifted, None).unwrap_err(),
+        JournalReadError::MalformedRecord { sequence: 1, .. }
+    ));
+
     let mut oversized = vec![b'x'; MAX_HISTORY_RECORD_BYTES];
     oversized.push(b'\n');
     let oversized = JournalSnapshot::new(journal_id, oversized).unwrap();

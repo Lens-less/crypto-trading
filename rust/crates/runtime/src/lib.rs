@@ -28,7 +28,8 @@ pub use journal::{
 };
 pub use journal_reader::{
     FileJournalSnapshotSource, JournalPage, JournalPageBoundary, JournalReadError, JournalSnapshot,
-    JournalSnapshotSource, LegacyJsonlJournalReader, MAX_JOURNAL_PAGE_BYTES,
-    MAX_JOURNAL_PAGE_EVENTS, MAX_JOURNAL_SOURCE_BYTES, MemoryJournalSnapshotSource,
+    JournalSnapshotSource, LegacyJsonlJournalReader, MAX_CURSOR_ANCHOR_SCAN_BYTES,
+    MAX_JOURNAL_PAGE_BYTES, MAX_JOURNAL_PAGE_EVENTS, MAX_JOURNAL_SOURCE_BYTES,
+    MemoryJournalSnapshotSource,
 };
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
