@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：M3 已完成，M4 待开始（M0、M1、M2 已完成）
+> 状态：M4 进行中（M0、M1、M2、M3 已完成）
 >
 > 日期：2026-07-24
 >
@@ -451,6 +451,36 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [ ] 任务启动/取消、优雅关闭、重启恢复、幂等键。
 - [ ] 账户级 paper ledger、pending reservation、费用/资金费率/滑点模型的明确版本。
 - [ ] Web 只开放 paper 命令，命令回读结果必须来自 journal/read model。
+
+首个纵向 tracer（库内实现与契约测试已完成，公开写入口尚未接入）：
+
+- [x] 新增 journal-backed `PaperAccountAuthority` v1：账户级 available/pending/uncertain/
+  committed exposure 由严格 durable projection 重建；同一任务只允许一个 active reservation，
+  同一 `task_id + idempotency_key` 永久绑定同一 reservation/batch，进程内并发不会重复
+  admission；每条账户事实也持久化并强校验 journal generation。
+- [x] 每个 reservation 在写入时显式携带 `cost_model.version = 1`，并分别记录 fee、
+  funding buffer 与 slippage bps；v1 只做保守容量预留，不宣称交易所真实费用或真实收益。
+- [x] 新增 exact-two-leg `DurablePaperArbitrageSaga`：先同步
+  `paper_account_reserved`，再同步 `execution_planned`，之后才允许执行回调；只有两腿均为
+  confirmed filled 才落 `execution_completed` 并提交 exposure。非 filled receipt 落
+  `execution_incomplete`：仅两腿均 confirmed cancelled 时释放 pending reservation，
+  其余结果冻结为 uncertain；单腿失败落 `execution_partial` 并冻结。
+- [x] planned-only（模拟 kill -9）、单腿成交、同 key 并发与重启 fixture 均证明：
+  已有请求只从 Journal/Read Model 分类，执行回调不会被再次调用。
+- [x] malformed fact、数字型 Money、Unicode/bidi 混淆 identity 与 partial tail
+  会降级 projection 并关闭所有新账户写入，同时保留最后一条有效 reservation。
+
+当前仍明确受限：
+
+- `JsonlHistory` 仍只有进程内单写者保证；journal generation 已随事实持久化并在误配时
+  失败关闭，但跨进程 writer exclusion、journal rotation 后的永久 idempotency 索引尚未交付。
+- v1 authority 只拥有 paper 容量和 reservation/committed exposure，不拥有真实 exchange
+  equity、margin、mark-to-market 或 position truth；`risk.account-authority` 不能因此提升为可用。
+- 普通 release 只允许 pending/uncertain reservation；committed exposure 必须等待后续携带
+  已验证对账证据的独立 transition，调用方提供一个 reason 不能释放已提交敞口。
+- 当前 saga 是可独立验证的一次性两腿 tracer；任务 stop/cancel、撤单不确定、显式 reconcile
+  命令、连续 Grid/Arbitrage owner、CLI/Web 写入口均继续保持关闭；capability 清单只把它
+  列为 library-only 证据，不把它宣称为已接入的 runtime surface。
 
 退出条件：
 

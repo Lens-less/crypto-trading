@@ -164,6 +164,57 @@ fn continuous_read_only_facts_do_not_advertise_trading_authority() {
 }
 
 #[test]
+fn paper_reservation_and_saga_evidence_do_not_overstate_full_account_or_continuous_authority() {
+    let manifest = current_capability_manifest();
+    let account = manifest.capability("risk.account-authority").unwrap();
+    assert_eq!(account.level, CapabilityLevel::Unavailable);
+    assert!(
+        account
+            .evidence
+            .contains(&"rust/crates/runtime/src/paper_account.rs".to_owned())
+    );
+    assert!(
+        account
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("paper-only reservation"))
+    );
+    assert!(
+        account
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("no cross-process writer exclusion"))
+    );
+
+    let arbitrage = manifest.capability("runtime.arbitrage").unwrap();
+    assert_eq!(arbitrage.level, CapabilityLevel::PaperOnce);
+    assert!(arbitrage.summary.contains("library-only tracer"));
+    assert!(
+        arbitrage
+            .summary
+            .contains("not wired to a supported command or service")
+    );
+    assert!(
+        arbitrage
+            .evidence
+            .contains(&"rust/crates/apps/src/paper_arbitrage_saga.rs".to_owned())
+    );
+    let continuous = manifest.capability("runtime.continuous").unwrap();
+    assert_eq!(continuous.level, CapabilityLevel::Unavailable);
+    assert!(
+        continuous
+            .evidence
+            .contains(&"rust/crates/apps/src/paper_arbitrage_saga.rs".to_owned())
+    );
+    assert!(
+        continuous
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("library-only paper arbitrage saga"))
+    );
+}
+
+#[test]
 fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
     let manifest = current_capability_manifest();
     let scanner = manifest.capability("runtime.scanner").unwrap();

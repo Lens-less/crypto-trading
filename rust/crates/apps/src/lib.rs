@@ -5,7 +5,12 @@ pub mod cli;
 pub mod command;
 pub mod continuous_monitor;
 pub mod monitor;
+pub mod paper_arbitrage_saga;
 pub mod scanner;
 
 pub use cli::{Cli, Command, ExchangeChoice, LogLevel};
 pub use command::run;
+pub use paper_arbitrage_saga::{
+    DurablePaperArbitrageSaga, PaperArbitragePreservedOutcome, PaperArbitrageRecoveryStage,
+    PaperArbitrageRequest, PaperArbitrageRun, PaperArbitrageSagaError,
+};

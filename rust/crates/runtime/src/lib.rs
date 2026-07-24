@@ -11,6 +11,7 @@ mod market_polling;
 mod market_supervisor;
 mod mode;
 mod monitor_read_model;
+mod paper_account;
 mod read_model;
 mod scanner_read_model;
 mod task_read_model;
@@ -64,6 +65,12 @@ pub use monitor_read_model::{
     ARBITRAGE_MONITOR_READ_MODEL_SCHEMA_VERSION, ArbitrageMonitorProjection,
     ArbitrageMonitorReadModel, ArbitrageMonitorView, MonitorContinuityState, MonitorFreshnessState,
     MonitorLegView, MonitorProjectionState,
+};
+pub use paper_account::{
+    MAX_PAPER_ACCOUNT_RESERVATIONS, PAPER_ACCOUNT_SCHEMA_VERSION, PAPER_COST_MODEL_VERSION,
+    PaperAccountAuthority, PaperAccountConfig, PaperAccountError, PaperAccountProjectionError,
+    PaperAccountReadModel, PaperAccountSnapshot, PaperCostModel, PaperReservationAdmission,
+    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, PaperReservationView,
 };
 pub use read_model::{
     ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,

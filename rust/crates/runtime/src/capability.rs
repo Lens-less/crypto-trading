@@ -694,9 +694,14 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 CapabilityAccess::Local,
             ),
             "Authoritative account equity, margin, global exposure, and pending-order reservations.",
-            &["Current risk is product-scoped and does not own an authoritative account ledger."],
+            &[
+                "A journal-backed process-local paper-only reservation authority owns conservative available/pending/uncertain/committed capacity, but it has no cross-process writer exclusion and does not own exchange equity, margin, mark-to-market, position truth, or testnet/mainnet state.",
+            ],
             &[
                 "rust/crates/strategy/src/risk.rs",
+                "rust/crates/runtime/src/paper_account.rs",
+                "rust/crates/runtime/tests/paper_account_contract.rs",
+                "rust/crates/runtime/tests/paper_account_read_model_contract.rs",
                 "rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md",
             ],
         ),
@@ -713,10 +718,12 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Two-leg segmented arbitrage evaluation and paper execution from explicit snapshots.",
+            "Two-leg segmented arbitrage evaluation and the existing paper-once CLI path; the journal-first account-reserved saga is a library-only tracer and is not wired to a supported command or service write surface.",
             &[],
             &[
                 "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_arbitrage_saga.rs",
+                "rust/crates/apps/tests/paper_arbitrage_saga_contract.rs",
                 "rust/crates/runtime/tests/arbitrage_paper_slice.rs",
             ],
         ),
@@ -734,7 +741,7 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
             ),
             "Supervised continuous strategy lifecycle with cancellation and restart recovery.",
             &[
-                "A durable read-only monitor task owner now exists, but no executable bootstrap, automatic restart, or continuous trading strategy lifecycle is implemented.",
+                "A durable read-only monitor owner and a library-only paper arbitrage saga exist, but the saga has no supported command/service write surface and there is no executable bootstrap, automatic restart, continuous trading owner, or task cancel/reconcile lifecycle.",
             ],
             &[
                 "rust/crates/runtime/src/market_supervisor.rs",
@@ -743,6 +750,8 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
                 "rust/crates/runtime/src/task_read_model.rs",
                 "rust/crates/runtime/tests/task_read_model_contract.rs",
+                "rust/crates/apps/src/paper_arbitrage_saga.rs",
+                "rust/crates/apps/tests/paper_arbitrage_saga_contract.rs",
             ],
         ),
         capability(
