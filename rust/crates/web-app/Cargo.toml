@@ -1,0 +1,30 @@
+[package]
+name = "crypto-trading-web-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "crypto_trading_web_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crypto-trading-web"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+crypto-trading-runtime = { path = "../runtime" }
+crypto-trading-web = { path = "../web" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[lints]
+workspace = true

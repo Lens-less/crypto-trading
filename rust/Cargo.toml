@@ -8,6 +8,7 @@ members = [
     "crates/runtime",
     "crates/strategy",
     "crates/web",
+    "crates/web-app",
 ]
 default-members = ["crates/apps"]
 resolver = "3"

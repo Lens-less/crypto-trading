@@ -44,12 +44,8 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
     assert_eq!(first.capabilities, *control_plane.capabilities());
     assert!(!first.capabilities.live_trading_enabled);
     let web = first.capabilities.capability("control-plane.web").unwrap();
-    assert_eq!(web.level, CapabilityLevel::Unavailable);
-    assert!(
-        web.blockers
-            .iter()
-            .any(|blocker| blocker.contains("composition root"))
-    );
+    assert_eq!(web.level, CapabilityLevel::ReadOnly);
+    assert!(web.blockers.is_empty());
     assert!(
         web.evidence
             .iter()

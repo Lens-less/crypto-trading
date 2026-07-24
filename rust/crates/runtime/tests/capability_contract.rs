@@ -66,6 +66,12 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
     let monitor_runtime = manifest.capability("runtime.monitor").unwrap();
     assert_eq!(monitor_runtime.level, CapabilityLevel::ValidateOnly);
 
+    let web = manifest.capability("control-plane.web").unwrap();
+    assert_eq!(web.level, CapabilityLevel::ReadOnly);
+    assert_eq!(web.scope.environments, vec![CapabilityEnvironment::Offline]);
+    assert_eq!(web.scope.access, CapabilityAccess::Local);
+    assert!(web.blockers.is_empty());
+
     let live_runtime = manifest.capability("runtime.live").unwrap();
     assert_eq!(live_runtime.level, CapabilityLevel::Unavailable);
     assert_eq!(

@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：M2 进行中（M0、M1 已完成）
+> 状态：M2 已完成，M3 待执行（M0、M1 已完成）
 >
 > 日期：2026-07-24
 >
@@ -248,15 +248,15 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 - [x] Control Plane 深模块及合约测试。
 - [x] 只读 HTTP/SSE adapter。
-- [ ] Phase 2 四方向设计预览、用户选择、项目级 `DESIGN.md`。
-- [ ] Overview / Executions / Integrations 首版。
+- [x] Phase 2 四方向设计预览、用户选择、项目级 `DESIGN.md`。
+- [x] Overview / Executions / Integrations 首版。
 - [x] loopback 默认绑定、可选访问认证、CSP/安全 headers、secret redaction。
 
 退出条件：
 
-- 离线 fixture 端到端可用；断流重连可从 cursor 恢复。
-- UI 在桌面与移动端完成加载/空/错误/过期/部分失败验收。
-- 任何 HTTP 调用都不能构造 live authority。
+- [x] 离线 fixture 端到端可用；断流重连可从 cursor 恢复。
+- [x] UI 在桌面与移动端完成加载/空/错误/过期/部分失败验收。
+- [x] 任何 HTTP 调用都不能构造 live authority。
 
 当前进度（2026-07-24）：
 
@@ -278,8 +278,23 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] 已生成金融精确、Operator Terminal、审计账簿、静默事件舱四个可交互方向；
   桌面双列、窄屏单列、三组实时拨盘、唯一选择按钮和二次确认均已验收，
   250 CSS px 高缩放窄屏也无横向溢出。
-- [ ] 当前 tracer-bullet：等待用户在预览中选择或混搭方向；选定后固化
-  `DESIGN.md`，再接应用 composition root 与 Overview/Executions/Integrations。
+- [x] 用户在预览中选定 A「金融精确」结构，并要求叠加 B 的开发者原生字体与 C 的
+  审计账簿配色；选择已持久化到 `selection.json`，项目级 `DESIGN.md` 已成为视觉单一事实源。
+- [x] 新增独立 `crypto-trading-web-app` composition root：只接收显式 journal 路径与
+  durable generation UUID，只绑定 loopback，可从环境变量名称启用 bearer；不存在 live flag
+  或命令路由。
+- [x] 嵌入同源、无外部依赖的中文优先 Web shell；Overview / Executions / Integrations
+  共用 capability manifest、coherent execution snapshot 与 fetch-stream SSE，opaque cursor 和
+  bearer token 只保存在页面内存。
+- [x] 真实浏览器已覆盖完整、空、source error、陈旧、partial/recovery、Bearer、
+  抽屉键盘流与 token 清除；390 CSS px 与桌面均无横向溢出，最终 release 构建页面
+  console error 为 0。
+- [x] 认证会话换绑/清除会同步销毁受保护 read model、cursor 与 SSE 状态，并以
+  session generation 丢弃旧认证成功响应和旧 401；终审无剩余 P0–P3。
+- [x] M2 发布门禁：全工作区 fmt/check/clippy/test/doc-test/release build 与
+  `cargo audit` 全部通过；`control-plane.web` 已由能力单一事实源提升为 `read-only`。
+- [ ] 当前 tracer-bullet：进入 M3，先统一只读 market-data provider 与 freshness
+  契约，再用一个 deterministic/offline source 打通连续 monitor 事件。
 
 ### M3：连续只读监控、Alert 与 Scanner
 

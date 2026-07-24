@@ -5,7 +5,7 @@ use axum::{
     extract::{Query, Request, State, rejection::QueryRejection},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, WWW_AUTHENTICATE},
+        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
     },
     middleware::{self, Next},
     response::{
@@ -32,8 +32,9 @@ const EVENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 
 const CACHE_CONTROL_VALUE: &str = "no-store";
-const CONTENT_SECURITY_POLICY_VALUE: &str =
-    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'";
+const API_CONTENT_SECURITY_POLICY_VALUE: &str =
+    "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const UI_CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'";
 const PERMISSIONS_POLICY_VALUE: &str = "camera=(), microphone=(), geolocation=()";
 
 #[derive(Clone)]
@@ -116,18 +117,23 @@ pub enum WebAccessPolicyError {
 
 /// Builds the read-only API router. The resulting router has no missing state.
 pub fn api_router(control_plane: Arc<ReadControlPlane>, access: WebAccessPolicy) -> Router {
+    Router::new()
+        .nest("/api/v1", api_routes(control_plane, access))
+        .fallback(not_found)
+        .layer(middleware::from_fn(add_security_headers))
+}
+
+pub(crate) fn api_routes(control_plane: Arc<ReadControlPlane>, access: WebAccessPolicy) -> Router {
     let state = ApiState {
         control_plane,
         authentication_required: access.authentication_required(),
     };
     Router::new()
-        .route("/api/v1/system", get(system))
-        .route("/api/v1/capabilities", get(capabilities))
-        .route("/api/v1/executions", get(executions))
-        .route("/api/v1/events", get(events))
-        .fallback(not_found)
+        .route("/system", get(system))
+        .route("/capabilities", get(capabilities))
+        .route("/executions", get(executions))
+        .route("/events", get(events))
         .layer(middleware::from_fn_with_state(access, authorize))
-        .layer(middleware::from_fn(add_security_headers))
         .with_state(state)
 }
 
@@ -328,12 +334,26 @@ async fn authorize(
     response
 }
 
-async fn add_security_headers(request: Request, next: Next) -> Response {
+pub(crate) async fn add_security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
+    let ui_asset = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.starts_with("text/html")
+                || value.starts_with("text/css")
+                || value.starts_with("text/javascript")
+        });
+    let content_security_policy = if ui_asset {
+        UI_CONTENT_SECURITY_POLICY_VALUE
+    } else {
+        API_CONTENT_SECURITY_POLICY_VALUE
+    };
     let headers = response.headers_mut();
     for (name, value) in [
         ("cache-control", CACHE_CONTROL_VALUE),
-        ("content-security-policy", CONTENT_SECURITY_POLICY_VALUE),
+        ("content-security-policy", content_security_policy),
         ("permissions-policy", PERMISSIONS_POLICY_VALUE),
         ("referrer-policy", "no-referrer"),
         ("x-content-type-options", "nosniff"),
@@ -347,7 +367,7 @@ async fn add_security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-async fn not_found() -> ApiError {
+pub(crate) async fn not_found() -> impl IntoResponse {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "resource not found")
 }
 

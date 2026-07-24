@@ -42,7 +42,7 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
         .iter()
         .find(|item| item["id"] == "control-plane.web")
         .unwrap();
-    assert_eq!(web["level"], "unavailable");
+    assert_eq!(web["level"], "read-only");
 
     let system = app.oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(system.status(), StatusCode::OK);

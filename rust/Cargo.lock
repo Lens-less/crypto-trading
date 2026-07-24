@@ -473,6 +473,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-trading-web-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "crypto-trading-runtime",
+ "crypto-trading-web",
+ "tokio",
+ "tower",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
