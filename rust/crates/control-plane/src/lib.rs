@@ -12,16 +12,31 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use crypto_trading_runtime::{
-    CapabilityError, CapabilityManifest, CursorError, JournalPageBoundary, JournalReadError,
-    JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope, OperatorReadModel,
-    ReadModelError, current_capability_manifest,
+    CapabilityError, CursorError, JournalPage, JournalPageBoundary, JournalReadError,
+    JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope, ReadModelError,
+    current_capability_manifest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use crypto_trading_runtime::{
+    CapabilityManifest, ExecutionBatchState, OperatorReadModel, ProjectionStatus,
+    RecoveryDirective, ReleaseStage,
+};
+
 pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
+
+/// Stable transport-independent classification for safe public error mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFailureKind {
+    InvalidCursor,
+    ExpiredCursor,
+    SourceUnavailable,
+    ResourceLimit,
+    InvalidJournal,
+}
 
 /// Thread-safe source handle constructed only by trusted bootstrap code.
 pub type SharedJournalSnapshotSource = dyn JournalSnapshotSource + Send + Sync;
@@ -94,24 +109,72 @@ impl ReadControlPlane {
             .transpose()
             .map_err(ControlPlaneEventsError::Cursor)?;
         let snapshot = self.journal.snapshot()?;
+        let page = LegacyJsonlJournalReader::read_page(&snapshot, cursor.as_ref())
+            .map_err(classify_events_error)?;
+        Ok(control_plane_events_page(&page))
+    }
+
+    /// Captures one journal generation for both the operator projection and
+    /// its cursor-bearing change page.
+    ///
+    /// This is the correct API for transports that return both views in one
+    /// response: a concurrent append can never make the projection newer than
+    /// the accompanying cursor watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlPlaneReadError`] when the cursor, journal, or bounded
+    /// projection cannot be represented safely.
+    pub fn snapshot_with_events_after(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<ControlPlaneRead, ControlPlaneReadError> {
+        let cursor = cursor
+            .map(str::parse)
+            .transpose()
+            .map_err(ControlPlaneReadError::Cursor)?;
+        let journal = self
+            .journal
+            .snapshot()
+            .map_err(ControlPlaneReadError::Journal)?;
         let page =
-            LegacyJsonlJournalReader::read_page(&snapshot, cursor.as_ref()).map_err(|error| {
+            LegacyJsonlJournalReader::read_page(&journal, cursor.as_ref()).map_err(|error| {
                 match error {
-                    JournalReadError::Cursor(source) => ControlPlaneEventsError::Cursor(source),
-                    source => ControlPlaneEventsError::Journal(source),
+                    JournalReadError::Cursor(source) => ControlPlaneReadError::Cursor(source),
+                    source => ControlPlaneReadError::Journal(source),
                 }
             })?;
-        Ok(ControlPlaneEventsPage {
-            schema_version: CONTROL_PLANE_EVENTS_SCHEMA_VERSION,
-            journal_id: page.journal_id(),
-            events: page
-                .events()
-                .iter()
-                .map(ControlPlaneEventNotice::from)
-                .collect(),
-            next_cursor: page.next_cursor().map(ToString::to_string),
-            boundary: page.boundary().clone(),
+        let operator = OperatorReadModel::from_legacy_snapshot(&journal)
+            .map_err(ControlPlaneReadError::Projection)?;
+        Ok(ControlPlaneRead {
+            snapshot: ControlPlaneSnapshot {
+                schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
+                capabilities: self.capabilities.clone(),
+                operator,
+            },
+            events: control_plane_events_page(&page),
         })
+    }
+}
+
+fn classify_events_error(error: JournalReadError) -> ControlPlaneEventsError {
+    match error {
+        JournalReadError::Cursor(source) => ControlPlaneEventsError::Cursor(source),
+        source => ControlPlaneEventsError::Journal(source),
+    }
+}
+
+fn control_plane_events_page(page: &JournalPage) -> ControlPlaneEventsPage {
+    ControlPlaneEventsPage {
+        schema_version: CONTROL_PLANE_EVENTS_SCHEMA_VERSION,
+        journal_id: page.journal_id(),
+        events: page
+            .events()
+            .iter()
+            .map(ControlPlaneEventNotice::from)
+            .collect(),
+        next_cursor: page.next_cursor().map(ToString::to_string),
+        boundary: page.boundary().clone(),
     }
 }
 
@@ -162,6 +225,21 @@ pub struct ControlPlaneEventsPage {
     pub boundary: JournalPageBoundary,
 }
 
+impl ControlPlaneEventsPage {
+    /// Whether another page can be read immediately from the same snapshot.
+    #[must_use]
+    pub const fn has_more_in_snapshot(&self) -> bool {
+        matches!(self.boundary, JournalPageBoundary::PageLimit)
+    }
+}
+
+/// Coherent projection and event watermark captured from one journal generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlPlaneRead {
+    pub snapshot: ControlPlaneSnapshot,
+    pub events: ControlPlaneEventsPage,
+}
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneSnapshotError {
     #[error(transparent)]
@@ -170,10 +248,91 @@ pub enum ControlPlaneSnapshotError {
     Projection(#[from] ReadModelError),
 }
 
+impl ControlPlaneSnapshotError {
+    #[must_use]
+    pub const fn kind(&self) -> ReadFailureKind {
+        match self {
+            Self::Journal(source) | Self::Projection(ReadModelError::Journal(source)) => {
+                journal_failure_kind(source)
+            }
+            Self::Projection(ReadModelError::BatchLimitExceeded { .. }) => {
+                ReadFailureKind::ResourceLimit
+            }
+            Self::Projection(ReadModelError::NonAdvancingPage) => ReadFailureKind::InvalidJournal,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneEventsError {
     #[error(transparent)]
     Cursor(CursorError),
     #[error(transparent)]
     Journal(#[from] JournalReadError),
+}
+
+impl ControlPlaneEventsError {
+    #[must_use]
+    pub const fn kind(&self) -> ReadFailureKind {
+        match self {
+            Self::Cursor(source) => cursor_failure_kind(source),
+            Self::Journal(source) => journal_failure_kind(source),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ControlPlaneReadError {
+    #[error(transparent)]
+    Cursor(CursorError),
+    #[error(transparent)]
+    Journal(JournalReadError),
+    #[error(transparent)]
+    Projection(ReadModelError),
+}
+
+impl ControlPlaneReadError {
+    #[must_use]
+    pub const fn kind(&self) -> ReadFailureKind {
+        match self {
+            Self::Cursor(source) => cursor_failure_kind(source),
+            Self::Journal(source) | Self::Projection(ReadModelError::Journal(source)) => {
+                journal_failure_kind(source)
+            }
+            Self::Projection(ReadModelError::BatchLimitExceeded { .. }) => {
+                ReadFailureKind::ResourceLimit
+            }
+            Self::Projection(ReadModelError::NonAdvancingPage) => ReadFailureKind::InvalidJournal,
+        }
+    }
+}
+
+const fn cursor_failure_kind(error: &CursorError) -> ReadFailureKind {
+    match error {
+        CursorError::Expired => ReadFailureKind::ExpiredCursor,
+        CursorError::TooLong { .. }
+        | CursorError::Malformed(_)
+        | CursorError::UnsupportedVersion(_)
+        | CursorError::ChecksumMismatch
+        | CursorError::InvalidValue(_) => ReadFailureKind::InvalidCursor,
+    }
+}
+
+const fn journal_failure_kind(error: &JournalReadError) -> ReadFailureKind {
+    match error {
+        JournalReadError::Cursor(source) => cursor_failure_kind(source),
+        JournalReadError::SourceTooLarge { .. }
+        | JournalReadError::Allocation { .. }
+        | JournalReadError::RecordTooLarge { .. } => ReadFailureKind::ResourceLimit,
+        JournalReadError::NotAFile
+        | JournalReadError::Open(_)
+        | JournalReadError::Metadata(_)
+        | JournalReadError::Read(_)
+        | JournalReadError::SourceChanged { .. } => ReadFailureKind::SourceUnavailable,
+        JournalReadError::NilJournalId
+        | JournalReadError::EmptyRecord { .. }
+        | JournalReadError::MalformedRecord { .. }
+        | JournalReadError::SequenceOverflow
+        | JournalReadError::EventContract { .. } => ReadFailureKind::InvalidJournal,
+    }
 }

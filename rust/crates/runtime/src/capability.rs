@@ -591,11 +591,14 @@ fn foundation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Operator-facing HTTP, event-stream, and web control plane.",
             &[
-                "The read-only control-plane interface exists; HTTP, SSE, and the web adapter are not implemented yet.",
+                "The read-only HTTP/SSE adapter exists; no application composition root or Web frontend exposes it yet.",
             ],
             &[
                 "rust/crates/control-plane/src/lib.rs",
                 "rust/crates/control-plane/tests/read_contract.rs",
+                "rust/crates/web/src/api.rs",
+                "rust/crates/web/src/server.rs",
+                "rust/crates/web/tests/http_contract.rs",
                 "docs/plans/2026-07-24-project-alignment-web-goal-plan.md",
             ],
         ),

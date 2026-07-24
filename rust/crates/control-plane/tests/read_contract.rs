@@ -1,8 +1,11 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use crypto_trading_control_plane::{
     CONTROL_PLANE_EVENTS_SCHEMA_VERSION, CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
-    ControlPlaneEventsError, ReadControlPlane,
+    ControlPlaneEventsError, ReadControlPlane, ReadFailureKind,
 };
 use crypto_trading_runtime::{
     CapabilityLevel, CursorError, ExecutionBatch, ExecutionBatchState, JournalPageBoundary,
@@ -45,12 +48,12 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
     assert!(
         web.blockers
             .iter()
-            .any(|blocker| blocker.contains("HTTP, SSE"))
+            .any(|blocker| blocker.contains("composition root"))
     );
     assert!(
         web.evidence
             .iter()
-            .any(|path| path == "rust/crates/control-plane/tests/read_contract.rs")
+            .any(|path| path == "rust/crates/web/tests/http_contract.rs")
     );
     assert_eq!(first.operator.projection_status, ProjectionStatus::Complete);
     assert_eq!(first.operator.batches.len(), 1);
@@ -86,6 +89,31 @@ fn opaque_cursor_resumes_after_an_external_append_without_replaying() {
     assert_eq!(resumed.events[0].sequence, 2);
     assert_eq!(resumed.events[0].kind, "legacy_decision");
     assert_eq!(resumed.boundary, JournalPageBoundary::SnapshotEnd);
+}
+
+#[test]
+fn combined_read_uses_one_journal_generation_for_projection_and_watermark() {
+    let batch = ExecutionBatch::new(fixed_uuid(12), Vec::new()).unwrap();
+    let source = MutableJournalSource::new(
+        fixed_uuid(7),
+        jsonl(&[execution_record(
+            "execution_planned",
+            &batch,
+            &planned_details(&batch),
+            "2026-07-24T00:00:00Z",
+        )]),
+    );
+    let observer = source.clone();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let read = control_plane.snapshot_with_events_after(None).unwrap();
+
+    assert_eq!(observer.snapshot_count(), 1);
+    assert_eq!(read.events.events.len(), 1);
+    assert_eq!(read.events.events[0].sequence, 1);
+    assert_eq!(read.snapshot.operator.head_sequence, Some(1));
+    assert_eq!(read.snapshot.operator.batches.len(), 1);
+    assert_eq!(read.snapshot.operator.batches[0].batch_id, batch.id());
 }
 
 #[test]
@@ -132,22 +160,26 @@ fn malformed_and_expired_cursors_never_restart_from_the_beginning() {
         .next_cursor
         .unwrap();
 
+    let malformed = original_plane
+        .events_after(Some("not-a-cursor"))
+        .unwrap_err();
     assert!(matches!(
-        original_plane
-            .events_after(Some("not-a-cursor"))
-            .unwrap_err(),
+        malformed,
         ControlPlaneEventsError::Cursor(CursorError::Malformed(_))
     ));
+    assert_eq!(malformed.kind(), ReadFailureKind::InvalidCursor);
 
     let replacement = MutableJournalSource::new(
         fixed_uuid(5),
         jsonl(&[decision_record("hold", &json!({}), "2026-07-24T00:00:00Z")]),
     );
     let replacement_plane = ReadControlPlane::new(Arc::new(replacement)).unwrap();
+    let expired = replacement_plane.events_after(Some(&cursor)).unwrap_err();
     assert!(matches!(
-        replacement_plane.events_after(Some(&cursor)).unwrap_err(),
+        expired,
         ControlPlaneEventsError::Cursor(CursorError::Expired)
     ));
+    assert_eq!(expired.kind(), ReadFailureKind::ExpiredCursor);
 }
 
 #[test]
@@ -170,6 +202,7 @@ fn partial_tail_is_reported_without_emitting_an_incomplete_event() {
 struct MutableJournalSource {
     journal_id: Uuid,
     bytes: Arc<RwLock<Vec<u8>>>,
+    snapshot_count: Arc<AtomicUsize>,
 }
 
 impl MutableJournalSource {
@@ -177,6 +210,7 @@ impl MutableJournalSource {
         Self {
             journal_id,
             bytes: Arc::new(RwLock::new(bytes)),
+            snapshot_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -185,10 +219,15 @@ impl MutableJournalSource {
         bytes.extend_from_slice(&serde_json::to_vec(record).unwrap());
         bytes.push(b'\n');
     }
+
+    fn snapshot_count(&self) -> usize {
+        self.snapshot_count.load(Ordering::SeqCst)
+    }
 }
 
 impl JournalSnapshotSource for MutableJournalSource {
     fn snapshot(&self) -> Result<JournalSnapshot, crypto_trading_runtime::JournalReadError> {
+        self.snapshot_count.fetch_add(1, Ordering::SeqCst);
         JournalSnapshot::new(self.journal_id, self.bytes.read().unwrap().clone())
     }
 }

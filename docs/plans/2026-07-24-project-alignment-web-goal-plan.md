@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：M2 准备中（M0、M1 已完成）
+> 状态：M2 进行中（M0、M1 已完成）
 >
 > 日期：2026-07-24
 >
@@ -237,7 +237,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   状态；冲突冻结首个可信终态事实，不暴露原始错误文本，也不生成“直接重试”建议。
 - [x] 容量窗口只淘汰日志序列最老的 completed 批次；所有未决与冲突批次必须保留，
   无安全淘汰候选时明确失败。
-- [ ] 下一条 tracer-bullet：建立只读 Control Plane snapshot/events interface 与
+- [x] 建立只读 Control Plane snapshot/events interface 与
   HTTP/SSE contract；正式 Web 实现前先生成四个设计方向并等待选择。
 
 ### M2：Control Plane 与只读 Web 切片
@@ -245,10 +245,10 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 交付：
 
 - [x] Control Plane 深模块及合约测试。
-- [ ] 只读 HTTP/SSE adapter。
+- [x] 只读 HTTP/SSE adapter。
 - [ ] Phase 2 四方向设计预览、用户选择、项目级 `DESIGN.md`。
 - [ ] Overview / Executions / Integrations 首版。
-- [ ] loopback 默认绑定、可选访问认证、CSP/安全 headers、secret redaction。
+- [x] loopback 默认绑定、可选访问认证、CSP/安全 headers、secret redaction。
 
 退出条件：
 
@@ -263,8 +263,18 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] `snapshot()` 与 `capabilities()` 保持确定性和 capability 单一事实源；
   `events_after(cursor)` 只返回 bounded event notice 与 opaque cursor，不向 transport
   透传 journal payload。
-- [ ] 下一条 tracer-bullet：实现只读 HTTP adapter 的 system/capabilities/executions
-  合约、loopback 默认绑定和统一安全错误/headers，再接整页 SSE notice。
+- [x] 新增独立 `crypto-trading-web` adapter；`system / capabilities / executions`
+  只依赖 `Arc<ReadControlPlane>`，同步 journal 投影统一进入 `spawn_blocking`，默认
+  只允许 loopback，并可选启用不会进入 `Debug` 的 bounded bearer token。
+- [x] `snapshot_with_events_after()` 在同一 journal generation 内生成 operator projection
+  与 cursor watermark，避免 HTTP 响应出现“投影领先于水位”的竞态。
+- [x] `/api/v1/events` 以一个完整 event page 对应一个 SSE message 与页末 `id`；
+  支持 `Last-Event-ID` 恢复、冲突 resume 位置预握手拒绝、bounded catch-up、心跳，
+  以及握手后一次安全错误通知再终止。
+- [x] HTTP/SSE 契约测试覆盖 security headers、鉴权、错误脱敏、secret/payload
+  redaction、原子页和断点恢复；架构与安全只读复核均无剩余 P0–P3。
+- [ ] 下一条 tracer-bullet：生成四个可交互设计方向并等待用户选择；选定后固化
+  `DESIGN.md`，再接应用 composition root 与 Overview/Executions/Integrations。
 
 ### M3：连续只读监控、Alert 与 Scanner
 

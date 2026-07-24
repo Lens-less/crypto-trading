@@ -1,0 +1,23 @@
+[package]
+name = "crypto-trading-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+crypto-trading-control-plane = { path = "../control-plane" }
+futures-util.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+crypto-trading-runtime = { path = "../runtime" }
+serde_json.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
