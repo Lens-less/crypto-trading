@@ -105,6 +105,10 @@ impl HyperliquidAsset {
 }
 
 /// Bounded exact Hyperliquid asset metadata catalog.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the by_* prefix distinguishes the catalog's three independent lookup indexes"
+)]
 #[derive(Debug, Clone, Default)]
 pub struct HyperliquidAssetCatalog {
     by_standard: HashMap<AssetKey, HyperliquidAsset>,
