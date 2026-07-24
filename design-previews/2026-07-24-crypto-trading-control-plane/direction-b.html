@@ -1,0 +1,692 @@
+<style>
+.dir-b,
+.dir-b * {
+  box-sizing: border-box;
+}
+
+.dir-b {
+  --bg: #17110d;
+  --panel: #1d1712;
+  --panel-2: #231b15;
+  --panel-3: #271f18;
+  --line: #3d2d20;
+  --line-strong: #5a412d;
+  --text: #eadfcf;
+  --muted: #ab947f;
+  --dim: #7e6857;
+  --accent: #c58a38;
+  --accent-soft: #8a6230;
+  --recovery: #a97043;
+  width: 100%;
+  height: 100%;
+  min-height: 600px;
+  padding: 16px;
+  color: var(--text);
+  background: var(--bg);
+  font-family: "SFMono-Regular", "Cascadia Mono", "Consolas", "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+.dir-b__shell {
+  width: 100%;
+  height: 100%;
+  min-height: 568px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 0 0 1px rgba(0, 0, 0, 0.28);
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+}
+
+.dir-b__topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.dir-b__titleblock {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.dir-b__page {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text);
+  font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.dir-b__cjk {
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans CJK SC", sans-serif;
+  letter-spacing: 0.06em;
+}
+
+.dir-b__subline {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dir-b__statusstack {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.dir-b__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  background: var(--panel-3);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.dir-b__chip--amber {
+  border-color: var(--line-strong);
+  color: var(--accent);
+}
+
+.dir-b__chip--soft {
+  color: var(--text);
+}
+
+.dir-b__summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  padding: 10px 16px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #201912;
+}
+
+.dir-b__summaryItem {
+  min-width: 0;
+  padding: 10px 10px 9px;
+  border: 1px solid rgba(90, 65, 45, 0.55);
+  background: #241c15;
+}
+
+.dir-b__summaryLabel {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--dim);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.dir-b__summaryValue {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.15;
+  letter-spacing: 0.03em;
+}
+
+.dir-b__summaryValue--amber {
+  color: var(--accent);
+}
+
+.dir-b__summaryValue--muted {
+  color: var(--muted);
+}
+
+.dir-b__panes {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1.02fr 1.22fr 0.96fr;
+}
+
+.dir-b__pane {
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 14px 12px;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 10px;
+}
+
+.dir-b__pane:last-child {
+  border-right: 0;
+}
+
+.dir-b__paneHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dir-b__paneTitle {
+  color: var(--text);
+  font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.dir-b__paneMeta {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.dir-b__tree,
+.dir-b__stream,
+.dir-b__inspector {
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.dir-b__treeRow {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.dir-b__treeRow[data-depth="1"] {
+  padding-left: 22px;
+}
+
+.dir-b__treeRow[data-depth="2"] {
+  padding-left: 34px;
+}
+
+.dir-b__treeRow[data-active="true"] {
+  border-color: rgba(197, 138, 56, 0.32);
+  background: rgba(197, 138, 56, 0.08);
+}
+
+.dir-b__treeLead {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.dir-b__treeLabel {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.dir-b__treeState {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.dir-b__treeState--amber {
+  color: var(--accent);
+}
+
+.dir-b__stream {
+  gap: 6px;
+}
+
+.dir-b__event {
+  display: grid;
+  grid-template-columns: 84px 120px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.dir-b__event[data-active="true"] {
+  border-color: rgba(197, 138, 56, 0.34);
+  background: rgba(197, 138, 56, 0.08);
+}
+
+.dir-b__eventTime {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.dir-b__eventName {
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1.25;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dir-b__eventBody {
+  display: grid;
+  gap: 4px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.dir-b__eventBody code,
+.dir-b__inspectorValue code,
+.dir-b__promptLine code {
+  color: var(--text);
+  font: inherit;
+}
+
+.dir-b__eventNote {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.dir-b__eventNote--amber {
+  color: var(--accent);
+}
+
+.dir-b__inspector {
+  gap: 10px;
+}
+
+.dir-b__panelCard {
+  padding: 10px 11px;
+  border: 1px solid rgba(90, 65, 45, 0.55);
+  background: #241c15;
+}
+
+.dir-b__panelKey {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--dim);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.dir-b__panelValue {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.dir-b__panelValue--amber {
+  color: var(--accent);
+}
+
+.dir-b__inspectorGrid {
+  display: grid;
+  gap: 8px;
+}
+
+.dir-b__inspectorRow {
+  display: grid;
+  grid-template-columns: 118px 1fr;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(90, 65, 45, 0.45);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.dir-b__inspectorKey {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.dir-b__inspectorValue {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.dir-b__inspectorValue--amber {
+  color: var(--accent);
+}
+
+.dir-b__inspectorValue--dim {
+  color: var(--muted);
+}
+
+.dir-b__commandbar {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: #1a140f;
+}
+
+.dir-b__prompt {
+  display: grid;
+  gap: 7px;
+}
+
+.dir-b__promptLine {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dir-b__promptGlyph {
+  color: var(--accent);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+}
+
+.dir-b__promptPath {
+  color: var(--muted);
+}
+
+.dir-b__promptHint {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.dir-b__keys {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.dir-b__key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-3);
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.dir-b__key--amber {
+  border-color: var(--line-strong);
+  color: var(--accent);
+}
+
+@media (max-width: 900px) {
+  .dir-b {
+    padding: 10px;
+  }
+
+  .dir-b__shell {
+    min-height: 0;
+  }
+
+  .dir-b__summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dir-b__panes {
+    grid-template-columns: 1fr;
+  }
+
+  .dir-b__pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .dir-b__pane:last-child {
+    border-bottom: 0;
+  }
+
+  .dir-b__event {
+    grid-template-columns: 72px 1fr;
+  }
+
+  .dir-b__eventBody {
+    grid-column: 1 / -1;
+  }
+
+  .dir-b__inspectorRow {
+    grid-template-columns: 1fr;
+  }
+
+  .dir-b__commandbar {
+    grid-template-columns: 1fr;
+  }
+
+  .dir-b__keys {
+    justify-content: flex-start;
+  }
+}
+</style>
+
+<section class="dir-b" data-direction="B" aria-label="Operator Terminal mockup">
+  <div class="dir-b__shell">
+    <header class="dir-b__topbar">
+      <div class="dir-b__titleblock">
+        <div class="dir-b__page">
+          <span>Operator Terminal</span>
+          <span class="dir-b__cjk">/ 命令终端</span>
+        </div>
+        <div class="dir-b__subline">warm terminal / command-first / journal-led control plane</div>
+      </div>
+      <div class="dir-b__statusstack" aria-label="Run mode status">
+        <span class="dir-b__chip dir-b__chip--amber">paper</span>
+        <span class="dir-b__chip dir-b__chip--soft">live closed</span>
+        <span class="dir-b__chip">cursor 02f4:81</span>
+      </div>
+    </header>
+
+    <div class="dir-b__summary" aria-label="Capability summary">
+      <div class="dir-b__summaryItem">
+        <span class="dir-b__summaryLabel">mode</span>
+        <span class="dir-b__summaryValue dir-b__summaryValue--amber">PAPER / LIVE CLOSED</span>
+      </div>
+      <div class="dir-b__summaryItem">
+        <span class="dir-b__summaryLabel">journal cursor</span>
+        <span class="dir-b__summaryValue">02f4:81 / operation_page</span>
+      </div>
+      <div class="dir-b__summaryItem">
+        <span class="dir-b__summaryLabel">capability</span>
+        <span class="dir-b__summaryValue">control-plane.web ready</span>
+      </div>
+      <div class="dir-b__summaryItem">
+        <span class="dir-b__summaryLabel">recovery</span>
+        <span class="dir-b__summaryValue">one item incomplete</span>
+      </div>
+      <div class="dir-b__summaryItem">
+        <span class="dir-b__summaryLabel">probe health</span>
+        <span class="dir-b__summaryValue dir-b__summaryValue--muted">kill switch / freshness / adapter health unavailable</span>
+      </div>
+    </div>
+
+    <div class="dir-b__panes">
+      <aside class="dir-b__pane" aria-label="Context tree">
+        <div class="dir-b__paneHeader">
+          <div class="dir-b__paneTitle">Context Tree</div>
+          <div class="dir-b__paneMeta">dense / keyboard aware</div>
+        </div>
+        <div class="dir-b__tree">
+          <div class="dir-b__treeRow" data-depth="0" data-active="true">
+            <div class="dir-b__treeLead">01</div>
+            <div class="dir-b__treeLabel">journal</div>
+            <div class="dir-b__treeState dir-b__treeState--amber">current</div>
+          </div>
+          <div class="dir-b__treeRow" data-depth="1">
+            <div class="dir-b__treeLead">02</div>
+            <div class="dir-b__treeLabel">operation_page</div>
+            <div class="dir-b__treeState">payload-free</div>
+          </div>
+          <div class="dir-b__treeRow" data-depth="1">
+            <div class="dir-b__treeLead">03</div>
+            <div class="dir-b__treeLabel">capability_state</div>
+            <div class="dir-b__treeState">stable</div>
+          </div>
+          <div class="dir-b__treeRow" data-depth="1">
+            <div class="dir-b__treeLead">04</div>
+            <div class="dir-b__treeLabel">recovery_bridge</div>
+            <div class="dir-b__treeState dir-b__treeState--amber">incomplete</div>
+          </div>
+          <div class="dir-b__treeRow" data-depth="2">
+            <div class="dir-b__treeLead">05</div>
+            <div class="dir-b__treeLabel">bridge cursor repair waiting on adapter freshness</div>
+            <div class="dir-b__treeState">hold</div>
+          </div>
+          <div class="dir-b__treeRow" data-depth="1">
+            <div class="dir-b__treeLead">06</div>
+            <div class="dir-b__treeLabel">kill_switch</div>
+            <div class="dir-b__treeState">unavailable</div>
+          </div>
+        </div>
+      </aside>
+
+      <section class="dir-b__pane" aria-label="Event stream">
+        <div class="dir-b__paneHeader">
+          <div class="dir-b__paneTitle">Event Stream</div>
+          <div class="dir-b__paneMeta">journal.cursor threaded forward</div>
+        </div>
+        <div class="dir-b__stream">
+          <div class="dir-b__event" data-active="true">
+            <div class="dir-b__eventTime">00:14:22</div>
+            <div class="dir-b__eventName">journal.cursor</div>
+            <div class="dir-b__eventBody">
+              <div><code>02f4:81</code> advanced through <code>operation_page</code></div>
+              <div class="dir-b__eventNote dir-b__eventNote--amber">payload-free notice</div>
+            </div>
+          </div>
+          <div class="dir-b__event">
+            <div class="dir-b__eventTime">00:14:24</div>
+            <div class="dir-b__eventName">operation_page.opened</div>
+            <div class="dir-b__eventBody">
+              <div>page record resolved from journal with no remote fetch</div>
+              <div class="dir-b__eventNote">payload-free notice</div>
+            </div>
+          </div>
+          <div class="dir-b__event">
+            <div class="dir-b__eventTime">00:14:27</div>
+            <div class="dir-b__eventName">operation_page.mode_changed</div>
+            <div class="dir-b__eventBody">
+              <div><code>PAPER</code> locked, <code>LIVE CLOSED</code> held, queue depth <code>3</code></div>
+              <div class="dir-b__eventNote">payload-free notice</div>
+            </div>
+          </div>
+          <div class="dir-b__event">
+            <div class="dir-b__eventTime">00:14:31</div>
+            <div class="dir-b__eventName">operation_page.capability</div>
+            <div class="dir-b__eventBody">
+              <div><code>control-plane.web</code> ready, <code>journal.read</code> ready, freshness probe unavailable</div>
+              <div class="dir-b__eventNote">payload-free notice</div>
+            </div>
+          </div>
+          <div class="dir-b__event">
+            <div class="dir-b__eventTime">00:14:35</div>
+            <div class="dir-b__eventName">operation_page.recovery</div>
+            <div class="dir-b__eventBody">
+              <div>one incomplete bridge remains at <code>02f4:81</code>; adapter health not exposed</div>
+              <div class="dir-b__eventNote">payload-free notice</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="dir-b__pane" aria-label="Inspector">
+        <div class="dir-b__paneHeader">
+          <div class="dir-b__paneTitle">Inspector</div>
+          <div class="dir-b__paneMeta">cursor echo</div>
+        </div>
+        <div class="dir-b__inspector">
+          <div class="dir-b__panelCard">
+            <span class="dir-b__panelKey">selected cursor</span>
+            <div class="dir-b__panelValue dir-b__panelValue--amber">journal.cursor / 02f4:81</div>
+          </div>
+          <div class="dir-b__inspectorGrid">
+            <div class="dir-b__inspectorRow">
+              <div class="dir-b__inspectorKey">page name</div>
+              <div class="dir-b__inspectorValue">operation_page</div>
+            </div>
+            <div class="dir-b__inspectorRow">
+              <div class="dir-b__inspectorKey">state</div>
+              <div class="dir-b__inspectorValue">paper locked, live gate closed, cursor active</div>
+            </div>
+            <div class="dir-b__inspectorRow">
+              <div class="dir-b__inspectorKey">capability state</div>
+              <div class="dir-b__inspectorValue">control-plane.web ready; journal.read ready; execution adapters idle</div>
+            </div>
+            <div class="dir-b__inspectorRow">
+              <div class="dir-b__inspectorKey">recovery item</div>
+              <div class="dir-b__inspectorValue dir-b__inspectorValue--amber">bridge cursor repair incomplete, waiting on freshness that remains unavailable</div>
+            </div>
+            <div class="dir-b__inspectorRow">
+              <div class="dir-b__inspectorKey">unavailable</div>
+              <div class="dir-b__inspectorValue dir-b__inspectorValue--dim">kill switch, freshness, adapter health</div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="dir-b__commandbar" aria-label="Command bar">
+      <div class="dir-b__prompt">
+        <div class="dir-b__promptLine">
+          <span class="dir-b__promptGlyph">&gt;</span>
+          <span class="dir-b__promptPath">journal / operation_page / cursor 02f4:81</span>
+          <code>inspect recovery --mode paper --gate closed</code>
+        </div>
+        <div class="dir-b__promptHint">enter to step, j/k to move, ctrl+l to clear, ? for commands</div>
+      </div>
+      <div class="dir-b__keys" aria-label="Keyboard affordances">
+        <span class="dir-b__key dir-b__key--amber">enter</span>
+        <span class="dir-b__key">j</span>
+        <span class="dir-b__key">k</span>
+        <span class="dir-b__key">ctrl+l</span>
+        <span class="dir-b__key">?</span>
+      </div>
+    </footer>
+  </div>
+</section>

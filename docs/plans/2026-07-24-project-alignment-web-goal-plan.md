@@ -181,6 +181,8 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 1. **金融精确**：Kraken/Coinbase 式风险优先、线框分区、低饱和蓝。
 2. **Operator Terminal**：Warp/Superhuman 式快捷、等宽遥测、紧凑事件流。
+3. **审计账簿**：IBM Carbon 式全宽 blotter、无圆角、可打印证据链。
+4. **静默事件舱**：低认知负担的事件时间线主从布局，一次聚焦一项恢复工作。
 
 ## 5. 分阶段执行路线
 
@@ -273,7 +275,10 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   以及握手后一次安全错误通知再终止。
 - [x] HTTP/SSE 契约测试覆盖 security headers、鉴权、错误脱敏、secret/payload
   redaction、原子页和断点恢复；架构与安全只读复核均无剩余 P0–P3。
-- [ ] 下一条 tracer-bullet：生成四个可交互设计方向并等待用户选择；选定后固化
+- [x] 已生成金融精确、Operator Terminal、审计账簿、静默事件舱四个可交互方向；
+  桌面双列、窄屏单列、三组实时拨盘、唯一选择按钮和二次确认均已验收，
+  250 CSS px 高缩放窄屏也无横向溢出。
+- [ ] 当前 tracer-bullet：等待用户在预览中选择或混搭方向；选定后固化
   `DESIGN.md`，再接应用 composition root 与 Overview/Executions/Integrations。
 
 ### M3：连续只读监控、Alert 与 Scanner

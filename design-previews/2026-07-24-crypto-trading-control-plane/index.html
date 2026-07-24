@@ -1,0 +1,1003 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Crypto Trading 控制面 · 设计方向样机</title>
+  <style>
+    :root {
+      --shell-bg: #eeefec;
+      --shell-surface: #f9f9f6;
+      --shell-ink: #20211f;
+      --shell-muted: #686b65;
+      --shell-line: #d7d9d3;
+      --shell-strong: #30322f;
+      --shell-focus: #1e6651;
+      --shell-radius: 14px;
+      --ease-out: cubic-bezier(.23, 1, .32, 1);
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      background: var(--shell-bg);
+    }
+
+    body {
+      min-height: 100dvh;
+      margin: 0;
+      overflow-x: hidden;
+      background: var(--shell-bg);
+      color: var(--shell-ink);
+      text-rendering: optimizeLegibility;
+    }
+
+    button,
+    input,
+    textarea {
+      font: inherit;
+    }
+
+    button {
+      touch-action: manipulation;
+    }
+
+    .preview-shell {
+      width: min(1500px, 100%);
+      margin: 0 auto;
+      padding: 30px clamp(16px, 3vw, 42px) 72px;
+    }
+
+    .preview-intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(240px, .7fr);
+      gap: 28px;
+      align-items: end;
+      padding: 22px 0 26px;
+      border-bottom: 1px solid var(--shell-line);
+    }
+
+    .preview-intro__copy {
+      min-width: 0;
+    }
+
+    .preview-intro__context {
+      margin: 0 0 9px;
+      color: var(--shell-muted);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .04em;
+    }
+
+    .preview-intro h1 {
+      max-width: 19ch;
+      margin: 0;
+      font-size: clamp(30px, 4.2vw, 62px);
+      font-weight: 600;
+      line-height: 1.03;
+      letter-spacing: -.045em;
+      text-wrap: balance;
+    }
+
+    .preview-intro__note {
+      max-width: 42ch;
+      margin: 0;
+      color: var(--shell-muted);
+      font-size: 14px;
+      line-height: 1.65;
+      text-wrap: pretty;
+    }
+
+    .dial-panel {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      gap: 1px;
+      margin: 22px 0;
+      overflow: hidden;
+      border: 1px solid var(--shell-line);
+      border-radius: 10px;
+      background: var(--shell-line);
+    }
+
+    .dial {
+      display: grid;
+      gap: 9px;
+      min-width: 0;
+      padding: 15px 17px;
+      background: var(--shell-surface);
+    }
+
+    .dial__head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .dial__label {
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .dial output {
+      min-width: 2ch;
+      color: var(--shell-focus);
+      font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .dial__hint {
+      color: var(--shell-muted);
+      font-size: 11px;
+    }
+
+    .dial input {
+      width: 100%;
+      margin: 0;
+      accent-color: var(--shell-strong);
+      cursor: pointer;
+    }
+
+    .direction-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 22px;
+      align-items: start;
+    }
+
+    .direction-card {
+      position: relative;
+      display: flex;
+      min-width: 0;
+      overflow: hidden;
+      border: 2px solid transparent;
+      border-radius: var(--shell-radius);
+      outline: 1px solid var(--shell-line);
+      background: var(--shell-surface);
+      transition:
+        border-color 160ms var(--ease-out),
+        outline-color 160ms var(--ease-out),
+        transform 160ms var(--ease-out);
+    }
+
+    .direction-card.qmdp-selected,
+    .direction-card.is-selected {
+      border-color: var(--shell-focus);
+      outline-color: var(--shell-focus);
+    }
+
+    .direction-card__inner {
+      display: flex;
+      width: 100%;
+      min-width: 0;
+      flex-direction: column;
+    }
+
+    .direction-card__head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      min-height: 64px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--shell-line);
+    }
+
+    .direction-letter {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--shell-strong);
+      color: #f7f7f3;
+      font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .direction-card__title {
+      min-width: 0;
+    }
+
+    .direction-card__title h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.3;
+    }
+
+    .direction-card__title p {
+      margin: 3px 0 0;
+      overflow: hidden;
+      color: var(--shell-muted);
+      font-size: 12px;
+      line-height: 1.4;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .recommendation-badge {
+      align-self: start;
+      padding: 5px 8px;
+      border: 1px solid #87aa9d;
+      border-radius: 999px;
+      background: #e7f0eb;
+      color: #245d4c;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .mock-window {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 976 / 616;
+      overflow: hidden;
+      background: #dfe1dd;
+      isolation: isolate;
+    }
+
+    .mock-window iframe {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 976px;
+      height: 616px;
+      border: 0;
+      pointer-events: none;
+      transform: translate(-50%, -50%) scale(.6);
+      transform-origin: center;
+    }
+
+    .direction-card__meta {
+      width: 100%;
+      min-width: 0;
+      padding: 14px 18px 12px;
+      border-top: 1px solid var(--shell-line);
+    }
+
+    .direction-card__meta p {
+      display: -webkit-box;
+      max-width: 65ch;
+      min-height: 42px;
+      margin: 0;
+      overflow: hidden;
+      color: #4f534d;
+      font-size: 13px;
+      line-height: 1.58;
+      overflow-wrap: break-word;
+      text-wrap: pretty;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
+
+    .qmdp-pick-button {
+      position: relative;
+      width: calc(100% - 36px);
+      min-height: 46px;
+      margin: 0 18px 18px;
+      border: 1px solid var(--shell-strong);
+      border-radius: 8px;
+      background: var(--shell-strong);
+      color: #f7f7f3;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 650;
+      transition:
+        background-color 150ms var(--ease-out),
+        border-color 150ms var(--ease-out),
+        transform 120ms var(--ease-out);
+    }
+
+    .qmdp-pick-button:active {
+      transform: scale(.985);
+    }
+
+    .qmdp-pick-button:focus-visible,
+    .dial input:focus-visible,
+    .native-dialog button:focus-visible,
+    .native-dialog textarea:focus-visible {
+      outline: 3px solid rgb(30 102 81 / 30%);
+      outline-offset: 2px;
+    }
+
+    .direction-explanations {
+      margin-top: 28px;
+      border-top: 1px solid var(--shell-line);
+    }
+
+    .direction-explanations__head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 22px 0 15px;
+    }
+
+    .direction-explanations__head h2 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+    }
+
+    .direction-explanations__head p {
+      margin: 0;
+      color: var(--shell-muted);
+      font-size: 12px;
+    }
+
+    .explanation-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border-top: 1px solid var(--shell-line);
+      border-left: 1px solid var(--shell-line);
+    }
+
+    .explanation {
+      min-width: 0;
+      padding: 17px;
+      border-right: 1px solid var(--shell-line);
+      border-bottom: 1px solid var(--shell-line);
+      background: rgb(249 249 246 / 60%);
+    }
+
+    .explanation h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .explanation dl {
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr);
+      gap: 7px 9px;
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .explanation dt {
+      color: var(--shell-muted);
+    }
+
+    .explanation dd {
+      min-width: 0;
+      margin: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .recommendation {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+      margin-top: 18px;
+      padding: 17px;
+      border-left: 3px solid var(--shell-focus);
+      background: #e6ece8;
+      color: #28453c;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .recommendation strong {
+      white-space: nowrap;
+    }
+
+    .native-confirm {
+      position: fixed;
+      z-index: 80;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+      background: rgb(23 24 22 / 42%);
+    }
+
+    .native-confirm[hidden] {
+      display: none;
+    }
+
+    .native-dialog {
+      width: min(520px, 100%);
+      padding: 20px;
+      border: 1px solid #cfd2cb;
+      border-radius: 12px;
+      background: #fbfbf8;
+      box-shadow: 0 20px 60px rgb(31 33 29 / 22%);
+    }
+
+    .native-dialog h2 {
+      margin: 0 0 9px;
+      font-size: 20px;
+      font-weight: 650;
+    }
+
+    .native-dialog p {
+      margin: 0 0 14px;
+      color: var(--shell-muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .native-dialog textarea {
+      width: 100%;
+      min-height: 96px;
+      resize: vertical;
+      border: 1px solid #bfc3ba;
+      border-radius: 8px;
+      padding: 11px 12px;
+      background: #fff;
+      color: var(--shell-ink);
+      line-height: 1.55;
+    }
+
+    .native-dialog__actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .native-dialog__actions button {
+      min-height: 42px;
+      border: 1px solid var(--shell-strong);
+      border-radius: 7px;
+      padding: 0 15px;
+      background: transparent;
+      color: var(--shell-ink);
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .native-dialog__actions .primary {
+      background: var(--shell-strong);
+      color: #fff;
+    }
+
+    .native-toast {
+      position: fixed;
+      z-index: 90;
+      right: 18px;
+      bottom: 18px;
+      max-width: min(420px, calc(100vw - 36px));
+      padding: 12px 15px;
+      border-radius: 8px;
+      background: #252724;
+      color: #f8f8f4;
+      font-size: 13px;
+      line-height: 1.5;
+      box-shadow: 0 12px 34px rgb(26 28 24 / 22%);
+      transform: translateY(calc(100% + 30px));
+      transition: transform 200ms var(--ease-out);
+    }
+
+    .native-toast.show {
+      transform: translateY(0);
+    }
+
+    @media (hover: hover) and (pointer: fine) {
+      .direction-card:hover {
+        transform: translateY(-2px);
+      }
+
+      .qmdp-pick-button:hover {
+        border-color: #1e6651;
+        background: #1e6651;
+      }
+    }
+
+    @media (max-width: 1080px) {
+      .explanation-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 760px) {
+      .preview-shell {
+        padding-inline: 14px;
+        padding-top: 18px;
+      }
+
+      .preview-intro {
+        grid-template-columns: 1fr;
+        gap: 14px;
+        align-items: start;
+      }
+
+      .preview-intro h1 {
+        max-width: 15ch;
+      }
+
+      .dial-panel,
+      .direction-grid,
+      .explanation-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .mock-window {
+        height: 320px;
+        aspect-ratio: auto;
+      }
+
+      .direction-card__head {
+        grid-template-columns: auto minmax(0, 1fr);
+      }
+
+      .recommendation-badge {
+        grid-column: 1 / -1;
+        justify-self: start;
+        margin-left: 46px;
+      }
+
+      .direction-explanations__head {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+
+    @media (max-width: 430px) {
+      .preview-shell {
+        padding-inline: 10px;
+      }
+
+      .direction-card__head {
+        padding-inline: 12px;
+      }
+
+      .mock-window {
+        height: 286px;
+      }
+
+      .direction-card__meta {
+        padding-inline: 14px;
+      }
+
+      .qmdp-pick-button {
+        width: calc(100% - 28px);
+        margin-inline: 14px;
+      }
+
+      .explanation {
+        padding: 15px;
+      }
+
+      .explanation dl {
+        grid-template-columns: 44px minmax(0, 1fr);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        transition-duration: .01ms !important;
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="preview-shell">
+    <header class="preview-intro">
+      <div class="preview-intro__copy">
+        <p class="preview-intro__context">单一操作者 · 风险优先 · 只读控制面</p>
+        <h1>Crypto Trading Web 工作台</h1>
+      </div>
+      <p class="preview-intro__note">
+        这是设计方向样机，用于选择视觉与交互气质，不是最终 App / 最终页面；选定后才进入正式实现。
+      </p>
+    </header>
+
+    <section class="dial-panel" data-qmdp-dials aria-label="设计拨盘">
+      <label class="dial">
+        <span class="dial__head">
+          <span class="dial__label">视觉冒险度</span>
+          <output data-qmdp-output="variance" for="variance">4</output>
+        </span>
+        <input id="variance" data-qmdp-dial="variance" type="range" min="1" max="10" value="4">
+        <span class="dial__hint">更稳妥 ↔ 更有性格</span>
+      </label>
+      <label class="dial">
+        <span class="dial__head">
+          <span class="dial__label">动效强度</span>
+          <output data-qmdp-output="motion" for="motion">3</output>
+        </span>
+        <input id="motion" data-qmdp-dial="motion" type="range" min="1" max="10" value="3">
+        <span class="dial__hint">近乎静态 ↔ 反馈丰富</span>
+      </label>
+      <label class="dial">
+        <span class="dial__head">
+          <span class="dial__label">信息密度</span>
+          <output data-qmdp-output="density" for="density">8</output>
+        </span>
+        <input id="density" data-qmdp-dial="density" type="range" min="1" max="10" value="8">
+        <span class="dial__hint">更疏朗 ↔ 驾驶舱满载</span>
+      </label>
+    </section>
+
+    <section class="direction-grid" aria-label="四个设计方向">
+      <article
+        class="direction-card"
+        data-design-option="A"
+        data-name="金融精确"
+        data-notes="深色金融驾驶舱，固定风险脊柱与跨栏批次带"
+      >
+        <div class="direction-card__inner">
+          <header class="direction-card__head">
+            <span class="direction-letter" aria-hidden="true">A</span>
+            <div class="direction-card__title">
+              <h2 data-direction-name>金融精确</h2>
+              <p>Precision Desk · 风险先于装饰</p>
+            </div>
+            <span class="recommendation-badge">推荐</span>
+          </header>
+          <div class="mock-window">
+            <iframe
+              src="direction-a.html"
+              title="方向 A 金融精确样机"
+              loading="eager"
+              scrolling="no"
+              sandbox=""
+            ></iframe>
+          </div>
+          <div class="direction-card__meta">
+            <p>左侧风险脊柱固定模式与授权，中区用跨栏 batch ribbon 把执行事实放到第一视觉层。</p>
+          </div>
+          <button class="qmdp-pick-button" data-qmdp-managed="page" type="button">
+            选择 A · 金融精确
+          </button>
+        </div>
+      </article>
+
+      <article
+        class="direction-card"
+        data-design-option="B"
+        data-name="Operator Terminal"
+        data-notes="命令优先，三栏事件流与持久命令行"
+      >
+        <div class="direction-card__inner">
+          <header class="direction-card__head">
+            <span class="direction-letter" aria-hidden="true">B</span>
+            <div class="direction-card__title">
+              <h2 data-direction-name>Operator Terminal</h2>
+              <p>命令终端 · 键盘与游标优先</p>
+            </div>
+          </header>
+          <div class="mock-window">
+            <iframe
+              src="direction-b.html"
+              title="方向 B Operator Terminal 样机"
+              loading="eager"
+              scrolling="no"
+              sandbox=""
+            ></iframe>
+          </div>
+          <div class="direction-card__meta">
+            <p>上下文树、payload-free 事件流与 inspector 并排，cursor prompt 贯穿整个值班路径。</p>
+          </div>
+          <button class="qmdp-pick-button" data-qmdp-managed="page" type="button">
+            选择 B · Operator Terminal
+          </button>
+        </div>
+      </article>
+
+      <article
+        class="direction-card"
+        data-design-option="C"
+        data-name="审计账簿"
+        data-notes="明亮工业账簿，Carbon 式锐角与全宽执行台账"
+      >
+        <div class="direction-card__inner">
+          <header class="direction-card__head">
+            <span class="direction-letter" aria-hidden="true">C</span>
+            <div class="direction-card__title">
+              <h2 data-direction-name>审计账簿</h2>
+              <p>Audit Ledger · 清算日报式证据</p>
+            </div>
+          </header>
+          <div class="mock-window">
+            <iframe
+              src="direction-c.html"
+              title="方向 C 审计账簿样机"
+              loading="eager"
+              scrolling="no"
+              sandbox=""
+            ></iframe>
+          </div>
+          <div class="direction-card__meta">
+            <p>无侧栏、无圆角卡片，以 sequence、cursor、batch state 和 recovery directive 组成可打印台账。</p>
+          </div>
+          <button class="qmdp-pick-button" data-qmdp-managed="page" type="button">
+            选择 C · 审计账簿
+          </button>
+        </div>
+      </article>
+
+      <article
+        class="direction-card"
+        data-design-option="D"
+        data-name="静默事件舱"
+        data-notes="低噪声事件主线，时间线与证据主从布局"
+      >
+        <div class="direction-card__inner">
+          <header class="direction-card__head">
+            <span class="direction-letter" aria-hidden="true">D</span>
+            <div class="direction-card__title">
+              <h2 data-direction-name>静默事件舱</h2>
+              <p>Quiet Incident Room · 一次看清一件事</p>
+            </div>
+          </header>
+          <div class="mock-window">
+            <iframe
+              src="direction-d.html"
+              title="方向 D 静默事件舱样机"
+              loading="eager"
+              scrolling="no"
+              sandbox=""
+            ></iframe>
+          </div>
+          <div class="direction-card__meta">
+            <p>一个 recovery-required 批次成为主事件，连续时间线连接摘要、证据和下一步调查。</p>
+          </div>
+          <button class="qmdp-pick-button" data-qmdp-managed="page" type="button">
+            选择 D · 静默事件舱
+          </button>
+        </div>
+      </article>
+    </section>
+
+    <section class="direction-explanations" aria-labelledby="direction-explanations-title">
+      <div class="direction-explanations__head">
+        <h2 id="direction-explanations-title">方向差异</h2>
+        <p>可以混搭，例如：A 的结构 + B 的快捷键 + C 的表格。</p>
+      </div>
+      <div class="explanation-grid">
+        <article class="explanation">
+          <h3>A · 金融精确</h3>
+          <dl>
+            <dt>字体</dt><dd>人文无衬线 + 等宽数字</dd>
+            <dt>色彩</dt><dd>深海军蓝 + 单一低饱和蓝</dd>
+            <dt>布局</dt><dd>窄左轨 + 非对称 12 列</dd>
+            <dt>优势</dt><dd>风险与密度最平衡</dd>
+            <dt>代价</dt><dd>桌面取向明显，视觉较克制</dd>
+          </dl>
+        </article>
+        <article class="explanation">
+          <h3>B · Operator Terminal</h3>
+          <dl>
+            <dt>字体</dt><dd>等宽为主 + 几何无衬线</dd>
+            <dt>色彩</dt><dd>暖黑 + 羊皮纸白 + 哑光琥珀</dd>
+            <dt>布局</dt><dd>三栏终端 + 底部命令行</dd>
+            <dt>优势</dt><dd>高频值班效率最高</dd>
+            <dt>代价</dt><dd>学习成本高，非技术用户疏离</dd>
+          </dl>
+        </article>
+        <article class="explanation">
+          <h3>C · 审计账簿</h3>
+          <dl>
+            <dt>字体</dt><dd>Plex 式无衬线 + 等宽</dd>
+            <dt>色彩</dt><dd>白 / 灰阶 + 单一工程蓝</dd>
+            <dt>布局</dt><dd>顶部 masthead + 全宽 blotter</dd>
+            <dt>优势</dt><dd>审计、打印与精确对齐最好</dd>
+            <dt>代价</dt><dd>企业感偏强，情绪温度最低</dd>
+          </dl>
+        </article>
+        <article class="explanation">
+          <h3>D · 静默事件舱</h3>
+          <dl>
+            <dt>字体</dt><dd>紧凑展示体 + 清晰正文</dd>
+            <dt>色彩</dt><dd>暖白 + 近黑 + 柔和苔绿</dd>
+            <dt>布局</dt><dd>顶部导航 + 事件时间线主从</dd>
+            <dt>优势</dt><dd>认知负担最低，异常叙事清楚</dd>
+            <dt>代价</dt><dd>同屏信息少，需要更多下钻</dd>
+          </dl>
+        </article>
+      </div>
+      <div class="recommendation">
+        <strong>推荐 A</strong>
+        <span>
+          它最贴合“单一操作者、金融信任、信息密度 8/10、风险优先”的设计读取，也最容易吸收 TickFlow 的分组导航与能力探测，而不把产品做成只适合工程师的终端。
+        </span>
+      </div>
+    </section>
+  </main>
+
+  <div
+    class="native-confirm"
+    id="native-confirm"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="native-confirm-title"
+    hidden
+  >
+    <div class="native-dialog">
+      <h2 id="native-confirm-title">确认设计方向</h2>
+      <p id="native-confirm-meta"></p>
+      <textarea
+        id="native-adjustments"
+        aria-label="调整建议"
+        placeholder="可选：写下调整建议，例如“要 A 的留白 + C 的表格”"
+      ></textarea>
+      <div class="native-dialog__actions">
+        <button id="native-cancel" type="button">取消</button>
+        <button class="primary" id="native-submit" type="button">确认并回传</button>
+      </div>
+    </div>
+  </div>
+  <div class="native-toast" id="native-toast" role="status" aria-live="polite"></div>
+
+  <script>
+    (() => {
+      const cards = Array.from(document.querySelectorAll("[data-design-option]"));
+      const modal = document.getElementById("native-confirm");
+      const modalMeta = document.getElementById("native-confirm-meta");
+      const adjustments = document.getElementById("native-adjustments");
+      const toast = document.getElementById("native-toast");
+      let pending = null;
+
+      function readDials() {
+        const value = key => Number(document.querySelector(`[data-qmdp-dial="${key}"]`).value);
+        return {
+          variance: value("variance"),
+          motion: value("motion"),
+          density: value("density")
+        };
+      }
+
+      function dialText(values) {
+        return `视觉冒险度 ${values.variance} / 动效强度 ${values.motion} / 信息密度 ${values.density}`;
+      }
+
+      document.querySelectorAll("[data-qmdp-dial]").forEach(input => {
+        const output = document.querySelector(`[data-qmdp-output="${input.dataset.qmdpDial}"]`);
+        const sync = () => {
+          output.value = input.value;
+          output.textContent = input.value;
+        };
+        input.addEventListener("input", sync);
+        sync();
+      });
+
+      function cardPayload(card) {
+        const id = card.dataset.designOption;
+        const name = card.dataset.name;
+        return {
+          id,
+          name,
+          label: `选 ${id}：${name}`,
+          notes: card.dataset.notes || "",
+          dials: readDials()
+        };
+      }
+
+      function markSelected(card) {
+        cards.forEach(item => item.classList.toggle("is-selected", item === card));
+      }
+
+      function openNative(card) {
+        markSelected(card);
+        pending = cardPayload(card);
+        modalMeta.textContent = `${pending.label} · ${dialText(pending.dials)}`;
+        adjustments.value = "";
+        modal.hidden = false;
+        requestAnimationFrame(() => adjustments.focus({preventScroll: true}));
+      }
+
+      function choose(card) {
+        if (typeof window.qiaomuDesignSelect === "function") {
+          window.qiaomuDesignSelect(cardPayload(card));
+          return;
+        }
+        openNative(card);
+      }
+
+      cards.forEach(card => {
+        const button = card.querySelector(".qmdp-pick-button");
+        button.addEventListener("click", event => {
+          event.preventDefault();
+          event.stopPropagation();
+          choose(card);
+        });
+        card.addEventListener("click", event => {
+          if (event.target.closest("button,input,textarea,a")) return;
+          if (typeof window.qiaomuDesignSelect === "function") return;
+          openNative(card);
+        });
+      });
+
+      function closeNative() {
+        modal.hidden = true;
+        pending = null;
+      }
+
+      document.getElementById("native-cancel").addEventListener("click", closeNative);
+      modal.addEventListener("click", event => {
+        if (event.target === modal) closeNative();
+      });
+
+      async function submitNative() {
+        if (!pending) return;
+        const payload = {
+          ...pending,
+          dials: readDials(),
+          adjustments: adjustments.value.trim(),
+          pageTitle: document.title,
+          at: new Date().toISOString()
+        };
+        const selectionText =
+          `${payload.label}；拨盘：${dialText(payload.dials)}` +
+          (payload.adjustments ? `；建议：${payload.adjustments}` : "");
+        let saved = false;
+        if (location.protocol !== "file:") {
+          try {
+            const response = await fetch("/api/select", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            saved = Boolean(result.ok);
+          } catch {
+            saved = false;
+          }
+        }
+        if (!saved && navigator.clipboard) {
+          await navigator.clipboard.writeText(selectionText).catch(() => {});
+        }
+        toast.textContent = saved
+          ? `已选择 ${payload.label}，已回传。`
+          : `已选择 ${payload.label}；当前为静态预览，请把已复制的选择发回对话。`;
+        toast.classList.add("show");
+        modal.hidden = true;
+        pending = null;
+      }
+
+      document.getElementById("native-submit").addEventListener("click", submitNative);
+
+      document.addEventListener("keydown", event => {
+        if (event.key === "Escape" && !modal.hidden) {
+          closeNative();
+          return;
+        }
+        if (event.target.closest("input,textarea,select,[contenteditable='true']")) return;
+        if (typeof window.qiaomuDesignSelect === "function") return;
+        const index = ["1", "2", "3", "4"].indexOf(event.key);
+        if (index >= 0 && cards[index]) {
+          event.preventDefault();
+          openNative(cards[index]);
+        }
+      });
+
+      function fitStages() {
+        const mobile = window.matchMedia("(max-width: 760px)").matches;
+        document.querySelectorAll(".mock-window").forEach(frame => {
+          const iframe = frame.querySelector("iframe");
+          const exactFit = Math.min(frame.clientWidth / 976, frame.clientHeight / 616);
+          const scale = mobile ? Math.max(exactFit, .5) : exactFit;
+          iframe.style.transform = `translate(-50%, -50%) scale(${scale})`;
+        });
+      }
+
+      let resizeFrame = 0;
+      window.addEventListener("resize", () => {
+        cancelAnimationFrame(resizeFrame);
+        resizeFrame = requestAnimationFrame(fitStages);
+      });
+      window.addEventListener("load", fitStages);
+      fitStages();
+    })();
+  </script>
+</body>
+</html>

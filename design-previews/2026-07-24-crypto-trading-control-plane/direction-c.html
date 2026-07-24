@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="zh-CN" style="height: 100%;">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Direction C - Audit Ledger</title>
+    <style>
+      .dir-c {
+        --paper: #f6f5ef;
+        --paper-soft: #efeee7;
+        --paper-ink: #fbfaf6;
+        --ink: #141414;
+        --ink-soft: #4b4b45;
+        --ink-faint: #6f6e66;
+        --rule: #c9c7bc;
+        --rule-strong: #9f9c90;
+        --blue: #2357d6;
+        --blue-soft: #e5edff;
+        width: 100%;
+        min-height: 100vh;
+        box-sizing: border-box;
+        overflow: hidden;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+        letter-spacing: 0.01em;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      .dir-c,
+      .dir-c * {
+        box-sizing: border-box;
+        border-radius: 0;
+        box-shadow: none;
+      }
+
+      .dir-c .dir-c__frame {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+        gap: 10px;
+        padding: 18px 20px 16px;
+        background: var(--paper);
+      }
+
+      .dir-c .dir-c__masthead {
+        display: grid;
+        grid-template-columns: repeat(16, minmax(0, 1fr));
+        gap: 12px;
+        align-items: start;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--rule-strong);
+      }
+
+      .dir-c .dir-c__masthead-copy {
+        grid-column: 1 / span 11;
+        min-width: 0;
+        display: grid;
+        gap: 6px;
+      }
+
+      .dir-c .dir-c__eyebrow {
+        margin: 0;
+        color: var(--ink-soft);
+        font-size: 11px;
+        line-height: 1.2;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+      }
+
+      .dir-c .dir-c__title {
+        margin: 0;
+        color: var(--ink);
+        font-size: clamp(30px, 4.1vw, 43px);
+        line-height: 0.94;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        text-wrap: balance;
+      }
+
+      .dir-c .dir-c__subhead {
+        margin: 0;
+        max-width: 38ch;
+        color: var(--ink-soft);
+        font-size: 13px;
+        line-height: 1.45;
+        letter-spacing: 0.04em;
+      }
+
+      .dir-c .dir-c__stamp {
+        grid-column: 12 / span 5;
+        display: grid;
+        gap: 8px;
+        align-content: start;
+        padding: 10px 12px 11px;
+        border: 2px solid var(--blue);
+        background: var(--paper-ink);
+      }
+
+      .dir-c .dir-c__stamp-kicker {
+        color: var(--blue);
+        font-size: 11px;
+        line-height: 1.2;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+
+      .dir-c .dir-c__stamp-body {
+        color: var(--ink);
+        font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 12px;
+        line-height: 1.35;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .dir-c .dir-c__stamp-bars {
+        display: grid;
+        gap: 4px;
+      }
+
+      .dir-c .dir-c__stamp-bars > span {
+        display: block;
+        height: 8px;
+        background: var(--ink);
+      }
+
+      .dir-c .dir-c__stamp-bars > span:nth-child(1) {
+        width: 100%;
+      }
+
+      .dir-c .dir-c__stamp-bars > span:nth-child(2) {
+        width: 84%;
+      }
+
+      .dir-c .dir-c__stamp-bars > span:nth-child(3) {
+        width: 72%;
+      }
+
+      .dir-c .dir-c__stamp-bars > span:nth-child(4) {
+        width: 58%;
+      }
+
+      .dir-c .dir-c__tabs {
+        display: flex;
+        align-items: flex-end;
+        gap: 18px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .dir-c .dir-c__tab {
+        padding-bottom: 7px;
+        color: var(--ink-soft);
+        font-size: 11px;
+        line-height: 1.2;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        font-weight: 600;
+        border-bottom: 2px solid transparent;
+      }
+
+      .dir-c .dir-c__tab--active {
+        color: var(--blue);
+        border-bottom-color: var(--blue);
+      }
+
+      .dir-c .dir-c__contract {
+        display: grid;
+        grid-template-columns: repeat(16, minmax(0, 1fr));
+        gap: 0;
+        background: var(--paper-ink);
+        border: 1px solid var(--rule-strong);
+      }
+
+      .dir-c .dir-c__contract-item {
+        grid-column: span 4;
+        min-width: 0;
+        min-height: 58px;
+        display: grid;
+        align-content: space-between;
+        gap: 7px;
+        padding: 9px 11px 10px;
+        border-right: 1px solid var(--rule-strong);
+        border-bottom: 1px solid var(--rule-strong);
+        background: var(--paper-ink);
+      }
+
+      .dir-c .dir-c__contract-item:nth-child(4n) {
+        border-right: 0;
+      }
+
+      .dir-c .dir-c__contract-item:nth-child(n + 5) {
+        border-bottom: 0;
+      }
+
+      .dir-c .dir-c__contract-label {
+        display: block;
+        color: var(--ink-faint);
+        font-size: 10px;
+        line-height: 1.2;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+
+      .dir-c .dir-c__contract-value {
+        color: var(--ink);
+        font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 12px;
+        line-height: 1.3;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        word-break: break-word;
+      }
+
+      .dir-c .dir-c__contract-value--accent {
+        color: var(--blue);
+      }
+
+      .dir-c .dir-c__surface {
+        display: grid;
+        grid-template-rows: auto auto 1fr;
+        border: 1px solid var(--ink);
+        background: var(--paper-ink);
+        overflow: hidden;
+      }
+
+      .dir-c .dir-c__surface-head {
+        display: grid;
+        grid-template-columns: repeat(16, minmax(0, 1fr));
+        gap: 0;
+        align-items: end;
+        padding: 9px 0 0;
+        border-bottom: 1px solid var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .dir-c .dir-c__surface-kicker {
+        grid-column: 1 / span 11;
+        padding: 0 12px 8px;
+        color: var(--ink);
+        font-size: 12px;
+        line-height: 1.2;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+
+      .dir-c .dir-c__surface-meta {
+        grid-column: 12 / span 5;
+        padding: 0 12px 8px 0;
+        color: var(--ink-soft);
+        font-size: 10px;
+        line-height: 1.3;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        text-align: right;
+      }
+
+      .dir-c .dir-c__ledger-head,
+      .dir-c .dir-c__ledger-row {
+        display: grid;
+        grid-template-columns: repeat(16, minmax(0, 1fr));
+      }
+
+      .dir-c .dir-c__ledger-head {
+        border-bottom: 1px solid var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .dir-c .dir-c__ledger-head > span {
+        min-width: 0;
+        padding: 8px 10px;
+        border-right: 1px solid var(--rule-strong);
+        color: var(--ink-soft);
+        font-size: 10px;
+        line-height: 1.2;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+
+      .dir-c .dir-c__ledger-head > span:last-child {
+        border-right: 0;
+      }
+
+      .dir-c .dir-c__ledger-body {
+        display: grid;
+        grid-template-rows: repeat(4, minmax(0, 1fr));
+      }
+
+      .dir-c .dir-c__ledger-row {
+        min-height: 42px;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .dir-c .dir-c__ledger-row:last-child {
+        border-bottom: 0;
+      }
+
+      .dir-c .dir-c__ledger-cell {
+        min-width: 0;
+        padding: 8px 10px 9px;
+        display: grid;
+        align-content: center;
+        gap: 3px;
+        border-right: 1px solid var(--rule);
+        overflow-wrap: anywhere;
+      }
+
+      .dir-c .dir-c__ledger-cell:last-child {
+        border-right: 0;
+      }
+
+      .dir-c .dir-c__ledger-cell--seq {
+        grid-column: span 1;
+        justify-items: center;
+        background: var(--paper-soft);
+      }
+
+      .dir-c .dir-c__ledger-cell--cursor {
+        grid-column: span 2;
+      }
+
+      .dir-c .dir-c__ledger-cell--batch {
+        grid-column: span 3;
+      }
+
+      .dir-c .dir-c__ledger-cell--state {
+        grid-column: span 2;
+      }
+
+      .dir-c .dir-c__ledger-cell--facts {
+        grid-column: span 4;
+      }
+
+      .dir-c .dir-c__ledger-cell--recovery {
+        grid-column: span 4;
+      }
+
+      .dir-c .dir-c__ledger-label {
+        display: block;
+        color: var(--ink-faint);
+        font-size: 9px;
+        line-height: 1.2;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+
+      .dir-c .dir-c__ledger-value {
+        display: block;
+        color: var(--ink);
+        font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .dir-c .dir-c__ledger-value--accent {
+        color: var(--blue);
+      }
+
+      .dir-c .dir-c__footer {
+        display: grid;
+        grid-template-columns: repeat(16, minmax(0, 1fr));
+        gap: 0;
+        border-top: 1px solid var(--rule-strong);
+        border-left: 1px solid var(--rule-strong);
+        background: var(--paper-ink);
+      }
+
+      .dir-c .dir-c__footer-item {
+        min-width: 0;
+        min-height: 54px;
+        padding: 10px 11px 11px;
+        display: grid;
+        align-content: space-between;
+        gap: 6px;
+        border-right: 1px solid var(--rule-strong);
+        border-bottom: 1px solid var(--rule-strong);
+        background: var(--paper-ink);
+      }
+
+      .dir-c .dir-c__footer-item:nth-child(1) {
+        grid-column: span 5;
+      }
+
+      .dir-c .dir-c__footer-item:nth-child(2) {
+        grid-column: span 5;
+      }
+
+      .dir-c .dir-c__footer-item:nth-child(3) {
+        grid-column: span 6;
+      }
+
+      .dir-c .dir-c__footer-label {
+        color: var(--ink-faint);
+        font-size: 10px;
+        line-height: 1.2;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+
+      .dir-c .dir-c__footer-value {
+        color: var(--ink);
+        font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .dir-c .dir-c__footer-value--accent {
+        color: var(--blue);
+      }
+
+      @media (max-width: 860px) {
+        .dir-c .dir-c__frame {
+          padding: 14px 14px 12px;
+          gap: 8px;
+        }
+
+        .dir-c .dir-c__masthead {
+          gap: 10px;
+        }
+
+        .dir-c .dir-c__masthead-copy {
+          grid-column: 1 / -1;
+        }
+
+        .dir-c .dir-c__stamp {
+          grid-column: 1 / -1;
+        }
+
+        .dir-c .dir-c__contract-item {
+          grid-column: span 8;
+          min-height: 54px;
+        }
+
+        .dir-c .dir-c__ledger-head,
+        .dir-c .dir-c__ledger-row {
+          grid-template-columns: repeat(8, minmax(0, 1fr));
+        }
+
+        .dir-c .dir-c__ledger-cell--seq {
+          grid-column: span 1;
+        }
+
+        .dir-c .dir-c__ledger-cell--cursor {
+          grid-column: span 1;
+        }
+
+        .dir-c .dir-c__ledger-cell--batch {
+          grid-column: span 1;
+        }
+
+        .dir-c .dir-c__ledger-cell--state {
+          grid-column: span 1;
+        }
+
+        .dir-c .dir-c__ledger-cell--facts {
+          grid-column: span 2;
+        }
+
+        .dir-c .dir-c__ledger-cell--recovery {
+          grid-column: span 2;
+        }
+
+        .dir-c .dir-c__footer-item:nth-child(1),
+        .dir-c .dir-c__footer-item:nth-child(2),
+        .dir-c .dir-c__footer-item:nth-child(3) {
+          grid-column: span 8;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .dir-c .dir-c__title {
+          font-size: clamp(26px, 8.6vw, 34px);
+        }
+
+        .dir-c .dir-c__subhead {
+          max-width: none;
+          font-size: 12px;
+        }
+
+        .dir-c .dir-c__contract-item {
+          grid-column: span 8;
+          min-height: 50px;
+          padding: 8px 10px 9px;
+        }
+
+        .dir-c .dir-c__surface-kicker,
+        .dir-c .dir-c__surface-meta {
+          padding-bottom: 7px;
+        }
+
+        .dir-c .dir-c__ledger-head > span,
+        .dir-c .dir-c__ledger-cell,
+        .dir-c .dir-c__footer-item {
+          padding-left: 8px;
+          padding-right: 8px;
+        }
+      }
+    </style>
+  </head>
+  <body style="margin: 0; min-height: 100%; background: #f6f5ef;">
+    <section class="dir-c" data-direction="C" aria-label="Direction C audit ledger mockup">
+      <div class="dir-c__frame">
+        <header class="dir-c__masthead">
+          <div class="dir-c__masthead-copy">
+            <p class="dir-c__eyebrow">Phase 2 / Control Plane Preview</p>
+            <h1 class="dir-c__title">审计账簿</h1>
+            <p class="dir-c__subhead">Audit Ledger for a paper-only control plane. Live authority is closed, projection is complete, and the preview stays honest about unavailable signals.</p>
+          </div>
+          <div class="dir-c__stamp" aria-label="Redacted audit stamp">
+            <span class="dir-c__stamp-kicker">Redacted Audit Stamp</span>
+            <span class="dir-c__stamp-body">Archive Only / No Live Write</span>
+            <span class="dir-c__stamp-bars" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+            </span>
+          </div>
+        </header>
+
+        <nav class="dir-c__tabs" aria-label="Preview sections">
+          <span class="dir-c__tab dir-c__tab--active">Overview</span>
+          <span class="dir-c__tab">Executions</span>
+          <span class="dir-c__tab">Integrations</span>
+        </nav>
+
+        <dl class="dir-c__contract" aria-label="Execution contract">
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Mode</dt>
+            <dd class="dir-c__contract-value dir-c__contract-value--accent">Paper-only</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Authority</dt>
+            <dd class="dir-c__contract-value">Live authority closed</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Projection</dt>
+            <dd class="dir-c__contract-value">Complete</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Journal ID</dt>
+            <dd class="dir-c__contract-value">C-LEDGER-0724</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Head Seq</dt>
+            <dd class="dir-c__contract-value">H-01 / H-07 / H-03</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Recovery</dt>
+            <dd class="dir-c__contract-value dir-c__contract-value--accent">Required</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">P&amp;L</dt>
+            <dd class="dir-c__contract-value">Not disclosed</dd>
+          </div>
+          <div class="dir-c__contract-item">
+            <dt class="dir-c__contract-label">Health</dt>
+            <dd class="dir-c__contract-value">Unavailable</dd>
+          </div>
+        </dl>
+
+        <section class="dir-c__surface" aria-label="Execution ledger">
+          <div class="dir-c__surface-head">
+            <div class="dir-c__surface-kicker">Execution Ledger</div>
+            <div class="dir-c__surface-meta">Ruled table / batch state / recovery directive</div>
+          </div>
+
+          <div class="dir-c__ledger-head" role="row">
+            <span class="dir-c__ledger-cell--seq">Seq</span>
+            <span class="dir-c__ledger-cell--cursor">Cursor</span>
+            <span class="dir-c__ledger-cell--batch">Batch</span>
+            <span class="dir-c__ledger-cell--state">State</span>
+            <span class="dir-c__ledger-cell--facts">Execution Facts</span>
+            <span class="dir-c__ledger-cell--recovery">Recovery Directive</span>
+          </div>
+
+          <div class="dir-c__ledger-body" role="rowgroup">
+            <div class="dir-c__ledger-row" role="row">
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--seq">
+                <span class="dir-c__ledger-label">Seq</span>
+                <span class="dir-c__ledger-value">01</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--cursor">
+                <span class="dir-c__ledger-label">Cursor</span>
+                <span class="dir-c__ledger-value">CUR-01A</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--batch">
+                <span class="dir-c__ledger-label">Batch</span>
+                <span class="dir-c__ledger-value">SETTLE-17</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--state">
+                <span class="dir-c__ledger-label">State</span>
+                <span class="dir-c__ledger-value dir-c__ledger-value--accent">Locked</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--facts">
+                <span class="dir-c__ledger-label">Execution Facts</span>
+                <span class="dir-c__ledger-value">Paper-only / projection complete / journal trace sealed.</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--recovery">
+                <span class="dir-c__ledger-label">Recovery Directive</span>
+                <span class="dir-c__ledger-value">Replay from head, then reconcile the venue bridge.</span>
+              </div>
+            </div>
+
+            <div class="dir-c__ledger-row" role="row">
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--seq">
+                <span class="dir-c__ledger-label">Seq</span>
+                <span class="dir-c__ledger-value">02</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--cursor">
+                <span class="dir-c__ledger-label">Cursor</span>
+                <span class="dir-c__ledger-value">CUR-02B</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--batch">
+                <span class="dir-c__ledger-label">Batch</span>
+                <span class="dir-c__ledger-value">VENUE-03</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--state">
+                <span class="dir-c__ledger-label">State</span>
+                <span class="dir-c__ledger-value">Sealed</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--facts">
+                <span class="dir-c__ledger-label">Execution Facts</span>
+                <span class="dir-c__ledger-value">Live authority closed / health signal unavailable / no P&amp;L claim.</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--recovery">
+                <span class="dir-c__ledger-label">Recovery Directive</span>
+                <span class="dir-c__ledger-value">Restore the adapter record before any new write path opens.</span>
+              </div>
+            </div>
+
+            <div class="dir-c__ledger-row" role="row">
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--seq">
+                <span class="dir-c__ledger-label">Seq</span>
+                <span class="dir-c__ledger-value">03</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--cursor">
+                <span class="dir-c__ledger-label">Cursor</span>
+                <span class="dir-c__ledger-value">CUR-03C</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--batch">
+                <span class="dir-c__ledger-label">Batch</span>
+                <span class="dir-c__ledger-value">ARCHIVE-11</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--state">
+                <span class="dir-c__ledger-label">State</span>
+                <span class="dir-c__ledger-value">Queued</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--facts">
+                <span class="dir-c__ledger-label">Execution Facts</span>
+                <span class="dir-c__ledger-value">Overview stays visible; execution rows keep the project vocabulary intact.</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--recovery">
+                <span class="dir-c__ledger-label">Recovery Directive</span>
+                <span class="dir-c__ledger-value">Rebuild the journal head, then restamp the sequence.</span>
+              </div>
+            </div>
+
+            <div class="dir-c__ledger-row" role="row">
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--seq">
+                <span class="dir-c__ledger-label">Seq</span>
+                <span class="dir-c__ledger-value">04</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--cursor">
+                <span class="dir-c__ledger-label">Cursor</span>
+                <span class="dir-c__ledger-value">CUR-04D</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--batch">
+                <span class="dir-c__ledger-label">Batch</span>
+                <span class="dir-c__ledger-value">RECOVER-02</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--state">
+                <span class="dir-c__ledger-label">State</span>
+                <span class="dir-c__ledger-value dir-c__ledger-value--accent">Review</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--facts">
+                <span class="dir-c__ledger-label">Execution Facts</span>
+                <span class="dir-c__ledger-value">Batch state and recovery directive are the visible truth on this screen.</span>
+              </div>
+              <div class="dir-c__ledger-cell dir-c__ledger-cell--recovery">
+                <span class="dir-c__ledger-label">Recovery Directive</span>
+                <span class="dir-c__ledger-value">Apply operator sign-off, then resume the audit ledger.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <footer class="dir-c__footer" aria-label="Integration summary">
+          <div class="dir-c__footer-item">
+            <span class="dir-c__footer-label">Overview</span>
+            <span class="dir-c__footer-value">Journal identity, head sequence, and the closed authority contract.</span>
+          </div>
+          <div class="dir-c__footer-item">
+            <span class="dir-c__footer-label">Executions</span>
+            <span class="dir-c__footer-value">Ruled rows for batch state, execution facts, and recovery directives.</span>
+          </div>
+          <div class="dir-c__footer-item">
+            <span class="dir-c__footer-label">Integrations</span>
+            <span class="dir-c__footer-value dir-c__footer-value--accent">Rust core / venue adapters / archive sink.</span>
+          </div>
+        </footer>
+      </div>
+    </section>
+  </body>
+</html>
