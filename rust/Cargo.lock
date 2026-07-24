@@ -337,6 +337,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-trading-control-plane"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crypto-trading-runtime",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "crypto-trading-domain"
 version = "0.1.0"
 dependencies = [

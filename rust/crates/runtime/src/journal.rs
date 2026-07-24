@@ -88,11 +88,13 @@ struct EventIntegrityWire {
     checksum: String,
 }
 
-/// Versioned journal envelope shared by future CLI, HTTP, and SSE adapters.
+/// Versioned journal envelope consumed by trusted journal/control-plane adapters.
 ///
 /// `sequence` is the only ordering authority. `recorded_at` is descriptive and
 /// must never be used to repair or reorder a stream. The integrity checksum
 /// detects accidental mutation; it is not a signature and conveys no trust.
+/// Operator transports must project or redact payloads instead of serializing
+/// this internal envelope directly.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OperationEventEnvelope {
     schema_version: u16,

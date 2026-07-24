@@ -244,7 +244,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 交付：
 
-- [ ] Control Plane 深模块及合约测试。
+- [x] Control Plane 深模块及合约测试。
 - [ ] 只读 HTTP/SSE adapter。
 - [ ] Phase 2 四方向设计预览、用户选择、项目级 `DESIGN.md`。
 - [ ] Overview / Executions / Integrations 首版。
@@ -255,6 +255,16 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - 离线 fixture 端到端可用；断流重连可从 cursor 恢复。
 - UI 在桌面与移动端完成加载/空/错误/过期/部分失败验收。
 - 任何 HTTP 调用都不能构造 live authority。
+
+当前进度（2026-07-24）：
+
+- [x] 新增独立 `crypto-trading-control-plane` 只读 crate；trusted bootstrap 只注入
+  `Arc<JournalSnapshotSource + Send + Sync>`，外部 adapter 不接触路径或执行原语。
+- [x] `snapshot()` 与 `capabilities()` 保持确定性和 capability 单一事实源；
+  `events_after(cursor)` 只返回 bounded event notice 与 opaque cursor，不向 transport
+  透传 journal payload。
+- [ ] 下一条 tracer-bullet：实现只读 HTTP adapter 的 system/capabilities/executions
+  合约、loopback 默认绑定和统一安全错误/headers，再接整页 SSE notice。
 
 ### M3：连续只读监控、Alert 与 Scanner
 

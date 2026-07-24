@@ -1,0 +1,179 @@
+//! Least-authority, read-only seam for operator-facing adapters.
+//!
+//! Trusted bootstrap code injects a bounded journal source once. HTTP, SSE,
+//! CLI, and future desktop adapters consume this facade instead of receiving
+//! filesystem paths or execution primitives.
+//!
+//! Journal payloads remain inside the trusted boundary. Event consumers receive
+//! bounded notices and then refetch the operator snapshot; transports do not
+//! choose their own payload-redaction policy.
+
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use crypto_trading_runtime::{
+    CapabilityError, CapabilityManifest, CursorError, JournalPageBoundary, JournalReadError,
+    JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope, OperatorReadModel,
+    ReadModelError, current_capability_manifest,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
+
+/// Thread-safe source handle constructed only by trusted bootstrap code.
+pub type SharedJournalSnapshotSource = dyn JournalSnapshotSource + Send + Sync;
+
+/// Read-only facade presented to transport adapters.
+#[derive(Clone)]
+pub struct ReadControlPlane {
+    journal: Arc<SharedJournalSnapshotSource>,
+    capabilities: CapabilityManifest,
+}
+
+impl ReadControlPlane {
+    /// Builds a read-only control plane from a trusted, bounded source.
+    ///
+    /// The current capability manifest is validated once and retained as the
+    /// only authority snapshot exposed through this instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityError`] if the build's capability source would
+    /// advertise an invalid or expanded authority.
+    pub fn new(journal: Arc<SharedJournalSnapshotSource>) -> Result<Self, CapabilityError> {
+        let capabilities = current_capability_manifest();
+        capabilities.validate()?;
+        Ok(Self {
+            journal,
+            capabilities,
+        })
+    }
+
+    /// Returns the validated capability single source of truth.
+    #[must_use]
+    pub const fn capabilities(&self) -> &CapabilityManifest {
+        &self.capabilities
+    }
+
+    /// Captures one immutable journal generation and projects its operator
+    /// state without adding wall-clock-dependent fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlPlaneSnapshotError`] when the source cannot be
+    /// captured or its durable execution facts cannot be projected safely.
+    pub fn snapshot(&self) -> Result<ControlPlaneSnapshot, ControlPlaneSnapshotError> {
+        let journal = self.journal.snapshot()?;
+        let operator = OperatorReadModel::from_legacy_snapshot(&journal)?;
+        Ok(ControlPlaneSnapshot {
+            schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
+            capabilities: self.capabilities.clone(),
+            operator,
+        })
+    }
+
+    /// Reads one bounded, payload-redacted event page after an opaque cursor.
+    ///
+    /// `cursor` is decoded and validated here so transport adapters never
+    /// depend on its representation or silently restart an expired stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlPlaneEventsError::Cursor`] for malformed or expired
+    /// cursors and [`ControlPlaneEventsError::Journal`] for source or durable
+    /// record failures.
+    pub fn events_after(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<ControlPlaneEventsPage, ControlPlaneEventsError> {
+        let cursor = cursor
+            .map(str::parse)
+            .transpose()
+            .map_err(ControlPlaneEventsError::Cursor)?;
+        let snapshot = self.journal.snapshot()?;
+        let page =
+            LegacyJsonlJournalReader::read_page(&snapshot, cursor.as_ref()).map_err(|error| {
+                match error {
+                    JournalReadError::Cursor(source) => ControlPlaneEventsError::Cursor(source),
+                    source => ControlPlaneEventsError::Journal(source),
+                }
+            })?;
+        Ok(ControlPlaneEventsPage {
+            schema_version: CONTROL_PLANE_EVENTS_SCHEMA_VERSION,
+            journal_id: page.journal_id(),
+            events: page
+                .events()
+                .iter()
+                .map(ControlPlaneEventNotice::from)
+                .collect(),
+            next_cursor: page.next_cursor().map(ToString::to_string),
+            boundary: page.boundary().clone(),
+        })
+    }
+}
+
+/// Deterministic operator snapshot consumed by read-only adapters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneSnapshot {
+    pub schema_version: u16,
+    pub capabilities: CapabilityManifest,
+    pub operator: OperatorReadModel,
+}
+
+/// Payload-free notification that tells an adapter which snapshot fact changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneEventNotice {
+    pub sequence: u64,
+    pub event_id: Uuid,
+    pub recorded_at: DateTime<Utc>,
+    pub kind: String,
+    pub aggregate_kind: String,
+    pub aggregate_id: Uuid,
+    pub producer: String,
+}
+
+impl From<&OperationEventEnvelope> for ControlPlaneEventNotice {
+    fn from(event: &OperationEventEnvelope) -> Self {
+        Self {
+            sequence: event.sequence(),
+            event_id: event.event_id(),
+            recorded_at: event.recorded_at(),
+            kind: event.kind().to_owned(),
+            aggregate_kind: event.aggregate().kind().to_owned(),
+            aggregate_id: event.aggregate().id(),
+            producer: event.producer().to_owned(),
+        }
+    }
+}
+
+/// One bounded event page with an opaque resume cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneEventsPage {
+    pub schema_version: u16,
+    pub journal_id: Uuid,
+    pub events: Vec<ControlPlaneEventNotice>,
+    pub next_cursor: Option<String>,
+    pub boundary: JournalPageBoundary,
+}
+
+#[derive(Debug, Error)]
+pub enum ControlPlaneSnapshotError {
+    #[error(transparent)]
+    Journal(#[from] JournalReadError),
+    #[error(transparent)]
+    Projection(#[from] ReadModelError),
+}
+
+#[derive(Debug, Error)]
+pub enum ControlPlaneEventsError {
+    #[error(transparent)]
+    Cursor(CursorError),
+    #[error(transparent)]
+    Journal(#[from] JournalReadError),
+}

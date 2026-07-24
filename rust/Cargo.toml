@@ -2,6 +2,7 @@
 members = [
     "crates/apps",
     "crates/config",
+    "crates/control-plane",
     "crates/domain",
     "crates/exchange",
     "crates/runtime",
