@@ -5,6 +5,12 @@
 //! journal before another mutation is admitted. It is still a **process-local
 //! single-writer contract**: opening the same history from multiple processes
 //! is unsupported and must remain unavailable at CLI/service boundaries.
+//!
+//! The repository keeps that boundary explicit instead of inventing a
+//! lockfile-based lease. With `rust-version = 1.85.0`,
+//! `unsafe_code = "forbid"`, and no extra file-locking dependency,
+//! `std::fs::File::lock` is still unstable, so this module cannot honestly
+//! promise recoverable cross-process writer exclusion yet.
 
 use std::{
     collections::HashMap,
@@ -503,7 +509,9 @@ impl PaperAccountAuthority {
     /// Every paper-account fact is bound to `journal_id`; reopening a history
     /// under another generation degrades the projection and closes writes.
     /// This does not provide a cross-process file lock. Callers must keep this
-    /// authority inaccessible from multi-process CLI/service write surfaces.
+    /// authority inaccessible from multi-process CLI/service write surfaces. On
+    /// Rust 1.85.0 the standard-library file-lock API is still unstable, so
+    /// this restriction is deliberate rather than an accidental omission.
     ///
     /// # Errors
     ///

@@ -104,6 +104,12 @@ pub struct DecisionRecord {
 /// serialized; recovery-critical multi-process deployments need a transactional
 /// journal or an external single-writer service.
 ///
+/// This crate intentionally does not emulate an OS file lease with lockfiles or
+/// PID metadata. Under the current repository constraints (`rust-version =
+/// 1.85.0`, `unsafe_code = "forbid"`, and no new dependency for platform file
+/// locking), `std::fs::File::lock` is still unstable, so a recoverable
+/// cross-process writer exclusion cannot be claimed honestly here.
+///
 /// Locks are keyed by normalized paths rather than filesystem object identity.
 /// Existing hard links and paths retargeted after construction can therefore
 /// still refer to one file through separate locks. Windows case folding is a

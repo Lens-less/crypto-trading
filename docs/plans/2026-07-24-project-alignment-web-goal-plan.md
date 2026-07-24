@@ -474,6 +474,10 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 - `JsonlHistory` 仍只有进程内单写者保证；journal generation 已随事实持久化并在误配时
   失败关闭，但跨进程 writer exclusion、journal rotation 后的永久 idempotency 索引尚未交付。
+  这一点已在 Friday, July 24, 2026 用 `rustup run 1.85.0 rustc` 探针再次确认：
+  `std::fs::File::lock` 仍属于 unstable `file_lock`，所以在当前 `rust-version = 1.85.0`、
+  `unsafe_code = "forbid"`、无新增依赖的约束下，不能诚实宣称存在可恢复的 std-only
+  cross-process writer lease。
 - v1 authority 只拥有 paper 容量和 reservation/committed exposure，不拥有真实 exchange
   equity、margin、mark-to-market 或 position truth；`risk.account-authority` 不能因此提升为可用。
 - 普通 release 只允许 pending/uncertain reservation；committed exposure 必须等待后续携带
