@@ -733,8 +733,13 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 CapabilityAccess::MainnetTrading,
             ),
             "Supervised continuous strategy lifecycle with cancellation and restart recovery.",
-            &["No continuous runtime supervisor is implemented."],
-            &["rust/crates/apps/src/command.rs", "rust/README.md"],
+            &[
+                "Only a read-only market-source supervisor exists; strategy lifecycle, durable task registration, and restart recovery are not implemented.",
+            ],
+            &[
+                "rust/crates/runtime/src/market_supervisor.rs",
+                "rust/crates/runtime/tests/market_supervisor_contract.rs",
+            ],
         ),
         capability(
             "runtime.grid",
@@ -778,16 +783,23 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             CapabilityArea::Runtime,
             CapabilityLevel::ReadOnly,
             scope(
-                &[CapabilityEnvironment::Offline, CapabilityEnvironment::Paper],
+                &[
+                    CapabilityEnvironment::Offline,
+                    CapabilityEnvironment::Paper,
+                    CapabilityEnvironment::Mainnet,
+                ],
                 CapabilityAccess::MarketData,
             ),
-            "Bounded exact-universe market book with freshness, continuity, deterministic replay, and subscription-gap adapters.",
+            "Bounded exact-universe market book with freshness, continuity, deterministic replay, subscription gaps, and credential-free Binance Spot polling.",
             &[
-                "External polling and reconnect supervision are not yet wired through this read plane.",
+                "Only Binance Spot public polling is implemented; multi-venue composition and durable supervisor status projection remain unavailable.",
             ],
             &[
                 "rust/crates/runtime/src/market_data.rs",
+                "rust/crates/runtime/src/market_polling.rs",
+                "rust/crates/runtime/src/market_supervisor.rs",
                 "rust/crates/runtime/tests/market_data_contract.rs",
+                "rust/crates/runtime/tests/market_supervisor_contract.rs",
             ],
         ),
         capability(
@@ -796,7 +808,9 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             CapabilityLevel::ReadOnly,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Finite continuous read-only arbitrage replay with one event per market input and a bounded operator projection.",
-            &["External venue polling and long-lived restart supervision remain unavailable."],
+            &[
+                "The Binance polling supervisor is not yet composed with a second real venue, the arbitrage monitor journal, or durable restart recovery.",
+            ],
             &[
                 "rust/crates/apps/src/command.rs",
                 "rust/crates/apps/src/monitor.rs",

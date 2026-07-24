@@ -75,7 +75,32 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
     assert_eq!(market_data.scope.access, CapabilityAccess::MarketData);
     assert_eq!(
         market_data.scope.environments,
-        vec![CapabilityEnvironment::Offline, CapabilityEnvironment::Paper]
+        vec![
+            CapabilityEnvironment::Offline,
+            CapabilityEnvironment::Paper,
+            CapabilityEnvironment::Mainnet
+        ]
+    );
+    assert!(
+        market_data
+            .evidence
+            .contains(&"rust/crates/runtime/src/market_supervisor.rs".to_owned())
+    );
+    assert!(
+        market_data
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Only Binance Spot public polling"))
+    );
+
+    let continuous = manifest.capability("runtime.continuous").unwrap();
+    assert_eq!(continuous.level, CapabilityLevel::Unavailable);
+    assert_eq!(continuous.scope.access, CapabilityAccess::MainnetTrading);
+    assert!(
+        continuous
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Only a read-only market-source supervisor"))
     );
 
     let web = manifest.capability("control-plane.web").unwrap();

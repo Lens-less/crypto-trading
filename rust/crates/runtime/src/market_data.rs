@@ -19,7 +19,7 @@ pub const MAX_MARKET_DATA_TARGETS: usize = 4_096;
 pub const MAX_MARKET_DATA_EVENTS: usize = 8_192;
 
 const MAX_EXCHANGE_NAME_BYTES: usize = 128;
-const MAX_MARKET_SYMBOL_BYTES: usize = 128;
+pub(crate) const MAX_MARKET_SYMBOL_BYTES: usize = 128;
 
 /// Exact market identity used by the read-only market-data plane.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -330,6 +330,24 @@ pub enum MarketDataEvent {
 }
 
 impl MarketDataEvent {
+    /// Returns the stable source identity carried by this event.
+    pub fn exchange(&self) -> &str {
+        match self {
+            Self::Observation(observation) => observation.snapshot.exchange(),
+            Self::SourceGap { exchange, .. } | Self::SourceUnavailable { exchange, .. } => exchange,
+        }
+    }
+
+    /// Returns when this event was observed by the runtime.
+    pub fn observed_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Observation(observation) => observation.received_at,
+            Self::SourceGap { observed_at, .. } | Self::SourceUnavailable { observed_at, .. } => {
+                *observed_at
+            }
+        }
+    }
+
     /// Creates an explicit source-wide continuity gap.
     ///
     /// # Errors
@@ -814,6 +832,11 @@ impl SubscriptionMarketDataAdapter {
         })
     }
 
+    /// Returns the exact source identity bound during construction.
+    pub fn exchange(&self) -> &str {
+        &self.exchange
+    }
+
     /// Waits for and translates the next bounded subscription outcome.
     ///
     /// Lag and disconnect errors become explicit events instead of being
@@ -860,7 +883,7 @@ impl SubscriptionMarketDataAdapter {
     }
 }
 
-fn classify_exchange_failure(error: &ExchangeError) -> MarketDataSourceFailure {
+pub(crate) fn classify_exchange_failure(error: &ExchangeError) -> MarketDataSourceFailure {
     match error {
         ExchangeError::Unavailable { .. } | ExchangeError::RemoteFailure { .. } => {
             MarketDataSourceFailure::Disconnected
@@ -874,7 +897,7 @@ fn classify_exchange_failure(error: &ExchangeError) -> MarketDataSourceFailure {
     }
 }
 
-fn validated_exchange(exchange: impl Into<String>) -> Result<String, MarketDataError> {
+pub(crate) fn validated_exchange(exchange: impl Into<String>) -> Result<String, MarketDataError> {
     let exchange = exchange.into();
     let trimmed = exchange.trim();
     if trimmed.is_empty() {
@@ -921,6 +944,14 @@ pub enum MarketDataError {
     GenerationExhausted,
     #[error("market-data event buffer has {count} entries; maximum is {limit}")]
     EventBufferTooLarge { count: usize, limit: usize },
+    #[error("invalid market-data polling policy: {0}")]
+    InvalidPollingPolicy(&'static str),
+    #[error("polling is unsupported for instrument {instrument:?}")]
+    UnsupportedPollingInstrument { instrument: MarketInstrument },
+    #[error("polling route for instrument {instrument:?} is duplicated")]
+    DuplicatePollingInstrument { instrument: MarketInstrument },
+    #[error("polling wire symbol {symbol} is mapped more than once")]
+    DuplicatePollingWireSymbol { symbol: Symbol },
     #[error("instrument {instrument:?} is outside the bound market-data universe")]
     InstrumentOutsideUniverse { instrument: MarketInstrument },
     #[error("market-data source {exchange} has no instruments in the bound universe")]

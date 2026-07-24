@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：M2 已完成，M3 待执行（M0、M1 已完成）
+> 状态：M3 进行中（M0、M1、M2 已完成）
 >
 > 日期：2026-07-24
 >
@@ -300,7 +300,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 交付：
 
-- [ ] 统一 market-data provider 能力与 freshness。
+- [x] 统一 market-data provider 能力与 freshness。
 - [ ] Arbitrage monitor 连续只读事件。
 - [ ] Price alert 冷却、去重、确认和持久化。
 - [ ] Virtual-grid scanner 的确定性排行。
@@ -321,13 +321,24 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   Execution SSE 只标记为“操作通知已连接”，不得把 monitor 抬升为“实时/新鲜”。
 - [x] Web 真实浏览器复核覆盖桌面与 250 CSS px 极窄视口；长交易对和小数证据完整换行，
   页面无横向溢出、应用自身 console error 为 0。
-- [ ] 后续 tracer：真实外部 venue polling/reconnect 与长驻 supervisor、Price Alert、
-  Virtual-grid Scanner、通知 adapter；完成这些之前 M3 保持未退出。
+
+第二条 tracer 证据（仍不等同于 M3 全部完成）：
+
+- [x] `BinancePublicPollingSource` 复用无凭证 Binance Spot public HTTP adapter，并要求
+  canonical instrument 与 wire symbol 的显式、有界、一一映射；非 Binance、非 Spot、
+  重复 instrument 或重复 wire symbol 均在发起网络请求前失败关闭。
+- [x] 远端 429/5xx/invalid payload 只生成 `SourceUnavailable`，不伪造行情；确定性指数退避
+  有一小时硬上限，恢复成功后才递增 revision，并重新通过现有 freshness/continuity book。
+- [x] source-neutral `MarketSupervisor` 隐藏 task/watch/select 细节，只暴露
+  `start / next_event / status / stop`；latest-value retention 为 O(1)，慢消费者先收到显式
+  `SourceGap` 再收到最新事件，请求进行中和长退避均可在 bounded grace 内取消。
+- [ ] 后续 tracer：把真实 source 组合进可审计的多 venue monitor 与 durable task projection，
+  再完成 Price Alert、Virtual-grid Scanner、通知 adapter；完成这些之前 M3 保持未退出。
 
 退出条件：
 
-- 网络断开、乱序、重复、过期行情和慢消费者均有测试。
-- 通知失败只影响通知状态，不影响监控主循环。
+- [x] 网络断开、乱序、重复、过期行情和慢消费者均有测试。
+- [ ] 通知失败只影响通知状态，不影响监控主循环。
 
 ### M4：连续 Paper Supervisor
 

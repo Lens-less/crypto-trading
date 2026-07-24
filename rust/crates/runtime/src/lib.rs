@@ -6,6 +6,8 @@ mod history;
 mod journal;
 mod journal_reader;
 mod market_data;
+mod market_polling;
+mod market_supervisor;
 mod mode;
 mod monitor_read_model;
 mod read_model;
@@ -42,6 +44,12 @@ pub use market_data::{
     MarketDataUpdate, MarketDataView, MarketFreshnessPolicy, MarketInstrument,
     MarketInstrumentView, MarketUniverse, ObservedMarketPair, SubscriptionMarketDataAdapter,
     SystemMarketDataClock,
+};
+pub use market_polling::{BinancePollingRoute, BinancePublicPollingSource, MarketPollingPolicy};
+pub use market_supervisor::{
+    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEventFuture, MarketDataEventSource,
+    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
+    MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
 };
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
 pub use monitor_read_model::{
