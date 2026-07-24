@@ -188,11 +188,11 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 交付：
 
-- [ ] 把三仓能力矩阵变成机器可检查的 `capabilities` 清单。
+- [x] 把三仓能力矩阵变成机器可检查的 `capabilities` 清单。
 - [x] 为 60 份配置记录 `parseable / executable / consumed-fields / runtime` 状态。
-- [ ] 发布 adapter 支持矩阵：public data / testnet protocol / authenticated /
+- [x] 发布 adapter 支持矩阵：public data / testnet protocol / authenticated /
   reconcile / live。
-- [ ] CI 增加可重复的干净构建检查，避免旧增量产物假阴性。
+- [x] CI 增加可重复的干净构建检查，避免旧增量产物假阴性。
 
 退出条件：
 
@@ -204,7 +204,11 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] 建立版本化 capability schema、运行时单一事实源，以及 CLI 人类/JSON 两种输出。
 - [x] 用契约测试锁定 `paper-only`、`live_trading_enabled=false` 和未授权能力失败关闭。
 - [x] `config-check config --json` 稳定输出 60 条迁移账本，并由端到端测试锁定数量和代表性状态。
-- [ ] 把 adapter 验证证据与 README/页面校验接入同一能力清单后，再关闭本里程碑的能力矩阵任务。
+- [x] adapter 验证证据、CLI、README 和文档矩阵均接入同一能力清单；
+  Web Integrations 页被约束为后续消费同一 manifest。
+- [x] 在全新 Windows worktree 与起始不存在的独立 target 中通过 `fmt`、
+  workspace `check`、`clippy -D warnings`、323 个 workspace tests、doc tests、
+  release build 与 `cargo audit`；CI 中 RustSec audit 保持独立、与 target 无关的门禁。
 
 ### M1：Journal 与 Operator Read Model
 
