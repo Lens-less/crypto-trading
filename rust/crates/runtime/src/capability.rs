@@ -824,15 +824,20 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
         capability(
             "runtime.price-alert",
             CapabilityArea::Runtime,
-            CapabilityLevel::ValidateOnly,
+            CapabilityLevel::ReadOnly,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Price-alert configuration loading and validation.",
+            "Bounded multi-symbol price-alert evaluation with durable samples, cooldowns, acknowledgements, a stable read model, and isolated local delivery adapters.",
             &[
-                "Continuous evaluation, cooldown persistence, and notifications are not implemented.",
+                "No CLI or market-source supervisor composition and no durable task lifecycle are available.",
+                "The JSONL alert journal has no rotation or compaction; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
             ],
             &[
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/strategy/src/alert.rs",
+                "rust/crates/apps/src/alert/mod.rs",
+                "rust/crates/apps/src/alert/journal.rs",
+                "rust/crates/apps/src/alert/notification.rs",
+                "rust/crates/apps/tests/alert_runtime_contract.rs",
+                "rust/crates/runtime/src/alert_read_model.rs",
+                "rust/crates/runtime/tests/alert_read_model_contract.rs",
             ],
         ),
         capability(

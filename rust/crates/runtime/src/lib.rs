@@ -1,5 +1,6 @@
 //! Supervised runtime and process-local synchronized decision history.
 
+mod alert_read_model;
 mod capability;
 mod execution;
 mod history;
@@ -12,6 +13,11 @@ mod mode;
 mod monitor_read_model;
 mod read_model;
 
+pub use alert_read_model::{
+    AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
+    AlertOccurrenceView, MAX_ALERT_READ_MODEL_OCCURRENCES, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
+    PriceAlertReadModel,
+};
 pub use capability::{
     AdapterFacet, AdapterFacetSupport, AdapterSupport, AdapterSupportLevel,
     CAPABILITY_SCHEMA_VERSION, Capability, CapabilityAccess, CapabilityArea, CapabilityEnvironment,

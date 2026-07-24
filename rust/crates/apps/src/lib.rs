@@ -1,5 +1,6 @@
 //! Unified command-line surface for the Rust runtime.
 
+pub mod alert;
 pub mod cli;
 pub mod command;
 pub mod monitor;
