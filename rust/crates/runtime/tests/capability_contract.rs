@@ -70,6 +70,25 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
         vec![CapabilityEnvironment::Offline]
     );
 
+    let price_alert = manifest.capability("runtime.price-alert").unwrap();
+    assert_eq!(price_alert.level, CapabilityLevel::ReadOnly);
+    assert_eq!(
+        price_alert.scope.environments,
+        vec![CapabilityEnvironment::Offline]
+    );
+    assert_eq!(price_alert.scope.access, CapabilityAccess::Local);
+    assert!(
+        price_alert
+            .evidence
+            .contains(&"rust/crates/runtime/src/alert_read_model.rs".to_owned())
+    );
+    assert!(
+        price_alert
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("No CLI or market-source supervisor composition"))
+    );
+
     let market_data = manifest.capability("runtime.market-data").unwrap();
     assert_eq!(market_data.level, CapabilityLevel::ReadOnly);
     assert_eq!(market_data.scope.access, CapabilityAccess::MarketData);

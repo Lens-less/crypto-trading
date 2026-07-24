@@ -14,8 +14,8 @@ use crypto_trading_cli::alert::{
     AlertAcknowledgementOutcome, AlertDeliveryMode, AlertNotification, AlertNotificationAdapter,
     AlertNotificationFuture, AlertOccurrenceId, DeterministicNotificationAdapter,
     LocalNoticeNotificationAdapter, NotificationConfigError, NotificationDispatcherConfig,
-    NotificationEnqueueState, NotificationFailure, PriceAlertRuntime, PriceAlertRuntimeConfig,
-    PriceAlertRuntimeError,
+    NotificationDispatcherExit, NotificationEnqueueState, NotificationFailure, PriceAlertRuntime,
+    PriceAlertRuntimeConfig, PriceAlertRuntimeError,
 };
 use crypto_trading_config::{
     PriceAlertConfig, PriceAlertSymbolConfig, PriceThresholdConfig, VolatilityAlertConfig,
@@ -120,6 +120,44 @@ fn dispatch_construction_without_tokio_runtime_fails_closed() {
     remove_file(&path);
 }
 
+#[test]
+fn runtime_rejects_unsafe_identity_and_unrecoverable_sampling_budget() {
+    let path = temp_path("alert-invalid-config");
+    let clock = Arc::new(TestClock::new(timestamp(0)));
+    let runtime_config =
+        PriceAlertRuntimeConfig::new(AlertDeliveryMode::JournalOnly, dispatcher_config(1), 1)
+            .unwrap();
+
+    let mut unsafe_identity = threshold_config(0);
+    unsafe_identity.exchange = "binance\u{1b}[2J".to_owned();
+    let error = PriceAlertRuntime::new(
+        &unsafe_identity,
+        MarketFreshnessPolicy::new(Duration::seconds(300), Duration::seconds(1)).unwrap(),
+        Arc::clone(&clock),
+        JsonlHistory::new(&path),
+        runtime_config,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, PriceAlertRuntimeError::InvalidConfig(_)));
+
+    let mut oversized_window = volatility_config(0);
+    oversized_window.symbols[0]
+        .volatility_alert
+        .time_window_seconds = 1_000_000;
+    let error = PriceAlertRuntime::new(
+        &oversized_window,
+        MarketFreshnessPolicy::new(Duration::seconds(300), Duration::seconds(1)).unwrap(),
+        clock,
+        JsonlHistory::new(&path),
+        runtime_config,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, PriceAlertRuntimeError::InvalidConfig(_)));
+    remove_file(&path);
+}
+
 #[tokio::test]
 async fn ready_samples_persist_occurrences_and_cooldown_suppresses_duplicates() {
     let path = temp_path("alert-cooldown");
@@ -174,7 +212,7 @@ async fn ready_samples_persist_occurrences_and_cooldown_suppresses_duplicates() 
         .unwrap();
     assert_eq!(after_cooldown.occurrences.len(), 1);
 
-    runtime.stop().await;
+    assert_eq!(runtime.stop().await, NotificationDispatcherExit::Drained);
     assert_eq!(probe.deliveries().len(), 2);
     let records = records(&path);
     assert_eq!(decision_count(&records, "price_alert_sampled"), 3);
@@ -306,7 +344,10 @@ async fn full_or_stuck_notification_adapter_never_blocks_the_monitor_loop() {
         decision_count(&records(&path), "price_alert_delivery_dropped"),
         1
     );
-    runtime.stop().await;
+    assert_eq!(
+        runtime.stop().await,
+        NotificationDispatcherExit::AbortedAfterGrace
+    );
     remove_file(&path);
 }
 

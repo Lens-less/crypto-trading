@@ -302,9 +302,9 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 - [x] 统一 market-data provider 能力与 freshness。
 - [ ] Arbitrage monitor 连续只读事件。
-- [ ] Price alert 冷却、去重、确认和持久化。
+- [x] Price alert 冷却、去重、确认和持久化。
 - [ ] Virtual-grid scanner 的确定性排行。
-- [ ] 非阻塞通知 adapter；至少一个本地 adapter 和一个 deterministic adapter。
+- [x] 非阻塞通知 adapter；至少一个本地 adapter 和一个 deterministic adapter。
 
 首条 tracer 证据（不等同于 M3 全部完成）：
 
@@ -333,12 +333,32 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   `start / next_event / status / stop`；latest-value retention 为 O(1)，慢消费者先收到显式
   `SourceGap` 再收到最新事件，请求进行中和长退避均可在 bounded grace 内取消。
 - [ ] 后续 tracer：把真实 source 组合进可审计的多 venue monitor 与 durable task projection，
-  再完成 Price Alert、Virtual-grid Scanner、通知 adapter；完成这些之前 M3 保持未退出。
+  再完成 Virtual-grid Scanner；Price Alert 仍缺 CLI/source composition、durable task lifecycle、
+  journal rotation/compaction、sound 与 remote acknowledgement，完成这些之前 M3 保持未退出。
+
+第三条 tracer 证据（仍不等同于 M3 全部完成）：
+
+- [x] `PriceAlertRuntime` 只消费 `Accepted + ready` 的稳定行情，先同批追加 sample、occurrence 与
+  adapter pending facts，再非阻塞派发；重复、断线、gap 与不新鲜行情不推进策略。冷却、滚动价格窗、
+  exact acknowledgement 和 occurrence sequence 都可从冻结 journal 事务式恢复，失败恢复不留下
+  半状态，且恢复默认不重放本地通知。
+- [x] notification dispatcher 对 adapter 数量、ID、逐 adapter 队列、delivery timeout 与 shutdown
+  grace 设置硬上限；`LocalNoticeNotificationAdapter` 只传递 typed in-process facts，
+  `DeterministicNotificationAdapter` 提供离线脚本结果。没有 shell、子进程、模板、路径或原始 OS
+  错误面；queue full、永久 pending 与 worker panic 只更新有界通知状态，不阻塞或终止 evaluator。
+- [x] 独立 `PriceAlertReadModel` 最多保留 256 个 occurrence，严格验证 schema、identity、
+  delivery transition、failure enum、时间顺序、ack 与引用；unknown field、orphan、矛盾状态或
+  partial tail 均把投影降级并清空 occurrence，避免展示不可信 latest。Control Plane snapshot
+  schema v3 与受相同鉴权保护的只读 `GET /api/v1/alerts` 只暴露该安全投影，不存在 Web ack/write
+  路由。
+- [x] capability 单一事实源把 `runtime.price-alert` 提升为 `read-only / offline / local`，并保留
+  CLI/source composition、durable task、journal 运维与 sound/remote ack 阻塞项；
+  `runtime.continuous`、`runtime.live` 与所有 mainnet trading authority 均未扩大。
 
 退出条件：
 
 - [x] 网络断开、乱序、重复、过期行情和慢消费者均有测试。
-- [ ] 通知失败只影响通知状态，不影响监控主循环。
+- [x] 通知失败只影响通知状态，不影响监控主循环。
 
 ### M4：连续 Paper Supervisor
 

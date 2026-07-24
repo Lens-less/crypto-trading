@@ -838,6 +838,8 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/apps/tests/alert_runtime_contract.rs",
                 "rust/crates/runtime/src/alert_read_model.rs",
                 "rust/crates/runtime/tests/alert_read_model_contract.rs",
+                "rust/crates/control-plane/tests/alert_projection_contract.rs",
+                "rust/crates/web/tests/http_contract.rs",
             ],
         ),
         capability(
