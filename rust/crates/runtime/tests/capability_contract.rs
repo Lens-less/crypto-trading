@@ -64,7 +64,19 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
     assert_eq!(grid_runtime.scope.access, CapabilityAccess::PaperTrading);
 
     let monitor_runtime = manifest.capability("runtime.monitor").unwrap();
-    assert_eq!(monitor_runtime.level, CapabilityLevel::ValidateOnly);
+    assert_eq!(monitor_runtime.level, CapabilityLevel::ReadOnly);
+    assert_eq!(
+        monitor_runtime.scope.environments,
+        vec![CapabilityEnvironment::Offline]
+    );
+
+    let market_data = manifest.capability("runtime.market-data").unwrap();
+    assert_eq!(market_data.level, CapabilityLevel::ReadOnly);
+    assert_eq!(market_data.scope.access, CapabilityAccess::MarketData);
+    assert_eq!(
+        market_data.scope.environments,
+        vec![CapabilityEnvironment::Offline, CapabilityEnvironment::Paper]
+    );
 
     let web = manifest.capability("control-plane.web").unwrap();
     assert_eq!(web.level, CapabilityLevel::ReadOnly);

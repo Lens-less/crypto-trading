@@ -32,6 +32,10 @@ Functional contract:
 - `Unavailable`, `stale`, `degraded`, `windowed`, `partial`, `empty`, and `error` are first-class
   product states, not implementation footnotes.
 - CLI, HTTP, and Web must display the same capability and execution truth.
+- A monitor result is a durable historical projection. It must show its recorded time and market
+  generation, and must never imply that the current external feed is connected or fresh.
+- The operation-event SSE badge describes notification-channel connectivity only. It uses
+  “connected / notification-only”, never “real-time” or “fresh”, and cannot upgrade monitor age.
 
 ## 2. Color Palette & Roles
 
@@ -131,6 +135,10 @@ Never use italic, weight 700, negative tracking on Chinese, or type smaller than
 - Errors include one safe next step and never display raw adapter/journal text.
 - Stale and degraded states remain usable but pin a visible warning band above the affected region.
 - `Unavailable` is neutral and explicit; it must never be styled as healthy or as a user setup task.
+- Monitor freshness and continuity labels describe the persisted observation only. System-level
+  market freshness remains `not_available` until a live read-only source is actually supervised.
+- A degraded monitor projection may retain its last valid fact internally for recovery, but the Web
+  must withhold that outcome and pin a danger band until the complete journal projects safely again.
 
 ## 5. Layout Principles
 
@@ -185,6 +193,8 @@ Breakpoints follow the Carbon grid:
 - `< 672px`: top authority strip, single-column content, 16px margins.
 - Tables become horizontally contained data regions with a visible scroll affordance; the page itself
   never scrolls horizontally.
+- Long symbols, exchange pairs, cursors, and decimal evidence wrap inside their own grid cell instead
+  of widening the page or being removed from the trust line.
 - Execution details move below the selected row on mobile.
 - All interactive targets are at least 40px; primary navigation rows are 48px.
 - The UI must remain usable at 320 CSS px and at 200% browser zoom.

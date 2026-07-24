@@ -58,6 +58,58 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
 }
 
 #[tokio::test]
+async fn monitor_endpoint_exposes_only_the_bounded_read_model() {
+    let bytes = jsonl(&[json!({
+        "timestamp": "2026-07-24T00:00:00Z",
+        "strategy": "arbitrage_monitor",
+        "symbol": "BTC-USDT",
+        "decision": "monitor_opportunity",
+        "details": {
+            "schema_version": 1,
+            "sequence": 2,
+            "market_generation": 2,
+            "market_update": "accepted",
+            "left": {
+                "exchange": "left",
+                "symbol": "BTC-USDT",
+                "market_type": "perpetual",
+            },
+            "right": {
+                "exchange": "right",
+                "symbol": "BTC-USDT",
+                "market_type": "perpetual",
+            },
+            "outcome": {
+                "type": "opportunity",
+                "buy_exchange": "left",
+                "sell_exchange": "right",
+                "buy_price": "100",
+                "sell_price": "102",
+                "absolute_spread": "2",
+                "spread_percent": "2",
+                "threshold_percent": "0.5",
+                "api_key": "must-not-leak",
+                "intents": ["must-not-leak"],
+            },
+        },
+    })]);
+    let response = fixture_app(bytes, WebAccessPolicy::loopback_open())
+        .oneshot(get("/api/v1/monitor"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    let monitor = response_json(response).await;
+    assert_eq!(monitor["latest"]["state"], "opportunity");
+    assert_eq!(monitor["latest"]["projection"]["spread_percent"], "2");
+    let encoded = serde_json::to_string(&monitor).unwrap();
+    assert!(!encoded.contains("api_key"));
+    assert!(!encoded.contains("intents"));
+    assert!(!encoded.contains("must-not-leak"));
+}
+
+#[tokio::test]
 async fn executions_use_cursor_as_a_change_watermark_without_exposing_payloads() {
     let bytes = jsonl(&[decision_record(&json!({
         "api_key": "super-secret",

@@ -164,8 +164,34 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     assert!(javascript.contains("TOKEN_LABELS"));
     assert!(javascript.contains("不透明恢复游标只保存在页面内存"));
     assert!(javascript.contains("market_data_freshness"));
+    assert_monitor_surface_contract(&javascript, &css);
     assert!(javascript.contains("kill_switch"));
     assert_protected_state_contract(&javascript);
+}
+
+fn assert_monitor_surface_contract(javascript: &str, css: &str) {
+    assert!(css.contains(".detail-block {\n  min-width: 0;"));
+    assert!(css.contains(
+        ".metric-value {\n  font-size: 24px;\n  line-height: 1.2;\n  overflow-wrap: anywhere;"
+    ));
+    assert!(javascript.contains("/api/v1/monitor"));
+    assert!(javascript.contains("只读套利监控"));
+    assert!(javascript.contains("不代表当前实时行情仍然新鲜"));
+    assert!(javascript.contains("state.monitor && projectionStatus !== \"complete\""));
+    assert!(javascript.contains("监控投影已降级"));
+    assert!(javascript.contains("最后一个有效结果停止展示"));
+    assert!(javascript.contains("保留事实"));
+    assert!(javascript.contains("function eventStreamLabel()"));
+    assert!(javascript.contains("function compactEventStreamLabel()"));
+    assert!(javascript.contains("已连接 / 仅通知"));
+    assert!(javascript.contains("读取方式"));
+    assert!(javascript.contains("历史快照"));
+    for forbidden in ["return \"实时\";", "return \"新鲜 / 流式更新\";"] {
+        assert!(
+            !javascript.contains(forbidden),
+            "execution SSE must not overstate monitor freshness with {forbidden}"
+        );
+    }
 }
 
 fn assert_protected_state_contract(javascript: &str) {

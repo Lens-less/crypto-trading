@@ -166,6 +166,12 @@ pub struct ArbitrageMarketArgs {
 pub struct MonitorArgs {
     #[arg(long, default_value = "config/arbitrage/monitor_v2.yaml")]
     pub config: PathBuf,
+    /// Finite JSONL replay of validated top-of-book snapshots.
+    #[arg(long, value_name = "PATH")]
+    pub replay: Option<PathBuf>,
+    /// Append read-only monitor outcomes to this JSONL journal.
+    #[arg(long, default_value = "var/history/arbitrage-monitor.jsonl")]
+    pub history_path: PathBuf,
     #[arg(long)]
     pub debug: bool,
     #[arg(long)]

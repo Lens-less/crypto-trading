@@ -57,6 +57,23 @@ const TOKEN_LABELS = new Map([
   ["config-only", "仅配置"],
   ["not-applicable", "不适用"],
 ]);
+for (const [token, label] of [
+  ["waiting", "等待行情"],
+  ["no_opportunity", "暂无机会"],
+  ["opportunity", "发现机会"],
+  ["analysis_rejected", "分析拒绝"],
+  ["missing", "缺失"],
+  ["fresh", "新鲜"],
+  ["stale", "陈旧"],
+  ["future", "未来时间"],
+  ["continuous", "连续"],
+  ["source_gap", "数据缺口"],
+  ["duplicate", "重复"],
+  ["out_of_order", "乱序"],
+]) {
+  TOKEN_LABELS.set(token, label);
+}
+
 const STREAM_RETRY_BASE_MS = 1500;
 const STREAM_RETRY_MAX_MS = 10000;
 const STALE_AFTER_MS = 15000;
@@ -78,6 +95,7 @@ const state = {
   authRequired: false,
   sessionGeneration: 0,
   system: null,
+  monitor: null,
   capabilities: null,
   executions: null,
   lastPage: null,
@@ -90,11 +108,13 @@ const state = {
   drawerFocusedBatch: "",
   loads: {
     system: "idle",
+    monitor: "idle",
     capabilities: "idle",
     executions: "idle",
   },
   errors: {
     system: null,
+    monitor: null,
     capabilities: null,
     executions: null,
   },
@@ -136,7 +156,12 @@ void bootstrap();
 
 async function bootstrap() {
   render();
-  await Promise.all([loadSystem(), loadCapabilities(), loadExecutions()]);
+  await Promise.all([
+    loadSystem(),
+    loadMonitor(),
+    loadCapabilities(),
+    loadExecutions(),
+  ]);
   if (!state.authRequired || state.authToken) {
     restartStream();
   }
@@ -206,6 +231,7 @@ function clearProtectedState() {
   }
   state.cursor = "";
   state.system = null;
+  state.monitor = null;
   state.capabilities = null;
   state.executions = null;
   state.lastPage = null;
@@ -215,11 +241,13 @@ function clearProtectedState() {
   state.drawerFocusedBatch = "";
   state.loads = {
     system: "idle",
+    monitor: "idle",
     capabilities: "idle",
     executions: "idle",
   };
   state.errors = {
     system: null,
+    monitor: null,
     capabilities: null,
     executions: null,
   };
@@ -257,7 +285,12 @@ function replaceAuthToken(nextToken) {
     return;
   }
   restartStream();
-  void Promise.all([loadSystem(), loadCapabilities(), loadExecutions()]);
+  void Promise.all([
+    loadSystem(),
+    loadMonitor(),
+    loadCapabilities(),
+    loadExecutions(),
+  ]);
   render();
 }
 
@@ -283,6 +316,32 @@ async function loadSystem() {
     if (!markAuthenticationRequired(problem)) {
       state.loads.system = "error";
       state.errors.system = problem;
+    }
+  }
+  render();
+}
+
+async function loadMonitor() {
+  const generation = state.sessionGeneration;
+  state.loads.monitor = "loading";
+  state.errors.monitor = null;
+  render();
+  try {
+    const monitor = await fetchJson("/api/v1/monitor");
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    state.monitor = monitor;
+    state.lastSnapshotAt = Date.now();
+    state.loads.monitor = "ready";
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    if (!markAuthenticationRequired(problem)) {
+      state.loads.monitor = "error";
+      state.errors.monitor = problem;
     }
   }
   render();
@@ -355,7 +414,7 @@ async function refreshOperationalTruth() {
   state.isRefreshing = true;
   render();
   try {
-    await Promise.all([loadSystem(), loadExecutions()]);
+    await Promise.all([loadSystem(), loadMonitor(), loadExecutions()]);
   } finally {
     state.isRefreshing = false;
     render();
@@ -624,8 +683,8 @@ function renderSpineStatusBlock() {
   const signals = [
     {
       label: "事件流",
-      value: freshnessLabel(),
-      tone: freshnessTone(),
+      value: eventStreamLabel(),
+      tone: eventStreamTone(),
     },
     {
       label: "行情新鲜度",
@@ -769,7 +828,7 @@ function renderHeader() {
     ["日志代次", state.system?.journal_id || "--"],
     ["游标", state.cursor || "尚未固定"],
     ["序号", state.system?.head_sequence?.toString() || "--"],
-    ["事件流", freshnessLabel()],
+    ["事件流", eventStreamLabel()],
   ];
   dom.header.replaceChildren(
     el("div", { className: "workspace-header-row" }, [
@@ -830,6 +889,7 @@ function renderMain() {
 function renderOverviewView() {
   const leftColumn = el("div", { className: "view-stack" }, [
     renderRibbon(),
+    renderMonitorRegion(),
     renderExecutionsSummaryRegion(),
     renderRecentNoticesRegion(),
   ]);
@@ -838,6 +898,85 @@ function renderOverviewView() {
     renderCapabilityPulseRegion(),
   ]);
   return el("section", { className: "overview-grid" }, [leftColumn, rightColumn]);
+}
+
+function renderMonitorRegion() {
+  const projectionStatus = state.monitor?.projection_status || "degraded";
+  const latest = state.monitor?.latest;
+  let body;
+  if (state.loads.monitor === "error" && !state.monitor) {
+    body = renderError(state.errors.monitor);
+  } else if (state.loads.monitor === "loading" && !state.monitor) {
+    body = renderSkeleton(4);
+  } else if (state.monitor && projectionStatus !== "complete") {
+    body = el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, [
+        detailStat("投影", humanizeToken(projectionStatus)),
+        detailStat("无效事件", state.monitor.invalid_event_count ?? "--"),
+        detailStat("保留事实", latest ? "已隐藏" : "无"),
+      ]),
+      el("p", {
+        className: "muted",
+        text: "监控投影已降级；最后一个有效结果停止展示，直到完整 journal 再次通过投影校验。",
+      }),
+    ]);
+  } else if (!latest) {
+    body = renderEmpty(
+      "尚未观察到只读套利监控事件。",
+      "监控投影不会把缺失行情提升为健康状态，也不会生成订单权限。",
+    );
+  } else {
+    const projection = latest.projection || {};
+    const facts = [
+      detailStat("状态", humanizeToken(latest.state)),
+      detailStat("读取方式", "历史快照"),
+      detailStat(
+        "监控对",
+        `${latest.left.exchange}/${latest.left.symbol} ↔ ${latest.right.exchange}/${latest.right.symbol}`,
+      ),
+      detailStat("市场代次", latest.market_generation),
+      detailStat("记录时间", formatDateTime(latest.recorded_at)),
+    ];
+    if (latest.state === "waiting") {
+      facts.push(
+        detailStat(
+          "等待腿",
+          `${projection.instrument?.exchange || "--"}/${projection.instrument?.symbol || "--"}`,
+        ),
+        detailStat("新鲜度", humanizeToken(projection.freshness || "missing")),
+        detailStat("连续性", humanizeToken(projection.continuity || "missing")),
+      );
+    } else if (
+      latest.state === "opportunity" ||
+      latest.state === "no_opportunity"
+    ) {
+      facts.push(
+        detailStat(
+          "方向",
+          `${projection.buy_exchange || "--"} → ${projection.sell_exchange || "--"}`,
+        ),
+        detailStat("价差", `${projection.spread_percent || "--"}%`),
+        detailStat("阈值", `${projection.threshold_percent || "--"}%`),
+      );
+    } else {
+      facts.push(
+        detailStat("拒绝分类", humanizeToken(projection.failure || "unknown")),
+      );
+    }
+    body = el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, facts),
+      el("p", {
+        className: "muted",
+        text: "这是持久化监控事件的最后一次投影，不代表当前实时行情仍然新鲜。",
+      }),
+    ]);
+  }
+  return renderRegion({
+    title: "只读套利监控",
+    subtitle:
+      "展示等待、无机会、机会与分析拒绝；不携带订单意图，也不把历史事件伪装成实时健康。",
+    body,
+  });
 }
 
 function renderRibbon() {
@@ -865,7 +1004,7 @@ function renderRibbon() {
     },
     {
       label: "事件流",
-      value: compactFreshnessLabel(),
+      value: compactEventStreamLabel(),
     },
   ];
   const leadCopy = state.executions?.operator
@@ -884,7 +1023,7 @@ function renderRibbon() {
           el("p", { className: "muted", text: leadCopy }),
           el("div", { className: "inline-button-row" }, [
             buildTag(accessDescriptor(), state.system?.authentication_required ? "warning" : "neutral"),
-            buildTag(`事件流：${freshnessLabel()}`, freshnessTone()),
+            buildTag(`操作通知：${eventStreamLabel()}`, eventStreamTone()),
             buildTag(state.cursor ? "游标已固定" : "游标待生成", state.cursor ? "info" : "ghost"),
           ]),
         ]),
@@ -1641,13 +1780,22 @@ function collectBands() {
         "读取模型只接受安全的部分事实；无效或不完整的持久记录不会被提升为健康状态。",
     });
   }
+  if (state.monitor && state.monitor.projection_status !== "complete") {
+    bands.push({
+      title: "监控投影已降级",
+      tag: "停止展示",
+      tone: "danger",
+      message:
+        "最后一个有效监控结果已停止展示；无效事件或不完整尾记录修复前，不把旧机会提升为可信状态。",
+    });
+  }
   if (isStale()) {
     bands.push({
-      title: "事件流已过期",
-      tag: "陈旧",
+      title: "操作事件流已断开",
+      tag: "断开",
       tone: "warning",
       message:
-        "最后一个良好快照仍然可见，但事件流当前并不新鲜。可继续只读检查，然后重试快照。",
+        "最后一个良好快照仍然可见，但操作通知通道当前断开；这不代表监控行情仍然新鲜。",
       action: {
         label: "重试快照",
         onClick: () => void refreshOperationalTruth(),
@@ -1656,6 +1804,7 @@ function collectBands() {
   }
   const authProblem =
     state.errors.system?.code === "authentication_required" ||
+    state.errors.monitor?.code === "authentication_required" ||
     state.errors.capabilities?.code === "authentication_required" ||
     state.errors.executions?.code === "authentication_required";
   if (authProblem) {
@@ -1878,33 +2027,33 @@ function formatOptionalNumber(value) {
   return typeof value === "number" ? String(value) : "--";
 }
 
-function freshnessLabel() {
+function eventStreamLabel() {
   if (state.stream.connected) {
-    return "新鲜 / 流式更新";
+    return "已连接 / 仅通知";
   }
   if (isStale()) {
-    return "陈旧 / 正在重试";
+    return "断开 / 正在重试";
+  }
+  if (state.lastSnapshotAt) {
+    return "未连接 / 仅快照";
+  }
+  return "正在连接";
+}
+
+function compactEventStreamLabel() {
+  if (state.stream.connected) {
+    return "已连接";
+  }
+  if (isStale()) {
+    return "断开";
   }
   if (state.lastSnapshotAt) {
     return "仅快照";
   }
-  return "正在加载";
+  return "连接中";
 }
 
-function compactFreshnessLabel() {
-  if (state.stream.connected) {
-    return "实时";
-  }
-  if (isStale()) {
-    return "陈旧";
-  }
-  if (state.lastSnapshotAt) {
-    return "快照";
-  }
-  return "加载中";
-}
-
-function freshnessTone() {
+function eventStreamTone() {
   if (state.stream.connected) {
     return "success";
   }
@@ -1978,7 +2127,9 @@ function errorDescription(problem) {
 }
 
 function hasAnyData() {
-  return Boolean(state.system || state.capabilities || state.executions);
+  return Boolean(
+    state.system || state.monitor || state.capabilities || state.executions,
+  );
 }
 
 function looksMonospaced(value) {

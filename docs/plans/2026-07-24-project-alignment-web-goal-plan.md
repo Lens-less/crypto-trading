@@ -293,7 +293,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   session generation 丢弃旧认证成功响应和旧 401；终审无剩余 P0–P3。
 - [x] M2 发布门禁：全工作区 fmt/check/clippy/test/doc-test/release build 与
   `cargo audit` 全部通过；`control-plane.web` 已由能力单一事实源提升为 `read-only`。
-- [ ] 当前 tracer-bullet：进入 M3，先统一只读 market-data provider 与 freshness
+- [x] 当前 tracer-bullet：进入 M3，先统一只读 market-data provider 与 freshness
   契约，再用一个 deterministic/offline source 打通连续 monitor 事件。
 
 ### M3：连续只读监控、Alert 与 Scanner
@@ -305,6 +305,24 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [ ] Price alert 冷却、去重、确认和持久化。
 - [ ] Virtual-grid scanner 的确定性排行。
 - [ ] 非阻塞通知 adapter；至少一个本地 adapter 和一个 deterministic adapter。
+
+首条 tracer 证据（不等同于 M3 全部完成）：
+
+- [x] `runtime::market_data` 固化 exact instrument universe、注入时钟、fresh/stale/future、
+  revision/timestamp/receipt 顺序、source gap/unavailable 与同 generation 双腿读取；内存、
+  universe 和事件数均有硬上限。
+- [x] deterministic replay 与现有 bounded subscription bridge 均跨同一 seam；断线、重复、
+  乱序、revision gap、timestamp rollback、慢消费者 lag 和延迟恢复均有合约测试。
+- [x] `monitor --replay` 以严格 JSONL allowlist 连续产生只读套利事件；完整处理成功后才追加
+  bounded journal，且没有 order intent、exchange handle 或 execution policy 权限；首条 tracer
+  明确只接受恰好两个交易所，多所配置失败关闭而不静默截断。
+- [x] monitor journal read model 与 execution projection 从同一冻结 snapshot 生成；
+  `/api/v1/monitor` 和 Overview 只展示安全投影，并明确“历史最后事件不代表当前行情新鲜”。
+  Execution SSE 只标记为“操作通知已连接”，不得把 monitor 抬升为“实时/新鲜”。
+- [x] Web 真实浏览器复核覆盖桌面与 250 CSS px 极窄视口；长交易对和小数证据完整换行，
+  页面无横向溢出、应用自身 console error 为 0。
+- [ ] 后续 tracer：真实外部 venue polling/reconnect 与长驻 supervisor、Price Alert、
+  Virtual-grid Scanner、通知 adapter；完成这些之前 M3 保持未退出。
 
 退出条件：
 

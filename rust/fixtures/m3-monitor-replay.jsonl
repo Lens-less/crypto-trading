@@ -1,0 +1,4 @@
+{"exchange":"paper-left","symbol":"ETH-USDC-PERP","market_type":"perpetual","bid":"99","ask":"100","timestamp":"2026-07-24T00:00:00Z"}
+{"exchange":"paper-right","symbol":"ETH-USDC-PERP","market_type":"perpetual","bid":"102","ask":"103","timestamp":"2026-07-24T00:00:00Z"}
+{"exchange":"paper-left","symbol":"ETH-USDC-PERP","market_type":"perpetual","bid":"100","ask":"101","timestamp":"2026-07-24T00:00:01Z"}
+{"exchange":"paper-right","symbol":"ETH-USDC-PERP","market_type":"perpetual","bid":"100","ask":"101","timestamp":"2026-07-24T00:00:01Z"}

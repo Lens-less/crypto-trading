@@ -5,7 +5,9 @@ mod execution;
 mod history;
 mod journal;
 mod journal_reader;
+mod market_data;
 mod mode;
+mod monitor_read_model;
 mod read_model;
 
 pub use capability::{
@@ -33,7 +35,20 @@ pub use journal_reader::{
     MAX_JOURNAL_PAGE_BYTES, MAX_JOURNAL_PAGE_EVENTS, MAX_JOURNAL_SOURCE_BYTES,
     MemoryJournalSnapshotSource,
 };
+pub use market_data::{
+    DeterministicMarketDataAdapter, MARKET_DATA_VIEW_SCHEMA_VERSION, MAX_MARKET_DATA_EVENTS,
+    MAX_MARKET_DATA_TARGETS, MarketContinuity, MarketDataBook, MarketDataClock, MarketDataError,
+    MarketDataEvent, MarketDataFreshness, MarketDataObservation, MarketDataSourceFailure,
+    MarketDataUpdate, MarketDataView, MarketFreshnessPolicy, MarketInstrument,
+    MarketInstrumentView, MarketUniverse, ObservedMarketPair, SubscriptionMarketDataAdapter,
+    SystemMarketDataClock,
+};
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
+pub use monitor_read_model::{
+    ARBITRAGE_MONITOR_READ_MODEL_SCHEMA_VERSION, ArbitrageMonitorProjection,
+    ArbitrageMonitorReadModel, ArbitrageMonitorView, MonitorContinuityState, MonitorFreshnessState,
+    MonitorLegView, MonitorProjectionState,
+};
 pub use read_model::{
     ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,
     MAX_OPERATOR_READ_MODEL_WARNINGS, OPERATOR_READ_MODEL_SCHEMA_VERSION, OperatorReadModel,

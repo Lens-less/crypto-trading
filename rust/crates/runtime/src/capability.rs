@@ -774,15 +774,37 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
 fn runtime_validation_capabilities() -> Vec<Capability> {
     vec![
         capability(
+            "runtime.market-data",
+            CapabilityArea::Runtime,
+            CapabilityLevel::ReadOnly,
+            scope(
+                &[CapabilityEnvironment::Offline, CapabilityEnvironment::Paper],
+                CapabilityAccess::MarketData,
+            ),
+            "Bounded exact-universe market book with freshness, continuity, deterministic replay, and subscription-gap adapters.",
+            &[
+                "External polling and reconnect supervision are not yet wired through this read plane.",
+            ],
+            &[
+                "rust/crates/runtime/src/market_data.rs",
+                "rust/crates/runtime/tests/market_data_contract.rs",
+            ],
+        ),
+        capability(
             "runtime.monitor",
             CapabilityArea::Runtime,
-            CapabilityLevel::ValidateOnly,
+            CapabilityLevel::ReadOnly,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Arbitrage monitor configuration loading and validation.",
-            &["Continuous monitoring and event production are not implemented."],
+            "Finite continuous read-only arbitrage replay with one event per market input and a bounded operator projection.",
+            &["External venue polling and long-lived restart supervision remain unavailable."],
             &[
                 "rust/crates/apps/src/command.rs",
-                "rust/crates/config/src/monitor.rs",
+                "rust/crates/apps/src/monitor.rs",
+                "rust/crates/apps/tests/monitor_contract.rs",
+                "rust/crates/apps/tests/monitor_replay_cli.rs",
+                "rust/crates/runtime/src/monitor_read_model.rs",
+                "rust/crates/control-plane/tests/monitor_projection_contract.rs",
+                "rust/crates/web/tests/http_contract.rs",
             ],
         ),
         capability(

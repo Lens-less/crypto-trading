@@ -22,8 +22,10 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::{PaperExchange, SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
-    DecisionRecord, ExchangeRouter, ExecutionBatch, ExecutionMode, ExecutionPolicy, HistoryError,
-    IntentExecutor, JsonlHistory, RuntimeError, current_capability_manifest,
+    DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
+    ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataEvent,
+    MarketFreshnessPolicy, MarketInstrument, MarketUniverse, RuntimeError,
+    current_capability_manifest,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -36,6 +38,10 @@ use serde_json::{Value, json};
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
     PriceAlertArgs, ScannerArgs, VolumeMakerArgs,
+};
+use crate::monitor::{
+    ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor, ReplayMarketDataClock,
+    load_market_snapshot_replay,
 };
 
 /// Runs one parsed CLI command.
@@ -50,7 +56,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::ConfigCheck(args) => check_configs(&args),
         Command::Grid(args) => run_grid(args).await,
         Command::Arbitrage(args) => run_arbitrage(&args).await,
-        Command::Monitor(args) => run_monitor(&args),
+        Command::Monitor(args) => run_monitor(&args).await,
         Command::VolumeMaker(args) => run_volume_maker(&args),
         Command::PriceAlert(args) => run_price_alert(&args),
         Command::Scanner(args) => run_scanner(&args),
@@ -204,16 +210,113 @@ async fn run_arbitrage(args: &ArbitrageArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_monitor(args: &MonitorArgs) -> Result<()> {
+async fn run_monitor(args: &MonitorArgs) -> Result<()> {
     let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
     let monitor = load_monitor_config_from_str(&body)
         .with_context(|| format!("failed to load monitor config {}", args.config.display()))?;
-    bail!(
-        "continuous monitor runtime is unavailable (validated {} exchanges and {} symbols from {})",
-        monitor.exchanges.len(),
-        monitor.symbols.len(),
-        args.config.display()
-    )
+    let replay_path = args.replay.as_ref().context(
+        "continuous external monitor sources are unavailable; use --replay with a strict JSONL snapshot fixture",
+    )?;
+    if monitor.exchanges.len() != 2 {
+        bail!(
+            "the first read-only monitor tracer requires exactly two configured exchanges; found {}",
+            monitor.exchanges.len()
+        );
+    }
+    if monitor.exchanges[0] == monitor.exchanges[1] {
+        bail!("read-only arbitrage monitor needs two distinct configured exchanges");
+    }
+    let symbol = selected_monitor_symbol(args, &monitor)?;
+
+    let mut instruments = Vec::new();
+    for exchange in &monitor.exchanges {
+        for configured_symbol in &monitor.symbols {
+            instruments.push(MarketInstrument::new(
+                exchange,
+                configured_symbol.clone(),
+                MarketType::Perpetual,
+            )?);
+        }
+    }
+    let universe = MarketUniverse::new(instruments)?;
+    let left = MarketInstrument::new(&monitor.exchanges[0], symbol.clone(), MarketType::Perpetual)?;
+    let right = MarketInstrument::new(&monitor.exchanges[1], symbol, MarketType::Perpetual)?;
+    let events = load_market_snapshot_replay(replay_path)?;
+    let first_at = match events.first() {
+        Some(MarketDataEvent::Observation(observation)) => observation.received_at,
+        Some(
+            MarketDataEvent::SourceGap { observed_at, .. }
+            | MarketDataEvent::SourceUnavailable { observed_at, .. },
+        ) => *observed_at,
+        None => bail!("monitor replay must contain at least one event"),
+    };
+    let clock = Arc::new(ReplayMarketDataClock::new(first_at));
+    let max_age_seconds = i64::try_from(monitor.data_timeout_seconds)
+        .context("monitor data timeout exceeds the runtime duration")?;
+    let max_age = Duration::try_seconds(max_age_seconds)
+        .context("monitor data timeout is outside the supported duration")?;
+    let book = MarketDataBook::new(
+        universe,
+        MarketFreshnessPolicy::new(max_age, Duration::seconds(1))?,
+        Arc::clone(&clock),
+    );
+    let mut read_monitor =
+        ReadOnlyArbitrageMonitor::new(book, left, right, monitor.min_spread_pct)?;
+    let mut adapter = DeterministicMarketDataAdapter::new(events)?;
+    let mut records = Vec::new();
+    let mut opportunities = 0usize;
+    let mut waiting = 0usize;
+    while let Some(event) = adapter.next_event() {
+        match &event {
+            MarketDataEvent::Observation(observation) => clock.advance(observation.received_at),
+            MarketDataEvent::SourceGap { observed_at, .. }
+            | MarketDataEvent::SourceUnavailable { observed_at, .. } => {
+                clock.advance(*observed_at);
+            }
+        }
+        let monitor_event = read_monitor.process(event)?;
+        match &monitor_event.outcome {
+            ArbitrageMonitorOutcome::Opportunity { .. } => {
+                opportunities = opportunities.saturating_add(1);
+            }
+            ArbitrageMonitorOutcome::Waiting { .. } => {
+                waiting = waiting.saturating_add(1);
+            }
+            ArbitrageMonitorOutcome::NoOpportunity { .. }
+            | ArbitrageMonitorOutcome::AnalysisRejected { .. } => {}
+        }
+        records.push(monitor_event.to_record());
+    }
+    JsonlHistory::new(&args.history_path)
+        .append_batch(&records)
+        .await
+        .context("failed to persist the read-only monitor replay")?;
+    println!(
+        "read-only monitor replay: events={} opportunities={} waiting={} history={}",
+        records.len(),
+        opportunities,
+        waiting,
+        args.history_path.display()
+    );
+    Ok(())
+}
+
+fn selected_monitor_symbol(args: &MonitorArgs, monitor: &MonitorConfig) -> Result<Symbol> {
+    if args.symbols.len() > 1 {
+        bail!("the first monitor tracer accepts at most one --symbols value");
+    }
+    if let Some(value) = args.symbols.first() {
+        let candidate = Symbol::new(value.clone()).context("invalid monitor symbol filter")?;
+        if !monitor.symbols.contains(&candidate) {
+            bail!("monitor symbol {candidate} is outside the configured allowlist");
+        }
+        return Ok(candidate);
+    }
+    monitor
+        .symbols
+        .first()
+        .cloned()
+        .context("monitor configuration has no symbols")
 }
 
 fn run_volume_maker(args: &VolumeMakerArgs) -> Result<()> {
