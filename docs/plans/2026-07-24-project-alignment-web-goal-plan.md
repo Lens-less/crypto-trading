@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：执行基线
+> 状态：M1 执行中（M0 已完成）
 >
 > 日期：2026-07-24
 >
@@ -35,7 +35,7 @@
    两份可执行配置是 `paper-once-btc.yaml` 与 `paper-once-eth.yaml`。
 4. 清除旧 Cargo 增量产物后，Rust 1.85.0 全工作区
    `cargo test --workspace --all-targets --all-features --locked` 为
-   **341 通过、0 失败**。旧产物曾制造“源码已导出但编译器看不到”和 5 个
+   **323 通过、0 失败**。旧产物曾制造“源码已导出但编译器看不到”和 5 个
    Binance 假失败，因此后续发布门禁必须包含干净构建验证。
 5. 当前 Rust 的真实产品定位仍是：
    - 配置兼容与分类；
@@ -214,7 +214,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 交付：
 
-- [ ] 稳定版本化事件 envelope 与 cursor。
+- [x] 稳定版本化事件 envelope 与 cursor。
 - [ ] 从现有 execution JSONL 构建 bounded read model。
 - [ ] 处理损坏尾行、重复事件、超限记录、游标过期和跨进程读取。
 - [ ] snapshot/history interface 的 deterministic adapter 与 fixture。
@@ -223,6 +223,16 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 
 - 同一 fixture 在 Windows/Linux 得到相同 snapshot。
 - partial/incomplete 批次能给出明确恢复状态，且不会生成“直接重试”建议。
+
+当前进度（2026-07-24）：
+
+- [x] `OperationEventEnvelope` v1 以 journal sequence 作为唯一排序权威，
+  固化 schema、journal/event/aggregate 身份、producer、payload 预算和非认证的
+  FNV-1a64 损坏检测。
+- [x] `JournalCursor` v1 固化 generation、last sequence/event 与 next byte offset，
+  不编码路径、inode 或 wall clock；FNV 只检测意外变更，reader 仍必须验证边界锚点。
+- [ ] 下一条 tracer-bullet：实现 bounded file/in-memory reader、legacy JSONL 映射与
+  cursor anchor 验证，再投影 Operator Read Model。
 
 ### M2：Control Plane 与只读 Web 切片
 

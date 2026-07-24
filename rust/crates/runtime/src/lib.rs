@@ -3,6 +3,7 @@
 mod capability;
 mod execution;
 mod history;
+mod journal;
 mod mode;
 
 pub use capability::{
@@ -18,5 +19,10 @@ pub use execution::{
 };
 pub use history::{
     DecisionRecord, HistoryError, JsonlHistory, MAX_HISTORY_BATCH_BYTES, MAX_HISTORY_RECORD_BYTES,
+};
+pub use journal::{
+    AggregateRef, CursorError, EventContractError, JOURNAL_CURSOR_SCHEMA_VERSION, JournalCursor,
+    MAX_JOURNAL_CURSOR_BYTES, MAX_OPERATION_EVENT_BYTES, MAX_OPERATION_EVENT_PAYLOAD_BYTES,
+    OPERATION_EVENT_SCHEMA_VERSION, OperationEventEnvelope,
 };
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
