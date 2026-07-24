@@ -23,7 +23,7 @@ use crypto_trading_domain::{
 use crypto_trading_exchange::{PaperExchange, SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     DecisionRecord, ExchangeRouter, ExecutionBatch, ExecutionMode, ExecutionPolicy, HistoryError,
-    IntentExecutor, JsonlHistory, RuntimeError,
+    IntentExecutor, JsonlHistory, RuntimeError, current_capability_manifest,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -34,8 +34,8 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use crate::cli::{
-    ArbitrageArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs, PriceAlertArgs,
-    ScannerArgs, VolumeMakerArgs,
+    ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
+    PriceAlertArgs, ScannerArgs, VolumeMakerArgs,
 };
 
 /// Runs one parsed CLI command.
@@ -46,6 +46,7 @@ use crate::cli::{
 /// evaluation, or paper execution fails.
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Capabilities(args) => run_capabilities(&args),
         Command::ConfigCheck(args) => check_configs(&args),
         Command::Grid(args) => run_grid(args).await,
         Command::Arbitrage(args) => run_arbitrage(&args).await,
@@ -54,6 +55,42 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::PriceAlert(args) => run_price_alert(&args),
         Command::Scanner(args) => run_scanner(&args),
     }
+}
+
+fn run_capabilities(args: &CapabilitiesArgs) -> Result<()> {
+    let manifest = current_capability_manifest();
+    manifest.validate()?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
+
+    println!(
+        "capabilities schema={} version={} release={} live-trading={}",
+        manifest.schema_version,
+        manifest.product_version,
+        manifest.release_stage,
+        manifest.live_trading_enabled
+    );
+    for capability in manifest.capabilities {
+        let environments = capability
+            .scope
+            .environments
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            capability.id,
+            capability.area,
+            capability.level,
+            capability.scope.access,
+            environments,
+            capability.summary
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

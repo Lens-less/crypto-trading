@@ -198,3 +198,18 @@ fn monitor_symbols_accept_the_legacy_comma_separated_form() {
     assert_eq!(args.symbols, vec!["BTC-USDC-PERP", "ETH-USDC-PERP"]);
     assert!(args.no_ui);
 }
+
+#[test]
+fn capabilities_supports_human_and_machine_readable_contracts() {
+    let cli = Cli::try_parse_from(["crypto-trading", "capabilities", "--json"]).unwrap();
+    let Command::Capabilities(args) = cli.command else {
+        panic!("expected capabilities command");
+    };
+    assert!(args.json);
+
+    let cli = Cli::try_parse_from(["crypto-trading", "capabilities"]).unwrap();
+    let Command::Capabilities(args) = cli.command else {
+        panic!("expected capabilities command");
+    };
+    assert!(!args.json);
+}

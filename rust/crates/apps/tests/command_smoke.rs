@@ -45,6 +45,30 @@ fn config_check_validates_an_existing_grid_file() {
 }
 
 #[test]
+fn capabilities_json_reports_the_fail_closed_runtime_contract() {
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .args(["capabilities", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["release_stage"], "paper-only");
+    assert_eq!(payload["live_trading_enabled"], false);
+    let capabilities = payload["capabilities"].as_array().unwrap();
+    assert!(capabilities.iter().any(|entry| {
+        entry["id"] == "runtime.live"
+            && entry["level"] == "unavailable"
+            && entry["scope"]["access"] == "mainnet-trading"
+            && entry["scope"]["environments"]
+                .as_array()
+                .is_some_and(|environments| environments.iter().any(|mode| mode == "mainnet"))
+    }));
+}
+
+#[test]
 fn config_check_returns_nonzero_for_a_missing_file() {
     let output = Command::new(binary())
         .current_dir(repo_root())

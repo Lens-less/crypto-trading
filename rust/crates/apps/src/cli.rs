@@ -13,6 +13,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Report the runtime's machine-checkable capability and authority manifest.
+    Capabilities(CapabilitiesArgs),
     /// Run or inspect a grid strategy.
     Grid(GridArgs),
     /// Run the segmented arbitrage engine.
@@ -30,6 +32,13 @@ pub enum Command {
     /// Parse and validate existing YAML configuration files.
     #[command(name = "config-check")]
     ConfigCheck(ConfigCheckArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CapabilitiesArgs {
+    /// Emit the stable versioned JSON manifest.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

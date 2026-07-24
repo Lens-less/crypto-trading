@@ -1,9 +1,15 @@
 //! Supervised runtime and process-local synchronized decision history.
 
+mod capability;
 mod execution;
 mod history;
 mod mode;
 
+pub use capability::{
+    CAPABILITY_SCHEMA_VERSION, Capability, CapabilityAccess, CapabilityArea, CapabilityEnvironment,
+    CapabilityError, CapabilityLevel, CapabilityManifest, CapabilityScope, ReleaseStage,
+    current_capability_manifest,
+};
 pub use execution::{
     ExchangeRouter, ExecutionBatch, ExecutionClock, ExecutionPolicy, IntentExecutor,
     MAX_EXECUTION_BATCH_ORDERS, MAX_EXECUTION_POLICY_SNAPSHOTS, ReconciliationObservation,
