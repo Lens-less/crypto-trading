@@ -30,9 +30,12 @@ pub use crypto_trading_runtime::{
     ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
     ReadOnlyTaskSourceExit, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
     ReadOnlyTaskSourceView, ReadOnlyTaskView, RecoveryDirective, ReleaseStage,
+    ScannerInstrumentView, ScannerPriorityView, ScannerRatingGradeView,
+    VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION, VirtualGridScanRowView, VirtualGridScanView,
+    VirtualGridScannerReadModel,
 };
 
-pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
 
 /// Stable transport-independent classification for safe public error mapping.
@@ -93,6 +96,7 @@ impl ReadControlPlane {
         let monitor = ArbitrageMonitorReadModel::from_legacy_snapshot(&journal)?;
         let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)?;
         let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)?;
+        let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)?;
         Ok(ControlPlaneSnapshot {
             schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
             capabilities: self.capabilities.clone(),
@@ -100,6 +104,7 @@ impl ReadControlPlane {
             monitor,
             alerts,
             tasks,
+            scanner,
         })
     }
 
@@ -165,6 +170,8 @@ impl ReadControlPlane {
             .map_err(ControlPlaneReadError::Projection)?;
         let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)
             .map_err(ControlPlaneReadError::Projection)?;
+        let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)
+            .map_err(ControlPlaneReadError::Projection)?;
         Ok(ControlPlaneRead {
             snapshot: ControlPlaneSnapshot {
                 schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
@@ -173,6 +180,7 @@ impl ReadControlPlane {
                 monitor,
                 alerts,
                 tasks,
+                scanner,
             },
             events: control_plane_events_page(&page),
         })
@@ -210,6 +218,7 @@ pub struct ControlPlaneSnapshot {
     pub monitor: ArbitrageMonitorReadModel,
     pub alerts: PriceAlertReadModel,
     pub tasks: ReadOnlyTaskReadModel,
+    pub scanner: VirtualGridScannerReadModel,
 }
 
 /// Payload-free notification that tells an adapter which snapshot fact changed.

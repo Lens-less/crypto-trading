@@ -5,6 +5,7 @@ pub mod cli;
 pub mod command;
 pub mod continuous_monitor;
 pub mod monitor;
+pub mod scanner;
 
 pub use cli::{Cli, Command, ExchangeChoice, LogLevel};
 pub use command::run;

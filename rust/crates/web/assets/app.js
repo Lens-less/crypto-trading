@@ -1,4 +1,10 @@
-const VIEW_IDS = new Set(["overview", "alerts", "executions", "integrations"]);
+const VIEW_IDS = new Set([
+  "overview",
+  "scanner",
+  "alerts",
+  "executions",
+  "integrations",
+]);
 const AREA_IDS = new Set([
   "all",
   "config",
@@ -105,6 +111,8 @@ for (const [token, label] of [
   ["task_panicked", "任务异常终止"],
   ["task_cancelled", "任务被取消"],
   ["arbitrage_monitor", "套利监控"],
+  ["benchmark", "基准优先"],
+  ["standard", "标准"],
 ]) {
   TOKEN_LABELS.set(token, label);
 }
@@ -133,6 +141,7 @@ const state = {
   monitor: null,
   alerts: null,
   tasks: null,
+  scanner: null,
   capabilities: null,
   executions: null,
   lastPage: null,
@@ -148,6 +157,7 @@ const state = {
     monitor: "idle",
     alerts: "idle",
     tasks: "idle",
+    scanner: "idle",
     capabilities: "idle",
     executions: "idle",
   },
@@ -156,6 +166,7 @@ const state = {
     monitor: null,
     alerts: null,
     tasks: null,
+    scanner: null,
     capabilities: null,
     executions: null,
   },
@@ -202,6 +213,7 @@ async function bootstrap() {
     loadMonitor(),
     loadAlerts(),
     loadTasks(),
+    loadScanner(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -277,6 +289,7 @@ function clearProtectedState() {
   state.monitor = null;
   state.alerts = null;
   state.tasks = null;
+  state.scanner = null;
   state.capabilities = null;
   state.executions = null;
   state.lastPage = null;
@@ -289,6 +302,7 @@ function clearProtectedState() {
     monitor: "idle",
     alerts: "idle",
     tasks: "idle",
+    scanner: "idle",
     capabilities: "idle",
     executions: "idle",
   };
@@ -297,6 +311,7 @@ function clearProtectedState() {
     monitor: null,
     alerts: null,
     tasks: null,
+    scanner: null,
     capabilities: null,
     executions: null,
   };
@@ -339,6 +354,7 @@ function replaceAuthToken(nextToken) {
     loadMonitor(),
     loadAlerts(),
     loadTasks(),
+    loadScanner(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -450,6 +466,32 @@ async function loadTasks() {
   render();
 }
 
+async function loadScanner() {
+  const generation = state.sessionGeneration;
+  state.loads.scanner = "loading";
+  state.errors.scanner = null;
+  render();
+  try {
+    const scanner = await fetchJson("/api/v1/scanner");
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    state.scanner = scanner;
+    state.lastSnapshotAt = Date.now();
+    state.loads.scanner = "ready";
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    if (!markAuthenticationRequired(problem)) {
+      state.loads.scanner = "error";
+      state.errors.scanner = problem;
+    }
+  }
+  render();
+}
+
 async function loadCapabilities() {
   const generation = state.sessionGeneration;
   state.loads.capabilities = "loading";
@@ -522,6 +564,7 @@ async function refreshOperationalTruth() {
       loadMonitor(),
       loadAlerts(),
       loadTasks(),
+      loadScanner(),
       loadExecutions(),
     ]);
   } finally {
@@ -836,6 +879,7 @@ function renderSpineStatusBlock() {
 function renderNavigationBlock() {
   const entries = [
     ["overview", "总览"],
+    ["scanner", "扫描"],
     ["alerts", "预警"],
     ["executions", "执行"],
     ["integrations", "集成"],
@@ -932,6 +976,7 @@ function renderHeader() {
   const currentPage = {
     alerts: "有界价格预警投影、确认状态与本地通知结果。",
     overview: "跨域读取模型与风险优先的运行事实。",
+    scanner: "离线确定性虚拟网格排行，以及可审计的 APR 与评分证据。",
     executions: "有界执行账本，以及恢复与结果证据。",
     integrations: "能力矩阵与适配器支持证据。",
   }[state.route.view];
@@ -989,6 +1034,8 @@ function renderMain() {
   }
   if (state.route.view === "overview") {
     content.push(renderOverviewView());
+  } else if (state.route.view === "scanner") {
+    content.push(renderScannerView());
   } else if (state.route.view === "alerts") {
     content.push(renderAlertsView());
   } else if (state.route.view === "executions") {
@@ -1004,6 +1051,7 @@ function renderOverviewView() {
     renderRibbon(),
     renderMonitorRegion(),
     renderTasksRegion(),
+    renderScannerSummaryRegion(),
     renderAlertsSummaryRegion(),
     renderExecutionsSummaryRegion(),
     renderRecentNoticesRegion(),
@@ -1169,6 +1217,243 @@ function taskTone(task) {
     return "success";
   }
   return "info";
+}
+
+function renderScannerSummaryRegion() {
+  const model = state.scanner;
+  const latest = model?.latest;
+  let body;
+  if (state.loads.scanner === "error" && !model) {
+    body = renderError(state.errors.scanner);
+  } else if (state.loads.scanner === "loading" && !model) {
+    body = renderSkeleton(4);
+  } else if (!latest) {
+    body = renderEmpty(
+      "尚未观察到虚拟网格排行事实。",
+      "已检查 /api/v1/scanner；缺失记录不会被解释为 scanner 正在运行。",
+    );
+  } else {
+    const leader = latest.rows?.[0];
+    body = el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, [
+        detailStat("投影", humanizeToken(model.projection_status)),
+        detailStat("评估时间", formatDateTime(latest.recorded_at)),
+        detailStat("候选 / 入榜", `${latest.candidate_count} / ${latest.eligible_count}`),
+        detailStat("首位", leader ? scannerMarketLabel(leader) : "无返回行"),
+        detailStat("首位 APR", leader ? `${leader.estimated_apr}%` : "--"),
+      ]),
+      el("p", {
+        className: "muted",
+        text:
+          "这是最后一次离线历史排行；不证明 scanner 进程仍存活，也不证明行情仍然新鲜。",
+      }),
+    ]);
+  }
+  return renderRegion({
+    title: "虚拟网格 Scanner",
+    subtitle:
+      "用有序历史价格回放生成 APR/Rating 排行；只读、可审计，不生成订单意图。",
+    body,
+  });
+}
+
+function renderScannerView() {
+  const model = state.scanner;
+  const latest = model?.latest;
+  let body;
+  if (state.loads.scanner === "error" && !model) {
+    body = renderError(state.errors.scanner);
+  } else if (state.loads.scanner === "loading" && !model) {
+    body = renderSkeleton(7);
+  } else if (!latest) {
+    body = renderEmpty(
+      "尚无确定性虚拟网格排行。",
+      "已检查完整 scanner read model；没有记录、启动按钮或在线行情推断。",
+    );
+  } else {
+    const projectionDegraded = model.projection_status !== "complete";
+    body = el("div", { className: "view-stack" }, [
+      projectionDegraded
+        ? el("div", {
+            className: "scanner-projection-warning",
+            attrs: { role: "status" },
+          }, [
+            buildTag("scanner 投影已降级", "danger"),
+            el("p", {
+              text:
+                "当前仅保留最后有效历史排行；无效事实或部分尾记录修复前，不把它解释为当前结果。",
+            }),
+          ])
+        : null,
+      el("div", { className: "detail-grid" }, [
+        detailStat("评估时间", formatDateTime(latest.recorded_at)),
+        detailStat("Run ID", latest.run_id),
+        detailStat("候选", latest.candidate_count),
+        detailStat("符合过滤", latest.eligible_count),
+        detailStat("循环过滤", latest.filtered_by_cycles_count),
+        detailStat("APR 窗口", `${latest.apr_window_seconds}s`),
+        detailStat("最小循环", latest.min_complete_cycles),
+        detailStat("返回行", latest.rows?.length || 0),
+      ]),
+      el("div", { className: "scanner-policy-note" }, [
+        el("div", { className: "compact-label", text: "排行政策" }),
+        el("p", {
+          text:
+            "显式 benchmark 优先，其余按 APR 降序；并列时按 exact instrument 稳定排序。benchmark 是展示优先级，不是评分加成。",
+        }),
+      ]),
+      latest.truncated
+        ? el("p", {
+            className: "muted",
+            text: `排行已截断：展示 ${latest.rows.length} / ${latest.eligible_count} 个符合条件的候选。`,
+          })
+        : null,
+      renderScannerTable(latest.rows || []),
+      el("p", {
+        className: "muted",
+        text:
+          "所有数值来自最后一次离线历史回放；不证明 scanner 进程仍存活，不证明行情仍然新鲜，也不是投资建议。本页没有启动、停止、重连或交易控件。",
+      }),
+    ]);
+  }
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "确定性虚拟网格排行",
+      subtitle:
+        "最后一次离线历史排行：网格穿越频率是波动代理，APR 与 Rating 都是估算证据，不是实时信号。",
+      body,
+    }),
+  ]);
+}
+
+function renderScannerTable(rows) {
+  if (rows.length === 0) {
+    return renderEmpty(
+      "本次排行没有返回行。",
+      "可能所有标准候选都未达到最小完整循环；benchmark 例外仍需显式配置。",
+    );
+  }
+  return el("div", {
+    className: "table-wrap",
+    attrs: {
+      role: "region",
+      tabindex: "0",
+      "aria-label": "确定性虚拟网格排行明细，可横向滚动",
+    },
+  }, [
+    el("table", { className: "scanner-table" }, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "排名 / 市场" }),
+          el("th", { attrs: { scope: "col" }, text: "优先级" }),
+          el("th", { attrs: { scope: "col" }, text: "APR / Rating" }),
+          el("th", { attrs: { scope: "col" }, text: "循环证据" }),
+          el("th", { attrs: { scope: "col" }, text: "价格 / 网格" }),
+          el("th", { attrs: { scope: "col" }, text: "回放证据" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        rows.map((row) =>
+          el("tr", {}, [
+            el("td", {}, [
+              el("div", { className: "scanner-market" }, [
+                el("span", { className: "scanner-rank mono", text: `#${row.rank}` }),
+                el("div", {}, [
+                  el("strong", {
+                    className: "scanner-symbol mono",
+                    text: row.instrument?.symbol || "--",
+                  }),
+                  el("div", {
+                    className: "muted mono",
+                    text: `${row.instrument?.exchange || "--"} / ${humanizeToken(
+                      row.instrument?.market_type || "unknown",
+                    )}`,
+                  }),
+                ]),
+              ]),
+            ]),
+            el("td", {}, [
+              buildTag(
+                humanizeToken(row.priority),
+                row.priority === "benchmark" ? "info" : "ghost",
+              ),
+            ]),
+            el("td", {}, [
+              el("div", {
+                className: "scanner-apr mono",
+                text: `${row.estimated_apr}%`,
+              }),
+              el("div", { className: "tag-row" }, [
+                buildTag(
+                  String(row.rating_grade || "--").toUpperCase(),
+                  scannerGradeTone(row.rating_grade),
+                ),
+                buildTag(`评分 ${row.rating_score}`, "ghost"),
+              ]),
+            ]),
+            el("td", {}, [
+              el("div", {
+                className: "mono",
+                text: `${row.complete_cycles} 完整 / ${row.recent_five_minute_cycles} 近 5m`,
+              }),
+              el("div", {
+                className: "muted mono",
+                text: `${row.cycles_per_hour} cycles/h · 买 ${row.buy_crosses} / 卖 ${row.sell_crosses}`,
+              }),
+            ]),
+            el("td", {}, [
+              el("div", { className: "mono", text: row.current_price }),
+              el("div", {
+                className: "muted mono",
+                text: `${row.lower_price} — ${row.upper_price}`,
+              }),
+              el("div", {
+                className: "muted",
+                text: `宽 ${row.grid_width_percent}% · 间距 ${row.grid_interval_percent}% · ${row.grid_count} 格`,
+              }),
+            ]),
+            el("td", {}, [
+              el("div", {
+                className: "mono",
+                text: `seq ${row.last_observation_sequence} / ${row.observation_count} samples`,
+              }),
+              el("div", {
+                className: "muted",
+                text: formatDateTime(row.last_observed_at),
+              }),
+              el("div", {
+                className: "muted mono",
+                text: `24h 量 ${row.volume_24h_usdc}`,
+              }),
+            ]),
+          ]),
+        ),
+      ),
+    ]),
+  ]);
+}
+
+function scannerMarketLabel(row) {
+  return `${row.instrument?.exchange || "--"}/${row.instrument?.symbol || "--"}`;
+}
+
+function scannerGradeTone(grade) {
+  switch (grade) {
+    case "s":
+      return "success";
+    case "a":
+      return "info";
+    case "b":
+      return "neutral";
+    case "c":
+      return "warning";
+    case "d":
+      return "danger";
+    default:
+      return "ghost";
+  }
 }
 
 function renderMonitorRegion() {
@@ -2375,6 +2660,24 @@ function collectBands() {
         "最后一个通过生命周期校验的任务快照仍然可见；重新读取成功前，不把其中的阶段或源健康解释为当前状态。",
     });
   }
+  if (state.scanner && state.scanner.projection_status !== "complete") {
+    bands.push({
+      title: "scanner 投影已降级",
+      tag: "保留最后有效历史排行",
+      tone: "danger",
+      message:
+        "无效排行事实或不完整尾记录不会覆盖最后一次通过严格校验的离线结果；该结果不代表当前行情或进程存活性。",
+    });
+  }
+  if (state.loads.scanner === "error" && state.scanner) {
+    bands.push({
+      title: "scanner 快照刷新失败",
+      tag: "保留旧快照",
+      tone: "warning",
+      message:
+        "最后一个通过校验的离线排行仍然可见；重新读取成功前，不把它解释为当前市场排名。",
+    });
+  }
   const alertProjectionStatus = state.alerts?.projection_status;
   if (alertProjectionStatus === "windowed" && isTrustedAlertProjection(state.alerts)) {
     bands.push({
@@ -2761,6 +3064,7 @@ function hasAnyData() {
       state.monitor ||
       state.alerts ||
       state.tasks ||
+      state.scanner ||
       state.capabilities ||
       state.executions,
   );

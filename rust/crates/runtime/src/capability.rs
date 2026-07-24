@@ -856,18 +856,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/web/tests/http_contract.rs",
             ],
         ),
-        capability(
-            "runtime.scanner",
-            CapabilityArea::Runtime,
-            CapabilityLevel::ValidateOnly,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Bounded scanner configuration file access checks.",
-            &["Scanner schema validation and runtime ranking are not implemented."],
-            &[
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/strategy/src/virtual_grid.rs",
-            ],
-        ),
+        scanner_capability(),
         capability(
             "runtime.volume-maker",
             CapabilityArea::Runtime,
@@ -881,6 +870,32 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             ],
         ),
     ]
+}
+
+fn scanner_capability() -> Capability {
+    capability(
+        "runtime.scanner",
+        CapabilityArea::Runtime,
+        CapabilityLevel::ReadOnly,
+        scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
+        "Bounded deterministic virtual-grid replay with explicit benchmark/APR ranking, durable projection, and a read-only Web view.",
+        &[
+            "Scanner configuration schema and CLI/service bootstrap are not implemented; the existing CLI remains fail-closed.",
+            "No real-time market discovery, continuous scanner supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
+            "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
+            "The JSONL journal serializes writers only inside one process and has no rotation or compaction.",
+        ],
+        &[
+            "rust/crates/apps/src/scanner.rs",
+            "rust/crates/apps/tests/virtual_grid_scanner_contract.rs",
+            "rust/crates/strategy/src/virtual_grid.rs",
+            "rust/crates/runtime/src/scanner_read_model.rs",
+            "rust/crates/runtime/tests/scanner_read_model_contract.rs",
+            "rust/crates/control-plane/tests/scanner_projection_contract.rs",
+            "rust/crates/web/tests/http_contract.rs",
+            "rust/crates/web/tests/ui_contract.rs",
+        ],
+    )
 }
 
 fn strategy_capabilities() -> Vec<Capability> {

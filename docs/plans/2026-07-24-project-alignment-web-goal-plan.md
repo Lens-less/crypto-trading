@@ -1,6 +1,6 @@
 # Crypto Trading 全项目对齐、Web 控制面与 Goal 执行计划
 
-> 状态：M3 进行中（M0、M1、M2 已完成）
+> 状态：M3 已完成，M4 待开始（M0、M1、M2 已完成）
 >
 > 日期：2026-07-24
 >
@@ -304,7 +304,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] Arbitrage monitor 连续只读事件（exact-pair library owner 与 durable task projection；
   CLI/service bootstrap、第二个真实 venue 和自动重启仍是显式阻塞项）。
 - [x] Price alert 冷却、去重、确认和持久化。
-- [ ] Virtual-grid scanner 的确定性排行。
+- [x] Virtual-grid scanner 的确定性排行。
 - [x] 非阻塞通知 adapter；至少一个本地 adapter 和一个 deterministic adapter。
 
 首条 tracer 证据（不等同于 M3 全部完成）：
@@ -394,15 +394,48 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   事实并降级，orphan/conflict/状态回退不伪造新状态，正常 terminal 必须同时证明双源均已 stopped，
   超限映射为 bounded resource failure。冷启动只重建最后持久事实：registered/running/stopping、
   failed 与 shutdown timeout 均要求 `investigate`，不会自动恢复网络任务。
-- [x] Control Plane snapshot schema v4 从同一冻结 journal generation 同时生成
-  operator/monitor/alerts/tasks；受同一 Bearer policy 保护的 `GET /api/v1/tasks` 与 Overview
+- [x] Control Plane snapshot schema v5 从同一冻结 journal generation 同时生成
+  operator/monitor/alerts/tasks/scanner；受同一 Bearer policy 保护的 `GET /api/v1/tasks` 与 Overview
   “只读连续任务”区域只展示阶段、双源健康、事件计数、最后事实与恢复判断。页面没有 start/stop/
   reconnect/auto-resume 控件，SSE 仍只作为 payload-free 变化通知触发重新读取。
 - [x] capability 真相只关闭了 composition core 与 durable projection 两项差距：
   `runtime.monitor` 仍是 `read-only / offline / local`；`runtime.continuous` 与 `runtime.live`
-  仍为 unavailable，所有 mainnet trading authority 保持关闭。下一条 tracer 是 Virtual-grid
-  Scanner；第二个真实 venue、CLI/service bootstrap、自动重启，以及 Price Alert 的 source/task
-  接线和 journal 运维仍未完成。
+  仍为 unavailable，所有 mainnet trading authority 保持关闭。第二个真实 venue、CLI/service
+  bootstrap、自动重启，以及 Price Alert 的 source/task 接线和 journal 运维仍未完成。
+
+第六条 tracer 证据（Virtual-grid Scanner 的离线闭环，完成 M3）：
+
+- [x] `DeterministicVirtualGridScanner` 只接受显式、有界、连续且时间单调的离线价格观测；
+  第一条观测锚定现有 `VirtualGridStrategy`，后续观测推进网格。候选、单候选观测、总观测和返回行
+  均有硬上限；重复 exact instrument、非法网格或时间形状在持久化前失败关闭。
+- [x] 排行策略显式固化为 `benchmark` 展示优先、其余按 APR 降序、最后按 exact
+  `MarketInstrument` 稳定排序；最小循环过滤只对显式 benchmark 例外。它没有复制 Python 的
+  BTC 子串启发式，也没有把 benchmark 优先解释为评分加成。
+- [x] 一次扫描只有在单条 `virtual_grid_scanner / scanner_ranked` 事实完成同步追加后才返回成功；
+  journal 失败不返回成功报告。事实只含规范化排行证据，没有原始价格序列、order intent、
+  exchange handle 或 execution authority。
+- [x] 独立 `VirtualGridScannerReadModel` 严格验证 schema、字段 allowlist、资源预算、exact
+  instrument 唯一性、排名顺序、网格/穿越/循环算术、APR 与 Rating；partial tail 或非法 scanner
+  事实只降级 scanner 投影并保留最后一个有效历史排行，不污染 operator/monitor/alerts/tasks。
+  Control Plane snapshot schema v5 从同一冻结 journal generation 生成该投影。
+- [x] 受同一 Bearer policy 保护的只读 `GET /api/v1/scanner`、Overview 摘要与 `/scanner`
+  工作台明确显示“最后一次离线历史排行”、benchmark 策略、exact-instrument tie-break、
+  非实时/非 freshness/非投资建议边界；没有启动、停止、重连或交易控件。
+- [x] 本次非 CI 的隔离本机 Edge 真实渲染复核覆盖 1440、390 与 250 CSS px：页面级
+  `scrollWidth == clientWidth`，scanner 表格在窄屏只于自身可聚焦滚动区内扩展到 980px，
+  三条 fixture 排行和只读按钮均正确呈现。仓内自动门禁当前只锁定语义、路由、危险控件缺席与
+  响应式 CSS 契约；跨平台浏览器 viewport 回归仍留到 M6 的视觉/可访问性门禁。
+- [x] Python 对齐审计把实际核心限定为“有序价格回放 -> 固定虚拟网格 -> 滚动 APR ->
+  Rating -> 排行”；`min_24h_volume`、`top_n_results` 与默认 duration 在旧路径中未真正落实，
+  且旧实现没有统计波动率。Rust 不为这些空壳字段或“实时波动率扫描”制造完成声明。
+- [x] capability 单一事实源把 `runtime.scanner` 提升为 `read-only / offline / local`，同时保留
+  配置 schema、CLI/service bootstrap、实时市场发现、连续 supervisor、自动重启、终端 UI、
+  24h enrichment 与 journal rotation/compaction 阻塞项；所有 live/mainnet 交易权限仍失败关闭。
+- [x] Scanner 规格、仓库标准与安全终审均为 PASS；Unicode/bidi 市场标识在 producer 与
+  read model 两侧失败关闭，同时保留 `-_.:/@` canonical identity 的持久化往返合约。
+  全工作区 fmt/check/clippy/test/doc-test/doc/release build、前端语法与 `cargo audit` 门禁通过。
+  首次全量测试中的既有 Price Alert panic-isolation 测试曾出现一次时序抖动，随后精确用例
+  5/5 通过且默认并发全量门禁复跑通过；该信号保留为后续并发稳定性观察项。
 
 退出条件：
 

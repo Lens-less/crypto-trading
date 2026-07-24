@@ -256,6 +256,96 @@ async fn tasks_endpoint_exposes_durable_lifecycle_without_control_authority() {
 }
 
 #[tokio::test]
+async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
+    let scanner_row = json!({
+        "rank": 1,
+        "activity": "active",
+        "priority": "benchmark",
+        "instrument": {
+            "exchange": "fixture",
+            "symbol": "BTC-USDC",
+            "market_type": "spot",
+        },
+        "started_at": "2026-07-25T00:00:00Z",
+        "last_observed_at": "2026-07-25T00:04:00Z",
+        "observation_count": 5,
+        "last_observation_sequence": 5,
+        "current_price": "100",
+        "lower_price": "95",
+        "upper_price": "105",
+        "pending_buy_price": "99",
+        "pending_sell_price": "101",
+        "grid_width_percent": "10",
+        "grid_interval_percent": "1",
+        "grid_count": 10,
+        "running_seconds": 300,
+        "buy_crosses": 2,
+        "sell_crosses": 2,
+        "total_crosses": 4,
+        "complete_cycles": 2,
+        "recent_five_minute_cycles": 2,
+        "cycles_per_hour": "10",
+        "estimated_apr": "500",
+        "volume_24h_usdc": "1000000",
+        "price_change_24h_percent": null,
+        "rating_grade": "s",
+        "rating_score": "95",
+    });
+    let bytes = jsonl(&[json!({
+        "timestamp": "2026-07-25T00:05:00Z",
+        "strategy": "virtual_grid_scanner",
+        "symbol": "control-plane",
+        "decision": "scanner_ranked",
+        "details": {
+            "schema_version": 1,
+            "run_id": "scan-web",
+            "ranking_policy": "explicit_benchmark_then_apr_desc",
+            "apr_window_seconds": 300,
+            "min_complete_cycles": 0,
+            "row_limit": 50,
+            "candidate_count": 1,
+            "eligible_count": 1,
+            "filtered_by_cycles_count": 0,
+            "truncated": false,
+            "rows": [scanner_row],
+        },
+    })]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.clone().oneshot(get("/api/v1/scanner")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    let scanner = response_json(response).await;
+    assert_eq!(scanner["projection_status"], "complete");
+    assert_eq!(scanner["latest"]["run_id"], "scan-web");
+    assert_eq!(
+        scanner["latest"]["rows"][0]["instrument"]["symbol"],
+        "BTC-USDC"
+    );
+    assert_eq!(scanner["latest"]["rows"][0]["estimated_apr"], "500");
+    let encoded = serde_json::to_string(&scanner).unwrap();
+    for forbidden in ["orders", "intents", "api_key", "authorization", "secret"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "{forbidden} leaked in {encoded}"
+        );
+    }
+
+    let write = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/scanner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn executions_use_cursor_as_a_change_watermark_without_exposing_payloads() {
     let bytes = jsonl(&[decision_record(&json!({
         "api_key": "super-secret",

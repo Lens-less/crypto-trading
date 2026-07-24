@@ -164,6 +164,39 @@ fn continuous_read_only_facts_do_not_advertise_trading_authority() {
 }
 
 #[test]
+fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
+    let manifest = current_capability_manifest();
+    let scanner = manifest.capability("runtime.scanner").unwrap();
+
+    assert_eq!(scanner.level, CapabilityLevel::ReadOnly);
+    assert_eq!(
+        scanner.scope.environments,
+        vec![CapabilityEnvironment::Offline]
+    );
+    assert_eq!(scanner.scope.access, CapabilityAccess::Local);
+    for evidence in [
+        "rust/crates/apps/src/scanner.rs",
+        "rust/crates/runtime/src/scanner_read_model.rs",
+        "rust/crates/web/tests/ui_contract.rs",
+    ] {
+        assert!(scanner.evidence.contains(&evidence.to_owned()));
+    }
+    assert!(
+        scanner
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("CLI/service bootstrap"))
+    );
+    assert!(
+        scanner
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("offline historical estimates"))
+    );
+    assert!(!manifest.live_trading_enabled);
+}
+
+#[test]
 fn mainnet_market_data_does_not_grant_live_trading_authority() {
     let manifest = current_capability_manifest();
     let public_data = manifest.capability("exchange.binance-public").unwrap();

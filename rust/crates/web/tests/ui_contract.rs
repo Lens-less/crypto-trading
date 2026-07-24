@@ -13,7 +13,14 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-const SHELL_PATHS: &[&str] = &["/", "/overview", "/alerts", "/executions", "/integrations"];
+const SHELL_PATHS: &[&str] = &[
+    "/",
+    "/overview",
+    "/scanner",
+    "/alerts",
+    "/executions",
+    "/integrations",
+];
 const WRITE_METHODS: &[Method] = &[Method::POST, Method::PUT, Method::PATCH, Method::DELETE];
 
 #[tokio::test]
@@ -106,6 +113,9 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
             .unwrap(),
     )
     .await;
+    let html = html.replace("\r\n", "\n");
+    let css = css.replace("\r\n", "\n");
+    let javascript = javascript.replace("\r\n", "\n");
 
     for external in ["http://", "https://", "//cdn", "//fonts"] {
         assert!(!html.contains(external), "HTML references {external}");
@@ -147,6 +157,7 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
         "/api/v1/system",
         "/api/v1/alerts",
         "/api/v1/tasks",
+        "/api/v1/scanner",
         "/api/v1/capabilities",
         "/api/v1/executions",
         "/api/v1/events",
@@ -169,6 +180,7 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     assert_monitor_surface_contract(&javascript, &css);
     assert_alert_surface_contract(&javascript, &css);
     assert_task_surface_contract(&javascript, &css);
+    assert_scanner_surface_contract(&javascript, &css);
     assert!(javascript.contains("kill_switch"));
     assert_protected_state_contract(&javascript);
 }
@@ -238,7 +250,7 @@ fn assert_alert_surface_contract(javascript: &str, css: &str) {
     assert!(css.contains(".alert-table {\n  min-width: 880px;"));
     assert!(css.contains(".alert-table th {\n  white-space: nowrap;"));
     assert!(css.contains(".risk-status-block .status-list li {\n    display: grid;"));
-    assert!(css.contains("grid-template-columns: repeat(4, minmax(0, 1fr));"));
+    assert!(css.contains("grid-template-columns: repeat(5, minmax(0, 1fr));"));
 }
 
 fn assert_task_surface_contract(javascript: &str, css: &str) {
@@ -274,12 +286,53 @@ fn assert_task_surface_contract(javascript: &str, css: &str) {
     }
 }
 
+fn assert_scanner_surface_contract(javascript: &str, css: &str) {
+    for required in [
+        "function loadScanner()",
+        "function renderScannerView()",
+        "function renderScannerSummaryRegion()",
+        "/api/v1/scanner",
+        "确定性虚拟网格排行",
+        "最后一次离线历史排行",
+        "显式 benchmark 优先",
+        "benchmark 是展示优先级，不是评分加成",
+        "不证明 scanner 进程仍存活",
+        "不证明行情仍然新鲜",
+        "不是投资建议",
+        "scanner 投影已降级",
+        "保留最后有效历史排行",
+        "排行已截断",
+        "可横向滚动",
+        "exact instrument",
+    ] {
+        assert!(
+            javascript.contains(required),
+            "browser asset is missing scanner-surface contract {required}"
+        );
+    }
+    assert!(css.contains(".scanner-table {\n  min-width: 980px;"));
+    assert!(css.contains(".scanner-policy-note {\n  display: grid;"));
+    for forbidden in [
+        "startScanner(",
+        "stopScanner(",
+        "restartScanner(",
+        "reconnectScanner(",
+        "submitScannerOrder(",
+    ] {
+        assert!(
+            !javascript.contains(forbidden),
+            "scanner surface must remain read-only: {forbidden}"
+        );
+    }
+}
+
 fn assert_protected_state_contract(javascript: &str) {
     for required in [
         "function clearProtectedState()",
         "state.system = null;",
         "state.alerts = null;",
         "state.tasks = null;",
+        "state.scanner = null;",
         "state.capabilities = null;",
         "state.executions = null;",
         "state.lastPage = null;",
@@ -303,7 +356,7 @@ fn assert_protected_state_contract(javascript: &str) {
         javascript
             .matches("if (generation !== state.sessionGeneration)")
             .count()
-            >= 7,
+            >= 8,
         "every protected JSON success and error path must reject stale auth sessions"
     );
 }

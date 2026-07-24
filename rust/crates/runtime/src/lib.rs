@@ -12,6 +12,7 @@ mod market_supervisor;
 mod mode;
 mod monitor_read_model;
 mod read_model;
+mod scanner_read_model;
 mod task_read_model;
 
 pub use alert_read_model::{
@@ -68,6 +69,11 @@ pub use read_model::{
     ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,
     MAX_OPERATOR_READ_MODEL_WARNINGS, OPERATOR_READ_MODEL_SCHEMA_VERSION, OperatorReadModel,
     ProjectionStatus, ReadModelError, ReadModelWarning, ReadModelWarningCode, RecoveryDirective,
+};
+pub use scanner_read_model::{
+    MAX_VIRTUAL_GRID_SCANNER_ROWS, ScannerInstrumentView, ScannerPriorityView,
+    ScannerRatingGradeView, VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION, VirtualGridScanRowView,
+    VirtualGridScanView, VirtualGridScannerReadModel,
 };
 pub use task_read_model::{
     MAX_READ_ONLY_TASKS, READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit,
