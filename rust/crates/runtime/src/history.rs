@@ -124,7 +124,7 @@ impl Drop for JsonlHistory {
 
 impl JsonlHistory {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
+        let path = stable_history_path(&path.into());
         let lock_key = normalized_lock_key(&path);
         let path_lock = shared_path_lock(lock_key);
         Self { path, path_lock }
@@ -252,6 +252,14 @@ impl JsonlHistory {
     }
 }
 
+fn stable_history_path(path: &Path) -> PathBuf {
+    canonicalize_existing_prefix(&absolute_key(path))
+}
+
+pub(crate) fn stable_history_path_for_read(path: &Path) -> PathBuf {
+    stable_history_path(path)
+}
+
 fn absolute_key(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -261,9 +269,7 @@ fn absolute_key(path: &Path) -> PathBuf {
 }
 
 fn normalized_lock_key(path: &Path) -> PathBuf {
-    let absolute = absolute_key(path);
-    let canonical = canonicalize_existing_prefix(&absolute);
-    normalize_key_case(&canonical)
+    normalize_key_case(path)
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
@@ -385,7 +391,11 @@ pub enum HistoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use uuid::Uuid;
+
+    const STABLE_CWD_TEST_NAME: &str =
+        "history::tests::relative_paths_remain_stable_after_cwd_changes";
 
     #[test]
     fn lexical_aliases_share_one_process_lock() {
@@ -465,6 +475,25 @@ mod tests {
         assert_eq!(writer.bytes.len(), 5);
     }
 
+    #[test]
+    fn relative_paths_remain_stable_after_cwd_changes() {
+        if std::env::var_os("JSONL_HISTORY_CWD_CHILD").is_some() {
+            run_relative_paths_remain_stable_after_cwd_changes();
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(STABLE_CWD_TEST_NAME)
+            .arg("--nocapture")
+            .env("JSONL_HISTORY_CWD_CHILD", "1")
+            .env("RUST_TEST_THREADS", "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child test failed: {status}");
+    }
+
     #[tokio::test]
     async fn history_allows_exact_file_limit_then_rejects_without_writing() {
         let path = std::env::temp_dir().join(format!("history-file-limit-{}", Uuid::new_v4()));
@@ -528,6 +557,51 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn append_batch_accepts_a_batch_that_exactly_fills_the_byte_budget() {
+        let path = std::env::temp_dir().join(format!("history-batch-exact-{}", Uuid::new_v4()));
+        let history = JsonlHistory::new(&path);
+        let record = sized_history_record(MAX_HISTORY_RECORD_BYTES);
+        let records = vec![record; MAX_HISTORY_BATCH_BYTES / MAX_HISTORY_RECORD_BYTES];
+
+        history.append_batch(&records).await.unwrap();
+
+        assert_eq!(
+            u64::try_from(MAX_HISTORY_BATCH_BYTES).unwrap(),
+            std::fs::metadata(&path).unwrap().len()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_batch_rejects_one_byte_over_budget_without_touching_the_file() {
+        let path = std::env::temp_dir().join(format!("history-batch-over-{}", Uuid::new_v4()));
+        let history = JsonlHistory::new(&path);
+        let sentinel = b"seed\n";
+        std::fs::write(&path, sentinel).unwrap();
+
+        let minimum = minimum_history_record_bytes();
+        let overflow_record = sized_history_record(MAX_HISTORY_RECORD_BYTES + 1 - minimum);
+        let mut records = vec![
+            sized_history_record(MAX_HISTORY_RECORD_BYTES);
+            (MAX_HISTORY_BATCH_BYTES / MAX_HISTORY_RECORD_BYTES) - 1
+        ];
+        records.push(overflow_record);
+        records.push(sized_history_record(minimum));
+
+        let error = history.append_batch(&records).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistoryError::BatchTooLarge {
+                bytes,
+                limit: MAX_HISTORY_BATCH_BYTES,
+            } if bytes == MAX_HISTORY_BATCH_BYTES + 1
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_path_keys_are_case_normalized() {
@@ -568,6 +642,59 @@ mod tests {
             .count()
     }
 
+    fn minimum_history_record_bytes() -> usize {
+        history_record_bytes(0)
+    }
+
+    fn sized_history_record(target_bytes: usize) -> DecisionRecord {
+        let minimum = minimum_history_record_bytes();
+        assert!(
+            (minimum..=MAX_HISTORY_RECORD_BYTES).contains(&target_bytes),
+            "target bytes must be within [{minimum}, {MAX_HISTORY_RECORD_BYTES}], got {target_bytes}",
+        );
+
+        let padding = target_bytes - minimum;
+        let record = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            strategy: "batch-budget".to_owned(),
+            symbol: "BTC-USDT".to_owned(),
+            decision: "hold".to_owned(),
+            details: Value::Object(
+                [("pad".to_owned(), Value::String("a".repeat(padding)))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        assert_eq!(
+            history_record_bytes(record_padding_len(&record)),
+            target_bytes
+        );
+        record
+    }
+
+    fn history_record_bytes(padding: usize) -> usize {
+        let record = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            strategy: "batch-budget".to_owned(),
+            symbol: "BTC-USDT".to_owned(),
+            decision: "hold".to_owned(),
+            details: Value::Object(
+                [("pad".to_owned(), Value::String("a".repeat(padding)))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        serde_json::to_vec(&record).unwrap().len() + 1
+    }
+
+    fn record_padding_len(record: &DecisionRecord) -> usize {
+        record
+            .details
+            .get("pad")
+            .and_then(Value::as_str)
+            .map_or(0, str::len)
+    }
+
     #[cfg(unix)]
     fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
         std::os::unix::fs::symlink(target, link)
@@ -586,5 +713,67 @@ mod tests {
     #[cfg(windows)]
     fn remove_directory_symlink(link: &Path) -> std::io::Result<()> {
         std::fs::remove_dir(link)
+    }
+
+    fn run_relative_paths_remain_stable_after_cwd_changes() {
+        let root = std::env::temp_dir().join(format!("history-stable-cwd-{}", Uuid::new_v4()));
+        let original = root.join("original");
+        let drift = root.join("drift");
+        let relative = PathBuf::from("logs").join("decisions.jsonl");
+        let expected = stable_history_path(&original.join(&relative));
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&drift).unwrap();
+
+        let cwd_guard = CurrentDirGuard::capture().unwrap();
+        std::env::set_current_dir(&original).unwrap();
+        let relative_history = JsonlHistory::new(&relative);
+        assert_eq!(relative_history.path(), expected.as_path());
+
+        std::env::set_current_dir(&drift).unwrap();
+        let direct_history = JsonlHistory::new(&expected);
+        assert_eq!(direct_history.path(), expected.as_path());
+        assert!(Arc::ptr_eq(
+            &relative_history.path_lock,
+            &direct_history.path_lock
+        ));
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(relative_history.append(&DecisionRecord {
+                timestamp: Utc::now(),
+                strategy: "stable-path".to_owned(),
+                symbol: "BTC".to_owned(),
+                decision: "hold".to_owned(),
+                details: Value::Null,
+            }))
+            .unwrap();
+
+        drop(cwd_guard);
+
+        let rows = std::fs::read_to_string(&expected).unwrap().lines().count();
+        assert_eq!(rows, 1);
+        assert!(!drift.join(&relative).exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn capture() -> std::io::Result<Self> {
+            Ok(Self {
+                original: std::env::current_dir()?,
+            })
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 }

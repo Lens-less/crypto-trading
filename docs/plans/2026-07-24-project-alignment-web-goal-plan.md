@@ -217,7 +217,7 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
 - [x] 稳定版本化事件 envelope 与 cursor。
 - [ ] 从现有 execution JSONL 构建 bounded read model。
 - [ ] 处理损坏尾行、重复事件、超限记录、游标过期和跨进程读取。
-- [ ] snapshot/history interface 的 deterministic adapter 与 fixture。
+- [x] snapshot/history interface 的 deterministic adapter 与 fixture。
 
 退出条件：
 

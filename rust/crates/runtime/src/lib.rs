@@ -4,6 +4,7 @@ mod capability;
 mod execution;
 mod history;
 mod journal;
+mod journal_reader;
 mod mode;
 
 pub use capability::{
@@ -24,5 +25,10 @@ pub use journal::{
     AggregateRef, CursorError, EventContractError, JOURNAL_CURSOR_SCHEMA_VERSION, JournalCursor,
     MAX_JOURNAL_CURSOR_BYTES, MAX_OPERATION_EVENT_BYTES, MAX_OPERATION_EVENT_PAYLOAD_BYTES,
     OPERATION_EVENT_SCHEMA_VERSION, OperationEventEnvelope,
+};
+pub use journal_reader::{
+    FileJournalSnapshotSource, JournalPage, JournalPageBoundary, JournalReadError, JournalSnapshot,
+    JournalSnapshotSource, LegacyJsonlJournalReader, MAX_JOURNAL_PAGE_BYTES,
+    MAX_JOURNAL_PAGE_EVENTS, MAX_JOURNAL_SOURCE_BYTES, MemoryJournalSnapshotSource,
 };
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
