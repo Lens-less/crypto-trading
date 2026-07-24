@@ -205,10 +205,11 @@ impl ProjectionBuilder {
     }
 
     fn apply_occurrence(&mut self, occurrence: AlertOccurrenceView) -> Result<(), ()> {
-        if self
-            .last_alert_sequence
-            .is_some_and(|last| occurrence.alert_sequence != last.saturating_add(1))
-        {
+        let expected_sequence = match self.last_alert_sequence {
+            Some(last) => last.checked_add(1).ok_or(())?,
+            None => 1,
+        };
+        if occurrence.alert_sequence != expected_sequence {
             return Err(());
         }
         self.last_alert_sequence = Some(occurrence.alert_sequence);

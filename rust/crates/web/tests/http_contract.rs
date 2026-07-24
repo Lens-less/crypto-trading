@@ -110,6 +110,64 @@ async fn monitor_endpoint_exposes_only_the_bounded_read_model() {
 }
 
 #[tokio::test]
+async fn alerts_endpoint_exposes_only_the_bounded_read_model_and_no_write_authority() {
+    let bytes = jsonl(&[
+        json!({
+            "timestamp": "2026-07-24T00:00:00Z",
+            "strategy": "price_alert",
+            "symbol": "BTC-USDT",
+            "decision": "price_alert_occurred",
+            "details": {
+                "schema_version": 1,
+                "sequence": 1,
+                "exchange": "binance",
+                "market_type": "spot",
+                "kind": "upper_limit",
+                "price": "101.25",
+                "change_percent": null,
+                "market_revision": 7,
+                "market_generation": 3,
+            },
+        }),
+        json!({
+            "timestamp": "2026-07-24T00:00:01Z",
+            "strategy": "unrelated",
+            "symbol": "BTC-USDT",
+            "decision": "hold",
+            "details": {
+                "api_key": "must-not-leak",
+                "message": "must-not-leak",
+            },
+        }),
+    ]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.clone().oneshot(get("/api/v1/alerts")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    let alerts = response_json(response).await;
+    assert_eq!(alerts["projection_status"], "complete");
+    assert_eq!(alerts["occurrences"][0]["kind"], "upper_limit");
+    assert_eq!(alerts["occurrences"][0]["price"], "101.25");
+    let encoded = serde_json::to_string(&alerts).unwrap();
+    assert!(!encoded.contains("api_key"));
+    assert!(!encoded.contains("must-not-leak"));
+
+    let write = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/alerts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn executions_use_cursor_as_a_change_watermark_without_exposing_payloads() {
     let bytes = jsonl(&[decision_record(&json!({
         "api_key": "super-secret",

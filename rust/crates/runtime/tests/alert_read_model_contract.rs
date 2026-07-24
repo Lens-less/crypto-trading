@@ -189,6 +189,31 @@ fn orphan_reference_degrades_and_hides_occurrences() {
 }
 
 #[test]
+fn first_occurrence_must_start_at_sequence_one() {
+    let snapshot = snapshot(&[alert_record(
+        "price_alert_occurred",
+        &json!({
+            "schema_version": 1,
+            "sequence": 2,
+            "exchange": "binance",
+            "market_type": "perpetual",
+            "kind": "upper_limit",
+            "price": "101",
+            "change_percent": null,
+            "market_revision": 1,
+            "market_generation": 1,
+        }),
+        0,
+    )]);
+
+    let model = PriceAlertReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Degraded);
+    assert_eq!(model.invalid_event_count, 1);
+    assert!(model.occurrences.is_empty());
+}
+
+#[test]
 fn partial_tail_degrades_and_hides_even_valid_occurrences() {
     let mut body = jsonl(&[alert_record(
         "price_alert_occurred",

@@ -59,6 +59,8 @@ fn control_plane_projects_monitor_and_execution_from_one_journal_generation() {
         CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION
     );
     assert_eq!(snapshot.monitor.journal_head_sequence, Some(2));
+    assert_eq!(snapshot.alerts.journal_head_sequence, Some(2));
+    assert!(snapshot.alerts.occurrences.is_empty());
     let latest = snapshot.monitor.latest.unwrap();
     assert_eq!(latest.source_sequence, 1);
     assert_eq!(latest.state, MonitorProjectionState::Opportunity);

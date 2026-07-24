@@ -21,13 +21,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use crypto_trading_runtime::{
-    ArbitrageMonitorProjection, ArbitrageMonitorReadModel, ArbitrageMonitorView,
-    CapabilityManifest, ExecutionBatchState, MonitorContinuityState, MonitorFreshnessState,
-    MonitorLegView, MonitorProjectionState, OperatorReadModel, ProjectionStatus, RecoveryDirective,
-    ReleaseStage,
+    AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
+    AlertOccurrenceView, ArbitrageMonitorProjection, ArbitrageMonitorReadModel,
+    ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState, MonitorContinuityState,
+    MonitorFreshnessState, MonitorLegView, MonitorProjectionState, OperatorReadModel,
+    PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PriceAlertReadModel, ProjectionStatus,
+    RecoveryDirective, ReleaseStage,
 };
 
-pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
 
 /// Stable transport-independent classification for safe public error mapping.
@@ -86,11 +88,13 @@ impl ReadControlPlane {
         let journal = self.journal.snapshot()?;
         let operator = OperatorReadModel::from_legacy_snapshot(&journal)?;
         let monitor = ArbitrageMonitorReadModel::from_legacy_snapshot(&journal)?;
+        let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)?;
         Ok(ControlPlaneSnapshot {
             schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
             capabilities: self.capabilities.clone(),
             operator,
             monitor,
+            alerts,
         })
     }
 
@@ -152,12 +156,15 @@ impl ReadControlPlane {
             .map_err(ControlPlaneReadError::Projection)?;
         let monitor = ArbitrageMonitorReadModel::from_legacy_snapshot(&journal)
             .map_err(ControlPlaneReadError::Projection)?;
+        let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)
+            .map_err(ControlPlaneReadError::Projection)?;
         Ok(ControlPlaneRead {
             snapshot: ControlPlaneSnapshot {
                 schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
                 capabilities: self.capabilities.clone(),
                 operator,
                 monitor,
+                alerts,
             },
             events: control_plane_events_page(&page),
         })
@@ -193,6 +200,7 @@ pub struct ControlPlaneSnapshot {
     pub capabilities: CapabilityManifest,
     pub operator: OperatorReadModel,
     pub monitor: ArbitrageMonitorReadModel,
+    pub alerts: PriceAlertReadModel,
 }
 
 /// Payload-free notification that tells an adapter which snapshot fact changed.

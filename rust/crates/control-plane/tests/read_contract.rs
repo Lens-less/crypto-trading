@@ -9,7 +9,8 @@ use crypto_trading_control_plane::{
 };
 use crypto_trading_runtime::{
     CapabilityLevel, CursorError, ExecutionBatch, ExecutionBatchState, JournalPageBoundary,
-    JournalSnapshot, JournalSnapshotSource, ProjectionStatus,
+    JournalSnapshot, JournalSnapshotSource, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
+    ProjectionStatus,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -51,6 +52,11 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
             .iter()
             .any(|path| path == "rust/crates/web/tests/http_contract.rs")
     );
+    assert_eq!(
+        first.alerts.schema_version,
+        PRICE_ALERT_READ_MODEL_SCHEMA_VERSION
+    );
+    assert!(first.alerts.occurrences.is_empty());
     assert_eq!(first.operator.projection_status, ProjectionStatus::Complete);
     assert_eq!(first.operator.batches.len(), 1);
     assert_eq!(
