@@ -1108,6 +1108,14 @@ const MAX_CONFIG_DETAIL_BYTES: usize = 8_192;
 const MAX_CONFIG_SCHEMA_ISSUES: usize = 64;
 const MAX_CONFIG_SCHEMA_ISSUE_BYTES: usize = 512;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigInspectionOutcome {
+    Invalid,
+    Unknown,
+}
+
+type ConfigInspectionFailure = (&'static str, String, ConfigInspectionOutcome);
+
 #[derive(Debug)]
 struct ConfigCheckReport {
     summaries: Vec<Value>,
@@ -1152,13 +1160,12 @@ impl ConfigCheckReport {
         if self.stopped {
             return Ok(());
         }
-        let summary = json!({
-            "path": path.map_or_else(String::new, bounded_path),
-            "kind": "configuration",
-            "classification": "unsupported",
-            "status": "error",
-            "error": "configuration check stopped before inspecting all paths because the summary count or output byte budget was exhausted",
-        });
+        let summary = config_error_summary(
+            path.unwrap_or_else(|| Path::new("")),
+            "configuration",
+            ConfigInspectionOutcome::Unknown,
+            "configuration check stopped before inspecting all paths because the summary count or output byte budget was exhausted",
+        );
         let json_delta = pretty_json_summary_delta(&summary)?;
         let text_delta = render_config_summary(&summary).len().saturating_add(1);
         if self.summaries.len() >= MAX_CONFIG_CHECK_SUMMARIES
@@ -1391,11 +1398,33 @@ fn is_config_file(path: &Path) -> bool {
 }
 
 fn discovery_error(path: &Path, error: &str) -> Value {
+    config_error_summary(
+        path,
+        "configuration",
+        ConfigInspectionOutcome::Unknown,
+        error,
+    )
+}
+
+fn config_error_summary(
+    path: &Path,
+    kind: &'static str,
+    outcome: ConfigInspectionOutcome,
+    error: &str,
+) -> Value {
+    let (parseable, consumed_fields) = match outcome {
+        ConfigInspectionOutcome::Invalid => (Value::from(false), "none"),
+        ConfigInspectionOutcome::Unknown => (Value::Null, "unknown"),
+    };
     json!({
         "path": bounded_path(path),
-        "kind": "configuration",
+        "kind": kind,
         "classification": "unsupported",
         "status": "error",
+        "parseable": parseable,
+        "executable": false,
+        "consumed_fields": consumed_fields,
+        "runtime": "unavailable",
         "error": bounded_text(error, MAX_CONFIG_MESSAGE_BYTES),
     })
 }
@@ -1403,13 +1432,7 @@ fn discovery_error(path: &Path, error: &str) -> Value {
 fn inspect_config(path: &Path) -> Value {
     match inspect_config_inner(path) {
         Ok(summary) => summary,
-        Err((kind, error)) => json!({
-            "path": bounded_path(path),
-            "kind": kind,
-            "classification": "unsupported",
-            "status": "error",
-            "error": bounded_text(&error, MAX_CONFIG_MESSAGE_BYTES),
-        }),
+        Err((kind, error, outcome)) => config_error_summary(path, kind, outcome, &error),
     }
 }
 
@@ -1444,75 +1467,77 @@ fn bounded_issue_detail(prefix: &str, issues: &[String]) -> String {
 
 fn mark_summary_error(mut summary: Value, error: &str) -> Value {
     summary["status"] = Value::from("error");
+    summary["classification"] = Value::from("unsupported");
+    summary["executable"] = Value::from(false);
+    summary["runtime"] = Value::from("unavailable");
     summary["error"] = Value::from(bounded_text(error, MAX_CONFIG_MESSAGE_BYTES));
     summary
 }
 
-fn inspect_config_inner(path: &Path) -> Result<Value, (&'static str, String)> {
-    let body = read_bounded_config(path).map_err(|error| ("configuration", error))?;
-    let document: serde_yaml::Value = serde_yaml::from_str(&body)
-        .map_err(|error| ("configuration", format!("invalid YAML: {error}")))?;
+fn invalid_config_error(
+    kind: &'static str,
+    error: &(impl ToString + ?Sized),
+) -> ConfigInspectionFailure {
+    (kind, error.to_string(), ConfigInspectionOutcome::Invalid)
+}
+
+fn unknown_config_error(
+    kind: &'static str,
+    error: &(impl ToString + ?Sized),
+) -> ConfigInspectionFailure {
+    (kind, error.to_string(), ConfigInspectionOutcome::Unknown)
+}
+
+fn inspect_config_inner(path: &Path) -> Result<Value, ConfigInspectionFailure> {
+    let body =
+        read_bounded_config(path).map_err(|error| unknown_config_error("configuration", &error))?;
+    let document: serde_yaml::Value = serde_yaml::from_str(&body).map_err(|error| {
+        invalid_config_error("configuration", &format!("invalid YAML: {error}"))
+    })?;
     let auxiliary_kind = auxiliary_config_filename_kind(path);
-    let mapping = document.as_mapping().ok_or((
-        "configuration",
-        "configuration must contain a YAML mapping".to_owned(),
-    ))?;
+    let mapping = document.as_mapping().ok_or_else(|| {
+        invalid_config_error("configuration", "configuration must contain a YAML mapping")
+    })?;
 
     let has = |key: &str| mapping.contains_key(serde_yaml::Value::from(key));
     let summary = if has("grid_system") || has("grid") || is_bare_grid(mapping) {
-        let config =
-            load_grid_config_from_str(&body).map_err(|error| ("grid", error.to_string()))?;
-        GridPlanner::try_from(&config).map_err(|error| ("grid", error.to_string()))?;
-        let issues = paper_runtime_schema_issues(PaperRuntimeSchema::Grid, &document);
-        if issues.is_empty() {
-            Ok(config_summary(path, "grid", "runtime-executable", None))
-        } else {
-            let detail = bounded_issue_detail(
-                "paper one-shot rejects ignored or unknown runtime keys: ",
-                &issues,
-            );
-            Ok(config_summary(
-                path,
-                "grid",
-                "legacy-parseable",
-                Some(&detail),
-            ))
-        }
+        inspect_grid_config(path, &body, &document)
     } else if has("volume_maker") {
         let config = load_volume_maker_config_from_str(&body)
-            .map_err(|error| ("volume-maker", error.to_string()))?;
+            .map_err(|error| invalid_config_error("volume-maker", &error))?;
         let detail = if let Err(error) = config.validate_execution_controls() {
             error.to_string()
+        } else if let Err(error) = VolumeMakerStrategy::try_from(&config) {
+            error.to_string()
         } else {
-            VolumeMakerStrategy::try_from(&config)
-                .map_err(|error| ("volume-maker", error.to_string()))?;
             "runtime command is unavailable".to_owned()
         };
         Ok(config_summary(
             path,
             "volume-maker",
-            "legacy-parseable",
+            ConfigSupport::ParseOnly,
             Some(&detail),
         ))
     } else if has("price_alert") {
         load_price_alert_config_from_str(&body)
-            .map_err(|error| ("price-alert", error.to_string()))?;
+            .map_err(|error| invalid_config_error("price-alert", &error))?;
         Ok(config_summary(
             path,
             "price-alert",
-            "legacy-parseable",
+            ConfigSupport::ParseOnly,
             Some("runtime command is unavailable"),
         ))
     } else if is_arbitrage(mapping) {
         inspect_arbitrage_config(path, &body, &document)
     } else if has("exchanges") && has("symbols") {
-        load_monitor_config_from_str(&body).map_err(|error| ("monitor", error.to_string()))?;
+        load_monitor_config_from_str(&body)
+            .map_err(|error| invalid_config_error("monitor", &error))?;
         let issues = paper_runtime_schema_issues(PaperRuntimeSchema::Monitor, &document);
         if issues.is_empty() {
             Ok(config_summary(
                 path,
                 "monitor",
-                "auxiliary",
+                ConfigSupport::PaperCompanion,
                 Some("arbitrage paper companion; standalone monitor runtime unavailable"),
             ))
         } else {
@@ -1523,33 +1548,74 @@ fn inspect_config_inner(path: &Path) -> Result<Value, (&'static str, String)> {
             Ok(config_summary(
                 path,
                 "monitor",
-                "legacy-parseable",
+                ConfigSupport::LegacyPartial,
                 Some(&detail),
             ))
         }
     } else if has("symbol_mappings") || has("conversions") {
         load_symbol_conversions_from_str(&body)
-            .map_err(|error| ("symbol-conversion", error.to_string()))?;
-        Ok(config_summary(path, "symbol-conversion", "auxiliary", None))
+            .map_err(|error| invalid_config_error("symbol-conversion", &error))?;
+        Ok(config_summary(
+            path,
+            "symbol-conversion",
+            ConfigSupport::AuxiliaryParsed,
+            None,
+        ))
     } else if let Some(exchange) = exchange_auth_name(mapping) {
         load_exchange_auth_from_str(exchange, &body)
-            .map_err(|error| ("exchange-auth", error.to_string()))?;
+            .map_err(|error| invalid_config_error("exchange-auth", &error))?;
         Ok(config_summary(
             path,
             "exchange-auth",
-            "legacy-parseable",
+            ConfigSupport::ParseOnly,
             Some("private live adapters are unavailable"),
         ))
     } else if let Some(kind) = auxiliary_config_kind(path, &document) {
-        Ok(config_summary(path, kind, "auxiliary", None))
+        Ok(config_summary(
+            path,
+            kind,
+            ConfigSupport::AuxiliaryOnly,
+            None,
+        ))
     } else {
-        Err((
+        Err(invalid_config_error(
             "configuration",
-            String::from("unsupported configuration schema"),
+            "unsupported configuration schema",
         ))
     }?;
 
     Ok(reject_auxiliary_filename_mismatch(summary, auxiliary_kind))
+}
+
+fn inspect_grid_config(
+    path: &Path,
+    body: &str,
+    document: &serde_yaml::Value,
+) -> Result<Value, ConfigInspectionFailure> {
+    let config =
+        load_grid_config_from_str(body).map_err(|error| invalid_config_error("grid", &error))?;
+    let issues = paper_runtime_schema_issues(PaperRuntimeSchema::Grid, document);
+    if !issues.is_empty() {
+        let detail = bounded_issue_detail(
+            "paper one-shot rejects ignored or unknown runtime keys: ",
+            &issues,
+        );
+        return Ok(config_summary(
+            path,
+            "grid",
+            ConfigSupport::LegacyPartial,
+            Some(&detail),
+        ));
+    }
+    if let Err(error) = GridPlanner::try_from(&config) {
+        return Ok(config_summary(
+            path,
+            "grid",
+            ConfigSupport::ParseOnly,
+            Some(&error.to_string()),
+        ));
+    }
+    Ok(config_summary(path, "grid", ConfigSupport::PaperOnce, None))
 }
 
 fn reject_auxiliary_filename_mismatch(
@@ -1573,9 +1639,9 @@ fn inspect_arbitrage_config(
     path: &Path,
     body: &str,
     document: &serde_yaml::Value,
-) -> Result<Value, (&'static str, String)> {
-    let config =
-        load_arbitrage_config_from_str(body).map_err(|error| ("arbitrage", error.to_string()))?;
+) -> Result<Value, ConfigInspectionFailure> {
+    let config = load_arbitrage_config_from_str(body)
+        .map_err(|error| invalid_config_error("arbitrage", &error))?;
     let enabled_keys = config
         .symbol_configs
         .iter()
@@ -1591,7 +1657,7 @@ fn inspect_arbitrage_config(
         return Ok(config_summary(
             path,
             "arbitrage",
-            "legacy-parseable",
+            ConfigSupport::LegacyPartial,
             Some(&detail),
         ));
     }
@@ -1599,7 +1665,7 @@ fn inspect_arbitrage_config(
         return Ok(config_summary(
             path,
             "arbitrage",
-            "legacy-parseable",
+            ConfigSupport::ParseOnly,
             Some(&error.to_string()),
         ));
     }
@@ -1607,7 +1673,7 @@ fn inspect_arbitrage_config(
         return Ok(config_summary(
             path,
             "arbitrage",
-            "legacy-parseable",
+            ConfigSupport::ParseOnly,
             Some("no enabled symbol_configs strategy key"),
         ));
     }
@@ -1615,9 +1681,17 @@ fn inspect_arbitrage_config(
     let mut missing_position_limit_keys = Vec::new();
     for (key, profile) in &config.symbol_configs {
         if profile.enabled {
-            let effective = config
-                .resolve_for_strategy(key)
-                .map_err(|error| ("arbitrage", error.to_string()))?;
+            let effective = match config.resolve_for_strategy(key) {
+                Ok(effective) => effective,
+                Err(error) => {
+                    return Ok(config_summary(
+                        path,
+                        "arbitrage",
+                        ConfigSupport::ParseOnly,
+                        Some(&error.to_string()),
+                    ));
+                }
+            };
             if effective.max_position_value.is_none() {
                 missing_position_limit_keys.push(key.to_string());
             }
@@ -1631,7 +1705,7 @@ fn inspect_arbitrage_config(
         return Ok(config_summary(
             path,
             "arbitrage",
-            "legacy-parseable",
+            ConfigSupport::ParseOnly,
             Some(&detail),
         ));
     }
@@ -1643,22 +1717,68 @@ fn inspect_arbitrage_config(
     Ok(config_summary(
         path,
         "arbitrage",
-        "runtime-executable",
+        ConfigSupport::PaperOnce,
         Some(&detail),
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSupport {
+    PaperOnce,
+    PaperCompanion,
+    LegacyPartial,
+    ParseOnly,
+    AuxiliaryParsed,
+    AuxiliaryOnly,
+}
+
+impl ConfigSupport {
+    const fn classification(self) -> &'static str {
+        match self {
+            Self::PaperOnce => "runtime-executable",
+            Self::LegacyPartial | Self::ParseOnly => "legacy-parseable",
+            Self::PaperCompanion | Self::AuxiliaryParsed | Self::AuxiliaryOnly => "auxiliary",
+        }
+    }
+
+    const fn executable(self) -> bool {
+        matches!(self, Self::PaperOnce)
+    }
+
+    const fn consumed_fields(self) -> &'static str {
+        match self {
+            Self::PaperOnce | Self::PaperCompanion => "strict",
+            Self::LegacyPartial => "partial",
+            Self::ParseOnly | Self::AuxiliaryParsed => "parse-only",
+            Self::AuxiliaryOnly => "auxiliary-only",
+        }
+    }
+
+    const fn runtime(self) -> &'static str {
+        match self {
+            Self::PaperOnce => "paper-once",
+            Self::PaperCompanion => "paper-companion",
+            Self::LegacyPartial | Self::ParseOnly => "unavailable",
+            Self::AuxiliaryParsed | Self::AuxiliaryOnly => "not-wired",
+        }
+    }
 }
 
 fn config_summary(
     path: &Path,
     kind: &'static str,
-    classification: &'static str,
+    support: ConfigSupport,
     detail: Option<&str>,
 ) -> Value {
     json!({
         "path": bounded_path(path),
         "kind": kind,
-        "classification": classification,
+        "classification": support.classification(),
         "status": "ok",
+        "parseable": true,
+        "executable": support.executable(),
+        "consumed_fields": support.consumed_fields(),
+        "runtime": support.runtime(),
         "detail": detail.map(|value| bounded_text(value, MAX_CONFIG_DETAIL_BYTES)),
     })
 }
@@ -2946,7 +3066,7 @@ grid_system:
             let summary = config_summary(
                 std::path::Path::new("large.yaml"),
                 "grid",
-                "legacy-parseable",
+                super::ConfigSupport::LegacyPartial,
                 Some(&detail),
             );
             if !report.try_push(summary).unwrap() {

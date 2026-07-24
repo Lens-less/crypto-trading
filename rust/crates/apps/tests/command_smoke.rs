@@ -1239,6 +1239,171 @@ fn config_check_classifies_strict_paper_profiles_explicitly() {
 }
 
 #[test]
+fn config_check_directory_emits_a_complete_migration_ledger() {
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .args(["config-check", "config", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summaries = summaries.as_array().unwrap();
+    assert_eq!(summaries.len(), 60, "{summaries:#?}");
+    for summary in summaries {
+        assert!(summary["parseable"].is_boolean(), "{summary}");
+        assert!(summary["executable"].is_boolean(), "{summary}");
+        assert!(summary["consumed_fields"].is_string(), "{summary}");
+        assert!(summary["runtime"].is_string(), "{summary}");
+    }
+
+    let entry = |suffix: &str| {
+        summaries
+            .iter()
+            .find(|summary| {
+                summary["path"]
+                    .as_str()
+                    .is_some_and(|path| path.replace('\\', "/").ends_with(suffix))
+            })
+            .unwrap_or_else(|| panic!("missing ledger entry {suffix}"))
+    };
+    let assert_status = |summary: &serde_json::Value,
+                         parseable: bool,
+                         executable: bool,
+                         consumed_fields: &str,
+                         runtime: &str| {
+        assert_eq!(summary["parseable"], parseable, "{summary}");
+        assert_eq!(summary["executable"], executable, "{summary}");
+        assert_eq!(summary["consumed_fields"], consumed_fields, "{summary}");
+        assert_eq!(summary["runtime"], runtime, "{summary}");
+    };
+    assert_status(
+        entry("config/grid/paper-once-btc.yaml"),
+        true,
+        true,
+        "strict",
+        "paper-once",
+    );
+    assert_status(
+        entry("config/arbitrage/paper-monitor-eth.yaml"),
+        true,
+        false,
+        "strict",
+        "paper-companion",
+    );
+    assert_status(
+        entry("config/grid/lighter-long-perp-btc.yaml"),
+        true,
+        false,
+        "partial",
+        "unavailable",
+    );
+    assert_status(
+        entry("config/exchanges/paradex_config.example.yaml"),
+        true,
+        false,
+        "parse-only",
+        "unavailable",
+    );
+    assert_status(
+        entry("config/symbol_conversion.yaml"),
+        true,
+        false,
+        "parse-only",
+        "not-wired",
+    );
+    assert_status(
+        entry("config/arbitrage/extra_symbols.yaml"),
+        true,
+        false,
+        "auxiliary-only",
+        "not-wired",
+    );
+}
+
+#[test]
+fn config_check_separates_parseability_from_execution_validation() {
+    let config = write_temp(
+        "parseable-grid-with-invalid-range",
+        "yaml",
+        r"
+grid_system:
+  exchange: paper
+  symbol: BTC-USDC-PERP
+  market_type: perpetual
+  mode: fixed
+  grid_interval: 10
+  order_amount: 1
+  lower_price: 100
+  upper_price: 105
+",
+    );
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("config-check")
+        .arg(&config)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    std::fs::remove_file(config).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summary = &summaries.as_array().unwrap()[0];
+    assert_eq!(summary["classification"], "legacy-parseable");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["parseable"], true);
+    assert_eq!(summary["executable"], false);
+    assert_eq!(summary["consumed_fields"], "parse-only");
+    assert_eq!(summary["runtime"], "unavailable");
+    assert!(
+        summary["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("at least one level")),
+        "{summary}"
+    );
+}
+
+#[test]
+fn config_check_filename_conflicts_fail_closed_in_every_ledger_field() {
+    let config = write_temp(
+        "logging-grid-conflict",
+        "yaml",
+        r"
+grid_system:
+  exchange: paper
+  symbol: BTC-USDC-PERP
+  market_type: perpetual
+  mode: fixed
+  grid_interval: 10
+  order_amount: 1
+  lower_price: 100
+  upper_price: 120
+",
+    );
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("config-check")
+        .arg(&config)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    std::fs::remove_file(config).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summary = &summaries.as_array().unwrap()[0];
+    assert_eq!(summary["classification"], "unsupported");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["parseable"], true);
+    assert_eq!(summary["executable"], false);
+    assert_eq!(summary["consumed_fields"], "strict");
+    assert_eq!(summary["runtime"], "unavailable");
+}
+
+#[test]
 fn config_check_accepts_every_checked_in_exchange_yaml() {
     let exchange_dir = repo_root().join("config/exchanges");
     let mut paths = std::fs::read_dir(&exchange_dir)
@@ -1325,6 +1490,10 @@ grid_system:
     assert_eq!(summaries.len(), 3, "{summaries:?}");
     assert_eq!(summaries[0]["classification"], "runtime-executable");
     assert_eq!(summaries[1]["classification"], "unsupported");
+    assert_eq!(summaries[1]["parseable"], false);
+    assert_eq!(summaries[1]["executable"], false);
+    assert_eq!(summaries[1]["consumed_fields"], "none");
+    assert_eq!(summaries[1]["runtime"], "unavailable");
     assert_eq!(summaries[2]["classification"], "auxiliary");
 }
 
@@ -1388,6 +1557,10 @@ fn config_check_rejects_a_directory_without_supported_config_files() {
     let summaries = summaries.as_array().unwrap();
     assert_eq!(summaries.len(), 1, "{summaries:?}");
     assert_eq!(summaries[0]["classification"], "unsupported");
+    assert!(summaries[0]["parseable"].is_null());
+    assert_eq!(summaries[0]["executable"], false);
+    assert_eq!(summaries[0]["consumed_fields"], "unknown");
+    assert_eq!(summaries[0]["runtime"], "unavailable");
     assert!(
         summaries[0]["error"]
             .as_str()
