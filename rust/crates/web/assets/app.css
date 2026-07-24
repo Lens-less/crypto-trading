@@ -587,6 +587,24 @@ code,
   border-top: 1px solid var(--border);
 }
 
+.alert-table {
+  min-width: 880px;
+}
+
+.alert-table th {
+  white-space: nowrap;
+}
+
+.alert-table th:first-child,
+.alert-table td:first-child {
+  width: 56px;
+}
+
+.alert-symbol,
+.alert-adapter-failure {
+  overflow-wrap: anywhere;
+}
+
 .table-wrap::-webkit-scrollbar,
 .scroll-region::-webkit-scrollbar {
   width: 10px;
@@ -789,6 +807,12 @@ code,
     padding-right: 14px;
   }
 
+  .risk-status-block .status-list li {
+    display: grid;
+    justify-items: start;
+    gap: 4px;
+  }
+
   .workspace-header,
   .workspace-main {
     padding-left: 24px;
@@ -864,7 +888,7 @@ code,
 
   .spine-nav {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .spine-nav a {

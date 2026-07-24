@@ -16,6 +16,7 @@ pub(crate) fn ui_router() -> Router {
     Router::new()
         .route("/", get(shell))
         .route("/overview", get(shell))
+        .route("/alerts", get(shell))
         .route("/executions", get(shell))
         .route("/integrations", get(shell))
         .route("/assets/app.css", get(app_css))

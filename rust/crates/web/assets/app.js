@@ -1,4 +1,4 @@
-const VIEW_IDS = new Set(["overview", "executions", "integrations"]);
+const VIEW_IDS = new Set(["overview", "alerts", "executions", "integrations"]);
 const AREA_IDS = new Set([
   "all",
   "config",
@@ -26,6 +26,8 @@ const BATCH_FILTER_IDS = new Set([
   "conflict",
   "unknown",
 ]);
+const MAX_ALERT_OCCURRENCES = 256;
+const TRUSTED_ALERT_PROJECTION_IDS = new Set(["complete", "windowed"]);
 const TOKEN_LABELS = new Map([
   ["complete", "完整"],
   ["degraded", "降级"],
@@ -58,6 +60,22 @@ const TOKEN_LABELS = new Map([
   ["not-applicable", "不适用"],
 ]);
 for (const [token, label] of [
+  ["pending", "最后记录：未决"],
+  ["dropped", "已丢弃"],
+  ["succeeded", "已送达"],
+  ["timed_out", "已超时"],
+  ["volatility_up", "波动上破"],
+  ["volatility_down", "波动下破"],
+  ["upper_limit", "上沿提醒"],
+  ["lower_limit", "下沿提醒"],
+  ["backpressure", "排队拥塞"],
+  ["adapter_closed", "适配器已关闭"],
+  ["device_unavailable", "设备不可用"],
+  ["rejected", "已拒绝"],
+  ["worker_failed", "通知 worker 异常终止"],
+  ["timeout", "超时"],
+  ["spot", "现货"],
+  ["perpetual", "永续"],
   ["waiting", "等待行情"],
   ["no_opportunity", "暂无机会"],
   ["opportunity", "发现机会"],
@@ -96,6 +114,7 @@ const state = {
   sessionGeneration: 0,
   system: null,
   monitor: null,
+  alerts: null,
   capabilities: null,
   executions: null,
   lastPage: null,
@@ -109,12 +128,14 @@ const state = {
   loads: {
     system: "idle",
     monitor: "idle",
+    alerts: "idle",
     capabilities: "idle",
     executions: "idle",
   },
   errors: {
     system: null,
     monitor: null,
+    alerts: null,
     capabilities: null,
     executions: null,
   },
@@ -159,6 +180,7 @@ async function bootstrap() {
   await Promise.all([
     loadSystem(),
     loadMonitor(),
+    loadAlerts(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -232,6 +254,7 @@ function clearProtectedState() {
   state.cursor = "";
   state.system = null;
   state.monitor = null;
+  state.alerts = null;
   state.capabilities = null;
   state.executions = null;
   state.lastPage = null;
@@ -242,12 +265,14 @@ function clearProtectedState() {
   state.loads = {
     system: "idle",
     monitor: "idle",
+    alerts: "idle",
     capabilities: "idle",
     executions: "idle",
   };
   state.errors = {
     system: null,
     monitor: null,
+    alerts: null,
     capabilities: null,
     executions: null,
   };
@@ -288,6 +313,7 @@ function replaceAuthToken(nextToken) {
   void Promise.all([
     loadSystem(),
     loadMonitor(),
+    loadAlerts(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -342,6 +368,32 @@ async function loadMonitor() {
     if (!markAuthenticationRequired(problem)) {
       state.loads.monitor = "error";
       state.errors.monitor = problem;
+    }
+  }
+  render();
+}
+
+async function loadAlerts() {
+  const generation = state.sessionGeneration;
+  state.loads.alerts = "loading";
+  state.errors.alerts = null;
+  render();
+  try {
+    const alerts = await fetchJson("/api/v1/alerts");
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    state.alerts = alerts;
+    state.lastSnapshotAt = Date.now();
+    state.loads.alerts = "ready";
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    if (!markAuthenticationRequired(problem)) {
+      state.loads.alerts = "error";
+      state.errors.alerts = problem;
     }
   }
   render();
@@ -414,7 +466,7 @@ async function refreshOperationalTruth() {
   state.isRefreshing = true;
   render();
   try {
-    await Promise.all([loadSystem(), loadMonitor(), loadExecutions()]);
+    await Promise.all([loadSystem(), loadMonitor(), loadAlerts(), loadExecutions()]);
   } finally {
     state.isRefreshing = false;
     render();
@@ -727,6 +779,7 @@ function renderSpineStatusBlock() {
 function renderNavigationBlock() {
   const entries = [
     ["overview", "总览"],
+    ["alerts", "预警"],
     ["executions", "执行"],
     ["integrations", "集成"],
   ];
@@ -820,6 +873,7 @@ function renderAccessBlock() {
 
 function renderHeader() {
   const currentPage = {
+    alerts: "有界价格预警投影、确认状态与本地通知结果。",
     overview: "跨域读取模型与风险优先的运行事实。",
     executions: "有界执行账本，以及恢复与结果证据。",
     integrations: "能力矩阵与适配器支持证据。",
@@ -878,6 +932,8 @@ function renderMain() {
   }
   if (state.route.view === "overview") {
     content.push(renderOverviewView());
+  } else if (state.route.view === "alerts") {
+    content.push(renderAlertsView());
   } else if (state.route.view === "executions") {
     content.push(renderExecutionsView());
   } else {
@@ -890,6 +946,7 @@ function renderOverviewView() {
   const leftColumn = el("div", { className: "view-stack" }, [
     renderRibbon(),
     renderMonitorRegion(),
+    renderAlertsSummaryRegion(),
     renderExecutionsSummaryRegion(),
     renderRecentNoticesRegion(),
   ]);
@@ -977,6 +1034,292 @@ function renderMonitorRegion() {
       "展示等待、无机会、机会与分析拒绝；不携带订单意图，也不把历史事件伪装成实时健康。",
     body,
   });
+}
+
+function renderAlertsSummaryRegion() {
+  return renderRegion({
+    title: "只读价格预警",
+    subtitle:
+      "展示最新预警、确认状态与本地通知的最后记录；投影降级时宁可隐藏 occurrence，也不猜测最新事实。",
+    body: renderAlertBody({ condensed: true }),
+  });
+}
+
+function renderAlertsView() {
+  const model = state.alerts;
+  const occurrences = visibleAlertOccurrences(model);
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "预警投影状态",
+      subtitle:
+        "预警页面只消费有界 read model。窗口化、降级、部分尾记录与确认状态都在这里显式说明。",
+      body:
+        state.loads.alerts === "error" && !state.alerts
+          ? renderError(state.errors.alerts)
+          : model
+          ? el("div", { className: "detail-grid" }, [
+              detailStat("投影", alertProjectionLabel(model)),
+              detailStat(
+                "可展示 occurrence",
+                isTrustedAlertProjection(model) ? occurrences.length : "已隐藏",
+              ),
+              detailStat("无效事件", model.invalid_event_count ?? "--"),
+              detailStat("窗口截断", model.occurrences_truncated ? "是" : "否"),
+              detailStat("边界", humanizeToken(model.boundary?.kind || "snapshot_end")),
+              detailStat("头序号", model.journal_head_sequence ?? "--"),
+              detailStat("规则定义", "当前投影未提供"),
+              detailStat("冷却状态", "当前投影未提供"),
+            ])
+          : renderSkeleton(8),
+    }),
+    renderRegion({
+      title: "预警 occurrence",
+      subtitle:
+        "按 occurrence sequence 展示价格、方向、触发与确认时间及各 adapter 的最后已记录状态，不暴露写入口。规则定义与冷却状态尚未进入当前投影，因此明确标记为不可用。",
+      body: renderAlertBody({ condensed: false }),
+    }),
+  ]);
+}
+
+function renderAlertBody({ condensed }) {
+  const model = state.alerts;
+  const occurrences = visibleAlertOccurrences(model);
+  if (state.loads.alerts === "error" && !state.alerts) {
+    return renderError(state.errors.alerts);
+  }
+  if (state.loads.alerts === "loading" && !state.alerts) {
+    return renderSkeleton(condensed ? 4 : 8);
+  }
+  if (model && !isTrustedAlertProjection(model)) {
+    return el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, [
+        detailStat("投影", alertProjectionLabel(model)),
+        detailStat("无效事件", model.invalid_event_count ?? "--"),
+        detailStat("可展示 occurrence", "已隐藏"),
+        detailStat("窗口截断", model.occurrences_truncated ? "是" : "否"),
+      ]),
+      el("p", {
+        className: "muted",
+        text: "预警投影未通过完整性校验；界面不会把不可信的最近预警提升成可操作事实。",
+      }),
+    ]);
+  }
+  if (occurrences.length === 0) {
+    return renderEmpty(
+      "当前冻结快照中还没有价格预警 occurrence。",
+      "已检查 /api/v1/alerts 返回的 occurrences；没有写路径会在这里补造状态。",
+    );
+  }
+  if (condensed) {
+    const latest = occurrences[occurrences.length - 1];
+    return el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, [
+        detailStat("最新序号", latest.alert_sequence),
+        detailStat("标的", `${latest.exchange}/${latest.symbol}`),
+        detailStat("类型", humanizeToken(latest.kind)),
+        detailStat("价格", latest.price),
+        detailStat("确认", latest.acknowledged_at ? "已确认" : "待确认"),
+        detailStat("通知", summarizeDeliveries(latest.deliveries)),
+      ]),
+      el("p", {
+        className: "muted",
+        text: `最近记录时间：${formatDateTime(latest.recorded_at)}；当前冻结视图保留 ${occurrences.length} 条 occurrence，${
+          model.occurrences_truncated ? "更早记录已被有界淘汰。" : "未发生窗口截断。"
+        }`,
+      }),
+    ]);
+  }
+  return renderAlertTable(occurrences);
+}
+
+function isTrustedAlertProjection(model) {
+  if (
+    !model ||
+    !TRUSTED_ALERT_PROJECTION_IDS.has(model.projection_status) ||
+    !Array.isArray(model.occurrences) ||
+    model.occurrences.length > MAX_ALERT_OCCURRENCES ||
+    model.invalid_event_count !== 0 ||
+    model.boundary?.kind !== "snapshot_end"
+  ) {
+    return false;
+  }
+  return model.projection_status === "windowed"
+    ? model.occurrences_truncated === true
+    : model.occurrences_truncated === false;
+}
+
+function alertProjectionLabel(model) {
+  if (!model) {
+    return humanizeToken("loading");
+  }
+  if (model.projection_status === "degraded") {
+    return humanizeToken("degraded");
+  }
+  return isTrustedAlertProjection(model)
+    ? humanizeToken(model.projection_status)
+    : "降级 / 契约不一致";
+}
+
+function visibleAlertOccurrences(model) {
+  if (!isTrustedAlertProjection(model) || !Array.isArray(model.occurrences)) {
+    return [];
+  }
+  return model.occurrences;
+}
+
+function renderAlertTable(occurrences) {
+  return el("div", {
+    className: "table-wrap",
+    attrs: {
+      role: "region",
+      tabindex: "0",
+      "aria-label": "价格预警明细，可横向滚动",
+    },
+  }, [
+    el("table", { className: "alert-table" }, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", {
+            className: "table-number",
+            attrs: { scope: "col" },
+            text: "序号",
+          }),
+          el("th", { attrs: { scope: "col" }, text: "标的" }),
+          el("th", { attrs: { scope: "col" }, text: "类型" }),
+          el("th", {
+            className: "table-number",
+            attrs: { scope: "col" },
+            text: "价格 / 波动",
+          }),
+          el("th", { attrs: { scope: "col" }, text: "通知结果" }),
+          el("th", { attrs: { scope: "col" }, text: "触发 / 确认" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        occurrences
+          .slice()
+          .reverse()
+          .map((occurrence) => {
+            const deliveries = Array.isArray(occurrence.deliveries)
+              ? occurrence.deliveries
+              : [];
+            return el("tr", {}, [
+              el("td", {
+                className: "mono table-number",
+                text: String(occurrence.alert_sequence),
+              }),
+              el("td", {}, [
+                el("div", {
+                  className: "mono alert-symbol",
+                  text: `${occurrence.exchange}/${occurrence.symbol}`,
+                }),
+                el("div", { className: "muted", text: humanizeToken(occurrence.market_type) }),
+              ]),
+              el("td", {}, [buildTag(humanizeToken(occurrence.kind), "warning")]),
+              el("td", { className: "table-number" }, [
+                el("div", { className: "mono", text: occurrence.price }),
+                el("div", {
+                  className: "muted mono",
+                  text: occurrence.change_percent ? `${occurrence.change_percent}%` : "--",
+                }),
+              ]),
+              el("td", {}, [
+                el(
+                  "div",
+                  { className: "tag-row" },
+                  deliveries.length > 0
+                    ? deliveries.map((delivery) =>
+                        buildTag(
+                          `${delivery.adapter_id}: ${humanizeToken(delivery.status)}`,
+                          toneForAlertDelivery(delivery.status),
+                        ),
+                      )
+                    : [buildTag("未发送", "neutral")],
+                ),
+                deliveries.some((delivery) => delivery.failure)
+                  ? el("div", {
+                      className: "muted alert-adapter-failure",
+                      text: deliveries
+                        .filter((delivery) => delivery.failure)
+                        .map((delivery) => `${delivery.adapter_id}=${humanizeToken(delivery.failure)}`)
+                        .join(" / "),
+                    })
+                  : null,
+                deliveries.length > 0
+                  ? el("div", {
+                      className: "muted mono alert-adapter-failure",
+                      text: deliveries
+                        .map(
+                          (delivery) =>
+                            `${delivery.adapter_id} ${formatDateTime(delivery.updated_at)}`,
+                        )
+                        .join(" / "),
+                    })
+                  : null,
+              ]),
+              el("td", {}, [
+                buildTag(
+                  occurrence.acknowledged_at ? "已确认" : "待确认",
+                  occurrence.acknowledged_at ? "success" : "warning",
+                ),
+                el("div", {
+                  className: "muted mono",
+                  text: `触发 ${formatDateTime(occurrence.recorded_at)}`,
+                }),
+                el("div", {
+                  className: "muted mono",
+                  text: occurrence.acknowledged_at
+                    ? `确认 ${formatDateTime(occurrence.acknowledged_at)}`
+                    : "确认 --",
+                }),
+              ]),
+            ]);
+          }),
+      ),
+    ]),
+  ]);
+}
+
+function summarizeDeliveries(deliveries) {
+  if (!deliveries || deliveries.length === 0) {
+    return "未发送";
+  }
+  const counts = new Map();
+  for (const delivery of deliveries) {
+    const key = delivery.status || "unknown";
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([status, count]) => `${humanizeToken(status)} ${count}`)
+    .join(" / ");
+}
+
+function countPendingAlertDeliveries(model) {
+  return visibleAlertOccurrences(model).reduce(
+    (count, occurrence) =>
+      count +
+      (Array.isArray(occurrence.deliveries)
+        ? occurrence.deliveries.filter((delivery) => delivery.status === "pending").length
+        : 0),
+    0,
+  );
+}
+
+function toneForAlertDelivery(status) {
+  switch (status) {
+    case "succeeded":
+      return "success";
+    case "failed":
+    case "timed_out":
+      return "danger";
+    case "dropped":
+    case "pending":
+      return "warning";
+    default:
+      return "neutral";
+  }
 }
 
 function renderRibbon() {
@@ -1789,6 +2132,47 @@ function collectBands() {
         "最后一个有效监控结果已停止展示；无效事件或不完整尾记录修复前，不把旧机会提升为可信状态。",
     });
   }
+  const alertProjectionStatus = state.alerts?.projection_status;
+  if (alertProjectionStatus === "windowed" && isTrustedAlertProjection(state.alerts)) {
+    bands.push({
+      title: "预警投影已窗口化",
+      tag: "可信 / 已截断",
+      tone: "warning",
+      message: `预警事实仍通过完整性校验；当前只展示最近 ${
+        visibleAlertOccurrences(state.alerts).length
+      } 条 occurrence，更早记录已被有界淘汰。`,
+    });
+  } else if (state.alerts && !isTrustedAlertProjection(state.alerts)) {
+    bands.push({
+      title: "预警投影已降级",
+      tag: "停止展示",
+      tone: "danger",
+      message:
+        "无效预警事件或不完整尾记录修复前，所有 occurrence 与最近预警都停止展示。",
+    });
+  }
+  if (
+    state.loads.alerts === "error" &&
+    state.alerts &&
+    isTrustedAlertProjection(state.alerts)
+  ) {
+    bands.push({
+      title: "预警快照刷新失败",
+      tag: "保留旧快照",
+      tone: "warning",
+      message:
+        "最后一个通过完整性校验的预警快照仍然可见；重新读取成功前，不把它解释为最新状态。",
+    });
+  }
+  const pendingAlertDeliveries = countPendingAlertDeliveries(state.alerts);
+  if (pendingAlertDeliveries > 0) {
+    bands.push({
+      title: "存在未决通知记录",
+      tag: "历史事实 / 不保证重放",
+      tone: "warning",
+      message: `冻结 journal 中有 ${pendingAlertDeliveries} 条 adapter 记录最后停在 pending。它可能源于进程中断或终态持久化失败；恢复默认不重放，本页不会把它解释为仍在排队。`,
+    });
+  }
   if (isStale()) {
     bands.push({
       title: "操作事件流已断开",
@@ -1805,6 +2189,7 @@ function collectBands() {
   const authProblem =
     state.errors.system?.code === "authentication_required" ||
     state.errors.monitor?.code === "authentication_required" ||
+    state.errors.alerts?.code === "authentication_required" ||
     state.errors.capabilities?.code === "authentication_required" ||
     state.errors.executions?.code === "authentication_required";
   if (authProblem) {
@@ -2128,7 +2513,11 @@ function errorDescription(problem) {
 
 function hasAnyData() {
   return Boolean(
-    state.system || state.monitor || state.capabilities || state.executions,
+    state.system ||
+      state.monitor ||
+      state.alerts ||
+      state.capabilities ||
+      state.executions,
   );
 }
 

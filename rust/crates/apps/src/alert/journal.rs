@@ -153,7 +153,25 @@ pub(crate) enum RecoveredAlertFact {
     },
     Delivery {
         occurrence_id: AlertOccurrenceId,
+        adapter_id: String,
+        status: RecoveredDeliveryStatus,
+        recorded_at: DateTime<Utc>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveredDeliveryStatus {
+    Pending,
+    Dropped,
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+impl RecoveredDeliveryStatus {
+    pub(crate) const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
 }
 
 pub(crate) fn parse_alert_fact(
@@ -178,7 +196,9 @@ pub(crate) fn parse_alert_fact(
         | PRICE_ALERT_DELIVERY_DROPPED
         | PRICE_ALERT_DELIVERY_SUCCEEDED
         | PRICE_ALERT_DELIVERY_FAILED
-        | PRICE_ALERT_DELIVERY_TIMED_OUT => parse_delivery(details, symbol, &decision).map(Some),
+        | PRICE_ALERT_DELIVERY_TIMED_OUT => {
+            parse_delivery(event, details, symbol, &decision).map(Some)
+        }
         _ => Err(()),
     }
 }
@@ -272,6 +292,7 @@ fn parse_acknowledgement(
 }
 
 fn parse_delivery(
+    event: &OperationEventEnvelope,
     details: &Map<String, Value>,
     symbol: String,
     decision: &str,
@@ -295,17 +316,35 @@ fn parse_delivery(
         instrument: parse_instrument(details, symbol)?,
         sequence,
     };
-    validate_adapter_id(&required_text(details, "adapter_id")?).map_err(|_| ())?;
+    let adapter_id = required_text(details, "adapter_id")?;
+    validate_adapter_id(&adapter_id).map_err(|_| ())?;
     let failure = details.get("failure").ok_or(())?;
-    match (decision, failure.as_str()) {
+    let status = match (decision, failure.as_str()) {
         (PRICE_ALERT_DELIVERY_PENDING | PRICE_ALERT_DELIVERY_SUCCEEDED, None)
-            if failure.is_null() => {}
-        (PRICE_ALERT_DELIVERY_DROPPED, Some("backpressure" | "adapter_closed"))
-        | (PRICE_ALERT_DELIVERY_FAILED, Some("device_unavailable" | "backpressure" | "rejected"))
-        | (PRICE_ALERT_DELIVERY_TIMED_OUT, Some("timeout")) => {}
+            if failure.is_null() =>
+        {
+            if decision == PRICE_ALERT_DELIVERY_PENDING {
+                RecoveredDeliveryStatus::Pending
+            } else {
+                RecoveredDeliveryStatus::Succeeded
+            }
+        }
+        (PRICE_ALERT_DELIVERY_DROPPED, Some("backpressure" | "adapter_closed")) => {
+            RecoveredDeliveryStatus::Dropped
+        }
+        (
+            PRICE_ALERT_DELIVERY_FAILED,
+            Some("device_unavailable" | "backpressure" | "rejected" | "worker_failed"),
+        ) => RecoveredDeliveryStatus::Failed,
+        (PRICE_ALERT_DELIVERY_TIMED_OUT, Some("timeout")) => RecoveredDeliveryStatus::TimedOut,
         _ => return Err(()),
-    }
-    Ok(RecoveredAlertFact::Delivery { occurrence_id })
+    };
+    Ok(RecoveredAlertFact::Delivery {
+        occurrence_id,
+        adapter_id,
+        status,
+        recorded_at: event.recorded_at(),
+    })
 }
 
 pub(crate) const fn alert_kind_label(kind: AlertKind) -> &'static str {

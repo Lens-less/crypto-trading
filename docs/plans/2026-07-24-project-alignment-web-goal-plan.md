@@ -355,6 +355,22 @@ Phase 2 将生成四个可交互方向样机并等待选择，正式前端代码
   CLI/source composition、durable task、journal 运维与 sound/remote ack 阻塞项；
   `runtime.continuous`、`runtime.live` 与所有 mainnet trading authority 均未扩大。
 
+第四条 tracer 证据（Price Alert 的 Web/audit 闭环，仍不等同于 M3 全部完成）：
+
+- [x] `/alerts` 与 Overview 只消费受同一鉴权保护的 `/api/v1/alerts`；完整与窗口化投影可见，
+  降级、partial tail 或契约矛盾时隐藏 occurrence。窗口化、刷新失败与 stale 的文案不互相冒充，
+  页面没有 acknowledgement 或其他写入口。
+- [x] Alerts 工作台按 sequence 展示触发时间、确认时间、adapter 最后记录状态、失败分类和更新时间；
+  长 symbol/failure ID 在表格自己的可聚焦横向滚动区内处理，桌面与 960/390/320 CSS px 视口
+  均无页面级横向溢出。规则定义与冷却状态尚未进入 read model，界面明确显示“当前投影未提供”，
+  不伪造对齐完成；历史 `pending` 明确标记为“未决／不保证重放”，不冒充仍在执行的队列状态。
+- [x] read model 只为已淘汰且仍有 pending 的 occurrence 保留有界 tombstone；合法迟到 terminal
+  不再摧毁窗口化投影，错 scope、未知 adapter、重复 terminal 与超过 8 个 adapter 仍失败关闭。
+  同一 instrument 的 occurrence 时间必须非递减，跨 instrument 的合法交错不被误判。
+- [x] journal recovery 保留 adapter、delivery phase 与时间并验证 `pending -> terminal`、唯一终态和
+  adapter 上限；worker panic 被隔离为 typed `worker_failed` 终态，关闭并排空该 adapter 的已排队项，
+  当前项、排队项和后续项均不会永久显示为 pending，原始 panic 文本不会写入 journal。
+
 退出条件：
 
 - [x] 网络断开、乱序、重复、过期行情和慢消费者均有测试。

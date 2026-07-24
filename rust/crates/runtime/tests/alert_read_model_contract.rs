@@ -77,6 +77,91 @@ fn more_than_256_occurrences_window_the_projection() {
 }
 
 #[test]
+fn late_terminal_for_evicted_occurrence_keeps_windowed_projection() {
+    let snapshot = snapshot(&windowed_delivery_records("local_notice", "BTC-USDT", 1));
+
+    let model = PriceAlertReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Windowed);
+    assert_eq!(model.invalid_event_count, 0);
+    assert!(model.occurrences_truncated);
+    assert_eq!(model.occurrences.len(), 256);
+    assert_eq!(model.occurrences.first().unwrap().alert_sequence, 2);
+    assert_eq!(model.occurrences.last().unwrap().alert_sequence, 257);
+}
+
+#[test]
+fn invalid_late_terminal_for_evicted_occurrence_still_degrades() {
+    for (adapter_id, symbol, terminal_count) in [
+        ("other_adapter", "BTC-USDT", 1),
+        ("local_notice", "ETH-USDT", 1),
+        ("local_notice", "BTC-USDT", 2),
+    ] {
+        let snapshot = snapshot(&windowed_delivery_records(
+            adapter_id,
+            symbol,
+            terminal_count,
+        ));
+
+        let model = PriceAlertReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+        assert_eq!(model.projection_status, ProjectionStatus::Degraded);
+        assert_eq!(model.invalid_event_count, 1);
+        assert!(model.occurrences.is_empty());
+    }
+}
+
+#[test]
+fn occurrence_timestamps_must_be_monotonic_within_one_scope() {
+    let snapshot = snapshot(&[
+        occurrence_record(1, "BTC-USDT", 10),
+        occurrence_record(2, "BTC-USDT", 9),
+    ]);
+
+    let model = PriceAlertReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Degraded);
+    assert_eq!(model.invalid_event_count, 1);
+    assert!(model.occurrences.is_empty());
+}
+
+#[test]
+fn occurrence_timestamps_may_move_back_across_independent_scopes() {
+    let snapshot = snapshot(&[
+        occurrence_record(1, "BTC-USDT", 10),
+        occurrence_record(2, "ETH-USDT", 9),
+    ]);
+
+    let model = PriceAlertReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Complete);
+    assert_eq!(model.invalid_event_count, 0);
+    assert_eq!(model.occurrences.len(), 2);
+}
+
+#[test]
+fn more_than_eight_delivery_adapters_degrades_the_projection() {
+    let mut records = vec![occurrence_record(1, "BTC-USDT", 0)];
+    records.extend((0..9).map(|index| {
+        delivery_record(
+            "price_alert_delivery_pending",
+            1,
+            &format!("adapter_{index}"),
+            "BTC-USDT",
+            None,
+            0,
+        )
+    }));
+    let snapshot = snapshot(&records);
+
+    let model = PriceAlertReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Degraded);
+    assert_eq!(model.invalid_event_count, 1);
+    assert!(model.occurrences.is_empty());
+}
+
+#[test]
 fn unknown_field_in_alert_fact_degrades_and_hides_occurrences() {
     let snapshot = snapshot(&[alert_record(
         "price_alert_occurred",
@@ -265,6 +350,84 @@ fn alert_record(decision: &str, details: &Value, offset_seconds: i64) -> Value {
         "decision": decision,
         "details": details,
     })
+}
+
+fn occurrence_record(sequence: u64, symbol: &str, offset_seconds: i64) -> Value {
+    json!({
+        "timestamp": timestamp(offset_seconds),
+        "strategy": "price_alert",
+        "symbol": symbol,
+        "decision": "price_alert_occurred",
+        "details": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "exchange": "binance",
+            "market_type": "perpetual",
+            "kind": "upper_limit",
+            "price": "100",
+            "change_percent": null,
+            "market_revision": sequence,
+            "market_generation": sequence,
+        },
+    })
+}
+
+fn delivery_record(
+    decision: &str,
+    sequence: u64,
+    adapter_id: &str,
+    symbol: &str,
+    failure: Option<&str>,
+    offset_seconds: i64,
+) -> Value {
+    json!({
+        "timestamp": timestamp(offset_seconds),
+        "strategy": "price_alert",
+        "symbol": symbol,
+        "decision": decision,
+        "details": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "exchange": "binance",
+            "market_type": "perpetual",
+            "adapter_id": adapter_id,
+            "failure": failure,
+        },
+    })
+}
+
+fn windowed_delivery_records(
+    terminal_adapter_id: &str,
+    terminal_symbol: &str,
+    terminal_count: usize,
+) -> Vec<Value> {
+    let mut records = vec![
+        occurrence_record(1, "BTC-USDT", 1),
+        delivery_record(
+            "price_alert_delivery_pending",
+            1,
+            "local_notice",
+            "BTC-USDT",
+            None,
+            1,
+        ),
+    ];
+    records.extend(
+        (2..=257u64).map(|sequence| {
+            occurrence_record(sequence, "BTC-USDT", i64::try_from(sequence).unwrap())
+        }),
+    );
+    records.extend((0..terminal_count).map(|index| {
+        delivery_record(
+            "price_alert_delivery_succeeded",
+            1,
+            terminal_adapter_id,
+            terminal_symbol,
+            None,
+            300 + i64::try_from(index).unwrap(),
+        )
+    }));
+    records
 }
 
 fn lifecycle_records() -> Vec<Value> {

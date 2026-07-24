@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use tokio::{
     runtime::Handle,
     sync::mpsc,
-    task::{JoinError, JoinHandle},
+    task::{JoinError, JoinHandle, JoinSet},
     time::Instant,
 };
 
@@ -26,6 +26,7 @@ const MAX_NOTIFICATION_ADAPTER_ID_BYTES: usize = 64;
 const MAX_NOTIFICATION_QUEUE_CAPACITY: usize = 4_096;
 const MAX_NOTIFICATION_DURATION: Duration = Duration::from_secs(60);
 const MAX_DETERMINISTIC_DELIVERIES: usize = 4_096;
+const WORKER_FAILED: &str = "worker_failed";
 
 /// Exact, stream-local identity of one durable alert occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +176,12 @@ struct NotificationWorker {
     adapter_id: String,
     sender: Option<mpsc::Sender<AlertNotification>>,
     join: Option<JoinHandle<()>>,
+}
+
+enum AdapterAttemptOutcome {
+    Succeeded,
+    Failed(NotificationFailure),
+    TimedOut,
 }
 
 /// Owns one bounded sequential worker per notification adapter.
@@ -393,25 +400,53 @@ fn start_worker(
     let (sender, mut receiver) = mpsc::channel::<AlertNotification>(config.queue_capacity);
     let join = runtime_handle.spawn(async move {
         while let Some(notification) = receiver.recv().await {
-            let result = tokio::time::timeout(
-                config.delivery_timeout,
-                adapter.deliver(notification.clone()),
-            )
-            .await;
-            let (decision, failure) = match result {
-                Ok(Ok(())) => {
+            let attempt_notification = notification.clone();
+            let mut attempt = JoinSet::new();
+            attempt.spawn(async move {
+                let outcome = match tokio::time::timeout(
+                    config.delivery_timeout,
+                    adapter.deliver(attempt_notification),
+                )
+                .await
+                {
+                    Ok(Ok(())) => AdapterAttemptOutcome::Succeeded,
+                    Ok(Err(error)) => AdapterAttemptOutcome::Failed(error),
+                    Err(_) => AdapterAttemptOutcome::TimedOut,
+                };
+                (adapter, outcome)
+            });
+            let Some(result) = attempt.join_next().await else {
+                break;
+            };
+            let outcome = if let Ok((returned_adapter, outcome)) = result {
+                adapter = returned_adapter;
+                outcome
+            } else {
+                retire_failed_worker(
+                    &mut receiver,
+                    &history,
+                    &status,
+                    clock.as_ref(),
+                    &notification,
+                    &worker_adapter_id,
+                )
+                .await;
+                break;
+            };
+            let (decision, failure) = match outcome {
+                AdapterAttemptOutcome::Succeeded => {
                     update_status(&status, |status| {
                         status.delivered = status.delivered.saturating_add(1);
                     });
                     ("price_alert_delivery_succeeded", None)
                 }
-                Ok(Err(error)) => {
+                AdapterAttemptOutcome::Failed(error) => {
                     update_status(&status, |status| {
                         status.failed = status.failed.saturating_add(1);
                     });
                     ("price_alert_delivery_failed", Some(error.as_str()))
                 }
-                Err(_) => {
+                AdapterAttemptOutcome::TimedOut => {
                     update_status(&status, |status| {
                         status.timed_out = status.timed_out.saturating_add(1);
                     });
@@ -437,6 +472,51 @@ fn start_worker(
         adapter_id,
         sender: Some(sender),
         join: Some(join),
+    }
+}
+
+async fn retire_failed_worker(
+    receiver: &mut mpsc::Receiver<AlertNotification>,
+    history: &JsonlHistory,
+    status: &Arc<Mutex<NotificationDispatcherStatus>>,
+    clock: &dyn MarketDataClock,
+    notification: &AlertNotification,
+    adapter_id: &str,
+) {
+    update_status(status, |status| {
+        status.failed = status.failed.saturating_add(1);
+        status.worker_failures = status.worker_failures.saturating_add(1);
+    });
+    receiver.close();
+    let mut records = vec![delivery_record(
+        notification,
+        adapter_id,
+        "price_alert_delivery_failed",
+        Some(WORKER_FAILED),
+        clock.now(),
+    )];
+    let mut drained = 0u64;
+    while let Some(queued) = receiver.recv().await {
+        records.push(dropped_record(
+            &queued,
+            adapter_id,
+            "adapter_closed",
+            clock.now(),
+        ));
+        drained = drained.saturating_add(1);
+    }
+    if drained > 0 {
+        update_status(status, |status| {
+            status.dropped = status.dropped.saturating_add(drained);
+            status.adapter_closed = status.adapter_closed.saturating_add(drained);
+        });
+    }
+    if history.append_batch(&records).await.is_err() {
+        let failures = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        update_status(status, |status| {
+            status.status_persistence_failures =
+                status.status_persistence_failures.saturating_add(failures);
+        });
     }
 }
 

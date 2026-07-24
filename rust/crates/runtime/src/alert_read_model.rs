@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use crypto_trading_domain::MarketType;
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,9 @@ const PRICE_ALERT_ACKNOWLEDGED: &str = "price_alert_acknowledged";
 const MAX_ALERT_TEXT_BYTES: usize = 128;
 const MAX_DECIMAL_TEXT_BYTES: usize = 64;
 const MAX_ADAPTER_ID_BYTES: usize = 64;
+const MAX_ALERT_NOTIFICATION_ADAPTERS: usize = 8;
+const MAX_EVICTED_PENDING_DELIVERIES: usize = 65_536;
+const MAX_ALERT_SCOPES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +85,7 @@ pub enum AlertDeliveryFailure {
     AdapterClosed,
     DeviceUnavailable,
     Rejected,
+    WorkerFailed,
     Timeout,
 }
 
@@ -118,6 +124,9 @@ struct ProjectionBuilder {
     truncated: bool,
     invalid_event_count: u64,
     last_alert_sequence: Option<u64>,
+    last_occurrence_at_by_scope: HashMap<AlertScope, DateTime<Utc>>,
+    evicted_pending: HashMap<u64, EvictedOccurrence>,
+    evicted_pending_delivery_count: usize,
 }
 
 impl ProjectionBuilder {
@@ -131,6 +140,9 @@ impl ProjectionBuilder {
             truncated: false,
             invalid_event_count: 0,
             last_alert_sequence: None,
+            last_occurrence_at_by_scope: HashMap::new(),
+            evicted_pending: HashMap::new(),
+            evicted_pending_delivery_count: 0,
         }
     }
 
@@ -212,53 +224,104 @@ impl ProjectionBuilder {
         if occurrence.alert_sequence != expected_sequence {
             return Err(());
         }
-        self.last_alert_sequence = Some(occurrence.alert_sequence);
+
+        let scope = AlertScope::from(&occurrence);
+        if let Some(previous) = self.last_occurrence_at_by_scope.get_mut(&scope) {
+            if occurrence.recorded_at < *previous {
+                return Err(());
+            }
+            *previous = occurrence.recorded_at;
+        } else {
+            if self.last_occurrence_at_by_scope.len() >= MAX_ALERT_SCOPES {
+                return Err(());
+            }
+            self.last_occurrence_at_by_scope
+                .insert(scope, occurrence.recorded_at);
+        }
+
         if self.occurrences.len() >= MAX_ALERT_READ_MODEL_OCCURRENCES {
-            self.occurrences.remove(0);
+            let evicted = self.occurrences.remove(0);
+            self.retain_evicted_pending(evicted)?;
             self.truncated = true;
         }
+        self.last_alert_sequence = Some(occurrence.alert_sequence);
         self.occurrences.push(occurrence);
         self.refresh_projection_status();
         Ok(())
     }
 
     fn apply_delivery(&mut self, delivery: DeliveryFact) -> Result<(), ()> {
-        let occurrence = self
+        if let Some(occurrence) = self
             .occurrences
             .iter_mut()
             .find(|occurrence| occurrence.alert_sequence == delivery.alert_sequence)
+        {
+            return apply_retained_delivery(occurrence, delivery);
+        }
+
+        self.apply_evicted_delivery(&delivery)
+    }
+
+    fn retain_evicted_pending(&mut self, occurrence: AlertOccurrenceView) -> Result<(), ()> {
+        let pending_deliveries = occurrence
+            .deliveries
+            .into_iter()
+            .filter(|delivery| delivery.status == AlertDeliveryStatus::Pending)
+            .collect::<Vec<_>>();
+        if pending_deliveries.is_empty() {
+            return Ok(());
+        }
+        let next_count = self
+            .evicted_pending_delivery_count
+            .checked_add(pending_deliveries.len())
+            .ok_or(())?;
+        if next_count > MAX_EVICTED_PENDING_DELIVERIES
+            || self
+                .evicted_pending
+                .contains_key(&occurrence.alert_sequence)
+        {
+            return Err(());
+        }
+        self.evicted_pending.insert(
+            occurrence.alert_sequence,
+            EvictedOccurrence {
+                exchange: occurrence.exchange,
+                symbol: occurrence.symbol,
+                market_type: occurrence.market_type,
+                pending_deliveries,
+            },
+        );
+        self.evicted_pending_delivery_count = next_count;
+        Ok(())
+    }
+
+    fn apply_evicted_delivery(&mut self, delivery: &DeliveryFact) -> Result<(), ()> {
+        let occurrence = self
+            .evicted_pending
+            .get_mut(&delivery.alert_sequence)
             .ok_or(())?;
         if occurrence.exchange != delivery.exchange
             || occurrence.symbol != delivery.symbol
             || occurrence.market_type != delivery.market_type
-            || delivery.recorded_at < occurrence.recorded_at
+            || delivery.status == AlertDeliveryStatus::Pending
         {
             return Err(());
         }
-        if let Some(existing) = occurrence
-            .deliveries
-            .iter_mut()
-            .find(|existing| existing.adapter_id == delivery.adapter_id)
-        {
-            if existing.status != AlertDeliveryStatus::Pending
-                || delivery.status == AlertDeliveryStatus::Pending
-                || delivery.recorded_at < existing.updated_at
-            {
-                return Err(());
-            }
-            existing.status = delivery.status;
-            existing.failure = delivery.failure;
-            existing.updated_at = delivery.recorded_at;
-        } else {
-            if delivery.status != AlertDeliveryStatus::Pending {
-                return Err(());
-            }
-            occurrence.deliveries.push(AlertDeliveryView {
-                adapter_id: delivery.adapter_id,
-                status: delivery.status,
-                failure: delivery.failure,
-                updated_at: delivery.recorded_at,
-            });
+        let index = occurrence
+            .pending_deliveries
+            .iter()
+            .position(|existing| existing.adapter_id == delivery.adapter_id)
+            .ok_or(())?;
+        if delivery.recorded_at < occurrence.pending_deliveries[index].updated_at {
+            return Err(());
+        }
+        occurrence.pending_deliveries.remove(index);
+        self.evicted_pending_delivery_count = self
+            .evicted_pending_delivery_count
+            .checked_sub(1)
+            .ok_or(())?;
+        if occurrence.pending_deliveries.is_empty() {
+            self.evicted_pending.remove(&delivery.alert_sequence);
         }
         Ok(())
     }
@@ -286,6 +349,9 @@ impl ProjectionBuilder {
         self.invalid_event_count = self.invalid_event_count.saturating_add(1);
         self.occurrences.clear();
         self.last_alert_sequence = None;
+        self.last_occurrence_at_by_scope.clear();
+        self.evicted_pending.clear();
+        self.evicted_pending_delivery_count = 0;
         self.truncated = false;
     }
 
@@ -299,6 +365,71 @@ impl ProjectionBuilder {
             ProjectionStatus::Complete
         };
     }
+}
+
+fn apply_retained_delivery(
+    occurrence: &mut AlertOccurrenceView,
+    delivery: DeliveryFact,
+) -> Result<(), ()> {
+    if occurrence.exchange != delivery.exchange
+        || occurrence.symbol != delivery.symbol
+        || occurrence.market_type != delivery.market_type
+        || delivery.recorded_at < occurrence.recorded_at
+    {
+        return Err(());
+    }
+    if let Some(existing) = occurrence
+        .deliveries
+        .iter_mut()
+        .find(|existing| existing.adapter_id == delivery.adapter_id)
+    {
+        if existing.status != AlertDeliveryStatus::Pending
+            || delivery.status == AlertDeliveryStatus::Pending
+            || delivery.recorded_at < existing.updated_at
+        {
+            return Err(());
+        }
+        existing.status = delivery.status;
+        existing.failure = delivery.failure;
+        existing.updated_at = delivery.recorded_at;
+    } else {
+        if delivery.status != AlertDeliveryStatus::Pending
+            || occurrence.deliveries.len() >= MAX_ALERT_NOTIFICATION_ADAPTERS
+        {
+            return Err(());
+        }
+        occurrence.deliveries.push(AlertDeliveryView {
+            adapter_id: delivery.adapter_id,
+            status: delivery.status,
+            failure: delivery.failure,
+            updated_at: delivery.recorded_at,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AlertScope {
+    exchange: String,
+    symbol: String,
+    market_type: MarketType,
+}
+
+impl From<&AlertOccurrenceView> for AlertScope {
+    fn from(occurrence: &AlertOccurrenceView) -> Self {
+        Self {
+            exchange: occurrence.exchange.clone(),
+            symbol: occurrence.symbol.clone(),
+            market_type: occurrence.market_type,
+        }
+    }
+}
+
+struct EvictedOccurrence {
+    exchange: String,
+    symbol: String,
+    market_type: MarketType,
+    pending_deliveries: Vec<AlertDeliveryView>,
 }
 
 enum AlertFact {
@@ -514,6 +645,10 @@ fn parse_delivery_outcome(
         (PRICE_ALERT_DELIVERY_FAILED, Some("rejected")) => Ok((
             AlertDeliveryStatus::Failed,
             Some(AlertDeliveryFailure::Rejected),
+        )),
+        (PRICE_ALERT_DELIVERY_FAILED, Some("worker_failed")) => Ok((
+            AlertDeliveryStatus::Failed,
+            Some(AlertDeliveryFailure::WorkerFailed),
         )),
         (PRICE_ALERT_DELIVERY_TIMED_OUT, Some("timeout")) => Ok((
             AlertDeliveryStatus::TimedOut,

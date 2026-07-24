@@ -22,10 +22,12 @@ use crypto_trading_config::{
 };
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_runtime::{
-    FileJournalSnapshotSource, JournalSnapshotSource, JsonlHistory, MarketDataClock,
-    MarketDataEvent, MarketDataObservation, MarketFreshnessPolicy,
+    AlertDeliveryFailure, AlertDeliveryStatus, FileJournalSnapshotSource, JournalSnapshotSource,
+    JsonlHistory, MarketDataClock, MarketDataEvent, MarketDataObservation, MarketFreshnessPolicy,
+    PriceAlertReadModel,
 };
 use rust_decimal::Decimal;
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -81,6 +83,7 @@ impl AlertNotificationAdapter for PendingAdapter {
 #[derive(Debug)]
 struct PanickingAdapter {
     entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 impl AlertNotificationAdapter for PanickingAdapter {
@@ -90,8 +93,10 @@ impl AlertNotificationAdapter for PanickingAdapter {
 
     fn deliver(&mut self, _notification: AlertNotification) -> AlertNotificationFuture<'_> {
         let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
         Box::pin(async move {
             entered.notify_one();
+            release.notified().await;
             panic!("scripted adapter panic");
         })
     }
@@ -411,8 +416,10 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
     let path = temp_path("alert-adapter-panic");
     let clock = Arc::new(TestClock::new(timestamp(0)));
     let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
     let panicking = PanickingAdapter {
         entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
     };
     let (healthy, probe) =
         DeterministicNotificationAdapter::new("healthy", VecDeque::new(), 4).unwrap();
@@ -430,8 +437,28 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
         .unwrap();
     entered.notified().await;
     clock.set(timestamp(1));
-    let report = runtime
+    let queued = runtime
         .process(observation(2, timestamp(1), "106"))
+        .await
+        .unwrap();
+    assert!(queued.notification_enqueues.iter().any(|enqueue| {
+        enqueue.adapter_id == "panicking" && enqueue.state == NotificationEnqueueState::Queued
+    }));
+    release.notify_one();
+    tokio::time::timeout(StdDuration::from_millis(100), async {
+        loop {
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            if body.contains("price_alert_delivery_failed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("panic must be converted into a terminal delivery fact");
+    clock.set(timestamp(2));
+    let report = runtime
+        .process(observation(3, timestamp(2), "107"))
         .await
         .unwrap();
     assert!(report.notification_enqueues.iter().any(|enqueue| {
@@ -440,12 +467,47 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
     }));
 
     runtime.stop().await;
-    assert_eq!(probe.deliveries().len(), 2);
+    assert_eq!(probe.deliveries().len(), 3);
     assert_eq!(runtime.notification_status().worker_failures, 1);
+    let journal_records = records(&path);
     assert_eq!(
-        decision_count(&records(&path), "price_alert_delivery_dropped"),
+        decision_count(&journal_records, "price_alert_delivery_failed"),
         1
     );
+    assert_eq!(
+        decision_count(&journal_records, "price_alert_delivery_dropped"),
+        2
+    );
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("scripted adapter panic"));
+    let source = FileJournalSnapshotSource::new(
+        "00000000-0000-0000-0000-000000000386".parse().unwrap(),
+        &path,
+    )
+    .unwrap();
+    let model = PriceAlertReadModel::from_legacy_snapshot(&source.snapshot().unwrap()).unwrap();
+    let first = model
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.alert_sequence == 1)
+        .unwrap();
+    assert!(first.deliveries.iter().any(|delivery| {
+        delivery.adapter_id == "panicking"
+            && delivery.status == AlertDeliveryStatus::Failed
+            && delivery.failure == Some(AlertDeliveryFailure::WorkerFailed)
+    }));
+    for sequence in [2, 3] {
+        let occurrence = model
+            .occurrences
+            .iter()
+            .find(|occurrence| occurrence.alert_sequence == sequence)
+            .unwrap();
+        assert!(occurrence.deliveries.iter().any(|delivery| {
+            delivery.adapter_id == "panicking"
+                && delivery.status == AlertDeliveryStatus::Dropped
+                && delivery.failure == Some(AlertDeliveryFailure::AdapterClosed)
+        }));
+    }
     remove_file(&path);
 }
 
@@ -554,6 +616,120 @@ async fn delivery_facts_use_the_injected_clock_and_invalid_status_cannot_recover
     let valid_snapshot = source.snapshot().unwrap();
     recovered.recover(&valid_snapshot).unwrap();
     assert_eq!(recovered.recent_occurrences().len(), 1);
+    recovered.stop().await;
+    remove_file(&path);
+}
+
+#[tokio::test]
+async fn recovery_rejects_invalid_delivery_state_machines_transactionally() {
+    let cases = [
+        (
+            "terminal-without-pending",
+            vec![
+                recovered_occurrence_record(1, 0),
+                recovered_delivery_record(
+                    "price_alert_delivery_succeeded",
+                    1,
+                    "adapter_a",
+                    None,
+                    1,
+                ),
+            ],
+        ),
+        (
+            "adapter-switch",
+            vec![
+                recovered_occurrence_record(1, 0),
+                recovered_delivery_record("price_alert_delivery_pending", 1, "adapter_a", None, 0),
+                recovered_delivery_record(
+                    "price_alert_delivery_succeeded",
+                    1,
+                    "adapter_b",
+                    None,
+                    1,
+                ),
+            ],
+        ),
+        (
+            "duplicate-terminal",
+            vec![
+                recovered_occurrence_record(1, 0),
+                recovered_delivery_record("price_alert_delivery_pending", 1, "adapter_a", None, 0),
+                recovered_delivery_record(
+                    "price_alert_delivery_succeeded",
+                    1,
+                    "adapter_a",
+                    None,
+                    1,
+                ),
+                recovered_delivery_record(
+                    "price_alert_delivery_succeeded",
+                    1,
+                    "adapter_a",
+                    None,
+                    2,
+                ),
+            ],
+        ),
+        (
+            "too-many-adapters",
+            std::iter::once(recovered_occurrence_record(1, 0))
+                .chain((0..9).map(|index| {
+                    recovered_delivery_record(
+                        "price_alert_delivery_pending",
+                        1,
+                        &format!("adapter_{index}"),
+                        None,
+                        0,
+                    )
+                }))
+                .collect(),
+        ),
+    ];
+
+    for (label, journal_records) in cases {
+        let path = temp_path(label);
+        write_records(&path, &journal_records);
+        let source = FileJournalSnapshotSource::new(
+            "00000000-0000-0000-0000-000000000387".parse().unwrap(),
+            &path,
+        )
+        .unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let clock = Arc::new(TestClock::new(timestamp(10)));
+        let mut recovered = journal_only_runtime(&threshold_config(30), clock, &path);
+
+        assert!(
+            recovered.recover(&snapshot).is_err(),
+            "{label} must fail closed"
+        );
+        assert!(recovered.recent_occurrences().is_empty());
+        recovered.stop().await;
+        remove_file(&path);
+    }
+}
+
+#[tokio::test]
+async fn recovery_rejects_regressing_occurrence_time_transactionally() {
+    let path = temp_path("regressing-occurrence-time");
+    write_records(
+        &path,
+        &[
+            recovered_occurrence_record(1, 10),
+            recovered_occurrence_record(2, 9),
+        ],
+    );
+    let source = FileJournalSnapshotSource::new(
+        "00000000-0000-0000-0000-000000000388".parse().unwrap(),
+        &path,
+    )
+    .unwrap();
+    let snapshot = source.snapshot().unwrap();
+    let clock = Arc::new(TestClock::new(timestamp(20)));
+    let mut recovered = journal_only_runtime(&threshold_config(30), clock, &path);
+
+    assert!(recovered.recover(&snapshot).is_err());
+    assert!(recovered.recent_occurrences().is_empty());
     recovered.stop().await;
     remove_file(&path);
 }
@@ -669,6 +845,59 @@ fn records(path: &std::path::Path) -> Vec<serde_json::Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn write_records(path: &std::path::Path, records: &[Value]) {
+    let body = records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    std::fs::write(path, format!("{body}\n")).unwrap();
+}
+
+fn recovered_occurrence_record(sequence: u64, offset_seconds: i64) -> Value {
+    json!({
+        "timestamp": timestamp(offset_seconds),
+        "strategy": "price_alert",
+        "symbol": "BTC-USDT",
+        "decision": "price_alert_occurred",
+        "details": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "exchange": "binance",
+            "market_type": "spot",
+            "kind": "upper_limit",
+            "price": "105",
+            "change_percent": null,
+            "market_revision": sequence,
+            "market_generation": sequence,
+        },
+    })
+}
+
+fn recovered_delivery_record(
+    decision: &str,
+    sequence: u64,
+    adapter_id: &str,
+    failure: Option<&str>,
+    offset_seconds: i64,
+) -> Value {
+    json!({
+        "timestamp": timestamp(offset_seconds),
+        "strategy": "price_alert",
+        "symbol": "BTC-USDT",
+        "decision": decision,
+        "details": {
+            "schema_version": 1,
+            "sequence": sequence,
+            "exchange": "binance",
+            "market_type": "spot",
+            "adapter_id": adapter_id,
+            "failure": failure,
+        },
+    })
 }
 
 fn decision_count(records: &[serde_json::Value], decision: &str) -> usize {

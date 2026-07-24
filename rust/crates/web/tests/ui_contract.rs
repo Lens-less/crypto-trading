@@ -13,7 +13,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-const SHELL_PATHS: &[&str] = &["/", "/overview", "/executions", "/integrations"];
+const SHELL_PATHS: &[&str] = &["/", "/overview", "/alerts", "/executions", "/integrations"];
 const WRITE_METHODS: &[Method] = &[Method::POST, Method::PUT, Method::PATCH, Method::DELETE];
 
 #[tokio::test]
@@ -145,6 +145,7 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     }
     for endpoint in [
         "/api/v1/system",
+        "/api/v1/alerts",
         "/api/v1/capabilities",
         "/api/v1/executions",
         "/api/v1/events",
@@ -165,6 +166,7 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     assert!(javascript.contains("不透明恢复游标只保存在页面内存"));
     assert!(javascript.contains("market_data_freshness"));
     assert_monitor_surface_contract(&javascript, &css);
+    assert_alert_surface_contract(&javascript, &css);
     assert!(javascript.contains("kill_switch"));
     assert_protected_state_contract(&javascript);
 }
@@ -194,10 +196,54 @@ fn assert_monitor_surface_contract(javascript: &str, css: &str) {
     }
 }
 
+fn assert_alert_surface_contract(javascript: &str, css: &str) {
+    for required in [
+        "const MAX_ALERT_OCCURRENCES = 256;",
+        "const TRUSTED_ALERT_PROJECTION_IDS = new Set([\"complete\", \"windowed\"]);",
+        "function renderAlertsView()",
+        "function alertProjectionLabel(model)",
+        "function visibleAlertOccurrences(model)",
+        "model.occurrences.length > MAX_ALERT_OCCURRENCES",
+        "model.boundary?.kind !== \"snapshot_end\"",
+        "价格预警明细，可横向滚动",
+        "预警投影已窗口化",
+        "可信 / 已截断",
+        "预警投影已降级",
+        "降级 / 契约不一致",
+        "所有 occurrence 与最近预警都停止展示",
+        "预警快照刷新失败",
+        "保留旧快照",
+        "未发生窗口截断",
+        "规则定义",
+        "冷却状态",
+        "当前投影未提供",
+        "触发 ${formatDateTime(occurrence.recorded_at)}",
+        "确认 ${formatDateTime(occurrence.acknowledged_at)}",
+        "formatDateTime(delivery.updated_at)",
+        "state.loads.alerts === \"error\" &&\n    state.alerts &&\n    isTrustedAlertProjection(state.alerts)",
+        "最后记录：未决",
+        "function countPendingAlertDeliveries(model)",
+        "存在未决通知记录",
+        "历史事实 / 不保证重放",
+        "恢复默认不重放，本页不会把它解释为仍在排队",
+        "通知 worker 异常终止",
+    ] {
+        assert!(
+            javascript.contains(required),
+            "browser asset is missing alert-surface contract {required}"
+        );
+    }
+    assert!(css.contains(".alert-table {\n  min-width: 880px;"));
+    assert!(css.contains(".alert-table th {\n  white-space: nowrap;"));
+    assert!(css.contains(".risk-status-block .status-list li {\n    display: grid;"));
+    assert!(css.contains("grid-template-columns: repeat(4, minmax(0, 1fr));"));
+}
+
 fn assert_protected_state_contract(javascript: &str) {
     for required in [
         "function clearProtectedState()",
         "state.system = null;",
+        "state.alerts = null;",
         "state.capabilities = null;",
         "state.executions = null;",
         "state.lastPage = null;",
@@ -221,7 +267,7 @@ fn assert_protected_state_contract(javascript: &str) {
         javascript
             .matches("if (generation !== state.sessionGeneration)")
             .count()
-            >= 6,
+            >= 7,
         "every protected JSON success and error path must reject stale auth sessions"
     );
 }
@@ -267,9 +313,12 @@ async fn app_router_remains_read_only_and_unknown_routes_fail_closed() {
     for path in [
         "/",
         "/overview",
+        "/alerts",
         "/executions",
         "/integrations",
         "/api/v1/system",
+        "/api/v1/monitor",
+        "/api/v1/alerts",
         "/api/v1/capabilities",
         "/api/v1/executions",
         "/api/v1/events",
@@ -387,7 +436,7 @@ fn assert_shell_markup(shell: &str) {
         lower.contains("<!doctype html") || lower.contains("<html"),
         "expected HTML shell, got {shell}"
     );
-    for label in ["Overview", "Executions", "Integrations"] {
+    for label in ["Overview", "Alerts", "Executions", "Integrations"] {
         assert!(shell.contains(label), "missing shell label {label}");
     }
 }
@@ -400,7 +449,7 @@ fn shell_asset_refs(shell: &str) -> BTreeSet<String> {
         !value.starts_with('#')
             && !matches!(
                 value.as_str(),
-                "/" | "/overview" | "/executions" | "/integrations"
+                "/" | "/overview" | "/alerts" | "/executions" | "/integrations"
             )
             && !value.starts_with("mailto:")
             && !value.starts_with("javascript:")

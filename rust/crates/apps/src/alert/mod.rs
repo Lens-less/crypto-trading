@@ -7,7 +7,7 @@
 mod journal;
 mod notification;
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use crypto_trading_config::PriceAlertConfig;
@@ -21,8 +21,8 @@ use crypto_trading_strategy::{AlertState, AlertStrategy, PriceAlert, StrategyErr
 use rust_decimal::Decimal;
 
 use journal::{
-    RecoveredAlertFact, acknowledgement_record, occurrence_record, parse_alert_fact,
-    pending_record, sample_record,
+    RecoveredAlertFact, RecoveredDeliveryStatus, acknowledgement_record, occurrence_record,
+    parse_alert_fact, pending_record, sample_record,
 };
 
 pub use journal::PRICE_ALERT_EVENT_SCHEMA_VERSION;
@@ -39,6 +39,8 @@ pub use notification::{
 pub const MAX_RECENT_ALERT_OCCURRENCES: usize = 256;
 
 const MAX_RECOVERABLE_ALERT_SAMPLES: u64 = 100_000;
+const MAX_RECOVERED_PENDING_DELIVERIES: usize = 65_536;
+const MAX_RECOVERED_DELIVERY_ADAPTERS: usize = 8;
 
 /// Runtime mode, queue budgets, and recent acknowledgement window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,7 @@ struct BoundAlertRule {
     strategy: AlertStrategy,
     state: AlertState,
     maximum_window: Option<Duration>,
+    last_occurrence_at: Option<DateTime<Utc>>,
 }
 
 /// One stable alert occurrence committed to the journal.
@@ -130,9 +133,29 @@ struct PreparedAlertUpdate {
     market_update: MarketDataUpdate,
     rule_index: Option<usize>,
     next_state: Option<AlertState>,
+    next_last_occurrence_at: Option<DateTime<Utc>>,
     next_occurrence_sequence: u64,
     records: Vec<crypto_trading_runtime::DecisionRecord>,
     occurrences: Vec<AlertOccurrence>,
+}
+
+#[derive(Debug, Default)]
+struct RecoveryDeliveryLedger {
+    occurrences: BTreeMap<u64, RecoveredOccurrenceDeliveries>,
+    pending_delivery_count: usize,
+}
+
+#[derive(Debug)]
+struct RecoveredOccurrenceDeliveries {
+    occurrence_id: AlertOccurrenceId,
+    occurred_at: DateTime<Utc>,
+    adapters: BTreeMap<String, RecoveredAdapterDelivery>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecoveredAdapterDelivery {
+    Pending { recorded_at: DateTime<Utc> },
+    Terminal,
 }
 
 /// Multi-symbol, journal-first, read-only price-alert application service.
@@ -200,6 +223,7 @@ impl PriceAlertRuntime {
                     strategy,
                     state: AlertState::default(),
                     maximum_window,
+                    last_occurrence_at: None,
                 })
             })
             .collect::<Result<Vec<_>, PriceAlertRuntimeError>>()?;
@@ -285,6 +309,9 @@ impl PriceAlertRuntime {
             (prepared.rule_index, prepared.next_state.take())
         {
             self.rules[rule_index].state = next_state;
+            if let Some(recorded_at) = prepared.next_last_occurrence_at {
+                self.rules[rule_index].last_occurrence_at = Some(recorded_at);
+            }
         }
         self.occurrence_sequence = prepared.next_occurrence_sequence;
         for occurrence in &prepared.occurrences {
@@ -394,6 +421,7 @@ impl PriceAlertRuntime {
         snapshot: &JournalSnapshot,
     ) -> Result<(), PriceAlertRuntimeError> {
         let mut cursor = None;
+        let mut delivery_ledger = RecoveryDeliveryLedger::default();
         loop {
             let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())
                 .map_err(ReadModelError::Journal)?;
@@ -401,7 +429,7 @@ impl PriceAlertRuntime {
                 let fact = parse_alert_fact(event)
                     .map_err(|()| PriceAlertRuntimeError::Recovery("invalid price alert event"))?;
                 if let Some(fact) = fact {
-                    self.apply_recovered_fact(fact)?;
+                    self.apply_recovered_fact(fact, &mut delivery_ledger)?;
                 }
             }
             match page.boundary() {
@@ -444,6 +472,7 @@ impl PriceAlertRuntime {
                 market_update,
                 rule_index: None,
                 next_state: None,
+                next_last_occurrence_at: None,
                 next_occurrence_sequence: self.occurrence_sequence,
                 records: Vec::new(),
                 occurrences: Vec::new(),
@@ -463,6 +492,7 @@ impl PriceAlertRuntime {
                 market_update,
                 rule_index: None,
                 next_state: None,
+                next_last_occurrence_at: None,
                 next_occurrence_sequence: self.occurrence_sequence,
                 records: Vec::new(),
                 occurrences: Vec::new(),
@@ -490,8 +520,15 @@ impl PriceAlertRuntime {
             next_state.prune_before(cutoff);
         }
         let alerts = rule.strategy.evaluate(&next_state, snapshot)?;
+        let mut next_last_occurrence_at = rule.last_occurrence_at;
         for alert in &alerts {
+            if next_last_occurrence_at.is_some_and(|previous| alert.timestamp < previous) {
+                return Err(PriceAlertRuntimeError::Recovery(
+                    "price alert occurrence time is not chronological",
+                ));
+            }
             next_state.record_alert(alert.kind, alert.timestamp);
+            next_last_occurrence_at = Some(alert.timestamp);
         }
         let current_price = snapshot.last.unwrap_or_else(|| snapshot.mid_price());
         next_state.record_price(snapshot.timestamp, current_price)?;
@@ -519,6 +556,7 @@ impl PriceAlertRuntime {
             market_update,
             rule_index: Some(rule_index),
             next_state: Some(next_state),
+            next_last_occurrence_at,
             next_occurrence_sequence: sequence,
             records,
             occurrences,
@@ -528,6 +566,7 @@ impl PriceAlertRuntime {
     fn apply_recovered_fact(
         &mut self,
         fact: RecoveredAlertFact,
+        delivery_ledger: &mut RecoveryDeliveryLedger,
     ) -> Result<(), PriceAlertRuntimeError> {
         match fact {
             RecoveredAlertFact::Sample {
@@ -556,9 +595,21 @@ impl PriceAlertRuntime {
                         "price alert occurrence sequence is not contiguous",
                     ));
                 }
-                let rule = self.rule_mut(&notification.occurrence_id.instrument)?;
-                rule.state
-                    .record_alert(notification.kind, notification.occurred_at);
+                {
+                    let rule = self.rule_mut(&notification.occurrence_id.instrument)?;
+                    if rule
+                        .last_occurrence_at
+                        .is_some_and(|previous| notification.occurred_at < previous)
+                    {
+                        return Err(PriceAlertRuntimeError::Recovery(
+                            "price alert occurrence time is not chronological",
+                        ));
+                    }
+                    rule.state
+                        .record_alert(notification.kind, notification.occurred_at);
+                    rule.last_occurrence_at = Some(notification.occurred_at);
+                }
+                delivery_ledger.record_occurrence(&notification)?;
                 self.occurrence_sequence = expected;
                 self.push_recent(alert_occurrence_from_notification(notification), None);
             }
@@ -585,24 +636,19 @@ impl PriceAlertRuntime {
                     ));
                 }
             }
-            RecoveredAlertFact::Delivery { occurrence_id } => {
+            RecoveredAlertFact::Delivery {
+                occurrence_id,
+                adapter_id,
+                status,
+                recorded_at,
+            } => {
                 let _ = self.rule_mut(&occurrence_id.instrument)?;
                 if occurrence_id.sequence > self.occurrence_sequence {
                     return Err(PriceAlertRuntimeError::Recovery(
                         "delivery references a future occurrence",
                     ));
                 }
-                let retained = self
-                    .recent_occurrences
-                    .iter()
-                    .find(|status| status.occurrence.id.sequence == occurrence_id.sequence);
-                if let Some(status) = retained {
-                    if status.occurrence.id != occurrence_id {
-                        return Err(PriceAlertRuntimeError::Recovery(
-                            "delivery occurrence identity is inconsistent",
-                        ));
-                    }
-                }
+                delivery_ledger.apply_delivery(&occurrence_id, adapter_id, status, recorded_at)?;
             }
         }
         Ok(())
@@ -629,6 +675,123 @@ impl PriceAlertRuntime {
             occurrence,
             acknowledged_at,
         });
+    }
+}
+
+impl RecoveryDeliveryLedger {
+    fn record_occurrence(
+        &mut self,
+        notification: &AlertNotification,
+    ) -> Result<(), PriceAlertRuntimeError> {
+        let sequence = notification.occurrence_id.sequence;
+        if self.occurrences.contains_key(&sequence) {
+            return Err(PriceAlertRuntimeError::Recovery(
+                "duplicate delivery occurrence state",
+            ));
+        }
+        self.occurrences.insert(
+            sequence,
+            RecoveredOccurrenceDeliveries {
+                occurrence_id: notification.occurrence_id.clone(),
+                occurred_at: notification.occurred_at,
+                adapters: BTreeMap::new(),
+            },
+        );
+        self.prune(sequence)
+    }
+
+    fn apply_delivery(
+        &mut self,
+        occurrence_id: &AlertOccurrenceId,
+        adapter_id: String,
+        status: RecoveredDeliveryStatus,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), PriceAlertRuntimeError> {
+        {
+            let occurrence = self.occurrences.get_mut(&occurrence_id.sequence).ok_or(
+                PriceAlertRuntimeError::Recovery("delivery references an unknown occurrence"),
+            )?;
+            if occurrence.occurrence_id != *occurrence_id || recorded_at < occurrence.occurred_at {
+                return Err(PriceAlertRuntimeError::Recovery(
+                    "delivery occurrence identity or time is inconsistent",
+                ));
+            }
+
+            if status.is_pending() {
+                if occurrence.adapters.contains_key(&adapter_id)
+                    || occurrence.adapters.len() >= MAX_RECOVERED_DELIVERY_ADAPTERS
+                {
+                    return Err(PriceAlertRuntimeError::Recovery(
+                        "duplicate or excessive delivery adapter state",
+                    ));
+                }
+                let next_pending = self.pending_delivery_count.checked_add(1).ok_or(
+                    PriceAlertRuntimeError::Recovery("recovered pending delivery limit overflowed"),
+                )?;
+                if next_pending > MAX_RECOVERED_PENDING_DELIVERIES {
+                    return Err(PriceAlertRuntimeError::Recovery(
+                        "recovered pending delivery limit exceeded",
+                    ));
+                }
+                occurrence.adapters.insert(
+                    adapter_id,
+                    RecoveredAdapterDelivery::Pending { recorded_at },
+                );
+                self.pending_delivery_count = next_pending;
+            } else {
+                let delivery = occurrence.adapters.get_mut(&adapter_id).ok_or(
+                    PriceAlertRuntimeError::Recovery(
+                        "terminal delivery has no pending adapter state",
+                    ),
+                )?;
+                match *delivery {
+                    RecoveredAdapterDelivery::Pending {
+                        recorded_at: pending_at,
+                    } if recorded_at >= pending_at => {
+                        *delivery = RecoveredAdapterDelivery::Terminal;
+                        self.pending_delivery_count = self
+                            .pending_delivery_count
+                            .checked_sub(1)
+                            .ok_or(PriceAlertRuntimeError::Recovery(
+                                "recovered pending delivery count is inconsistent",
+                            ))?;
+                    }
+                    RecoveredAdapterDelivery::Pending { .. }
+                    | RecoveredAdapterDelivery::Terminal => {
+                        return Err(PriceAlertRuntimeError::Recovery(
+                            "invalid or duplicate terminal delivery state",
+                        ));
+                    }
+                }
+            }
+        }
+
+        let latest_sequence = self
+            .occurrences
+            .last_key_value()
+            .map_or(occurrence_id.sequence, |(sequence, _)| *sequence);
+        self.prune(latest_sequence)
+    }
+
+    fn prune(&mut self, latest_sequence: u64) -> Result<(), PriceAlertRuntimeError> {
+        let window = u64::try_from(MAX_RECENT_ALERT_OCCURRENCES).map_err(|_| {
+            PriceAlertRuntimeError::Recovery("delivery recovery window is not representable")
+        })?;
+        let first_retained = latest_sequence.saturating_sub(window.saturating_sub(1));
+        let stale =
+            self.occurrences
+                .range(..first_retained)
+                .filter_map(|(sequence, occurrence)| {
+                    let has_pending = occurrence.adapters.values().any(|delivery| {
+                        matches!(delivery, RecoveredAdapterDelivery::Pending { .. })
+                    });
+                    (!has_pending).then_some(*sequence)
+                })
+                .collect::<Vec<_>>();
+        for sequence in stale {
+            self.occurrences.remove(&sequence);
+        }
+        Ok(())
     }
 }
 
