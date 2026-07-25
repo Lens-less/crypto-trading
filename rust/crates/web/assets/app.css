@@ -497,6 +497,15 @@ code,
   padding: 20px;
 }
 
+.subregion {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  border-top: 1px solid var(--border);
+  background: var(--layer-01);
+}
+
 .region-head {
   display: flex;
   justify-content: space-between;
@@ -972,7 +981,7 @@ code,
 
   .spine-nav {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .spine-nav a {

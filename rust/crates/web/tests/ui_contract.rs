@@ -20,6 +20,10 @@ const SHELL_PATHS: &[&str] = &[
     "/alerts",
     "/executions",
     "/integrations",
+    "/strategies",
+    "/risk",
+    "/replay",
+    "/settings",
 ];
 const WRITE_METHODS: &[Method] = &[Method::POST, Method::PUT, Method::PATCH, Method::DELETE];
 
@@ -250,7 +254,7 @@ fn assert_alert_surface_contract(javascript: &str, css: &str) {
     assert!(css.contains(".alert-table {\n  min-width: 880px;"));
     assert!(css.contains(".alert-table th {\n  white-space: nowrap;"));
     assert!(css.contains(".risk-status-block .status-list li {\n    display: grid;"));
-    assert!(css.contains("grid-template-columns: repeat(5, minmax(0, 1fr));"));
+    assert!(css.contains("grid-template-columns: repeat(3, minmax(0, 1fr));"));
 }
 
 fn assert_task_surface_contract(javascript: &str, css: &str) {
@@ -402,13 +406,19 @@ async fn app_router_remains_read_only_and_unknown_routes_fail_closed() {
     for path in [
         "/",
         "/overview",
+        "/scanner",
         "/alerts",
         "/executions",
         "/integrations",
+        "/strategies",
+        "/risk",
+        "/replay",
+        "/settings",
         "/api/v1/system",
         "/api/v1/monitor",
         "/api/v1/alerts",
         "/api/v1/tasks",
+        "/api/v1/scanner",
         "/api/v1/capabilities",
         "/api/v1/executions",
         "/api/v1/events",

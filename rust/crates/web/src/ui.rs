@@ -20,6 +20,10 @@ pub(crate) fn ui_router() -> Router {
         .route("/alerts", get(shell))
         .route("/executions", get(shell))
         .route("/integrations", get(shell))
+        .route("/strategies", get(shell))
+        .route("/risk", get(shell))
+        .route("/replay", get(shell))
+        .route("/settings", get(shell))
         .route("/assets/app.css", get(app_css))
         .route("/assets/app.js", get(app_js))
 }

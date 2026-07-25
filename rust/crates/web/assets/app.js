@@ -4,6 +4,10 @@ const VIEW_IDS = new Set([
   "alerts",
   "executions",
   "integrations",
+  "strategies",
+  "risk",
+  "replay",
+  "settings",
 ]);
 const AREA_IDS = new Set([
   "all",
@@ -878,6 +882,10 @@ function renderSpineStatusBlock() {
 
 function renderNavigationBlock() {
   const entries = [
+    ["strategies", "Strategies"],
+    ["risk", "Risk"],
+    ["replay", "Replay"],
+    ["settings", "Settings"],
     ["overview", "总览"],
     ["scanner", "扫描"],
     ["alerts", "预警"],
@@ -974,6 +982,10 @@ function renderAccessBlock() {
 
 function renderHeader() {
   const currentPage = {
+    strategies: "Read-only strategy surfaces grounded in the current journal projection.",
+    risk: "Fail-closed risk status, recovery pressure, and bounded authority evidence.",
+    replay: "Historical snapshots and event-watermark context; not a live matching replay.",
+    settings: "Read-only shell, access, and projection boundary settings available to this page.",
     alerts: "有界价格预警投影、确认状态与本地通知结果。",
     overview: "跨域读取模型与风险优先的运行事实。",
     scanner: "离线确定性虚拟网格排行，以及可审计的 APR 与评分证据。",
@@ -1040,6 +1052,14 @@ function renderMain() {
     content.push(renderAlertsView());
   } else if (state.route.view === "executions") {
     content.push(renderExecutionsView());
+  } else if (state.route.view === "strategies") {
+    content.push(renderStrategiesView());
+  } else if (state.route.view === "risk") {
+    content.push(renderRiskView());
+  } else if (state.route.view === "replay") {
+    content.push(renderReplayView());
+  } else if (state.route.view === "settings") {
+    content.push(renderSettingsView());
   } else {
     content.push(renderIntegrationsView());
   }
@@ -2092,6 +2112,368 @@ function renderIntegrationsView() {
   ]);
 }
 
+function renderStrategiesView() {
+  const capabilities = capabilityRowsFor("strategy");
+  const taskKinds = uniqueValues((state.tasks?.tasks || []).map((task) => task.kind));
+  const batchStrategies = uniqueValues(
+    (state.executions?.operator?.batches || []).map((batch) => batch.strategy),
+  );
+  const latestAlert = latestAlertOccurrence();
+  const latestScanner = state.scanner?.latest || null;
+  const latestMonitor = state.monitor?.latest || null;
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "Strategy surfaces",
+      subtitle:
+        "Current strategy evidence only. This page exposes no start, stop, replay-submit, or order authority.",
+      body: el("div", { className: "detail-grid" }, [
+        detailStat("Monitor", latestMonitor ? humanizeToken(latestMonitor.state) : "unavailable"),
+        detailStat("Scanner rows", latestScanner?.rows?.length || 0),
+        detailStat("Alert occurrences", visibleAlertOccurrences(state.alerts).length),
+        detailStat("Task kinds", taskKinds.length),
+        detailStat("Batch strategies", batchStrategies.length),
+        detailStat("Strategy capabilities", capabilities.length),
+      ]),
+    }),
+    renderRegion({
+      title: "Read-only strategy evidence",
+      subtitle:
+        "Each surface reflects the last bounded fact available from the current journal snapshot and fails closed when data is missing.",
+      body: el("div", { className: "evidence-grid" }, [
+        renderSubregion("Arbitrage monitor", el("div", { className: "detail-grid" }, [
+          detailStat("Projection", humanizeToken(state.monitor?.projection_status || "unavailable")),
+          detailStat(
+            "Pair",
+            latestMonitor
+              ? `${latestMonitor.left.exchange}/${latestMonitor.left.symbol} -> ${latestMonitor.right.exchange}/${latestMonitor.right.symbol}`
+              : "--",
+          ),
+          detailStat("Recorded", latestMonitor ? formatDateTime(latestMonitor.recorded_at) : "--"),
+          detailStat("Sequence", latestMonitor?.monitor_sequence ?? "--"),
+        ])),
+        renderSubregion("Virtual grid scanner", el("div", { className: "detail-grid" }, [
+          detailStat("Projection", humanizeToken(state.scanner?.projection_status || "unavailable")),
+          detailStat("Run ID", latestScanner?.run_id || "--"),
+          detailStat(
+            "Leader",
+            latestScanner?.rows?.[0] ? scannerMarketLabel(latestScanner.rows[0]) : "--",
+          ),
+          detailStat("Recorded", latestScanner ? formatDateTime(latestScanner.recorded_at) : "--"),
+        ])),
+        renderSubregion("Price alerts", el("div", { className: "detail-grid" }, [
+          detailStat("Projection", alertProjectionLabel(state.alerts)),
+          detailStat("Latest sequence", latestAlert?.alert_sequence ?? "--"),
+          detailStat("Pending deliveries", countPendingAlertDeliveries(state.alerts)),
+          detailStat("Recorded", latestAlert ? formatDateTime(latestAlert.recorded_at) : "--"),
+        ])),
+        renderSubregion("Execution ledger", el("div", { className: "detail-grid" }, [
+          detailStat("Batches", state.executions?.operator?.batches?.length || 0),
+          detailStat("Strategies", batchStrategies.length),
+          detailStat("Recovery required", state.system?.recovery_required_count ?? "--"),
+          detailStat("Projection", humanizeToken(state.system?.projection_status || "unavailable")),
+        ])),
+      ]),
+    }),
+    renderRegion({
+      title: "Strategy capability ledger",
+      subtitle:
+        "Capabilities are sourced from the same bounded manifest used by CLI and HTTP surfaces.",
+      body:
+        state.loads.capabilities === "error" && !state.capabilities
+          ? renderError(state.errors.capabilities)
+          : state.capabilities
+          ? capabilities.length > 0
+            ? renderCapabilityTable(capabilities)
+            : renderEmpty(
+                "No strategy capabilities are available in the current manifest.",
+                "Checked /api/v1/capabilities for area=strategy.",
+              )
+          : renderSkeleton(6),
+    }),
+  ]);
+}
+
+function renderRiskView() {
+  const riskyBatches = attentionBatches();
+  const tasks = attentionTasks();
+  const capabilities = capabilityRowsFor("risk");
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "Risk overview",
+      subtitle:
+        "Fail-closed risk status only. Missing reservation, kill-switch, or credential facts are left unavailable rather than inferred.",
+      body: el("div", { className: "detail-grid" }, [
+        detailStat("Kill switch", humanizeToken(state.system?.kill_switch || "not_available")),
+        detailStat("Recovery required", state.system?.recovery_required_count ?? "--"),
+        detailStat("Conflicts", state.system?.conflict_count ?? "--"),
+        detailStat("Task investigations", tasks.length),
+        detailStat("Risk capabilities", capabilities.length),
+        detailStat("Projection", humanizeToken(state.system?.projection_status || "unavailable")),
+      ]),
+    }),
+    renderRegion({
+      title: "Recovery ledger",
+      subtitle:
+        "Batches shown here require investigation or reconciliation. This page does not expose retry, release, or submit actions.",
+      body:
+        state.loads.executions === "error" && !state.executions
+          ? renderError(state.errors.executions)
+          : state.loads.executions === "loading" && !state.executions
+          ? renderSkeleton(6)
+          : riskyBatches.length > 0
+          ? renderBatchTable(riskyBatches, { condensed: false })
+          : renderEmpty(
+              "No execution batches currently project recovery pressure.",
+              "Checked operator.batches for recovery != none or state conflict/partial/failed/outcome_unknown.",
+            ),
+    }),
+    renderRegion({
+      title: "Task investigation ledger",
+      subtitle:
+        "Durable task lifecycle facts may indicate that manual verification is still required after a stop or failure boundary.",
+      body:
+        state.loads.tasks === "error" && !state.tasks
+          ? renderError(state.errors.tasks)
+          : state.loads.tasks === "loading" && !state.tasks
+          ? renderSkeleton(5)
+          : tasks.length > 0
+          ? renderTaskAttentionTable(tasks)
+          : renderEmpty(
+              "No tasks currently require investigation.",
+              "Checked /api/v1/tasks for recovery=investigate, failure, or failed phase.",
+            ),
+    }),
+    renderRegion({
+      title: "Risk capability ledger",
+      subtitle:
+        "Current manifest evidence for risk-owned authority. Unavailable remains neutral and explicit.",
+      body:
+        state.loads.capabilities === "error" && !state.capabilities
+          ? renderError(state.errors.capabilities)
+          : state.capabilities
+          ? capabilities.length > 0
+            ? renderCapabilityTable(capabilities)
+            : renderEmpty(
+                "The current manifest does not expose additional risk capability rows.",
+                "Checked /api/v1/capabilities for area=risk.",
+              )
+          : renderSkeleton(6),
+    }),
+  ]);
+}
+
+function renderReplayView() {
+  const page = state.lastPage;
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "Replay snapshot",
+      subtitle:
+        "This surface shows historical snapshots and cursor watermarks only. It is not a live matching replay and it cannot submit work.",
+      body: el("div", { className: "detail-grid" }, [
+        detailStat("Journal", state.system?.journal_id || "--"),
+        detailStat("Head sequence", state.system?.head_sequence ?? "--"),
+        detailStat("Cursor", state.cursor || "--"),
+        detailStat("Event page", page?.events?.length || 0),
+        detailStat("Boundary", humanizeToken(page?.boundary?.kind || "snapshot_end")),
+        detailStat("Stream", eventStreamLabel()),
+      ]),
+    }),
+    renderRegion({
+      title: "Historical surface timestamps",
+      subtitle:
+        "Each row names the last retained fact for one read-only projection so operators can inspect what period the page is actually describing.",
+      body: renderReplaySurfaceTable(),
+    }),
+    renderRegion({
+      title: "Recent operation events",
+      subtitle:
+        "Event metadata is bounded and scrubbed. Deep links remain shareable because the cursor stays in page memory only.",
+      body:
+        page
+          ? page.events.length > 0
+            ? renderNoticeTable(page)
+            : renderEmpty(
+                "No new operation events follow the current cursor watermark.",
+                `Checked boundary ${humanizeToken(page.boundary?.kind || "snapshot_end")}.`,
+              )
+          : state.loads.executions === "error"
+          ? renderError(state.errors.executions)
+          : renderSkeleton(4),
+    }),
+  ]);
+}
+
+function renderSettingsView() {
+  const alertAdapters = uniqueValues(
+    visibleAlertOccurrences(state.alerts).flatMap((occurrence) =>
+      Array.isArray(occurrence.deliveries)
+        ? occurrence.deliveries.map((delivery) => delivery.adapter_id)
+        : [],
+    ),
+  );
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "Access and shell",
+      subtitle:
+        "Only settings already surfaced to the read-only shell are shown here. Secrets, filesystem paths, and adapter credentials remain intentionally hidden.",
+      body: el("div", { className: "detail-grid" }, [
+        detailStat("Product version", state.system?.product_version || "--"),
+        detailStat("Release stage", state.system?.release_stage || "--"),
+        detailStat("Access scope", state.system?.access_scope || "--"),
+        detailStat("Auth required", state.system?.authentication_required ? "true" : "false"),
+        detailStat("Bearer bound", state.authToken ? "in-memory" : "not bound"),
+        detailStat("Event stream", eventStreamLabel()),
+      ]),
+    }),
+    renderRegion({
+      title: "Projection sources",
+      subtitle:
+        "These are the bounded journals and read-model watermarks currently available to the embedded shell.",
+      body: el("div", { className: "evidence-grid" }, [
+        renderSubregion("System", el("div", { className: "detail-grid" }, [
+          detailStat("Journal", state.system?.journal_id || "--"),
+          detailStat("Head", state.system?.head_sequence ?? "--"),
+          detailStat("Projection", humanizeToken(state.system?.projection_status || "unavailable")),
+          detailStat("Updated", state.lastSnapshotAt ? formatDateTime(state.lastSnapshotAt) : "--"),
+        ])),
+        renderSubregion("Monitor", el("div", { className: "detail-grid" }, [
+          detailStat("Journal", state.monitor?.journal_id || "--"),
+          detailStat("Head", state.monitor?.journal_head_sequence ?? "--"),
+          detailStat("Projection", humanizeToken(state.monitor?.projection_status || "unavailable")),
+          detailStat("Latest", state.monitor?.latest ? formatDateTime(state.monitor.latest.recorded_at) : "--"),
+        ])),
+        renderSubregion("Alerts", el("div", { className: "detail-grid" }, [
+          detailStat("Journal", state.alerts?.journal_id || "--"),
+          detailStat("Head", state.alerts?.journal_head_sequence ?? "--"),
+          detailStat("Projection", alertProjectionLabel(state.alerts)),
+          detailStat("Boundary", humanizeToken(state.alerts?.boundary?.kind || "snapshot_end")),
+        ])),
+        renderSubregion("Tasks / scanner", el("div", { className: "detail-grid" }, [
+          detailStat("Task head", state.tasks?.journal_head_sequence ?? "--"),
+          detailStat("Task projection", humanizeToken(state.tasks?.projection_status || "unavailable")),
+          detailStat("Scanner head", state.scanner?.journal_head_sequence ?? "--"),
+          detailStat("Scanner projection", humanizeToken(state.scanner?.projection_status || "unavailable")),
+        ])),
+      ]),
+    }),
+    renderRegion({
+      title: "Read-only boundaries",
+      subtitle:
+        "The shell exposes only same-origin read endpoints. Data directories, log file paths, and adapter credential state are not projected to the browser in this release.",
+      body: el("div", { className: "detail-grid" }, [
+        detailStat("HTML routes", VIEW_IDS.size),
+        detailStat("API routes", 8),
+        detailStat("Alert adapters seen", alertAdapters.length),
+        detailStat("Token persistence", "page memory only"),
+        detailStat("Directories", "not projected"),
+        detailStat("Credentials", "not projected"),
+      ]),
+    }),
+  ]);
+}
+
+function renderSubregion(title, body) {
+  return el("section", { className: "subregion" }, [
+    el("div", { className: "compact-label", text: title }),
+    body,
+  ]);
+}
+
+function renderTaskAttentionTable(tasks) {
+  return el("div", { className: "table-wrap" }, [
+    el("table", {}, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "Task" }),
+          el("th", { attrs: { scope: "col" }, text: "Phase" }),
+          el("th", { attrs: { scope: "col" }, text: "Recovery" }),
+          el("th", { attrs: { scope: "col" }, text: "Updated" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        tasks.map((task) =>
+          el("tr", {}, [
+            el("td", {}, [
+              el("div", { className: "mono", text: task.task_id || "--" }),
+              el("div", { className: "muted", text: humanizeToken(task.kind) }),
+            ]),
+            el("td", {}, [buildTag(humanizeToken(task.phase), taskTone(task))]),
+            el("td", {}, [
+              buildTag(humanizeToken(task.recovery), tagToneForRecovery(task.recovery)),
+              task.failure
+                ? el("div", { className: "muted", text: humanizeToken(task.failure) })
+                : null,
+            ]),
+            el("td", { className: "mono", text: formatDateTime(task.updated_at) }),
+          ]),
+        ),
+      ),
+    ]),
+  ]);
+}
+
+function renderReplaySurfaceTable() {
+  const latestAlert = latestAlertOccurrence();
+  const rows = [
+    [
+      "Monitor",
+      humanizeToken(state.monitor?.projection_status || "unavailable"),
+      state.monitor?.latest ? formatDateTime(state.monitor.latest.recorded_at) : "--",
+      state.monitor?.latest?.source_sequence ?? "--",
+    ],
+    [
+      "Alerts",
+      alertProjectionLabel(state.alerts),
+      latestAlert ? formatDateTime(latestAlert.recorded_at) : "--",
+      latestAlert?.source_sequence ?? "--",
+    ],
+    [
+      "Tasks",
+      humanizeToken(state.tasks?.projection_status || "unavailable"),
+      latestTaskUpdateAt(),
+      latestTaskSequence(),
+    ],
+    [
+      "Scanner",
+      humanizeToken(state.scanner?.projection_status || "unavailable"),
+      state.scanner?.latest ? formatDateTime(state.scanner.latest.recorded_at) : "--",
+      state.scanner?.latest?.source_sequence ?? "--",
+    ],
+    [
+      "Executions",
+      humanizeToken(state.system?.projection_status || "unavailable"),
+      state.lastSnapshotAt ? formatDateTime(state.lastSnapshotAt) : "--",
+      state.system?.head_sequence ?? "--",
+    ],
+  ];
+  return el("div", { className: "table-wrap" }, [
+    el("table", {}, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "Surface" }),
+          el("th", { attrs: { scope: "col" }, text: "Projection" }),
+          el("th", { attrs: { scope: "col" }, text: "Latest fact" }),
+          el("th", { attrs: { scope: "col" }, text: "Sequence" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        rows.map(([surface, projection, recordedAt, sequence]) =>
+          el("tr", {}, [
+            el("td", { text: surface }),
+            el("td", {}, [buildTag(String(projection), projectionToneForLabel(projection))]),
+            el("td", { className: "mono", text: String(recordedAt) }),
+            el("td", { className: "mono", text: String(sequence) }),
+          ]),
+        ),
+      ),
+    ]),
+  ]);
+}
+
 function renderDrawer() {
   const batch = selectedBatch();
   const isMobile = window.matchMedia("(max-width: 671px)").matches;
@@ -2578,6 +2960,56 @@ function filteredCapabilities() {
   );
 }
 
+function capabilityRowsFor(area) {
+  return (state.capabilities?.capabilities || []).filter((capability) => capability.area === area);
+}
+
+function attentionBatches() {
+  return filteredBatches().filter((batch) =>
+    batch.recovery !== "none" ||
+    ["conflict", "partial", "failed", "outcome_unknown"].includes(batch.state),
+  );
+}
+
+function attentionTasks() {
+  return (state.tasks?.tasks || [])
+    .slice()
+    .filter(
+      (task) =>
+        task.recovery === "investigate" ||
+        Boolean(task.failure) ||
+        task.phase === "failed",
+    )
+    .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function latestAlertOccurrence() {
+  const occurrences = visibleAlertOccurrences(state.alerts);
+  return occurrences.length > 0 ? occurrences[occurrences.length - 1] : null;
+}
+
+function latestTaskUpdateAt() {
+  const tasks = (state.tasks?.tasks || []).slice().sort(
+    (left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at),
+  );
+  return tasks[0] ? formatDateTime(tasks[0].updated_at) : "--";
+}
+
+function latestTaskSequence() {
+  const tasks = state.tasks?.tasks || [];
+  if (tasks.length === 0) {
+    return "--";
+  }
+  return tasks.reduce(
+    (latest, task) => (task.last_sequence > latest ? task.last_sequence : latest),
+    0,
+  );
+}
+
 function selectedBatch() {
   return (state.executions?.operator?.batches || []).find((batch) => batch.batch_id === state.route.batch) || null;
 }
@@ -2896,6 +3328,26 @@ function tagToneForCapability(level) {
     case "contract-only":
       return "warning";
     case "unavailable":
+      return "neutral";
+    default:
+      return "info";
+  }
+}
+
+function projectionToneForLabel(label) {
+  switch (label) {
+    case "complete":
+    case "完整":
+      return "success";
+    case "windowed":
+    case "窗口化":
+      return "warning";
+    case "degraded":
+    case "降级":
+      return "danger";
+    case "unavailable":
+    case "not_available":
+    case "不可用":
       return "neutral";
     default:
       return "info";
