@@ -1,10 +1,12 @@
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
     error::Error,
     fmt,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -21,8 +23,9 @@ use crypto_trading_domain::{
 use crypto_trading_exchange::{PaperExchange, SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
-    ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataEvent,
-    MarketFreshnessPolicy, MarketInstrument, MarketUniverse, RuntimeError,
+    ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataError,
+    MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy,
+    MarketInstrument, MarketSupervisorConfig, MarketUniverse, RuntimeError, SystemMarketDataClock,
     current_capability_manifest,
 };
 use crypto_trading_strategy::{
@@ -35,11 +38,18 @@ use serde_json::{Value, json};
 
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
-    PriceAlertArgs, ScannerArgs, VolumeMakerArgs,
+    MonitorMode, PriceAlertArgs, ScannerArgs, VolumeMakerArgs,
+};
+use crate::continuous_monitor::{
+    ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
+    ContinuousMonitorTaskStatus,
 };
 use crate::monitor::{
     ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor, ReplayMarketDataClock,
     load_market_snapshot_replay,
+};
+use crate::task_host::{
+    TaskHostControlCommand, TaskHostServeOutcome, control_addr, query_control, serve_host,
 };
 
 /// Runs one parsed CLI command.
@@ -213,21 +223,25 @@ async fn run_arbitrage(args: &ArbitrageArgs) -> Result<()> {
 }
 
 async fn run_monitor(args: &MonitorArgs) -> Result<()> {
+    match args.mode {
+        MonitorMode::Replay => run_monitor_replay(args).await,
+        MonitorMode::Serve => run_monitor_serve(args).await,
+        MonitorMode::Status => run_monitor_status(args).await,
+        MonitorMode::Stop => run_monitor_stop(args).await,
+    }
+}
+
+async fn run_monitor_replay(args: &MonitorArgs) -> Result<()> {
     let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
     let monitor = load_monitor_config_from_str(&body)
         .with_context(|| format!("failed to load monitor config {}", args.config.display()))?;
-    let replay_path = args.replay.as_ref().context(
-        "continuous external monitor sources are unavailable; use --replay with a strict JSONL snapshot fixture",
-    )?;
-    if monitor.exchanges.len() != 2 {
-        bail!(
-            "the first read-only monitor tracer requires exactly two configured exchanges; found {}",
-            monitor.exchanges.len()
-        );
-    }
-    if monitor.exchanges[0] == monitor.exchanges[1] {
-        bail!("read-only arbitrage monitor needs two distinct configured exchanges");
-    }
+    let replay_path = args
+        .replay
+        .as_ref()
+        .context(
+            "monitor replay mode requires --replay with a strict JSONL snapshot fixture; continuous external monitor sources remain unavailable",
+        )?;
+    validate_monitor_pair(&monitor)?;
     let symbol = selected_monitor_symbol(args, &monitor)?;
 
     let mut instruments = Vec::new();
@@ -303,6 +317,121 @@ async fn run_monitor(args: &MonitorArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
+    let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
+    let monitor = load_monitor_config_from_str(&body)
+        .with_context(|| format!("failed to load monitor config {}", args.config.display()))?;
+    let replay_path = args.replay.as_ref().context(
+        "monitor serve currently requires --replay until external continuous source adapters are wired into this task host",
+    )?;
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("monitor serve mode requires --task-id")?;
+    validate_monitor_pair(&monitor)?;
+    let symbol = selected_monitor_symbol(args, &monitor)?;
+    let market_type = serve_market_type(&symbol);
+    let left = MarketInstrument::new(&monitor.exchanges[0], symbol.clone(), market_type)?;
+    let right = MarketInstrument::new(&monitor.exchanges[1], symbol.clone(), market_type)?;
+    let universe = MarketUniverse::new(vec![left.clone(), right.clone()])?;
+    let max_age_seconds = i64::try_from(monitor.data_timeout_seconds)
+        .context("monitor data timeout exceeds the runtime duration")?;
+    let max_age = Duration::try_seconds(max_age_seconds)
+        .context("monitor data timeout is outside the supported duration")?;
+    let book = MarketDataBook::new(
+        universe,
+        MarketFreshnessPolicy::new(max_age, Duration::seconds(1))?,
+        Arc::new(SystemMarketDataClock),
+    );
+    let read_monitor = ReadOnlyArbitrageMonitor::new(book, left, right, monitor.min_spread_pct)?;
+    let (left_source, right_source) = build_serve_replay_sources(
+        replay_path,
+        &monitor.exchanges[0],
+        &monitor.exchanges[1],
+        &symbol,
+    )?;
+    let mut task = ContinuousMonitorTask::start(
+        ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args)?)?,
+        read_monitor,
+        left_source,
+        right_source,
+        JsonlHistory::new(&args.history_path),
+    )
+    .await
+    .context("failed to start continuous monitor task")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind monitor control socket on {address}"))?;
+
+    println!(
+        "continuous monitor task started: task_id={} control={} history={}",
+        task_id,
+        address,
+        args.history_path.display()
+    );
+
+    let outcome = serve_host(
+        &mut task,
+        listener,
+        StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
+        render_live_monitor_status,
+        render_live_monitor_stop,
+    )
+    .await
+    .map_err(|error| anyhow::Error::new(error).context("monitor control host failed"))?;
+
+    match outcome {
+        TaskHostServeOutcome::StopRequested(exit) => {
+            println!("continuous monitor task stopped: task_id={task_id} exit={exit}");
+        }
+        TaskHostServeOutcome::Terminal(status) => {
+            println!(
+                "continuous monitor task terminated: task_id={} phase={} processed_event_count={}",
+                status.task_id, status.phase, status.processed_event_count
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_monitor_status(args: &MonitorArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("monitor status mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
+        print!("{response}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        render_projected_monitor_status(&project_monitor_status(&args.history_path, task_id)?)
+    );
+    Ok(())
+}
+
+async fn run_monitor_stop(args: &MonitorArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("monitor stop mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
+        print!("{response}");
+        return Ok(());
+    }
+    let projected = project_monitor_status(&args.history_path, task_id)?;
+    if projected.phase == "stopped" || projected.phase == "failed" {
+        print!("{}", render_projected_monitor_status(&projected));
+        return Ok(());
+    }
+    bail!(
+        "monitor task control endpoint is unavailable at {address}; the task is not confirmed stopped"
+    );
+}
+
 fn selected_monitor_symbol(args: &MonitorArgs, monitor: &MonitorConfig) -> Result<Symbol> {
     if args.symbols.len() > 1 {
         bail!("the first monitor tracer accepts at most one --symbols value");
@@ -319,6 +448,249 @@ fn selected_monitor_symbol(args: &MonitorArgs, monitor: &MonitorConfig) -> Resul
         .first()
         .cloned()
         .context("monitor configuration has no symbols")
+}
+
+fn validate_monitor_pair(monitor: &MonitorConfig) -> Result<()> {
+    if monitor.exchanges.len() != 2 {
+        bail!(
+            "the first read-only monitor tracer requires exactly two configured exchanges; found {}",
+            monitor.exchanges.len()
+        );
+    }
+    if monitor.exchanges[0] == monitor.exchanges[1] {
+        bail!("read-only arbitrage monitor needs two distinct configured exchanges");
+    }
+    if monitor.symbols.is_empty() {
+        bail!("monitor configuration has no symbols");
+    }
+    Ok(())
+}
+
+fn serve_market_type(symbol: &Symbol) -> MarketType {
+    if symbol.as_str().ends_with("-SPOT") {
+        MarketType::Spot
+    } else {
+        MarketType::Perpetual
+    }
+}
+
+fn supervisor_config(args: &MonitorArgs) -> Result<MarketSupervisorConfig> {
+    match args.shutdown_grace_ms {
+        Some(milliseconds) => MarketSupervisorConfig::new(StdDuration::from_millis(milliseconds))
+            .map_err(anyhow::Error::msg)
+            .context("invalid monitor shutdown grace override"),
+        None => Ok(MarketSupervisorConfig::default()),
+    }
+}
+
+#[derive(Debug)]
+struct ServeReplaySource {
+    source_id: String,
+    events: VecDeque<MarketDataEvent>,
+}
+
+impl MarketDataEventSource for ServeReplaySource {
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn next_event(&mut self) -> MarketDataEventFuture<'_> {
+        if let Some(event) = self.events.pop_front() {
+            return Box::pin(async move { Ok(Some(event)) });
+        }
+        Box::pin(async move {
+            std::future::pending::<Result<Option<MarketDataEvent>, MarketDataError>>().await
+        })
+    }
+}
+
+fn build_serve_replay_sources(
+    replay_path: &Path,
+    left_source_id: &str,
+    right_source_id: &str,
+    symbol: &Symbol,
+) -> Result<(ServeReplaySource, ServeReplaySource)> {
+    let events = load_market_snapshot_replay(replay_path)?;
+    Ok((
+        ServeReplaySource {
+            source_id: left_source_id.to_owned(),
+            events: filter_serve_replay_events(&events, left_source_id, symbol),
+        },
+        ServeReplaySource {
+            source_id: right_source_id.to_owned(),
+            events: filter_serve_replay_events(&events, right_source_id, symbol),
+        },
+    ))
+}
+
+fn filter_serve_replay_events(
+    events: &[MarketDataEvent],
+    source_id: &str,
+    symbol: &Symbol,
+) -> VecDeque<MarketDataEvent> {
+    events
+        .iter()
+        .filter(|event| match event {
+            MarketDataEvent::Observation(observation) => {
+                observation.snapshot.exchange() == source_id
+                    && observation.snapshot.symbol == *symbol
+            }
+            MarketDataEvent::SourceGap { exchange, .. }
+            | MarketDataEvent::SourceUnavailable { exchange, .. } => exchange == source_id,
+        })
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug)]
+struct ProjectedMonitorStatus {
+    task_id: String,
+    phase: String,
+    recovery: String,
+    failure: String,
+    processed_event_count: u64,
+    updated_at: String,
+    exit: String,
+    runtime_failure: String,
+}
+
+fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<ProjectedMonitorStatus> {
+    if !history_path.exists() {
+        bail!(
+            "monitor status failed: history file {} does not exist",
+            history_path.display()
+        );
+    }
+
+    let mut projected = None;
+    for (index, line) in std::fs::read_to_string(history_path)
+        .with_context(|| format!("failed to read {}", history_path.display()))?
+        .lines()
+        .enumerate()
+    {
+        let record: Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "failed to parse monitor task record {} from {}",
+                index + 1,
+                history_path.display()
+            )
+        })?;
+        if record["strategy"].as_str() != Some("read_only_task") {
+            continue;
+        }
+        if record["details"]["task_kind"].as_str() != Some("arbitrage_monitor") {
+            continue;
+        }
+        if record["details"]["task_id"].as_str() != Some(task_id) {
+            continue;
+        }
+        let phase = record["details"]["phase"]
+            .as_str()
+            .context("monitor task status record is missing phase")?
+            .to_owned();
+        let failure = record["details"]["failure"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        let exit = record["details"]["exit"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        let recovery = if phase == "stopped" && failure == "none" {
+            "none"
+        } else {
+            "investigate"
+        }
+        .to_owned();
+        projected = Some(ProjectedMonitorStatus {
+            task_id: task_id.to_owned(),
+            phase,
+            recovery,
+            failure,
+            processed_event_count: record["details"]["processed_event_count"]
+                .as_u64()
+                .unwrap_or(0),
+            updated_at: record["timestamp"].as_str().unwrap_or("unknown").to_owned(),
+            exit,
+            runtime_failure: "none".to_owned(),
+        });
+    }
+
+    projected.context(format!("monitor task not found: {task_id}"))
+}
+
+fn render_live_monitor_status(status: &ContinuousMonitorTaskStatus) -> String {
+    format_monitor_status(&MonitorStatusRender {
+        task_id: &status.task_id,
+        phase: Cow::Owned(status.phase.to_string()),
+        recovery: Cow::Borrowed("none"),
+        failure: Cow::Owned(
+            status
+                .failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+        processed_event_count: status.processed_event_count,
+        updated_at: Cow::Owned(
+            status
+                .last_recorded_at
+                .map_or_else(|| "none".to_owned(), |recorded_at| recorded_at.to_rfc3339()),
+        ),
+        exit: Cow::Owned(
+            status
+                .exit
+                .map_or("none".to_owned(), |exit| exit.to_string()),
+        ),
+        runtime_failure: Cow::Owned(
+            status
+                .runtime_failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+    })
+}
+
+fn render_live_monitor_stop(
+    status: &ContinuousMonitorTaskStatus,
+    _exit: ContinuousMonitorTaskExit,
+) -> String {
+    render_live_monitor_status(status)
+}
+
+fn render_projected_monitor_status(status: &ProjectedMonitorStatus) -> String {
+    format_monitor_status(&MonitorStatusRender {
+        task_id: &status.task_id,
+        phase: Cow::Borrowed(&status.phase),
+        recovery: Cow::Borrowed(&status.recovery),
+        failure: Cow::Borrowed(&status.failure),
+        processed_event_count: status.processed_event_count,
+        updated_at: Cow::Borrowed(&status.updated_at),
+        exit: Cow::Borrowed(&status.exit),
+        runtime_failure: Cow::Borrowed(&status.runtime_failure),
+    })
+}
+
+struct MonitorStatusRender<'a> {
+    task_id: &'a str,
+    phase: Cow<'a, str>,
+    recovery: Cow<'a, str>,
+    failure: Cow<'a, str>,
+    processed_event_count: u64,
+    updated_at: Cow<'a, str>,
+    exit: Cow<'a, str>,
+    runtime_failure: Cow<'a, str>,
+}
+
+fn format_monitor_status(status: &MonitorStatusRender<'_>) -> String {
+    format!(
+        "task_id={task_id}\nphase={phase}\nrecovery={recovery}\nfailure={}\nprocessed_event_count={processed_event_count}\nupdated_at={}\nexit={}\nruntime_failure={}\n",
+        status.failure,
+        status.updated_at,
+        status.exit,
+        status.runtime_failure,
+        task_id = status.task_id,
+        phase = status.phase,
+        recovery = status.recovery,
+        processed_event_count = status.processed_event_count,
+    )
 }
 
 fn run_volume_maker(args: &VolumeMakerArgs) -> Result<()> {

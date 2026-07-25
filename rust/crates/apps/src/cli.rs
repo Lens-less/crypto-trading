@@ -164,11 +164,16 @@ pub struct ArbitrageMarketArgs {
 
 #[derive(Debug, Args)]
 pub struct MonitorArgs {
+    #[arg(long, default_value_t = MonitorMode::Replay, value_enum)]
+    pub mode: MonitorMode,
     #[arg(long, default_value = "config/arbitrage/monitor_v2.yaml")]
     pub config: PathBuf,
     /// Finite JSONL replay of validated top-of-book snapshots.
     #[arg(long, value_name = "PATH")]
     pub replay: Option<PathBuf>,
+    /// Service task identity for long-running monitor operations.
+    #[arg(long)]
+    pub task_id: Option<String>,
     /// Append read-only monitor outcomes to this JSONL journal.
     #[arg(long, default_value = "var/history/arbitrage-monitor.jsonl")]
     pub history_path: PathBuf,
@@ -180,6 +185,24 @@ pub struct MonitorArgs {
     pub symbols: Vec<String>,
     #[arg(long)]
     pub no_ui: bool,
+    /// Local loopback control port override used by monitor serve/status/stop.
+    #[arg(long, hide = true)]
+    pub control_port: Option<u16>,
+    /// Serve-loop status polling interval used for bounded local tests.
+    #[arg(long, hide = true, default_value_t = 100)]
+    pub control_poll_interval_ms: u64,
+    /// Supervisor shutdown grace override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub shutdown_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, ValueEnum)]
+pub enum MonitorMode {
+    #[default]
+    Replay,
+    Serve,
+    Status,
+    Stop,
 }
 
 #[derive(Debug, Args)]

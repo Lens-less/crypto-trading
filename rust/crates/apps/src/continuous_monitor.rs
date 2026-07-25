@@ -21,6 +21,7 @@ use tokio::{
 };
 
 use crate::monitor::{ArbitrageMonitorError, ReadOnlyArbitrageMonitor};
+use crate::task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture};
 
 /// Stable schema version for the process-local task status surface.
 pub const CONTINUOUS_MONITOR_TASK_STATUS_SCHEMA_VERSION: u16 = 2;
@@ -80,6 +81,13 @@ pub enum ContinuousMonitorTaskPhase {
     Failed,
 }
 
+impl ContinuousMonitorTaskPhase {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
+}
+
 /// Bounded normal terminal reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContinuousMonitorTaskExit {
@@ -115,6 +123,13 @@ pub struct ContinuousMonitorTaskStatus {
     pub exit: Option<ContinuousMonitorTaskExit>,
     pub failure: Option<ContinuousMonitorTaskFailure>,
     pub runtime_failure: Option<ContinuousMonitorTaskFailure>,
+}
+
+impl ContinuousMonitorTaskStatus {
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        self.phase.is_terminal()
+    }
 }
 
 /// Opaque owner of two source supervisors and one monitor loop.
@@ -769,11 +784,23 @@ const fn task_phase_label(phase: ContinuousMonitorTaskPhase) -> &'static str {
     }
 }
 
+impl fmt::Display for ContinuousMonitorTaskPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(task_phase_label(*self))
+    }
+}
+
 const fn task_exit_label(exit: ContinuousMonitorTaskExit) -> &'static str {
     match exit {
         ContinuousMonitorTaskExit::StopRequested => "stop_requested",
         ContinuousMonitorTaskExit::SourceEnded => "source_ended",
         ContinuousMonitorTaskExit::ShutdownTimedOut => "shutdown_timed_out",
+    }
+}
+
+impl fmt::Display for ContinuousMonitorTaskExit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(task_exit_label(*self))
     }
 }
 
@@ -785,6 +812,12 @@ const fn task_failure_label(failure: ContinuousMonitorTaskFailure) -> &'static s
         ContinuousMonitorTaskFailure::JournalUnavailable => "journal_unavailable",
         ContinuousMonitorTaskFailure::TaskPanicked => "task_panicked",
         ContinuousMonitorTaskFailure::TaskCancelled => "task_cancelled",
+    }
+}
+
+impl fmt::Display for ContinuousMonitorTaskFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(task_failure_label(*self))
     }
 }
 
@@ -892,6 +925,26 @@ impl std::error::Error for ContinuousMonitorTaskError {
 impl From<ArbitrageMonitorError> for ContinuousMonitorTaskError {
     fn from(_: ArbitrageMonitorError) -> Self {
         Self::MonitorContract
+    }
+}
+
+impl TaskHostStatus for ContinuousMonitorTaskStatus {
+    fn is_terminal(&self) -> bool {
+        ContinuousMonitorTaskStatus::is_terminal(self)
+    }
+}
+
+impl TaskHost for ContinuousMonitorTask {
+    type Status = ContinuousMonitorTaskStatus;
+    type Exit = ContinuousMonitorTaskExit;
+    type Error = ContinuousMonitorTaskError;
+
+    fn status(&self) -> Self::Status {
+        ContinuousMonitorTask::status(self)
+    }
+
+    fn stop(&mut self) -> TaskHostStopFuture<'_, Self::Exit, Self::Error> {
+        Box::pin(async move { ContinuousMonitorTask::stop(self).await })
     }
 }
 

@@ -7,6 +7,7 @@ pub mod continuous_monitor;
 pub mod monitor;
 pub mod paper_arbitrage_saga;
 pub mod scanner;
+pub mod task_host;
 
 pub use cli::{Cli, Command, ExchangeChoice, LogLevel};
 pub use command::run;
