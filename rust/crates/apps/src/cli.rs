@@ -19,6 +19,9 @@ pub enum Command {
     /// Run bounded Binance testnet connectivity and reconcile smoke checks.
     #[command(name = "testnet-smoke")]
     TestnetSmoke(TestnetSmokeArgs),
+    /// Run, inspect, stop, or verify a durable Binance testnet soak campaign.
+    #[command(name = "testnet-soak")]
+    TestnetSoak(TestnetSoakArgs),
     /// Run or inspect a grid strategy.
     Grid(GridArgs),
     /// Run the segmented arbitrage engine.
@@ -71,6 +74,60 @@ pub struct TestnetSmokeArgs {
     /// Total HTTP timeout for each remote call in milliseconds.
     #[arg(long, default_value_t = 10_000)]
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct TestnetSoakArgs {
+    /// Task host mode for the durable soak owner.
+    #[arg(long, value_enum)]
+    pub mode: TestnetSoakMode,
+    /// Stable durable task identity.
+    #[arg(long)]
+    pub task_id: String,
+    /// Append read-only soak facts to this JSONL journal.
+    #[arg(long)]
+    pub history_path: PathBuf,
+    /// Spot symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDC-SPOT")]
+    pub spot_symbol: String,
+    /// Perpetual symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDC-PERP")]
+    pub perpetual_symbol: String,
+    /// Exact Binance wire symbol used for both spot and perpetual probes.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Bounded probe cadence in milliseconds; required for `serve`.
+    #[arg(long)]
+    pub interval_ms: Option<u64>,
+    /// Per-probe timeout in milliseconds; required for `serve`.
+    #[arg(long)]
+    pub probe_timeout_ms: Option<u64>,
+    /// Consecutive probe failures tolerated before the task fails closed; required for `serve`.
+    #[arg(long)]
+    pub failure_threshold: Option<u16>,
+    /// Minimum successful probes required by 24-hour verification; required for `verify`.
+    #[arg(long)]
+    pub minimum_successes: Option<u64>,
+    /// Loopback control port override. `serve` requires an explicit value.
+    #[arg(long)]
+    pub control_port: Option<u16>,
+    /// Total HTTP timeout for each remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
+    /// Serve-loop polling interval used for bounded local tests.
+    #[arg(long, hide = true, default_value_t = 100)]
+    pub control_poll_interval_ms: u64,
+    /// Comma-separated fixture probe script for bounded local tests.
+    #[arg(long, hide = true)]
+    pub fixture_probe_script: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum TestnetSoakMode {
+    Serve,
+    Status,
+    Stop,
+    Verify,
 }
 
 #[derive(Debug, Args)]

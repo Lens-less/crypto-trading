@@ -8,14 +8,17 @@
 | --- | --- | --- | --- | --- | --- |
 | `capabilities [--json]` | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
 | `config-check` | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；public path loaders、public `from_str` loaders 和 shared raw reader 共享 1 MiB / YAML 读入护栏；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
+| `testnet-smoke` | 不适用 | 否 | 否 | 否 | 显式选择后执行 Binance Testnet Spot/USD-M 只读行情和鉴权对账探针；不会提交或撤销订单 |
+| `testnet-soak` | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
 | `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
 | `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
-| `monitor` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
+| `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model |
+| `monitor` | 是 | 否 | 是（只读 replay） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
 | `price-alert` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
 | `scanner` | 路径存在性 | 否 | 否 | 否 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态报告运行时尚未实现 |
 
-`grid` 和 `arbitrage` 的 one-shot 执行会先持久化 `execution_planned`（批次 ID 及全部 client order ID/legs），再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。后两者都会非零退出，且不得直接重试。
+`grid` 和 `arbitrage` 的 one-shot 以及连续 Paper owner 都会先持久化计划/预留事实，再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。不确定结果不得直接重试，必须先按 journal 投影和权威对账处理。
 
 ## 快速验证
 
@@ -93,13 +96,26 @@ cargo run -- config-check config/exchanges/paradex_config.yaml
 
 不要把密钥写入仓库。各 exchange YAML 仅用于字段映射；私有 live 适配器仍未开放。
 
+## Binance Testnet 24 小时演练
+
+`testnet-soak` 只执行 Spot `bookTicker`、USD-M `bookTicker` 和鉴权对账，不具有下单或撤单权限。凭证必须仅通过 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 进程环境变量提供。生产候选要求使用同一 `task_id`、history 和 control port 完成一次真实强制终止后重启，并在累计有探针活动时长达到 24 小时后干净停止：
+
+```powershell
+cargo run --locked -- testnet-soak --mode serve --help
+cargo run --locked -- testnet-soak --mode status --help
+cargo run --locked -- testnet-soak --mode stop --help
+cargo run --locked -- testnet-soak --mode verify --help
+```
+
+完整 PowerShell 命令见 [`../README.md`](../README.md#binance-testnet-soak)，Linux PID 捕获、kill/restart、验真和留证步骤见 [`../docs/runbooks/production-candidate.md`](../docs/runbooks/production-candidate.md#binance-testnet-24-hour-soak-gate)。本地 fixture 契约、缺失凭证或不足 24 小时的 journal 都不能满足发布门禁。
+
 ## 安全边界
 
-- 默认且当前唯一可下单的模式是可重复验证的 paper one-shot。
-- 不受支持的连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
+- 默认不授予写权限；当前可下单路径仅限显式 Paper one-shot 和 bearer-protected、严格 profile 匹配的 replay-backed Paper owner。
+- 不受支持的外部连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
 - 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、正的 `max_position_value`、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
 - `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；`equity` 与 `available_balance` 也尚未参与资金或保证金校验。它不代表跨进程仓位、账户资金、挂单风险 reservation、多腿补偿或真实账户风控已经完成。
-- Grid one-shot 当前用于验证网格规划与 paper 挂单语义，尚未接入权威账户风险或 pending-order reservation；不得据此开放连续或 live 网格，也不要把它解释为账户级 pending-order 风险预留。
+- Grid one-shot 仍只验证网格规划与 paper 挂单语义；连续 Grid/Arbitrage owner 另行使用 journal-backed `PaperAccountAuthority` 做 pending/uncertain/committed 预留。两者都不代表真实交易所权益、保证金、持仓真相或 live 风控已经完成。
 - 历史 Python 实现冻结在 `../archive/python-legacy/`，不得作为当前 Rust 入口。
 
 架构、兼容面和验收门槛见 [`RUST_REFACTOR_PLAN.md`](RUST_REFACTOR_PLAN.md)；审计复核、修复证据和剩余 NO-GO 项见 [`RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。

@@ -56,7 +56,7 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
 
     let grid_runtime = manifest.capability("runtime.grid").unwrap();
     assert_eq!(grid_runtime.area, CapabilityArea::Runtime);
-    assert_eq!(grid_runtime.level, CapabilityLevel::PaperOnce);
+    assert_eq!(grid_runtime.level, CapabilityLevel::Available);
     assert_eq!(
         grid_runtime.scope.environments,
         vec![CapabilityEnvironment::Paper]
@@ -64,10 +64,17 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
     assert_eq!(grid_runtime.scope.access, CapabilityAccess::PaperTrading);
 
     let web = manifest.capability("control-plane.web").unwrap();
-    assert_eq!(web.level, CapabilityLevel::ReadOnly);
-    assert_eq!(web.scope.environments, vec![CapabilityEnvironment::Offline]);
-    assert_eq!(web.scope.access, CapabilityAccess::Local);
-    assert!(web.blockers.is_empty());
+    assert_eq!(web.level, CapabilityLevel::Available);
+    assert_eq!(
+        web.scope.environments,
+        vec![CapabilityEnvironment::Offline, CapabilityEnvironment::Paper]
+    );
+    assert_eq!(web.scope.access, CapabilityAccess::PaperTrading);
+    assert!(
+        web.blockers
+            .iter()
+            .any(|blocker| blocker.contains("replay-backed"))
+    );
 
     let live_runtime = manifest.capability("runtime.live").unwrap();
     assert_eq!(live_runtime.level, CapabilityLevel::Unavailable);
@@ -79,7 +86,7 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
 }
 
 #[test]
-fn continuous_read_only_facts_do_not_advertise_trading_authority() {
+fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
     let manifest = current_capability_manifest();
 
     let monitor_runtime = manifest.capability("runtime.monitor").unwrap();
@@ -148,13 +155,17 @@ fn continuous_read_only_facts_do_not_advertise_trading_authority() {
     );
 
     let continuous = manifest.capability("runtime.continuous").unwrap();
-    assert_eq!(continuous.level, CapabilityLevel::Unavailable);
-    assert_eq!(continuous.scope.access, CapabilityAccess::MainnetTrading);
+    assert_eq!(continuous.level, CapabilityLevel::Available);
+    assert_eq!(continuous.scope.access, CapabilityAccess::PaperTrading);
+    assert_eq!(
+        continuous.scope.environments,
+        vec![CapabilityEnvironment::Paper]
+    );
     assert!(
         continuous
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("no executable bootstrap, automatic restart"))
+            .any(|blocker| blocker.contains("External continuous trading sources"))
     );
     assert!(
         continuous
@@ -164,7 +175,38 @@ fn continuous_read_only_facts_do_not_advertise_trading_authority() {
 }
 
 #[test]
-fn paper_reservation_and_saga_evidence_do_not_overstate_full_account_or_continuous_authority() {
+fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
+    let manifest = current_capability_manifest();
+    let soak = manifest.capability("runtime.testnet-soak").unwrap();
+
+    assert_eq!(soak.level, CapabilityLevel::ReadOnly);
+    assert_eq!(
+        soak.scope.environments,
+        vec![CapabilityEnvironment::Testnet]
+    );
+    assert_eq!(soak.scope.access, CapabilityAccess::TestnetTrading);
+    assert!(
+        soak.summary
+            .contains("without submitting or cancelling orders")
+    );
+    assert!(
+        soak.blockers
+            .iter()
+            .any(|blocker| blocker.contains("24-hour credentialed run"))
+    );
+
+    let binance = manifest.adapter("binance").unwrap();
+    assert!(
+        binance
+            .testnet_protocol
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not checked in"))
+    );
+}
+
+#[test]
+fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() {
     let manifest = current_capability_manifest();
     let account = manifest.capability("risk.account-authority").unwrap();
     assert_eq!(account.level, CapabilityLevel::Unavailable);
@@ -183,34 +225,29 @@ fn paper_reservation_and_saga_evidence_do_not_overstate_full_account_or_continuo
         account
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("no cross-process writer exclusion"))
+            .any(|blocker| blocker.contains("gap is closed"))
     );
 
     let arbitrage = manifest.capability("runtime.arbitrage").unwrap();
-    assert_eq!(arbitrage.level, CapabilityLevel::PaperOnce);
-    assert!(arbitrage.summary.contains("library-only tracer"));
-    assert!(
-        arbitrage
-            .summary
-            .contains("not wired to a supported command or service")
-    );
+    assert_eq!(arbitrage.level, CapabilityLevel::Available);
+    assert!(arbitrage.summary.contains("trusted CLI/Web submit path"));
     assert!(
         arbitrage
             .evidence
             .contains(&"rust/crates/apps/src/paper_arbitrage_saga.rs".to_owned())
     );
     let continuous = manifest.capability("runtime.continuous").unwrap();
-    assert_eq!(continuous.level, CapabilityLevel::Unavailable);
+    assert_eq!(continuous.level, CapabilityLevel::Available);
     assert!(
         continuous
             .evidence
-            .contains(&"rust/crates/apps/src/paper_arbitrage_saga.rs".to_owned())
+            .contains(&"rust/crates/apps/src/paper_arbitrage_task.rs".to_owned())
     );
     assert!(
         continuous
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("library-only paper arbitrage saga"))
+            .any(|blocker| blocker.contains("automatic nonterminal restart"))
     );
 }
 

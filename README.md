@@ -146,6 +146,7 @@ cargo run --locked -- <COMMAND> --help
 ```text
 crypto-trading capabilities [--json]
 crypto-trading testnet-smoke [OPTIONS]
+crypto-trading testnet-soak --mode <serve|status|stop|verify> [OPTIONS]
 crypto-trading grid <CONFIG> [OPTIONS]
 crypto-trading arbitrage [OPTIONS]
 crypto-trading monitor [OPTIONS]
@@ -154,6 +155,76 @@ crypto-trading price-alert [CONFIG] [OPTIONS]
 crypto-trading scanner [OPTIONS]
 crypto-trading config-check <PATHS>... [--json]
 ```
+
+## Binance Testnet soak
+
+该持久化 soak host 只读运行并保持 mainnet 关闭；每轮依次执行 Spot
+`bookTicker`、USD-M `bookTicker` 和 Binance Testnet 鉴权对账。它不会提交或撤销订单，
+也不会把本地 fixture、离线时间或缺失凭证伪装成通过的 24 小时证据。
+
+```powershell
+$env:BINANCE_API_KEY = "..."
+$env:BINANCE_API_SECRET = "..."
+
+$taskId = "binance-testnet-24h"
+$history = "var/history/binance-testnet-24h.jsonl"
+$controlPort = 55124
+$minSuccesses = 288
+$stdout = "var/history/binance-testnet-24h.stdout.log"
+$stderr = "var/history/binance-testnet-24h.stderr.log"
+
+cargo build --release --locked --package crypto-trading-apps --bin crypto-trading
+$binary = (Resolve-Path "target/release/crypto-trading.exe").Path
+New-Item -ItemType Directory -Force (Split-Path $history) | Out-Null
+
+$serveArgs = @(
+  "testnet-soak", "--mode", "serve",
+  "--task-id", $taskId,
+  "--history-path", $history,
+  "--interval-ms", "300000",
+  "--probe-timeout-ms", "15000",
+  "--failure-threshold", "3",
+  "--control-port", "$controlPort",
+  "--timeout-ms", "10000"
+)
+$soak = Start-Process -FilePath $binary -ArgumentList $serveArgs `
+  -WindowStyle Hidden -PassThru `
+  -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+$soak.Id
+
+& $binary testnet-soak --mode status `
+  --task-id $taskId `
+  --history-path $history `
+  --control-port $controlPort
+
+# status 至少确认 3 次成功探针后，执行且只执行一次强制终止恢复演练。
+$killedPid = $soak.Id
+Stop-Process -Id $killedPid -Force
+Wait-Process -Id $killedPid -ErrorAction SilentlyContinue
+
+$soak = Start-Process -FilePath $binary -ArgumentList $serveArgs `
+  -WindowStyle Hidden -PassThru `
+  -RedirectStandardOutput "$stdout.restart" -RedirectStandardError "$stderr.restart"
+$soak.Id
+
+& $binary testnet-soak --mode stop `
+  --task-id $taskId `
+  --history-path $history `
+  --control-port $controlPort
+Wait-Process -Id $soak.Id
+
+& $binary testnet-soak --mode verify `
+  --task-id $taskId `
+  --history-path $history `
+  --minimum-successes $minSuccesses |
+  Tee-Object -FilePath "var/history/binance-testnet-24h-evidence.json"
+if ($LASTEXITCODE -ne 0) { throw "Binance Testnet soak evidence is not release-ready" }
+```
+
+先让累计的有探针活动时长达到至少 24 小时，再执行 `stop`。`verify` 始终输出稳定 JSON；
+在证据同时证明干净停止、至少一次可观察的非正常重启、最低成功次数，以及 Spot、USD-M
+和鉴权对账三类非零覆盖之前，它都会非零退出。完整 Linux 演练和留证清单见
+[`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md)。
 
 `--debug`、`--debug-detail` 和 `--no-ui` 目前主要保留 CLI 兼容性，尚不会改变对应 handler 的行为。运行时日志过滤由 `RUST_LOG` 控制，例如 PowerShell 中可设置 `$env:RUST_LOG = "debug"`。
 

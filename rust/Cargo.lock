@@ -483,6 +483,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "crypto-trading-apps",
  "crypto-trading-control-plane",
  "crypto-trading-runtime",
  "crypto-trading-web",

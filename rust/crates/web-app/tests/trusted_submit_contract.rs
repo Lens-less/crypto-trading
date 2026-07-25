@@ -191,38 +191,8 @@ async fn replay_is_durable_and_conflicting_payload_does_not_redispatch() {
 }
 
 #[tokio::test]
-async fn invalid_unknown_and_oversized_bodies_fail_closed_without_echoing_input() {
-    let (listener, router, path, calls) = application("invalid").await;
-    let envelope = paper_stop(Uuid::new_v4(), "stop-invalid", "paper-grid-btc-usdt");
-
-    let mut invalid = serde_json::to_value(&envelope).unwrap();
-    invalid["schema_version"] = json!(99);
-    let response = router
-        .clone()
-        .oneshot(request(
-            "POST",
-            "/api/v1/submit",
-            Body::from(serde_json::to_vec(&invalid).unwrap()),
-            true,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-    let mut unknown = serde_json::to_value(&envelope).unwrap();
-    unknown["command"]["kind"] = json!("enable_mainnet");
-    let response = router
-        .clone()
-        .oneshot(request(
-            "POST",
-            "/api/v1/submit",
-            Body::from(serde_json::to_vec(&unknown).unwrap()),
-            true,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
+async fn server_identity_rejects_principal_spoof_and_reconciler_escalation() {
+    let (listener, router, path, calls) = application("identity").await;
     let spoofed = SubmitEnvelope::new(
         Uuid::new_v4(),
         "stop-spoofed",
@@ -243,6 +213,10 @@ async fn invalid_unknown_and_oversized_bodies_fail_closed_without_echoing_input(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 16_384).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "permission_denied");
+    assert!(!body.to_string().contains("operator-b"));
 
     let proof = PaperReconciliationProof::new(
         "paper-account",
@@ -274,6 +248,49 @@ async fn invalid_unknown_and_oversized_bodies_fail_closed_without_echoing_input(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 16_384).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "permission_denied");
+    assert!(!body.to_string().contains("reconciler"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    drop(router);
+    drop(listener);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_unknown_and_oversized_bodies_fail_closed_without_echoing_input() {
+    let (listener, router, path, calls) = application("invalid").await;
+    let envelope = paper_stop(Uuid::new_v4(), "stop-invalid", "paper-grid-btc-usdt");
+
+    let mut invalid = serde_json::to_value(&envelope).unwrap();
+    invalid["schema_version"] = json!(99);
+    let response = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/submit",
+            Body::from(serde_json::to_vec(&invalid).unwrap()),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let mut unknown = serde_json::to_value(&envelope).unwrap();
+    unknown["command"]["kind"] = json!("enable_mainnet");
+    let response = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/submit",
+            Body::from(serde_json::to_vec(&unknown).unwrap()),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let secret = "never-echo-this-secret";
     let oversized = format!(

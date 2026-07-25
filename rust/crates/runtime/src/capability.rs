@@ -374,6 +374,12 @@ fn binance_adapter() -> AdapterSupport {
         "rust/crates/exchange/tests/binance_testnet_exchange_contract.rs",
         "rust/crates/apps/src/command.rs",
         "rust/crates/apps/tests/command_smoke.rs",
+        "rust/crates/apps/src/testnet_soak.rs",
+        "rust/crates/apps/tests/testnet_soak_contract.rs",
+        "rust/crates/apps/tests/testnet_soak_cli_contract.rs",
+    ];
+    let credentialed_evidence_blocker = [
+        "The executable adapter and read-only soak harness have deterministic coverage, but credentialed Binance Testnet lifecycle evidence and a completed 24-hour soak are not checked in.",
     ];
     AdapterSupport {
         id: "binance".to_owned(),
@@ -386,9 +392,21 @@ fn binance_adapter() -> AdapterSupport {
                 "rust/crates/exchange/tests/binance_public_contract.rs",
             ],
         ),
-        testnet_protocol: adapter_facet(AdapterSupportLevel::Implemented, &[], &execution_evidence),
-        authenticated: adapter_facet(AdapterSupportLevel::Implemented, &[], &execution_evidence),
-        reconcile: adapter_facet(AdapterSupportLevel::Implemented, &[], &execution_evidence),
+        testnet_protocol: adapter_facet(
+            AdapterSupportLevel::Implemented,
+            &credentialed_evidence_blocker,
+            &execution_evidence,
+        ),
+        authenticated: adapter_facet(
+            AdapterSupportLevel::Implemented,
+            &credentialed_evidence_blocker,
+            &execution_evidence,
+        ),
+        reconcile: adapter_facet(
+            AdapterSupportLevel::Implemented,
+            &credentialed_evidence_blocker,
+            &execution_evidence,
+        ),
         live: external_live_unavailable(),
     }
 }
@@ -573,15 +591,23 @@ fn foundation_capabilities() -> Vec<Capability> {
         capability(
             "control-plane.web",
             CapabilityArea::ControlPlane,
-            CapabilityLevel::ReadOnly,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Loopback operator Web control plane with coherent snapshots and resumable payload-free events.",
-            &[],
+            CapabilityLevel::Available,
+            scope(
+                &[CapabilityEnvironment::Offline, CapabilityEnvironment::Paper],
+                CapabilityAccess::PaperTrading,
+            ),
+            "Loopback operator Web control plane with coherent read models, resumable payload-free events, and an explicit bearer-protected paper-task submit mode.",
+            &[
+                "Write authority is limited to configured replay-backed Grid/Arbitrage paper owners; reconciliation, direct order submission, testnet mutation, and mainnet authority are not exposed.",
+            ],
             &[
                 "DESIGN.md",
                 "rust/crates/control-plane/src/lib.rs",
+                "rust/crates/control-plane/src/submit.rs",
                 "rust/crates/control-plane/tests/read_contract.rs",
                 "rust/crates/web-app/src/lib.rs",
+                "rust/crates/web-app/src/paper_dispatcher.rs",
+                "rust/crates/web-app/tests/paper_dispatcher_contract.rs",
                 "rust/crates/web/src/api.rs",
                 "rust/crates/web/src/app.rs",
                 "rust/crates/web/src/server.rs",
@@ -700,35 +726,39 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
         capability(
             "runtime.arbitrage",
             CapabilityArea::Runtime,
-            CapabilityLevel::PaperOnce,
+            CapabilityLevel::Available,
             scope(
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Two-leg segmented arbitrage evaluation and the existing paper-once CLI path; the journal-first account-reserved saga is a library-only tracer and is not wired to a supported command or service write surface.",
-            &[],
+            "Two-leg segmented paper execution through both the one-shot CLI and a recoverable exact-pair owner reached through the trusted CLI/Web submit path.",
+            &[
+                "The continuous owner currently consumes only an explicit replay-backed profile; nonterminal restart remains deliberately fail-closed and no testnet/mainnet order authority is implied.",
+            ],
             &[
                 "rust/crates/apps/src/command.rs",
                 "rust/crates/apps/src/paper_arbitrage_saga.rs",
+                "rust/crates/apps/src/paper_arbitrage_task.rs",
+                "rust/crates/apps/src/paper_profile.rs",
                 "rust/crates/apps/tests/paper_arbitrage_saga_contract.rs",
+                "rust/crates/apps/tests/paper_arbitrage_task_contract.rs",
+                "rust/crates/apps/tests/trusted_submit_cli_contract.rs",
+                "rust/crates/web-app/src/paper_dispatcher.rs",
+                "rust/crates/web-app/tests/paper_dispatcher_contract.rs",
                 "rust/crates/runtime/tests/arbitrage_paper_slice.rs",
             ],
         ),
         capability(
             "runtime.continuous",
             CapabilityArea::Runtime,
-            CapabilityLevel::Unavailable,
+            CapabilityLevel::Available,
             scope(
-                &[
-                    CapabilityEnvironment::Paper,
-                    CapabilityEnvironment::Testnet,
-                    CapabilityEnvironment::Mainnet,
-                ],
-                CapabilityAccess::MainnetTrading,
+                &[CapabilityEnvironment::Paper],
+                CapabilityAccess::PaperTrading,
             ),
-            "Supervised continuous strategy lifecycle with cancellation and restart recovery.",
+            "Supervised replay-backed Grid and exact-pair Arbitrage paper owners with durable start/status/stop/cancel facts and bounded graceful shutdown.",
             &[
-                "A durable read-only monitor owner and a library-only paper arbitrage saga exist, but the saga has no supported command/service write surface and there is no executable bootstrap, automatic restart, continuous trading owner, or task cancel/reconcile lifecycle.",
+                "External continuous trading sources and automatic nonterminal restart are not enabled; the Testnet soak path is read-only, and all mainnet authority remains unavailable.",
             ],
             &[
                 "rust/crates/runtime/src/market_supervisor.rs",
@@ -737,23 +767,33 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
                 "rust/crates/runtime/src/task_read_model.rs",
                 "rust/crates/runtime/tests/task_read_model_contract.rs",
-                "rust/crates/apps/src/paper_arbitrage_saga.rs",
-                "rust/crates/apps/tests/paper_arbitrage_saga_contract.rs",
+                "rust/crates/apps/src/paper_grid_task.rs",
+                "rust/crates/apps/src/paper_arbitrage_task.rs",
+                "rust/crates/apps/src/paper_profile.rs",
+                "rust/crates/web-app/src/paper_dispatcher.rs",
+                "rust/crates/web-app/tests/paper_dispatcher_contract.rs",
             ],
         ),
         capability(
             "runtime.grid",
             CapabilityArea::Runtime,
-            CapabilityLevel::PaperOnce,
+            CapabilityLevel::Available,
             scope(
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Fixed-snapshot grid planning and resting-order paper placement.",
-            &[],
+            "Fixed-snapshot grid planning plus a recoverable continuous paper owner that emits one durable operation per crossed level.",
+            &[
+                "The continuous owner currently consumes only an explicit replay-backed profile and does not imply a real external feed or testnet/mainnet authority.",
+            ],
             &[
                 "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_grid_task.rs",
+                "rust/crates/apps/src/paper_profile.rs",
                 "rust/crates/apps/tests/command_smoke.rs",
+                "rust/crates/apps/tests/paper_grid_task_contract.rs",
+                "rust/crates/web-app/src/paper_dispatcher.rs",
+                "rust/crates/web-app/tests/paper_dispatcher_contract.rs",
             ],
         ),
         capability(
@@ -813,7 +853,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, bounded stop, and a Web-visible task projection.",
             &[
-                "The composition core has no CLI or service bootstrap, only Binance has a real public adapter, and restart recovery projects prior facts without automatically resuming external sources.",
+                "The CLI service bootstrap is replay-backed, only Binance has a real public adapter, and restart recovery projects prior facts without automatically resuming external sources.",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
@@ -853,6 +893,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             ],
         ),
         scanner_capability(),
+        testnet_soak_capability(),
         capability(
             "runtime.volume-maker",
             CapabilityArea::Runtime,
@@ -890,6 +931,28 @@ fn scanner_capability() -> Capability {
             "rust/crates/control-plane/tests/scanner_projection_contract.rs",
             "rust/crates/web/tests/http_contract.rs",
             "rust/crates/web/tests/ui_contract.rs",
+        ],
+    )
+}
+
+fn testnet_soak_capability() -> Capability {
+    capability(
+        "runtime.testnet-soak",
+        CapabilityArea::Runtime,
+        CapabilityLevel::ReadOnly,
+        scope(
+            &[CapabilityEnvironment::Testnet],
+            CapabilityAccess::TestnetTrading,
+        ),
+        "Durable Binance Testnet soak owner that cycles Spot and USD-M book tickers plus authenticated reconciliation without submitting or cancelling orders.",
+        &[
+            "A passing 24-hour credentialed run with an observed kill-and-restart drill remains external release evidence and has not been produced in this workspace.",
+        ],
+        &[
+            "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/src/testnet_soak.rs",
+            "rust/crates/apps/tests/testnet_soak_contract.rs",
+            "rust/crates/apps/tests/testnet_soak_cli_contract.rs",
         ],
     )
 }

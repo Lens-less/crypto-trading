@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     fmt,
+    io::Read,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
@@ -26,17 +27,18 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::{
     BinanceHmacSha256Signer, BinanceProduct, BinanceRequestSigner, BinanceTestnetEndpoints,
-    BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeHandle, ExchangeSymbol,
+    BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError, ExchangeHandle, ExchangeSymbol,
     ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules, PaperExchange, ReconcileScope,
     RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition, TradingReceipt,
 };
 use crypto_trading_runtime::{
     DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
-    ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataError,
-    MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy,
-    MarketInstrument, MarketSupervisorConfig, MarketUniverse, ReadOnlyTaskExit,
-    ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel,
-    ReadOnlyTaskRecovery, RuntimeError, SystemMarketDataClock, current_capability_manifest,
+    ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MAX_HISTORY_RECORD_BYTES,
+    MAX_JOURNAL_SOURCE_BYTES, MarketDataBook, MarketDataError, MarketDataEvent,
+    MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy, MarketInstrument,
+    MarketSupervisorConfig, MarketUniverse, ReadOnlyTaskExit, ReadOnlyTaskFailure,
+    ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError,
+    SystemMarketDataClock, current_capability_manifest,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -54,7 +56,8 @@ use tokio::{
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
     MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs,
-    PaperTaskArgs, PriceAlertArgs, ScannerArgs, TestnetSmokeArgs, VolumeMakerArgs,
+    PaperTaskArgs, PriceAlertArgs, ScannerArgs, TestnetSmokeArgs, TestnetSoakArgs, TestnetSoakMode,
+    VolumeMakerArgs,
 };
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
@@ -67,6 +70,13 @@ use crate::monitor::{
 use crate::task_host::{
     TaskHostControlCommand, TaskHostServeOutcome, control_addr, query_control, serve_host,
 };
+use crate::testnet_soak::{
+    MAX_TESTNET_SOAK_EVIDENCE_RECORDS, TESTNET_SOAK_SCHEMA_VERSION,
+    TestnetSoakEvidenceRequirements, TestnetSoakProbe, TestnetSoakProbeFailure,
+    TestnetSoakProbeFuture, TestnetSoakSample, TestnetSoakTask, TestnetSoakTaskConfig,
+    TestnetSoakTaskExit, TestnetSoakTaskFailure, TestnetSoakTaskStatus,
+    verify_testnet_soak_evidence,
+};
 
 /// Runs one parsed CLI command.
 ///
@@ -78,6 +88,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Capabilities(args) => run_capabilities(&args),
         Command::TestnetSmoke(args) => run_testnet_smoke(&args).await,
+        Command::TestnetSoak(args) => run_testnet_soak(&args).await,
         Command::ConfigCheck(args) => check_configs(&args),
         Command::Grid(args) => run_grid(args).await,
         Command::Arbitrage(args) => run_arbitrage(&args).await,
@@ -712,10 +723,10 @@ async fn run_book_ticker_check(
     )?);
     let protocol = build_binance_testnet_protocol(signer, symbols)?;
     let spot =
-        fetch_binance_book_ticker(&protocol, transport, &symbols.spot, MarketType::Spot).await?;
+        fetch_binance_book_ticker(&protocol, &**transport, &symbols.spot, MarketType::Spot).await?;
     let perpetual = fetch_binance_book_ticker(
         &protocol,
-        transport,
+        &**transport,
         &symbols.perpetual,
         MarketType::Perpetual,
     )
@@ -870,10 +881,10 @@ where
 
 async fn fetch_binance_book_ticker(
     protocol: &BinanceTestnetProtocol,
-    transport: &ReqwestHttpTransport,
+    transport: &(dyn RemoteHttpTransport + Send + Sync),
     symbol: &Symbol,
     market_type: MarketType,
-) -> Result<MarketSnapshot> {
+) -> std::result::Result<MarketSnapshot, ExchangeError> {
     let request = protocol.build_book_ticker_request(symbol, market_type)?;
     let product = match market_type {
         MarketType::Spot => BinanceProduct::Spot,
@@ -881,12 +892,12 @@ async fn fetch_binance_book_ticker(
     };
     let response = transport.send(request).await?;
     if !response.is_success() {
-        return Err(BinanceTestnetProtocol::remote_failure_from_response(&response).into());
+        return Err(BinanceTestnetProtocol::remote_failure_from_response(
+            &response,
+        ));
     }
     let received_at = response.server_time().unwrap_or_else(Utc::now);
-    protocol
-        .parse_book_ticker(product, response.body(), received_at)
-        .map_err(Into::into)
+    protocol.parse_book_ticker(product, response.body(), received_at)
 }
 
 fn summarize_reconcile_receipt(receipt: &crypto_trading_exchange::ReconcileReceipt) -> Value {
@@ -896,6 +907,688 @@ fn summarize_reconcile_receipt(receipt: &crypto_trading_exchange::ReconcileRecei
         "positions": receipt.positions.len(),
         "observed_at": receipt.observed_at,
     })
+}
+
+struct ProductionBinanceTestnetSoakProbe {
+    protocol: BinanceTestnetProtocol,
+    exchange: BinanceTestnetExchange,
+    transport: Arc<dyn RemoteHttpTransport>,
+    symbols: BinanceSmokeSymbols,
+    next_step: usize,
+}
+
+impl ProductionBinanceTestnetSoakProbe {
+    fn new(
+        transport: Arc<dyn RemoteHttpTransport>,
+        symbols: BinanceSmokeSymbols,
+        api_key: String,
+        api_secret: String,
+    ) -> Result<Self> {
+        let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+        let protocol = build_binance_testnet_protocol(Arc::clone(&signer), &symbols)?;
+        let exchange_protocol = build_binance_testnet_protocol(signer, &symbols)?;
+        let exchange = BinanceTestnetExchange::new(exchange_protocol, Arc::clone(&transport));
+        Ok(Self {
+            protocol,
+            exchange,
+            transport,
+            symbols,
+            next_step: 0,
+        })
+    }
+
+    async fn next_probe(&mut self) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
+        let step = self.next_step;
+        self.next_step = (self.next_step + 1) % 3;
+        match step {
+            0 => fetch_binance_book_ticker(
+                &self.protocol,
+                &*self.transport,
+                &self.symbols.spot,
+                MarketType::Spot,
+            )
+            .await
+            .map(|_| TestnetSoakSample::SpotBookTicker)
+            .map_err(|error| classify_testnet_soak_probe_failure(&error)),
+            1 => fetch_binance_book_ticker(
+                &self.protocol,
+                &*self.transport,
+                &self.symbols.perpetual,
+                MarketType::Perpetual,
+            )
+            .await
+            .map(|_| TestnetSoakSample::UsdMBookTicker)
+            .map_err(|error| classify_testnet_soak_probe_failure(&error)),
+            _ => self
+                .exchange
+                .reconcile(ReconcileScope::All)
+                .await
+                .map(|_| TestnetSoakSample::AuthenticatedReconcile)
+                .map_err(|error| classify_testnet_soak_probe_failure(&error)),
+        }
+    }
+}
+
+impl TestnetSoakProbe for ProductionBinanceTestnetSoakProbe {
+    fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
+        Box::pin(async move { self.next_probe().await })
+    }
+}
+
+struct ScriptedTestnetSoakProbe {
+    results: VecDeque<Result<TestnetSoakSample, TestnetSoakProbeFailure>>,
+}
+
+impl ScriptedTestnetSoakProbe {
+    fn parse(script: &str) -> Result<Self> {
+        let mut results = VecDeque::new();
+        for token in script.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                bail!("fixture probe script contains an empty step");
+            }
+            results.push_back(parse_fixture_probe_step(token)?);
+        }
+        if results.is_empty() {
+            bail!("fixture probe script must contain at least one step");
+        }
+        Ok(Self { results })
+    }
+}
+
+impl TestnetSoakProbe for ScriptedTestnetSoakProbe {
+    fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
+        let result = self
+            .results
+            .pop_front()
+            .unwrap_or(Ok(TestnetSoakSample::SpotBookTicker));
+        Box::pin(async move { result })
+    }
+}
+
+#[derive(Debug)]
+struct ProjectedTestnetSoakStatus {
+    task_id: String,
+    phase: String,
+    recovery: String,
+    successful_probe_count: u64,
+    failed_probe_count: u64,
+    consecutive_failure_count: u16,
+    unclean_restart_count: u32,
+    last_sample: String,
+    last_probe_failure: String,
+    updated_at: String,
+    exit: String,
+    failure: String,
+    runtime_failure: String,
+}
+
+async fn run_testnet_soak(args: &TestnetSoakArgs) -> Result<()> {
+    match args.mode {
+        TestnetSoakMode::Serve => run_testnet_soak_serve(args).await,
+        TestnetSoakMode::Status => run_testnet_soak_status(args).await,
+        TestnetSoakMode::Stop => run_testnet_soak_stop(args).await,
+        TestnetSoakMode::Verify => run_testnet_soak_verify(args),
+    }
+}
+
+async fn run_testnet_soak_serve(args: &TestnetSoakArgs) -> Result<()> {
+    if args.timeout_ms == 0 {
+        bail!("testnet-soak serve requires --timeout-ms > 0");
+    }
+    let control_port = args
+        .control_port
+        .context("testnet-soak serve requires --control-port")?;
+    if control_port == 0 {
+        bail!("testnet-soak serve requires a nonzero --control-port");
+    }
+    let interval_ms = args
+        .interval_ms
+        .context("testnet-soak serve requires --interval-ms")?;
+    let probe_timeout_ms = args
+        .probe_timeout_ms
+        .context("testnet-soak serve requires --probe-timeout-ms")?;
+    let failure_threshold = args
+        .failure_threshold
+        .context("testnet-soak serve requires --failure-threshold")?;
+    let config = TestnetSoakTaskConfig::new(
+        args.task_id.clone(),
+        StdDuration::from_millis(interval_ms),
+        StdDuration::from_millis(probe_timeout_ms),
+        failure_threshold,
+    )?;
+
+    if let Some(script) = &args.fixture_probe_script {
+        let probe = ScriptedTestnetSoakProbe::parse(script)?;
+        return serve_testnet_soak_task(args, control_port, config, probe).await;
+    }
+
+    let symbols = testnet_soak_symbols(args)?;
+    let (api_key, api_secret) = load_binance_testnet_credentials()?;
+    let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
+        StdDuration::from_millis(args.timeout_ms),
+    )?);
+    let probe = ProductionBinanceTestnetSoakProbe::new(transport, symbols, api_key, api_secret)?;
+    serve_testnet_soak_task(args, control_port, config, probe).await
+}
+
+async fn serve_testnet_soak_task<P>(
+    args: &TestnetSoakArgs,
+    control_port: u16,
+    config: TestnetSoakTaskConfig,
+    probe: P,
+) -> Result<()>
+where
+    P: TestnetSoakProbe,
+{
+    let task_id = args.task_id.as_str();
+    let address = control_addr(task_id, &args.history_path, Some(control_port));
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind testnet soak control socket on {address}"))?;
+    let mut task = TestnetSoakTask::start(config, probe, JsonlHistory::new(&args.history_path))
+        .await
+        .context("failed to start testnet soak task")?;
+
+    println!(
+        "testnet soak task started: task_id={} control={} history={}",
+        task_id,
+        address,
+        args.history_path.display()
+    );
+
+    let outcome = serve_host(
+        &mut task,
+        listener,
+        StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
+        render_live_testnet_soak_status,
+        render_live_testnet_soak_stop,
+    )
+    .await
+    .map_err(|error| anyhow::Error::new(error).context("testnet soak control host failed"))?;
+
+    match outcome {
+        TaskHostServeOutcome::StopRequested(exit) => {
+            println!(
+                "testnet soak task stopped: task_id={task_id} exit={}",
+                testnet_soak_exit_name(exit)
+            );
+        }
+        TaskHostServeOutcome::Terminal(status) => {
+            println!(
+                "testnet soak task terminated: task_id={} phase={} successful_probe_count={} failed_probe_count={}",
+                status.task_id,
+                testnet_soak_phase_name(status.phase),
+                status.successful_probe_count,
+                status.failed_probe_count
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_testnet_soak_status(args: &TestnetSoakArgs) -> Result<()> {
+    let address = control_addr(&args.task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
+        print!("{response}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        render_projected_testnet_soak_status(&project_testnet_soak_status(
+            &args.history_path,
+            &args.task_id,
+        )?)
+    );
+    Ok(())
+}
+
+async fn run_testnet_soak_stop(args: &TestnetSoakArgs) -> Result<()> {
+    let address = control_addr(&args.task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
+        print!("{response}");
+        return Ok(());
+    }
+    let projected = project_testnet_soak_status(&args.history_path, &args.task_id)?;
+    if matches!(projected.phase.as_str(), "stopped" | "failed") {
+        print!("{}", render_projected_testnet_soak_status(&projected));
+        return Ok(());
+    }
+    bail!(
+        "testnet soak control endpoint is unavailable at {address}; the task is not confirmed stopped"
+    );
+}
+
+fn run_testnet_soak_verify(args: &TestnetSoakArgs) -> Result<()> {
+    let minimum_successes = args
+        .minimum_successes
+        .context("testnet-soak verify requires --minimum-successes")?;
+    let summary = verify_testnet_soak_evidence(
+        &args.history_path,
+        &args.task_id,
+        TestnetSoakEvidenceRequirements::twenty_four_hour(minimum_successes)?,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary.as_json())?);
+    if summary.requirements_met {
+        return Ok(());
+    }
+    bail!("testnet soak evidence does not satisfy the 24-hour production policy")
+}
+
+fn testnet_soak_symbols(args: &TestnetSoakArgs) -> Result<BinanceSmokeSymbols> {
+    Ok(BinanceSmokeSymbols {
+        spot: Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?,
+        perpetual: Symbol::new(args.perpetual_symbol.clone())
+            .context("invalid --perpetual-symbol")?,
+        wire_symbol: args.wire_symbol.clone(),
+    })
+}
+
+fn parse_fixture_probe_step(
+    token: &str,
+) -> Result<Result<TestnetSoakSample, TestnetSoakProbeFailure>> {
+    Ok(match token {
+        "spot" | "spot_book_ticker" => Ok(TestnetSoakSample::SpotBookTicker),
+        "usdm" | "usd_m_book_ticker" => Ok(TestnetSoakSample::UsdMBookTicker),
+        "reconcile" | "authenticated_reconcile" => Ok(TestnetSoakSample::AuthenticatedReconcile),
+        "transport" => Err(TestnetSoakProbeFailure::Transport),
+        "timeout" => Err(TestnetSoakProbeFailure::Timeout),
+        "rate_limited" => Err(TestnetSoakProbeFailure::RateLimited),
+        "clock_skew" => Err(TestnetSoakProbeFailure::ClockSkew),
+        "remote_rejected" => Err(TestnetSoakProbeFailure::RemoteRejected),
+        "protocol" => Err(TestnetSoakProbeFailure::Protocol),
+        "unavailable" => Err(TestnetSoakProbeFailure::Unavailable),
+        _ => bail!("unknown fixture probe step {token:?}"),
+    })
+}
+
+fn classify_testnet_soak_probe_failure(error: &ExchangeError) -> TestnetSoakProbeFailure {
+    match error {
+        ExchangeError::Unavailable { reason } => {
+            if reason.contains("timed out") {
+                TestnetSoakProbeFailure::Timeout
+            } else {
+                TestnetSoakProbeFailure::Transport
+            }
+        }
+        ExchangeError::Rejected { .. } => TestnetSoakProbeFailure::RemoteRejected,
+        ExchangeError::RemoteFailure {
+            status, metadata, ..
+        } => {
+            if metadata.exchange_code.as_deref() == Some("-1021") {
+                TestnetSoakProbeFailure::ClockSkew
+            } else if metadata.retry_after.is_some() || matches!(status, Some(418 | 429)) {
+                TestnetSoakProbeFailure::RateLimited
+            } else if status.is_some_and(|value| value >= 500) {
+                TestnetSoakProbeFailure::Unavailable
+            } else {
+                TestnetSoakProbeFailure::RemoteRejected
+            }
+        }
+        ExchangeError::InvalidResponse { .. } | ExchangeError::InvariantViolation { .. } => {
+            TestnetSoakProbeFailure::Protocol
+        }
+        ExchangeError::AmbiguousOutcome { .. } => TestnetSoakProbeFailure::Transport,
+        ExchangeError::InvalidRequest { .. }
+        | ExchangeError::Unsupported { .. }
+        | ExchangeError::Backpressure { .. }
+        | ExchangeError::ResourceLimit { .. }
+        | ExchangeError::SubscriptionLagged { .. } => TestnetSoakProbeFailure::Protocol,
+    }
+}
+
+fn overwrite_string(target: &mut String, value: &str) {
+    value.clone_into(target);
+}
+
+#[allow(clippy::too_many_lines)]
+fn project_testnet_soak_status(
+    history_path: &Path,
+    task_id: &str,
+) -> Result<ProjectedTestnetSoakStatus> {
+    let mut projected = ProjectedTestnetSoakStatus {
+        task_id: task_id.to_owned(),
+        phase: "unknown".to_owned(),
+        recovery: "investigate".to_owned(),
+        successful_probe_count: 0,
+        failed_probe_count: 0,
+        consecutive_failure_count: 0,
+        unclean_restart_count: 0,
+        last_sample: "none".to_owned(),
+        last_probe_failure: "none".to_owned(),
+        updated_at: "unknown".to_owned(),
+        exit: "none".to_owned(),
+        failure: "none".to_owned(),
+        runtime_failure: "none".to_owned(),
+    };
+    let mut running = false;
+    let mut awaiting_restart_start = false;
+    let mut saw_record = false;
+    let mut saw_started = false;
+
+    for record in read_bounded_testnet_soak_records(history_path)? {
+        if record.strategy != "testnet_soak" {
+            continue;
+        }
+        if record.details["task_kind"].as_str() != Some("binance_testnet_read_only_soak") {
+            continue;
+        }
+        if record.details["task_id"].as_str() != Some(task_id) {
+            continue;
+        }
+        if record.details["schema_version"].as_u64() != Some(u64::from(TESTNET_SOAK_SCHEMA_VERSION))
+        {
+            bail!("testnet soak status failed: unsupported schema for task {task_id}");
+        }
+        saw_record = true;
+        projected.updated_at = record.timestamp.to_rfc3339();
+        let observation = &record.details["observation"];
+        match record.decision.as_str() {
+            "testnet_soak_started" => {
+                if saw_started && !awaiting_restart_start {
+                    projected.successful_probe_count = 0;
+                    projected.failed_probe_count = 0;
+                    projected.consecutive_failure_count = 0;
+                    projected.unclean_restart_count = 0;
+                    overwrite_string(&mut projected.last_sample, "none");
+                    overwrite_string(&mut projected.last_probe_failure, "none");
+                }
+                saw_started = true;
+                running = true;
+                awaiting_restart_start = false;
+                overwrite_string(&mut projected.phase, "running");
+                overwrite_string(&mut projected.exit, "none");
+                overwrite_string(&mut projected.failure, "none");
+            }
+            "testnet_soak_unclean_restart_detected" => {
+                projected.unclean_restart_count = projected.unclean_restart_count.saturating_add(1);
+                running = false;
+                awaiting_restart_start = true;
+                overwrite_string(&mut projected.phase, "restarting");
+                overwrite_string(&mut projected.exit, "none");
+                overwrite_string(&mut projected.failure, "none");
+            }
+            "testnet_soak_probe_succeeded" => {
+                projected.successful_probe_count =
+                    projected.successful_probe_count.saturating_add(1);
+                projected.consecutive_failure_count = 0;
+                overwrite_string(&mut projected.last_probe_failure, "none");
+                overwrite_string(
+                    &mut projected.last_sample,
+                    observation["sample"].as_str().unwrap_or("none"),
+                );
+                running = true;
+                overwrite_string(&mut projected.phase, "running");
+                overwrite_string(&mut projected.exit, "none");
+                overwrite_string(&mut projected.failure, "none");
+            }
+            "testnet_soak_probe_failed" => {
+                projected.failed_probe_count = projected.failed_probe_count.saturating_add(1);
+                projected.consecutive_failure_count =
+                    projected.consecutive_failure_count.saturating_add(1);
+                overwrite_string(
+                    &mut projected.last_probe_failure,
+                    observation["probe_failure"].as_str().unwrap_or("none"),
+                );
+                running = true;
+                overwrite_string(&mut projected.phase, "running");
+                overwrite_string(&mut projected.exit, "none");
+                overwrite_string(&mut projected.failure, "none");
+            }
+            "testnet_soak_stopped" => {
+                running = false;
+                awaiting_restart_start = false;
+                overwrite_string(&mut projected.phase, "stopped");
+                overwrite_string(
+                    &mut projected.exit,
+                    observation["exit"].as_str().unwrap_or("stop_requested"),
+                );
+                overwrite_string(&mut projected.failure, "none");
+                projected.consecutive_failure_count = 0;
+            }
+            "testnet_soak_failed" => {
+                running = false;
+                awaiting_restart_start = false;
+                overwrite_string(&mut projected.phase, "failed");
+                overwrite_string(&mut projected.exit, "none");
+                overwrite_string(
+                    &mut projected.failure,
+                    observation["task_failure"].as_str().unwrap_or("none"),
+                );
+                if let Some(probe_failure) = observation["probe_failure"].as_str() {
+                    overwrite_string(&mut projected.last_probe_failure, probe_failure);
+                }
+            }
+            _ => bail!("testnet soak status failed: unsupported fact for task {task_id}"),
+        }
+    }
+
+    if !saw_record {
+        bail!("testnet soak task not found: {task_id}");
+    }
+    projected.recovery = if !running && projected.phase == "stopped" && projected.failure == "none"
+    {
+        "none".to_owned()
+    } else {
+        "investigate".to_owned()
+    };
+    Ok(projected)
+}
+
+fn read_bounded_testnet_soak_records(history_path: &Path) -> Result<Vec<DecisionRecord>> {
+    let mut file = std::fs::File::open(history_path)
+        .with_context(|| format!("failed to open {}", history_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", history_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "testnet soak status failed: history source {} is not a file",
+            history_path.display()
+        );
+    }
+    if metadata.len() > MAX_JOURNAL_SOURCE_BYTES {
+        bail!(
+            "testnet soak status failed: history source {} exceeds {} bytes",
+            history_path.display(),
+            MAX_JOURNAL_SOURCE_BYTES
+        );
+    }
+    let expected = usize::try_from(metadata.len())
+        .context("testnet soak status history is too large for this process")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected)
+        .context("testnet soak status could not reserve history buffer")?;
+    std::io::Read::by_ref(&mut file)
+        .take(metadata.len())
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", history_path.display()))?;
+    if bytes.len() != expected {
+        bail!(
+            "testnet soak status failed: history source {} changed while reading",
+            history_path.display()
+        );
+    }
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bail!(
+            "testnet soak status failed: history source {} has a partial trailing record",
+            history_path.display()
+        );
+    }
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let complete = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let mut records = Vec::new();
+    for (index, raw_line) in complete.split(|byte| *byte == b'\n').enumerate() {
+        if records.len() == MAX_TESTNET_SOAK_EVIDENCE_RECORDS {
+            bail!(
+                "testnet soak status failed: history source {} exceeds {} records",
+                history_path.display(),
+                MAX_TESTNET_SOAK_EVIDENCE_RECORDS
+            );
+        }
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            bail!(
+                "testnet soak status failed: history source {} contains an empty record",
+                history_path.display()
+            );
+        }
+        if line.len().saturating_add(1) > MAX_HISTORY_RECORD_BYTES {
+            bail!(
+                "testnet soak status failed: history record {} exceeds {} bytes",
+                index + 1,
+                MAX_HISTORY_RECORD_BYTES
+            );
+        }
+        records.push(
+            serde_json::from_slice::<DecisionRecord>(line).with_context(|| {
+                format!(
+                    "failed to parse testnet soak history record {} from {}",
+                    index + 1,
+                    history_path.display()
+                )
+            })?,
+        );
+    }
+    Ok(records)
+}
+
+fn render_live_testnet_soak_status(status: &TestnetSoakTaskStatus) -> String {
+    format_testnet_soak_status(
+        &status.task_id,
+        Cow::Owned(testnet_soak_phase_name(status.phase)),
+        Cow::Borrowed("none"),
+        status.successful_probe_count,
+        status.failed_probe_count,
+        status.consecutive_failure_count,
+        status.unclean_restart_count,
+        Cow::Owned(
+            status
+                .last_sample
+                .map_or("none".to_owned(), testnet_soak_sample_name),
+        ),
+        Cow::Owned(
+            status
+                .last_probe_failure
+                .map_or("none".to_owned(), testnet_soak_probe_failure_name),
+        ),
+        Cow::Owned(status.last_recorded_at.to_rfc3339()),
+        Cow::Owned(
+            status
+                .exit
+                .map_or("none".to_owned(), testnet_soak_exit_name),
+        ),
+        Cow::Owned(
+            status
+                .failure
+                .map_or("none".to_owned(), testnet_soak_task_failure_name),
+        ),
+        Cow::Owned(
+            status
+                .runtime_failure
+                .map_or("none".to_owned(), testnet_soak_task_failure_name),
+        ),
+    )
+}
+
+fn render_live_testnet_soak_stop(
+    status: &TestnetSoakTaskStatus,
+    _exit: TestnetSoakTaskExit,
+) -> String {
+    render_live_testnet_soak_status(status)
+}
+
+fn render_projected_testnet_soak_status(status: &ProjectedTestnetSoakStatus) -> String {
+    format_testnet_soak_status(
+        &status.task_id,
+        Cow::Borrowed(&status.phase),
+        Cow::Borrowed(&status.recovery),
+        status.successful_probe_count,
+        status.failed_probe_count,
+        status.consecutive_failure_count,
+        status.unclean_restart_count,
+        Cow::Borrowed(&status.last_sample),
+        Cow::Borrowed(&status.last_probe_failure),
+        Cow::Borrowed(&status.updated_at),
+        Cow::Borrowed(&status.exit),
+        Cow::Borrowed(&status.failure),
+        Cow::Borrowed(&status.runtime_failure),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value)]
+fn format_testnet_soak_status(
+    task_id: &str,
+    phase: Cow<'_, str>,
+    recovery: Cow<'_, str>,
+    successful_probe_count: u64,
+    failed_probe_count: u64,
+    consecutive_failure_count: u16,
+    unclean_restart_count: u32,
+    last_sample: Cow<'_, str>,
+    last_probe_failure: Cow<'_, str>,
+    updated_at: Cow<'_, str>,
+    exit: Cow<'_, str>,
+    failure: Cow<'_, str>,
+    runtime_failure: Cow<'_, str>,
+) -> String {
+    format!(
+        "task_id={task_id}\nphase={phase}\nrecovery={recovery}\nsuccessful_probe_count={successful_probe_count}\nfailed_probe_count={failed_probe_count}\nconsecutive_failure_count={consecutive_failure_count}\nunclean_restart_count={unclean_restart_count}\nlast_sample={last_sample}\nlast_probe_failure={last_probe_failure}\nupdated_at={updated_at}\nexit={exit}\nfailure={failure}\nruntime_failure={runtime_failure}\n"
+    )
+}
+
+fn testnet_soak_sample_name(sample: TestnetSoakSample) -> String {
+    match sample {
+        TestnetSoakSample::SpotBookTicker => "spot_book_ticker",
+        TestnetSoakSample::UsdMBookTicker => "usd_m_book_ticker",
+        TestnetSoakSample::AuthenticatedReconcile => "authenticated_reconcile",
+    }
+    .to_owned()
+}
+
+fn testnet_soak_phase_name(phase: crate::testnet_soak::TestnetSoakTaskPhase) -> String {
+    match phase {
+        crate::testnet_soak::TestnetSoakTaskPhase::Running => "running",
+        crate::testnet_soak::TestnetSoakTaskPhase::Stopped => "stopped",
+        crate::testnet_soak::TestnetSoakTaskPhase::Failed => "failed",
+    }
+    .to_owned()
+}
+
+fn testnet_soak_probe_failure_name(failure: TestnetSoakProbeFailure) -> String {
+    match failure {
+        TestnetSoakProbeFailure::Transport => "transport",
+        TestnetSoakProbeFailure::Timeout => "timeout",
+        TestnetSoakProbeFailure::RateLimited => "rate_limited",
+        TestnetSoakProbeFailure::ClockSkew => "clock_skew",
+        TestnetSoakProbeFailure::RemoteRejected => "remote_rejected",
+        TestnetSoakProbeFailure::Protocol => "protocol",
+        TestnetSoakProbeFailure::Unavailable => "unavailable",
+    }
+    .to_owned()
+}
+
+fn testnet_soak_exit_name(exit: TestnetSoakTaskExit) -> String {
+    match exit {
+        TestnetSoakTaskExit::StopRequested => "stop_requested",
+    }
+    .to_owned()
+}
+
+fn testnet_soak_task_failure_name(failure: TestnetSoakTaskFailure) -> String {
+    match failure {
+        TestnetSoakTaskFailure::ProbeFailureThreshold => "probe_failure_threshold",
+        TestnetSoakTaskFailure::CounterOverflow => "counter_overflow",
+        TestnetSoakTaskFailure::JournalUnavailable => "journal_unavailable",
+        TestnetSoakTaskFailure::TaskPanicked => "task_panicked",
+        TestnetSoakTaskFailure::TaskCancelled => "task_cancelled",
+    }
+    .to_owned()
 }
 
 #[derive(Debug)]

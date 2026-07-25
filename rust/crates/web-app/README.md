@@ -1,8 +1,9 @@
 # Crypto Trading Web Control Plane
 
-This binary is the trusted composition root for the local read-only HTTP/SSE and Web adapters.
-It accepts one bounded execution journal, a durable generation ID, and a loopback port. It has no
-live-trading flag and exposes no command route.
+This binary is the trusted composition root for the local HTTP/SSE and Web adapters.
+By default it is read-only. An explicit replay-backed paper write mode can be enabled for one
+bounded grid profile and one bounded arbitrage profile, but it still has no live-trading flag and
+cannot bind a mainnet exchange handle.
 
 From the `rust/` workspace:
 
@@ -20,11 +21,49 @@ and pass only its name:
 
 ```powershell
 $env:CRYPTO_TRADING_WEB_TOKEN = '<generated secret>'
+New-Item -ItemType Directory -Force data | Out-Null
+if (-not (Test-Path data/paper-control.jsonl)) {
+  New-Item -ItemType File data/paper-control.jsonl | Out-Null
+}
 cargo +1.89.0 run -p crypto-trading-web-app --bin crypto-trading-web -- `
-  --history-path fixtures/m2-operator-journal.jsonl `
+  --history-path data/paper-control.jsonl `
   --journal-id 44444444-4444-4444-8444-444444444444 `
   --bearer-token-env CRYPTO_TRADING_WEB_TOKEN
 ```
 
 The shell remains data-free and same-origin. The browser keeps the supplied token only in memory
 and uses authenticated `fetch` requests for JSON and event-stream reads.
+
+To opt into the loopback-only trusted submit route, you must also provide a bearer env var plus at
+least one replay-backed paper profile. The first surface supports one grid profile and one exact-pair
+arbitrage profile at most:
+
+```powershell
+$env:CRYPTO_TRADING_WEB_TOKEN = '<generated secret>'
+cargo +1.89.0 run -p crypto-trading-web-app --bin crypto-trading-web -- `
+  --history-path fixtures/m2-operator-journal.jsonl `
+  --journal-id 44444444-4444-4444-8444-444444444444 `
+  --bearer-token-env CRYPTO_TRADING_WEB_TOKEN `
+  --enable-paper-writes `
+  --paper-grid-task-id paper-grid-owner `
+  --paper-grid-strategy-id grid.strategy `
+  --paper-grid-strategy-revision grid.v1 `
+  --paper-grid-config config/grid/paper-once-btc.yaml `
+  --paper-grid-replay fixtures/m4-grid-paper-replay.jsonl `
+  --paper-arbitrage-task-id paper-arbitrage-owner `
+  --paper-arbitrage-strategy-id arb.strategy `
+  --paper-arbitrage-strategy-revision arb.v1 `
+  --paper-arbitrage-config config/arbitrage/paper-once-eth.yaml `
+  --paper-arbitrage-monitor-config config/arbitrage/paper-monitor-eth.yaml `
+  --paper-arbitrage-replay fixtures/m4-arbitrage-paper-replay.jsonl
+```
+
+This mode remains honest about its inputs:
+- Every start command must match the configured task id, strategy id, and strategy revision exactly.
+- Market data comes only from the supplied finite JSONL replay fixtures mirrored into process-local
+  `PaperExchange` adapters.
+- Task status still comes only from `GET /api/v1/tasks`; the in-memory dispatcher registry is never
+  treated as operator truth.
+- Normal process shutdown first closes command admission and durably stops every running paper
+  owner. A rejected or unknown owner shutdown makes the process exit with an error and requires
+  inspection through the task projection.
