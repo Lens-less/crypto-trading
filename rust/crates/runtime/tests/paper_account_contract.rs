@@ -9,8 +9,9 @@ use std::{
 use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symbol};
 use crypto_trading_runtime::{
     JsonlHistory, PAPER_COST_MODEL_VERSION, PaperAccountAuthority, PaperAccountConfig,
-    PaperAccountError, PaperCostModel, PaperReservationAdmission, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
+    PaperAccountError, PaperCostModel, PaperReconciliationDigestAlgorithm,
+    PaperReconciliationOutcome, PaperReconciliationProof, PaperReservationAdmission,
+    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -51,6 +52,26 @@ fn reservation_request(
             PaperReservationLeg::from_intent(0, &left, money("100")).unwrap(),
             PaperReservationLeg::from_intent(1, &right, money("100")).unwrap(),
         ],
+    )
+    .unwrap()
+}
+
+fn reconciliation_proof(
+    account_id: &str,
+    reservation_id: Uuid,
+    batch_id: Uuid,
+    snapshot_id: &str,
+    snapshot_sequence: u64,
+    digest: &str,
+) -> PaperReconciliationProof {
+    PaperReconciliationProof::new(
+        account_id,
+        reservation_id,
+        batch_id,
+        snapshot_id,
+        snapshot_sequence,
+        PaperReconciliationDigestAlgorithm::Fnv1a64,
+        digest,
     )
     .unwrap()
 }
@@ -187,7 +208,7 @@ async fn account_scope_prevents_overcommit_and_parallel_double_admission() {
 }
 
 #[tokio::test]
-async fn uncertain_commit_and_safe_release_transitions_survive_restart() {
+async fn uncertain_commit_reconcile_and_safe_release_transitions_survive_restart() {
     let path = temp_path("restart-transitions");
     let journal_id = Uuid::new_v4();
     let config = PaperAccountConfig::new("paper-main", money("1000")).unwrap();
@@ -196,12 +217,12 @@ async fn uncertain_commit_and_safe_release_transitions_survive_restart() {
     let request = reservation_request("arb:btc", "open:0001", Uuid::new_v4(), Uuid::new_v4());
     let reservation_id = request.reservation_id();
 
-    authority.reserve(request).await.unwrap();
+    authority.reserve(request.clone()).await.unwrap();
     let uncertain = authority.mark_uncertain(reservation_id).await.unwrap();
     assert_eq!(uncertain.phase, PaperReservationPhase::Uncertain);
 
     let restarted =
-        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config).unwrap();
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config.clone()).unwrap();
     let recovered = restarted.snapshot().await.unwrap();
     assert_eq!(recovered.uncertain_reserved, money("200.60"));
     assert_eq!(recovered.available, money("799.40"));
@@ -224,19 +245,198 @@ async fn uncertain_commit_and_safe_release_transitions_survive_restart() {
     let still_committed = restarted.snapshot().await.unwrap();
     assert_eq!(still_committed.available, money("850"));
     assert_eq!(still_committed.committed_exposure, money("150"));
+    assert!(
+        still_committed.reservations[0].reconciliation.is_none(),
+        "reason-only release must not invent reconcile evidence"
+    );
 
-    let releasable = reservation_request("arb:eth", "open:0002", Uuid::new_v4(), Uuid::new_v4());
-    let releasable_id = releasable.reservation_id();
-    restarted.reserve(releasable).await.unwrap();
-    restarted.mark_uncertain(releasable_id).await.unwrap();
-    let released = restarted
-        .release(releasable_id, "confirmed_no_submission")
+    let failed = restarted
+        .record_reconciliation_failure(reconciliation_proof(
+            "paper-main",
+            reservation_id,
+            request.batch_id(),
+            "binance/account-2026-07-25T00:00:01Z",
+            41,
+            "0123456789abcdef",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed.phase, PaperReservationPhase::Committed);
+    assert_eq!(failed.held_exposure, money("150"));
+    let failed_record = failed.reconciliation.as_ref().unwrap();
+    assert_eq!(failed_record.outcome, PaperReconciliationOutcome::Failed);
+    assert_eq!(failed_record.proof.snapshot_sequence(), 41);
+
+    let restarted_again =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config).unwrap();
+    let persisted_failed = restarted_again.snapshot().await.unwrap();
+    assert_eq!(persisted_failed.available, money("850"));
+    assert_eq!(persisted_failed.committed_exposure, money("150"));
+    assert_eq!(
+        persisted_failed.reservations[0]
+            .reconciliation
+            .as_ref()
+            .unwrap()
+            .outcome,
+        PaperReconciliationOutcome::Failed
+    );
+
+    let released = restarted_again
+        .reconcile_release(reconciliation_proof(
+            "paper-main",
+            reservation_id,
+            request.batch_id(),
+            "binance/account-2026-07-25T00:00:01Z",
+            42,
+            "fedcba9876543210",
+        ))
         .await
         .unwrap();
     assert_eq!(released.phase, PaperReservationPhase::Released);
-    let released_snapshot = restarted.snapshot().await.unwrap();
-    assert_eq!(released_snapshot.available, money("850"));
-    assert_eq!(released_snapshot.committed_exposure, money("150"));
+    assert_eq!(released.held_exposure, Money::default());
+    assert_eq!(
+        released.reconciliation.as_ref().unwrap().outcome,
+        PaperReconciliationOutcome::Released
+    );
+    let released_snapshot = restarted_again.snapshot().await.unwrap();
+    assert_eq!(released_snapshot.available, money("1000"));
+    assert_eq!(released_snapshot.committed_exposure, Money::default());
+
+    let records = std::fs::read_to_string(&path).unwrap();
+    assert!(records.contains("\"decision\":\"paper_account_reconcile_failed\""));
+    assert!(records.contains("\"decision\":\"paper_account_released\""));
+    assert!(records.contains("\"snapshot_sequence\":42"));
+    assert!(records.contains("\"digest\":\"fedcba9876543210\""));
+}
+
+#[tokio::test]
+async fn uncertain_reservation_still_accepts_reason_based_release() {
+    let path = temp_path("uncertain-reason-release");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let request = reservation_request("arb:eth", "open:0002", Uuid::new_v4(), Uuid::new_v4());
+    let reservation_id = request.reservation_id();
+
+    authority.reserve(request).await.unwrap();
+    authority.mark_uncertain(reservation_id).await.unwrap();
+    let released = authority
+        .release(reservation_id, "confirmed_no_submission")
+        .await
+        .unwrap();
+
+    assert_eq!(released.phase, PaperReservationPhase::Released);
+    let snapshot = authority.snapshot().await.unwrap();
+    assert_eq!(snapshot.available, money("1000"));
+    assert_eq!(snapshot.committed_exposure, Money::default());
+}
+
+#[tokio::test]
+async fn committed_reconciliation_requires_bound_non_conflicting_proof() {
+    let path = temp_path("reconcile-guards");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let request = reservation_request("arb:btc", "open:guard", Uuid::new_v4(), Uuid::new_v4());
+    let reservation_id = request.reservation_id();
+    let batch_id = request.batch_id();
+
+    authority.reserve(request).await.unwrap();
+    authority
+        .commit(reservation_id, money("150"))
+        .await
+        .unwrap();
+
+    let wrong_account = authority
+        .reconcile_release(reconciliation_proof(
+            "paper-alt",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:10:00Z",
+            1,
+            "0011223344556677",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_account,
+        PaperAccountError::InvalidTransition
+    ));
+
+    authority
+        .record_reconciliation_failure(reconciliation_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:10:00Z",
+            5,
+            "0011223344556677",
+        ))
+        .await
+        .unwrap();
+    let conflicting = authority
+        .reconcile_release(reconciliation_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:10:00Z",
+            5,
+            "8899aabbccddeeff",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(conflicting, PaperAccountError::InvalidTransition));
+
+    let lower_different_snapshot = authority
+        .reconcile_release(reconciliation_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:09:59Z",
+            4,
+            "0011223344556677",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        lower_different_snapshot,
+        PaperAccountError::InvalidTransition
+    ));
+
+    let equal_different_snapshot = authority
+        .record_reconciliation_failure(reconciliation_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:10:01Z",
+            5,
+            "0011223344556677",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        equal_different_snapshot,
+        PaperAccountError::InvalidTransition
+    ));
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+
+    let malformed = PaperReconciliationProof::new(
+        "paper-main",
+        reservation_id,
+        batch_id,
+        "binance/account-2026-07-25T00:10:00Z",
+        6,
+        PaperReconciliationDigestAlgorithm::Fnv1a64,
+        "not-hex",
+    )
+    .unwrap_err();
+    assert!(matches!(malformed, PaperAccountError::InvalidRequest(_)));
 }
 
 #[tokio::test]

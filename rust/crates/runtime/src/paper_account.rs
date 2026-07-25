@@ -42,12 +42,14 @@ const MAX_PAPER_ACCOUNTS: usize = 16;
 const MAX_RESERVATION_LEGS: usize = 256;
 const MAX_LABEL_BYTES: usize = 128;
 const MAX_REASON_BYTES: usize = 128;
+const RECONCILIATION_DIGEST_HEX_BYTES: usize = 16;
 const MAX_COST_BPS: u32 = 10_000;
 const PAPER_ACCOUNT_STRATEGY: &str = "paper_account";
 const PAPER_ACCOUNT_RESERVED: &str = "paper_account_reserved";
 const PAPER_ACCOUNT_UNCERTAIN: &str = "paper_account_uncertain";
 const PAPER_ACCOUNT_COMMITTED: &str = "paper_account_committed";
 const PAPER_ACCOUNT_RELEASED: &str = "paper_account_released";
+const PAPER_ACCOUNT_RECONCILE_FAILED: &str = "paper_account_reconcile_failed";
 
 type AuthorityLock = AsyncMutex<()>;
 static AUTHORITY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<AuthorityLock>>>> = OnceLock::new();
@@ -404,6 +406,126 @@ pub enum PaperReservationPhase {
     Released,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperReconciliationDigestAlgorithm {
+    Fnv1a64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperReconciliationProof {
+    account_id: String,
+    reservation_id: Uuid,
+    batch_id: Uuid,
+    snapshot_id: String,
+    snapshot_sequence: u64,
+    digest_algorithm: PaperReconciliationDigestAlgorithm,
+    digest: String,
+}
+
+impl PaperReconciliationProof {
+    /// Creates one bounded, replayable reconciliation proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PaperAccountError::InvalidRequest`] for unsafe identities,
+    /// nil identifiers, zero snapshot sequences, or malformed digests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        account_id: impl Into<String>,
+        reservation_id: Uuid,
+        batch_id: Uuid,
+        snapshot_id: impl Into<String>,
+        snapshot_sequence: u64,
+        digest_algorithm: PaperReconciliationDigestAlgorithm,
+        digest: impl Into<String>,
+    ) -> Result<Self, PaperAccountError> {
+        let proof = Self {
+            account_id: bounded_identity(&account_id.into(), "account id")
+                .map_err(PaperAccountError::InvalidRequest)?,
+            reservation_id,
+            batch_id,
+            snapshot_id: bounded_identity(&snapshot_id.into(), "snapshot id")
+                .map_err(PaperAccountError::InvalidRequest)?,
+            snapshot_sequence,
+            digest_algorithm,
+            digest: bounded_digest(digest_algorithm, &digest.into())?,
+        };
+        proof.validate()?;
+        Ok(proof)
+    }
+
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub const fn reservation_id(&self) -> Uuid {
+        self.reservation_id
+    }
+
+    #[must_use]
+    pub const fn batch_id(&self) -> Uuid {
+        self.batch_id
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn snapshot_sequence(&self) -> u64 {
+        self.snapshot_sequence
+    }
+
+    #[must_use]
+    pub const fn digest_algorithm(&self) -> PaperReconciliationDigestAlgorithm {
+        self.digest_algorithm
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    fn validate(&self) -> Result<(), PaperAccountError> {
+        bounded_identity(&self.account_id, "account id")
+            .map_err(PaperAccountError::InvalidRequest)?;
+        bounded_identity(&self.snapshot_id, "snapshot id")
+            .map_err(PaperAccountError::InvalidRequest)?;
+        if self.reservation_id.is_nil() || self.batch_id.is_nil() {
+            return Err(PaperAccountError::InvalidRequest(
+                "paper reconciliation proof ids must not be nil",
+            ));
+        }
+        if self.snapshot_sequence == 0 {
+            return Err(PaperAccountError::InvalidRequest(
+                "paper reconciliation snapshot sequence must be positive",
+            ));
+        }
+        let _ = bounded_digest(self.digest_algorithm, &self.digest)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperReconciliationOutcome {
+    Released,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperReconciliationRecord {
+    pub outcome: PaperReconciliationOutcome,
+    pub proof: PaperReconciliationProof,
+    pub evidence_sequence: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaperReservationView {
@@ -418,6 +540,7 @@ pub struct PaperReservationView {
     pub phase: PaperReservationPhase,
     pub first_sequence: u64,
     pub last_sequence: u64,
+    pub reconciliation: Option<PaperReconciliationRecord>,
 }
 
 impl PaperReservationView {
@@ -655,7 +778,7 @@ impl PaperAccountAuthority {
                 return Err(PaperAccountError::InvalidTransition);
             }
         }
-        self.append_transition(PAPER_ACCOUNT_UNCERTAIN, reservation, None, None)
+        self.append_transition(PAPER_ACCOUNT_UNCERTAIN, reservation, None, None, None)
             .await?;
         self.reloaded_reservation(reservation_id).await
     }
@@ -696,6 +819,7 @@ impl PaperAccountAuthority {
             reservation,
             Some(confirmed_exposure),
             None,
+            None,
         )
         .await?;
         self.reloaded_reservation(reservation_id).await
@@ -728,9 +852,107 @@ impl PaperAccountAuthority {
         if reservation.phase == PaperReservationPhase::Committed {
             return Err(PaperAccountError::InvalidTransition);
         }
-        self.append_transition(PAPER_ACCOUNT_RELEASED, reservation, None, Some(reason))
-            .await?;
+        self.append_transition(
+            PAPER_ACCOUNT_RELEASED,
+            reservation,
+            None,
+            Some(reason),
+            None,
+        )
+        .await?;
         self.reloaded_reservation(reservation_id).await
+    }
+
+    /// Releases committed exposure only when caller presents durable,
+    /// replayable reconciliation proof bound to this account and batch.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on missing/mismatched proof, degraded durable state, or
+    /// conflicting reconciliation evidence.
+    pub async fn reconcile_release(
+        &self,
+        proof: PaperReconciliationProof,
+    ) -> Result<PaperReservationView, PaperAccountError> {
+        let _guard = self.authority_lock.lock().await;
+        let snapshot = self.load_account_snapshot().await?;
+        require_writable(&snapshot)?;
+        let reservation = find_reservation(&snapshot, proof.reservation_id())?;
+        ensure_reconciliation_proof_matches(
+            &proof,
+            self.config.account_id(),
+            reservation.reservation_id,
+            reservation.batch_id,
+        )?;
+        if reservation.phase == PaperReservationPhase::Released {
+            return if matches_reconciliation(
+                reservation.reconciliation.as_ref(),
+                PaperReconciliationOutcome::Released,
+                &proof,
+            ) {
+                Ok(reservation.clone())
+            } else {
+                Err(PaperAccountError::InvalidTransition)
+            };
+        }
+        if reservation.phase != PaperReservationPhase::Committed {
+            return Err(PaperAccountError::InvalidTransition);
+        }
+        validate_reconciliation_progress(
+            reservation.reconciliation.as_ref(),
+            PaperReconciliationOutcome::Released,
+            &proof,
+        )?;
+        self.append_transition(PAPER_ACCOUNT_RELEASED, reservation, None, None, Some(proof))
+            .await?;
+        self.reloaded_reservation(reservation.reservation_id).await
+    }
+
+    /// Durably records a failed committed reconciliation without releasing
+    /// committed exposure.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on missing/mismatched proof, degraded durable state, or
+    /// conflicting reconciliation evidence.
+    pub async fn record_reconciliation_failure(
+        &self,
+        proof: PaperReconciliationProof,
+    ) -> Result<PaperReservationView, PaperAccountError> {
+        let _guard = self.authority_lock.lock().await;
+        let snapshot = self.load_account_snapshot().await?;
+        require_writable(&snapshot)?;
+        let reservation = find_reservation(&snapshot, proof.reservation_id())?;
+        ensure_reconciliation_proof_matches(
+            &proof,
+            self.config.account_id(),
+            reservation.reservation_id,
+            reservation.batch_id,
+        )?;
+        if reservation.phase != PaperReservationPhase::Committed {
+            return Err(PaperAccountError::InvalidTransition);
+        }
+        if matches_reconciliation(
+            reservation.reconciliation.as_ref(),
+            PaperReconciliationOutcome::Failed,
+            &proof,
+        ) {
+            return Ok(reservation.clone());
+        }
+        validate_reconciliation_progress(
+            reservation.reconciliation.as_ref(),
+            PaperReconciliationOutcome::Failed,
+            &proof,
+        )?;
+        self.append_transition(
+            PAPER_ACCOUNT_RECONCILE_FAILED,
+            reservation,
+            None,
+            None,
+            Some(proof),
+        )
+        .await?;
+        self.reloaded_reservation(reservation.reservation_id).await
     }
 
     async fn append_transition(
@@ -739,6 +961,7 @@ impl PaperAccountAuthority {
         reservation: &PaperReservationView,
         confirmed_exposure: Option<Money>,
         reason: Option<String>,
+        proof: Option<PaperReconciliationProof>,
     ) -> Result<(), PaperAccountError> {
         self.append_fact(
             decision,
@@ -750,6 +973,7 @@ impl PaperAccountAuthority {
                 batch_id: reservation.batch_id,
                 confirmed_exposure,
                 reason,
+                proof,
             },
         )
         .await
@@ -843,6 +1067,7 @@ struct TransitionFact {
     batch_id: Uuid,
     confirmed_exposure: Option<Money>,
     reason: Option<String>,
+    proof: Option<PaperReconciliationProof>,
 }
 
 struct ProjectionBuilder {
@@ -919,6 +1144,7 @@ impl ProjectionBuilder {
                 | PAPER_ACCOUNT_UNCERTAIN
                 | PAPER_ACCOUNT_COMMITTED
                 | PAPER_ACCOUNT_RELEASED
+                | PAPER_ACCOUNT_RECONCILE_FAILED
         ) {
             return;
         }
@@ -966,6 +1192,17 @@ impl ProjectionBuilder {
                 self.accounts[account_index].reserve(sequence, fact)
             }
             PAPER_ACCOUNT_UNCERTAIN | PAPER_ACCOUNT_COMMITTED | PAPER_ACCOUNT_RELEASED => {
+                require_money_strings_for_transition(&details)?;
+                let fact: TransitionFact = serde_json::from_value(details).map_err(|_| ())?;
+                validate_transition_fact(&fact, symbol, decision, self.journal_id)?;
+                let account = self
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.account_id == fact.account_id)
+                    .ok_or(())?;
+                account.transition(sequence, decision, &fact)
+            }
+            PAPER_ACCOUNT_RECONCILE_FAILED => {
                 require_money_strings_for_transition(&details)?;
                 let fact: TransitionFact = serde_json::from_value(details).map_err(|_| ())?;
                 validate_transition_fact(&fact, symbol, decision, self.journal_id)?;
@@ -1027,6 +1264,7 @@ impl AccountAccumulator {
             phase: PaperReservationPhase::Pending,
             first_sequence: sequence,
             last_sequence: sequence,
+            reconciliation: None,
         });
         Ok(())
     }
@@ -1050,6 +1288,7 @@ impl AccountAccumulator {
                 if reservation.phase != PaperReservationPhase::Pending
                     || fact.confirmed_exposure.is_some()
                     || fact.reason.is_some()
+                    || fact.proof.is_some()
                 {
                     return Err(());
                 }
@@ -1060,6 +1299,7 @@ impl AccountAccumulator {
                     reservation.phase,
                     PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
                 ) || fact.reason.is_some()
+                    || fact.proof.is_some()
                 {
                     return Err(());
                 }
@@ -1071,16 +1311,65 @@ impl AccountAccumulator {
                 reservation.held_exposure = confirmed;
             }
             PAPER_ACCOUNT_RELEASED => {
-                if matches!(
-                    reservation.phase,
-                    PaperReservationPhase::Committed | PaperReservationPhase::Released
-                ) || fact.confirmed_exposure.is_some()
+                if fact.confirmed_exposure.is_some() {
+                    return Err(());
+                }
+                match (&fact.reason, &fact.proof) {
+                    (Some(reason), None) => {
+                        if matches!(
+                            reservation.phase,
+                            PaperReservationPhase::Committed | PaperReservationPhase::Released
+                        ) {
+                            return Err(());
+                        }
+                        bounded_reason(reason).map_err(|_| ())?;
+                        reservation.phase = PaperReservationPhase::Released;
+                        reservation.held_exposure = Money::default();
+                    }
+                    (None, Some(proof)) => {
+                        if reservation.phase != PaperReservationPhase::Committed {
+                            return Err(());
+                        }
+                        ensure_reconciliation_proof_matches(
+                            proof,
+                            &self.account_id,
+                            reservation.reservation_id,
+                            reservation.batch_id,
+                        )
+                        .map_err(|_| ())?;
+                        apply_reconciliation_record(
+                            &mut reservation.reconciliation,
+                            PaperReconciliationOutcome::Released,
+                            proof,
+                            sequence,
+                        )?;
+                        reservation.phase = PaperReservationPhase::Released;
+                        reservation.held_exposure = Money::default();
+                    }
+                    _ => return Err(()),
+                }
+            }
+            PAPER_ACCOUNT_RECONCILE_FAILED => {
+                if reservation.phase != PaperReservationPhase::Committed
+                    || fact.confirmed_exposure.is_some()
+                    || fact.reason.is_some()
                 {
                     return Err(());
                 }
-                bounded_reason(fact.reason.as_deref().ok_or(())?).map_err(|_| ())?;
-                reservation.phase = PaperReservationPhase::Released;
-                reservation.held_exposure = Money::default();
+                let proof = fact.proof.as_ref().ok_or(())?;
+                ensure_reconciliation_proof_matches(
+                    proof,
+                    &self.account_id,
+                    reservation.reservation_id,
+                    reservation.batch_id,
+                )
+                .map_err(|_| ())?;
+                apply_reconciliation_record(
+                    &mut reservation.reconciliation,
+                    PaperReconciliationOutcome::Failed,
+                    proof,
+                    sequence,
+                )?;
             }
             _ => return Err(()),
         }
@@ -1177,18 +1466,41 @@ fn validate_transition_fact(
     }
     match decision {
         PAPER_ACCOUNT_UNCERTAIN => {
-            if fact.confirmed_exposure.is_some() || fact.reason.is_some() {
+            if fact.confirmed_exposure.is_some() || fact.reason.is_some() || fact.proof.is_some() {
                 return Err(());
             }
         }
         PAPER_ACCOUNT_COMMITTED => {
-            if fact.confirmed_exposure.is_none() || fact.reason.is_some() {
+            if fact.confirmed_exposure.is_none() || fact.reason.is_some() || fact.proof.is_some() {
                 return Err(());
             }
         }
         PAPER_ACCOUNT_RELEASED => {
-            if fact.confirmed_exposure.is_some()
-                || bounded_reason(fact.reason.as_deref().ok_or(())?).is_err()
+            if fact.confirmed_exposure.is_some() {
+                return Err(());
+            }
+            match (&fact.reason, &fact.proof) {
+                (Some(reason), None) => {
+                    if bounded_reason(reason).is_err() {
+                        return Err(());
+                    }
+                }
+                (None, Some(proof)) => {
+                    if proof.validate().is_err() {
+                        return Err(());
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+        PAPER_ACCOUNT_RECONCILE_FAILED => {
+            if fact.confirmed_exposure.is_some() || fact.reason.is_some() {
+                return Err(());
+            }
+            if fact
+                .proof
+                .as_ref()
+                .is_none_or(|proof| proof.validate().is_err())
             {
                 return Err(());
             }
@@ -1304,6 +1616,88 @@ fn bounded_reason(value: &str) -> Result<String, PaperAccountError> {
         ));
     }
     Ok(normalized.to_owned())
+}
+
+fn bounded_digest(
+    algorithm: PaperReconciliationDigestAlgorithm,
+    value: &str,
+) -> Result<String, PaperAccountError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let expected_len = match algorithm {
+        PaperReconciliationDigestAlgorithm::Fnv1a64 => RECONCILIATION_DIGEST_HEX_BYTES,
+    };
+    if normalized.len() != expected_len || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(PaperAccountError::InvalidRequest(
+            "paper reconciliation digest is malformed",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn ensure_reconciliation_proof_matches(
+    proof: &PaperReconciliationProof,
+    account_id: &str,
+    reservation_id: Uuid,
+    batch_id: Uuid,
+) -> Result<(), PaperAccountError> {
+    if proof.account_id() != account_id
+        || proof.reservation_id() != reservation_id
+        || proof.batch_id() != batch_id
+    {
+        return Err(PaperAccountError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_progress(
+    current: Option<&PaperReconciliationRecord>,
+    outcome: PaperReconciliationOutcome,
+    proof: &PaperReconciliationProof,
+) -> Result<(), PaperAccountError> {
+    if let Some(current) = current {
+        if proof.snapshot_sequence() < current.proof.snapshot_sequence() {
+            return Err(PaperAccountError::InvalidTransition);
+        }
+        if proof.snapshot_sequence() == current.proof.snapshot_sequence()
+            && (current.proof != *proof || outcome != current.outcome)
+        {
+            return Err(PaperAccountError::InvalidTransition);
+        }
+    }
+    Ok(())
+}
+
+fn matches_reconciliation(
+    current: Option<&PaperReconciliationRecord>,
+    outcome: PaperReconciliationOutcome,
+    proof: &PaperReconciliationProof,
+) -> bool {
+    current.is_some_and(|current| current.outcome == outcome && current.proof == *proof)
+}
+
+fn apply_reconciliation_record(
+    current: &mut Option<PaperReconciliationRecord>,
+    outcome: PaperReconciliationOutcome,
+    proof: &PaperReconciliationProof,
+    evidence_sequence: u64,
+) -> Result<(), ()> {
+    if let Some(existing) = current {
+        if proof.snapshot_sequence() < existing.proof.snapshot_sequence() {
+            return Err(());
+        }
+        if proof.snapshot_sequence() == existing.proof.snapshot_sequence()
+            && (existing.proof != *proof || outcome != existing.outcome)
+        {
+            return Err(());
+        }
+    }
+    *current = Some(PaperReconciliationRecord {
+        outcome,
+        proof: proof.clone(),
+        evidence_sequence,
+    });
+    Ok(())
 }
 
 fn exact_object<'a>(value: &'a Value, expected: &[&str]) -> Result<&'a Map<String, Value>, ()> {
