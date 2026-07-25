@@ -26,6 +26,7 @@ use crypto_trading_runtime::{
 };
 use crypto_trading_strategy::{VirtualGrid, VirtualGridConfig};
 use rust_decimal::Decimal;
+use tokio::sync::Semaphore;
 
 fn decimal(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
@@ -187,6 +188,50 @@ impl GridPaperExecutor for PendingExecutor {
     }
 }
 
+#[derive(Debug)]
+struct GatedFillExecutor {
+    started: AtomicBool,
+    release: Arc<Semaphore>,
+}
+
+impl Default for GatedFillExecutor {
+    fn default() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+impl GatedFillExecutor {
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl GridPaperExecutor for GatedFillExecutor {
+    fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
+        self.started.store(true, Ordering::SeqCst);
+        let permit = self.release.clone();
+        Box::pin(async move {
+            permit.acquire_owned().await.unwrap().forget();
+            let intent = batch.intents()[0].clone();
+            Ok(vec![TradingReceipt::Submitted {
+                order: Order {
+                    id: format!("paper-{}", intent.client_order_id),
+                    intent: intent.clone(),
+                    filled_quantity: intent.quantity,
+                    average_fill_price: intent.price,
+                    status: OrderStatus::Filled,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                disposition: SubmissionDisposition::Filled,
+            }])
+        })
+    }
+}
+
 #[tokio::test]
 async fn price_gap_emits_three_independent_single_leg_operations() {
     let (account, history, _) = account("three-crosses");
@@ -242,6 +287,63 @@ async fn price_gap_emits_three_independent_single_leg_operations() {
     assert_eq!(durable.phase, ReadOnlyTaskPhase::Stopped);
     assert_eq!(durable.sources.len(), 1);
     assert_eq!(task.status().operation_count, 3);
+}
+
+#[tokio::test]
+async fn stop_during_a_multi_cross_event_never_checkpoints_unexecuted_crosses_as_consumed() {
+    let (account, history, path) = account("stop-multi-cross");
+    let executor = Arc::new(GatedFillExecutor::default());
+    let source = BlockingSource {
+        first: Some(observation("97", 1, base_time() + Duration::seconds(70))),
+    };
+    let mut task = GridPaperTask::start(
+        config("grid:stop-gap", StdDuration::from_secs(1)),
+        grid(),
+        source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    wait_until(|| executor.started.load(Ordering::SeqCst)).await;
+
+    let (stop_result, ()) = tokio::join!(task.stop(), async {
+        tokio::task::yield_now().await;
+        executor.release_one();
+    });
+
+    assert!(matches!(
+        stop_result,
+        Err(GridPaperTaskError::RecoveryRequired)
+    ));
+    assert_eq!(task.status().phase, GridPaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(GridPaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(task.status().operation_count, 1);
+    let snapshot = account.snapshot().await.unwrap();
+    assert_eq!(snapshot.reservations.len(), 1);
+    assert_eq!(
+        snapshot.reservations[0].phase,
+        PaperReservationPhase::Committed
+    );
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(!body.contains("\"decision\":\"task_checkpointed\""));
+    assert!(!body.contains("\"decision\":\"task_stopped\""));
+
+    let restart = GridPaperTask::start(
+        config("grid:stop-gap", StdDuration::from_secs(1)),
+        grid(),
+        VecSource::new(Vec::new()),
+        account,
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(restart, GridPaperTaskError::RecoveryRequired));
 }
 
 #[tokio::test]

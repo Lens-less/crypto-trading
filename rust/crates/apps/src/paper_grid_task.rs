@@ -516,6 +516,16 @@ async fn run_owner(
                 .await;
             }
             Selected::Source(Ok(Some(event))) => {
+                if *cancel.borrow() || *stop.borrow() {
+                    return stop_owner(
+                        &mut source,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        GridPaperTaskExit::StopRequested,
+                    )
+                    .await;
+                }
                 let mut next = status_sender.borrow().clone();
                 next.processed_event_count = next
                     .processed_event_count
@@ -537,11 +547,22 @@ async fn run_owner(
                     }
                 };
 
+                let cross_count = crosses.len();
+                let mut completed_cross_count = 0_usize;
                 let mut stop_after_operation = false;
                 for cross in crosses {
-                    if *stop.borrow() {
-                        stop_after_operation = true;
-                        break;
+                    if *cancel.borrow() || *stop.borrow() {
+                        next.operation_count = operation_sequence;
+                        status_sender.send_replace(next);
+                        return fail_owner(
+                            &mut source,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            GridPaperTaskFailure::RecoveryRequired,
+                            GridPaperTaskError::RecoveryRequired,
+                        )
+                        .await;
                     }
                     operation_sequence = operation_sequence
                         .checked_add(1)
@@ -557,6 +578,7 @@ async fn run_owner(
                     .await
                     {
                         OperationOutcome::Terminal(Ok(_), stop_requested) => {
+                            completed_cross_count += 1;
                             next.operation_count = operation_sequence;
                             stop_after_operation |= stop_requested;
                         }
@@ -592,6 +614,20 @@ async fn run_owner(
                     if stop_after_operation {
                         break;
                     }
+                }
+
+                if completed_cross_count < cross_count {
+                    next.operation_count = operation_sequence;
+                    status_sender.send_replace(next);
+                    return fail_owner(
+                        &mut source,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        GridPaperTaskFailure::RecoveryRequired,
+                        GridPaperTaskError::RecoveryRequired,
+                    )
+                    .await;
                 }
 
                 let recorded_at = Utc::now().max(last_recorded_at);
