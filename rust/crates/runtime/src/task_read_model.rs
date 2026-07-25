@@ -16,7 +16,8 @@ pub const MAX_READ_ONLY_TASKS: usize = 64;
 const TASK_STRATEGY: &str = "read_only_task";
 const TASK_SYMBOL: &str = "control-plane";
 const MAX_TASK_TEXT_BYTES: usize = 128;
-const EXPECTED_SOURCE_COUNT: usize = 2;
+const GRID_SOURCE_COUNT: usize = 1;
+const ARBITRAGE_SOURCE_COUNT: usize = 2;
 
 /// Durable task lifecycle projection reconstructed only from journal facts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +50,7 @@ impl ReadOnlyTaskReadModel {
 pub enum ReadOnlyTaskKind {
     ArbitrageMonitor,
     ArbitragePaper,
+    GridPaper,
 }
 
 /// Last durably recorded aggregate phase.
@@ -396,6 +398,7 @@ fn parse_task_fact(
     let kind = match required_text(details, "task_kind")?.as_str() {
         "arbitrage_monitor" => ReadOnlyTaskKind::ArbitrageMonitor,
         "arbitrage_paper" => ReadOnlyTaskKind::ArbitragePaper,
+        "grid_paper" => ReadOnlyTaskKind::GridPaper,
         _ => return Err(()),
     };
     let phase_text = required_text(details, "phase")?;
@@ -405,6 +408,15 @@ fn parse_task_fact(
     }
     let processed_event_count = required_u64(details, "processed_event_count")?;
     let sources = parse_sources(required(details, "sources")?)?;
+    let expected_source_count = match kind {
+        ReadOnlyTaskKind::GridPaper => GRID_SOURCE_COUNT,
+        ReadOnlyTaskKind::ArbitrageMonitor | ReadOnlyTaskKind::ArbitragePaper => {
+            ARBITRAGE_SOURCE_COUNT
+        }
+    };
+    if sources.len() != expected_source_count {
+        return Err(());
+    }
     let exit = optional_exit(required(details, "exit")?)?;
     let failure = optional_failure(required(details, "failure")?)?;
     validate_fact_shape(
@@ -489,14 +501,18 @@ fn validate_fact_shape(
 
 fn parse_sources(value: &Value) -> Result<Vec<ReadOnlyTaskSourceView>, ()> {
     let rows = value.as_array().ok_or(())?;
-    if rows.len() != EXPECTED_SOURCE_COUNT {
+    if rows.is_empty() || rows.len() > ARBITRAGE_SOURCE_COUNT {
         return Err(());
     }
-    let mut sources = Vec::with_capacity(EXPECTED_SOURCE_COUNT);
+    let mut sources = Vec::with_capacity(rows.len());
     for row in rows {
         sources.push(parse_source(row)?);
     }
-    if sources[0].source_id == sources[1].source_id {
+    if sources.iter().enumerate().any(|(index, source)| {
+        sources[..index]
+            .iter()
+            .any(|previous| previous.source_id == source.source_id)
+    }) {
         return Err(());
     }
     Ok(sources)

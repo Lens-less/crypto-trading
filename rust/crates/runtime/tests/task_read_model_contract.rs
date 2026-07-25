@@ -172,6 +172,104 @@ fn arbitrage_paper_kind_reuses_the_same_durable_recovery_contract() {
 }
 
 #[test]
+fn grid_paper_projects_a_single_source_task_without_fabricating_a_pair() {
+    let snapshot = snapshot(jsonl(&[
+        task_record_with_kind(
+            "grid_paper",
+            "task_registered",
+            "registered",
+            0,
+            grid_registered_sources(),
+            None,
+            None,
+            "2026-07-25T00:00:00Z",
+        ),
+        task_record_with_kind(
+            "grid_paper",
+            "task_running",
+            "running",
+            3,
+            grid_running_sources(3, "healthy"),
+            None,
+            None,
+            "2026-07-25T00:00:01Z",
+        ),
+        task_record_with_kind(
+            "grid_paper",
+            "task_stopped",
+            "stopped",
+            3,
+            grid_stopped_sources(3),
+            Some("completed"),
+            None,
+            "2026-07-25T00:00:02Z",
+        ),
+    ]));
+
+    let model = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.tasks.len(), 1);
+    assert_eq!(model.tasks[0].kind, ReadOnlyTaskKind::GridPaper);
+    assert_eq!(model.tasks[0].phase, ReadOnlyTaskPhase::Stopped);
+    assert_eq!(model.tasks[0].recovery, ReadOnlyTaskRecovery::None);
+    assert_eq!(model.tasks[0].sources.len(), 1);
+    assert_eq!(model.tasks[0].sources[0].source_id, "grid-paper");
+    assert_eq!(model.tasks[0].exit, Some(ReadOnlyTaskExit::Completed));
+}
+
+#[test]
+fn task_kind_rejects_the_wrong_source_cardinality() {
+    let cases = [
+        ("arbitrage_monitor", grid_registered_sources()),
+        ("arbitrage_paper", grid_registered_sources()),
+        ("grid_paper", registered_sources()),
+        ("grid_paper", json!([])),
+    ];
+
+    for (kind, sources) in cases {
+        let snapshot = snapshot(jsonl(&[task_record_with_kind(
+            kind,
+            "task_registered",
+            "registered",
+            0,
+            sources,
+            None,
+            None,
+            "2026-07-25T00:00:00Z",
+        )]));
+        let model = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            model.projection_status,
+            ProjectionStatus::Degraded,
+            "{kind}"
+        );
+        assert_eq!(model.invalid_event_count, 1, "{kind}");
+        assert!(model.tasks.is_empty(), "{kind}");
+    }
+
+    let mut three_sources = registered_sources();
+    three_sources
+        .as_array_mut()
+        .unwrap()
+        .push(source(None, "third", "starting", "unknown", 0, 0, None));
+    let snapshot = snapshot(jsonl(&[task_record_with_kind(
+        "arbitrage_monitor",
+        "task_registered",
+        "registered",
+        0,
+        three_sources,
+        None,
+        None,
+        "2026-07-25T00:00:00Z",
+    )]));
+    let model = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
+    assert_eq!(model.projection_status, ProjectionStatus::Degraded);
+    assert_eq!(model.invalid_event_count, 1);
+    assert!(model.tasks.is_empty());
+}
+
+#[test]
 fn normal_terminal_requires_every_source_to_be_durably_stopped() {
     let snapshot = snapshot(jsonl(&[
         task_record(
@@ -538,6 +636,18 @@ fn registered_sources() -> Value {
     ])
 }
 
+fn grid_registered_sources() -> Value {
+    json!([source(
+        None,
+        "grid-paper",
+        "starting",
+        "unknown",
+        0,
+        0,
+        None
+    )])
+}
+
 fn running_sources(event_sequence: u64, left_health: &str, right_health: &str) -> Value {
     json!([
         source(
@@ -559,6 +669,18 @@ fn running_sources(event_sequence: u64, left_health: &str, right_health: &str) -
             None,
         ),
     ])
+}
+
+fn grid_running_sources(event_sequence: u64, health: &str) -> Value {
+    json!([source(
+        Some("00000000-0000-0000-0000-000000000103"),
+        "grid-paper",
+        "running",
+        health,
+        event_sequence,
+        u32::from(health == "degraded"),
+        None,
+    )])
 }
 
 fn stopping_sources(event_sequence: u64) -> Value {
@@ -616,6 +738,23 @@ fn stopped_sources(event_sequence: u64) -> Value {
             Some("stop_requested"),
         ),
     ])
+}
+
+fn grid_stopped_sources(event_sequence: u64) -> Value {
+    let health = if event_sequence == 0 {
+        "unknown"
+    } else {
+        "healthy"
+    };
+    json!([source(
+        Some("00000000-0000-0000-0000-000000000103"),
+        "grid-paper",
+        "stopped",
+        health,
+        event_sequence,
+        0,
+        Some("source_ended"),
+    )])
 }
 
 fn source(
