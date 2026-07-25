@@ -274,6 +274,27 @@ impl TaskProjectionBuilder {
         };
 
         let task = &mut self.tasks[index];
+        let restarting = task.phase == ReadOnlyTaskPhase::Stopped
+            && task.recovery == ReadOnlyTaskRecovery::None
+            && fact.decision == TaskDecision::Registered
+            && task.kind == fact.kind
+            && same_source_identities(&task.sources, &fact.sources);
+        if restarting {
+            // One stable owner identity may have multiple clean process runs.
+            // Registration resets only the lifecycle/source instance; account
+            // operations retain their independent durable identities.
+            task.first_sequence = fact.source_sequence;
+            task.last_sequence = fact.source_sequence;
+            task.registered_at = fact.recorded_at;
+            task.updated_at = fact.recorded_at;
+            task.phase = fact.phase;
+            task.recovery = recovery_for(fact.phase, fact.exit);
+            task.processed_event_count = fact.processed_event_count;
+            task.sources = fact.sources;
+            task.exit = fact.exit;
+            task.failure = fact.failure;
+            return Ok(());
+        }
         if !valid_transition(task.phase, fact.phase, fact.decision)
             || task.kind != fact.kind
             || fact.processed_event_count < task.processed_event_count
@@ -576,6 +597,17 @@ fn parse_source(value: &Value) -> Result<ReadOnlyTaskSourceView, ()> {
         last_event_at,
         exit,
     })
+}
+
+fn same_source_identities(
+    previous: &[ReadOnlyTaskSourceView],
+    next: &[ReadOnlyTaskSourceView],
+) -> bool {
+    previous.len() == next.len()
+        && previous
+            .iter()
+            .zip(next)
+            .all(|(previous, next)| previous.source_id == next.source_id)
 }
 
 fn same_source_contract(
