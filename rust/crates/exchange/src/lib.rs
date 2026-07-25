@@ -11,6 +11,7 @@ mod instrument;
 mod model;
 mod paper;
 mod remote;
+mod sha256;
 mod symbol;
 mod unsupported;
 

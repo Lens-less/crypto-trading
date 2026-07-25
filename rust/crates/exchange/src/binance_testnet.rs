@@ -5,7 +5,6 @@ use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, Order, OrderIntent, OrderStatus, OrderType, Position,
     PositionSide, Price, Quantity, Side, Symbol, TimeInForce,
 };
-use ring::hmac;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
@@ -13,7 +12,7 @@ use crate::{
     BinanceProduct, BinanceTestnetEndpoints, ExchangeError, ExchangeOperation,
     ExchangeOperationKey, ExchangeSymbolCatalog, ForeignOrder, InstrumentRuleCatalog,
     RemoteHttpMethod, RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport,
-    SubmissionDisposition, TradingReceipt,
+    SubmissionDisposition, TradingReceipt, sha256::HmacSha256Key,
 };
 
 const EXCHANGE: &str = "binance";
@@ -44,7 +43,7 @@ pub trait BinanceRequestSigner: Send + Sync {
 #[derive(Clone)]
 pub struct BinanceHmacSha256Signer {
     api_key: String,
-    secret: hmac::Key,
+    secret: HmacSha256Key,
 }
 
 impl fmt::Debug for BinanceHmacSha256Signer {
@@ -73,7 +72,7 @@ impl BinanceHmacSha256Signer {
         validate_secret_text("Binance API secret", &api_secret, MAX_SECRET_BYTES)?;
         Ok(Self {
             api_key,
-            secret: hmac::Key::new(hmac::HMAC_SHA256, api_secret.as_bytes()),
+            secret: HmacSha256Key::new(api_secret.as_bytes()),
         })
     }
 }
@@ -84,8 +83,7 @@ impl BinanceRequestSigner for BinanceHmacSha256Signer {
     }
 
     fn sign(&self, payload: &str) -> Result<String, ExchangeError> {
-        let signature = hmac::sign(&self.secret, payload.as_bytes());
-        Ok(hex_lower(signature.as_ref()))
+        Ok(hex_lower(&self.secret.sign(payload.as_bytes())))
     }
 }
 
