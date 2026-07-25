@@ -129,14 +129,16 @@ label {
 
 .confirm-row {
   grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
+  align-items: center;
   gap: 10px;
+  min-height: 40px;
+  padding-block: 8px;
 }
 
 .confirm-row input {
   width: auto;
   min-height: 20px;
-  margin: 2px 0 0;
+  margin: 0;
   padding: 0;
 }
 

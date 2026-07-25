@@ -293,6 +293,9 @@ fn assert_m6_information_architecture_contract(javascript: &str, css: &str) {
     }
     assert!(css.contains(".subregion {"));
     assert!(css.contains("grid-template-columns: repeat(3, minmax(0, 1fr));"));
+    assert!(css.contains(
+        ".confirm-row {\n  grid-template-columns: auto minmax(0, 1fr);\n  align-items: center;\n  gap: 10px;\n  min-height: 40px;"
+    ));
 }
 
 fn assert_monitor_surface_contract(javascript: &str, css: &str) {

@@ -23,6 +23,8 @@ use uuid::Uuid;
 mod paper_dispatcher;
 mod submit;
 
+const PAPER_WRITE_PRINCIPAL_ID: &str = "local-paper-operator";
+
 pub use paper_dispatcher::TrustedPaperSubmitDispatcher;
 pub use submit::{
     MAX_TRUSTED_SUBMIT_BODY_BYTES, TrustedSubmitApplication, TrustedSubmitIdentity,
@@ -64,10 +66,6 @@ pub struct PaperWriteArgs {
     /// Explicitly enable the loopback-only trusted submit route.
     #[arg(long, default_value_t = false)]
     pub enable_paper_writes: bool,
-
-    /// Stable server-side principal that all paper submit envelopes must match exactly.
-    #[arg(long, default_value = "local-paper-operator")]
-    pub principal_id: String,
 
     /// Stable task identity for the one configured replay-backed paper grid owner.
     #[arg(long, value_name = "TASK_ID")]
@@ -262,7 +260,7 @@ fn write_mode_config(cli: &Cli) -> Result<Option<WriteModeConfig>> {
         .as_deref()
         .context("trusted paper writes require --bearer-token-env")?;
     let bearer_token = bearer_token_from_env(bearer_env)?;
-    let identity = TrustedSubmitIdentity::paper_operator(cli.paper_write.principal_id.clone())
+    let identity = TrustedSubmitIdentity::paper_operator(PAPER_WRITE_PRINCIPAL_ID)
         .context("trusted paper write principal is invalid")?;
     let catalog = PaperProfileCatalog::new(PaperProfileCatalogInput {
         grid: grid_profile_input(&cli.paper_write)?,
@@ -377,7 +375,9 @@ fn bearer_token_from_env(name: &str) -> Result<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Cli, PaperWriteArgs, access_policy, prepare, write_mode_config};
+    use super::{
+        Cli, PAPER_WRITE_PRINCIPAL_ID, PaperWriteArgs, access_policy, prepare, write_mode_config,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -405,7 +405,23 @@ mod tests {
         assert_eq!(cli.journal_id.to_string(), JOURNAL_ID);
         assert_eq!(cli.port, 0);
         assert!(cli.bearer_token_env.is_none());
-        assert_eq!(cli.paper_write.principal_id, "local-paper-operator");
+        assert_eq!(PAPER_WRITE_PRINCIPAL_ID, "local-paper-operator");
+    }
+
+    #[test]
+    fn command_line_cannot_override_the_browser_paper_principal() {
+        assert!(
+            Cli::try_parse_from([
+                "crypto-trading-web",
+                "--history-path",
+                "fixture.jsonl",
+                "--journal-id",
+                JOURNAL_ID,
+                "--principal-id",
+                "operator-b",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
