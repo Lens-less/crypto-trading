@@ -1,0 +1,29 @@
+services:
+  operator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: crypto-trading:production-candidate
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CRYPTO_TRADING_WEB_TOKEN: ${CRYPTO_TRADING_WEB_TOKEN:?set CRYPTO_TRADING_WEB_TOKEN}
+    command:
+      - --history-path
+      - /var/lib/crypto-trading/operations.jsonl
+      - --journal-id
+      - ${CRYPTO_TRADING_JOURNAL_ID:?set CRYPTO_TRADING_JOURNAL_ID}
+      - --port
+      - "8787"
+      - --bearer-token-env
+      - CRYPTO_TRADING_WEB_TOKEN
+    volumes:
+      - ${CRYPTO_TRADING_DATA_DIR:?set CRYPTO_TRADING_DATA_DIR}:/var/lib/crypto-trading
+      - ../rust/config:/etc/crypto-trading:ro

@@ -1,0 +1,17 @@
+.git
+.github
+.agents
+.codex
+.omx
+archive
+design-previews
+docs
+target
+rust/target
+rust/temp-*
+*.log
+**/*.lock.json
+**/.env
+**/.env.*
+**/*secret*
+**/*credential*
