@@ -72,6 +72,14 @@ const TOKEN_LABELS = new Map([
   ["request-only", "仅请求"],
   ["config-only", "仅配置"],
   ["not-applicable", "不适用"],
+  ["configured", "\u5df2\u914d\u7f6e"],
+  ["not_configured", "\u672a\u914d\u7f6e"],
+  ["not_accepted", "\u4e0d\u63a5\u53d7"],
+  ["not_projected", "\u672a\u6295\u5f71"],
+  ["stdout_stderr", "stdout / stderr"],
+  ["journal_projection", "Journal \u6295\u5f71"],
+  ["grid", "Grid"],
+  ["arbitrage", "Arbitrage"],
 ]);
 for (const [token, label] of [
   ["arbitrage_paper", "Paper \u5957\u5229"],
@@ -181,6 +189,8 @@ const state = {
   alerts: null,
   tasks: null,
   scanner: null,
+  risk: null,
+  settings: null,
   capabilities: null,
   executions: null,
   lastPage: null,
@@ -198,6 +208,8 @@ const state = {
     alerts: "idle",
     tasks: "idle",
     scanner: "idle",
+    risk: "idle",
+    settings: "idle",
     capabilities: "idle",
     executions: "idle",
   },
@@ -207,6 +219,8 @@ const state = {
     alerts: null,
     tasks: null,
     scanner: null,
+    risk: null,
+    settings: null,
     capabilities: null,
     executions: null,
   },
@@ -254,6 +268,8 @@ async function bootstrap() {
     loadAlerts(),
     loadTasks(),
     loadScanner(),
+    loadRisk(),
+    loadSettings(),
     loadCapabilities(),
     loadExecutions(),
   ]);
@@ -331,6 +347,8 @@ function clearProtectedState() {
   state.alerts = null;
   state.tasks = null;
   state.scanner = null;
+  state.risk = null;
+  state.settings = null;
   state.capabilities = null;
   state.executions = null;
   state.lastPage = null;
@@ -344,6 +362,8 @@ function clearProtectedState() {
     alerts: "idle",
     tasks: "idle",
     scanner: "idle",
+    risk: "idle",
+    settings: "idle",
     capabilities: "idle",
     executions: "idle",
   };
@@ -353,6 +373,8 @@ function clearProtectedState() {
     alerts: null,
     tasks: null,
     scanner: null,
+    risk: null,
+    settings: null,
     capabilities: null,
     executions: null,
   };
@@ -533,6 +555,57 @@ async function loadScanner() {
   render();
 }
 
+async function loadRisk() {
+  const generation = state.sessionGeneration;
+  state.loads.risk = "loading";
+  state.errors.risk = null;
+  render();
+  try {
+    const risk = await fetchJson("/api/v1/risk");
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    state.risk = risk;
+    state.lastSnapshotAt = Date.now();
+    state.loads.risk = "ready";
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    if (!markAuthenticationRequired(problem)) {
+      state.loads.risk = "error";
+      state.errors.risk = problem;
+    }
+  }
+  render();
+}
+
+async function loadSettings() {
+  const generation = state.sessionGeneration;
+  state.loads.settings = "loading";
+  state.errors.settings = null;
+  render();
+  try {
+    const settings = await fetchJson("/api/v1/settings");
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    state.settings = settings;
+    state.loads.settings = "ready";
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    if (!markAuthenticationRequired(problem)) {
+      state.loads.settings = "error";
+      state.errors.settings = problem;
+    }
+  }
+  render();
+}
+
 async function loadCapabilities() {
   const generation = state.sessionGeneration;
   state.loads.capabilities = "loading";
@@ -606,6 +679,7 @@ async function refreshOperationalTruth() {
       loadAlerts(),
       loadTasks(),
       loadScanner(),
+      loadRisk(),
       loadExecutions(),
     ]);
   } finally {
@@ -2535,6 +2609,9 @@ function renderRiskView() {
   const riskyBatches = attentionBatches();
   const tasks = attentionTasks();
   const capabilities = capabilityRowsFor("risk");
+  const paperAccounts = Array.isArray(state.risk?.accounts)
+    ? state.risk.accounts
+    : [];
   return el("section", { className: "view-stack" }, [
     renderRegion({
       title: "风险总览",
@@ -2597,7 +2674,157 @@ function renderRiskView() {
               )
           : renderSkeleton(6),
     }),
+    renderPaperRiskRegion(paperAccounts),
   ]);
+}
+
+function renderPaperRiskRegion(accounts) {
+  const pendingReserved = totalPaperAccountMetric(accounts, "pending_reserved");
+  const uncertainReserved = totalPaperAccountMetric(accounts, "uncertain_reserved");
+  const committedExposure = totalPaperAccountMetric(accounts, "committed_exposure");
+  const totalExposure = sumDecimalValues([
+    pendingReserved,
+    uncertainReserved,
+    committedExposure,
+  ]);
+  let body = renderEmpty(
+    "\u5c1a\u672a\u6295\u5f71\u51fa Paper \u8d26\u6237\u9884\u7559\u3002",
+    "\u5df2\u68c0\u67e5 /api/v1/risk\uff1b\u7a7a\u96c6\u5408\u8868\u793a journal \u4e2d\u6ca1\u6709\u53ef\u9a8c\u8bc1\u7684 paper_account \u4e8b\u5b9e\u3002",
+  );
+  if (state.loads.risk === "error" && !state.risk) {
+    body = renderError(state.errors.risk);
+  } else if (state.loads.risk === "loading" && !state.risk) {
+    body = renderSkeleton(6);
+  } else if (accounts.length > 0) {
+    body = el("div", { className: "view-stack" }, [
+      el("div", { className: "detail-grid" }, [
+        detailStat("\u8d26\u6237", accounts.length),
+        detailStat("\u5f85\u5904\u7406\u9884\u7559", pendingReserved),
+        detailStat("\u4e0d\u786e\u5b9a\u9884\u7559", uncertainReserved),
+        detailStat("\u5df2\u786e\u8ba4\u655e\u53e3", committedExposure),
+        detailStat("\u8d26\u6237\u7ea7\u603b\u655e\u53e3", totalExposure),
+        detailStat(
+          "\u6295\u5f71",
+          humanizeToken(state.risk?.projection_status || "unavailable"),
+        ),
+      ]),
+      renderPaperAccountTable(accounts),
+      renderPaperReservationTable(accounts),
+    ]);
+  }
+  return renderRegion({
+    title: "\u8d26\u6237\u9884\u7559\u4e0e\u603b\u655e\u53e3",
+    subtitle:
+      "\u6570\u503c\u6765\u81ea durable PaperAccountReadModel\uff1b\u672c\u9875\u53ea\u8bfb\uff0c\u4e0d\u63d0\u4f9b\u91ca\u653e\u3001\u63d0\u4ea4\u6216 reconcile \u64cd\u4f5c\u3002",
+    body,
+  });
+}
+
+function renderPaperAccountTable(accounts) {
+  return el("div", { className: "table-wrap" }, [
+    el("table", {}, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "\u8d26\u6237" }),
+          el("th", { attrs: { scope: "col" }, text: "\u53ef\u7528" }),
+          el("th", { attrs: { scope: "col" }, text: "\u5f85\u5904\u7406" }),
+          el("th", { attrs: { scope: "col" }, text: "\u4e0d\u786e\u5b9a" }),
+          el("th", { attrs: { scope: "col" }, text: "\u5df2\u63d0\u4ea4" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        accounts.map((account) =>
+          el("tr", {}, [
+            el("td", { className: "mono", text: account.account_id || "--" }),
+            el("td", { className: "mono", text: account.available || "0" }),
+            el("td", { className: "mono", text: account.pending_reserved || "0" }),
+            el("td", { className: "mono", text: account.uncertain_reserved || "0" }),
+            el("td", { className: "mono", text: account.committed_exposure || "0" }),
+          ]),
+        ),
+      ),
+    ]),
+  ]);
+}
+
+function renderPaperReservationTable(accounts) {
+  const reservations = accounts.flatMap((account) =>
+    (account.reservations || []).map((reservation) => ({
+      ...reservation,
+      accountId: account.account_id,
+    })),
+  );
+  if (reservations.length === 0) {
+    return renderEmpty(
+      "\u8d26\u6237\u5c1a\u65e0 reservation \u4e8b\u5b9e\u3002",
+      "\u603b\u655e\u53e3\u4ecd\u4ee5\u4e0a\u65b9\u8d26\u6237\u7ea7\u805a\u5408\u4e3a\u51c6\u3002",
+    );
+  }
+  return el("div", { className: "table-wrap" }, [
+    el("table", {}, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "\u8d26\u6237 / \u4efb\u52a1" }),
+          el("th", { attrs: { scope: "col" }, text: "reservation_id" }),
+          el("th", { attrs: { scope: "col" }, text: "\u9636\u6bb5" }),
+          el("th", { attrs: { scope: "col" }, text: "\u9884\u7559\u655e\u53e3" }),
+          el("th", { attrs: { scope: "col" }, text: "\u5f53\u524d\u5360\u7528" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        reservations.map((reservation) =>
+          el("tr", {}, [
+            el("td", {}, [
+              el("div", { className: "mono", text: reservation.accountId || "--" }),
+              el("div", { className: "muted mono", text: reservation.task_id || "--" }),
+            ]),
+            el("td", { className: "mono", text: reservation.reservation_id || "--" }),
+            el("td", {}, [buildTag(humanizeToken(reservation.phase), "neutral")]),
+            el("td", { className: "mono", text: reservation.reserved_exposure || "0" }),
+            el("td", { className: "mono", text: reservation.held_exposure || "0" }),
+          ]),
+        ),
+      ),
+    ]),
+  ]);
+}
+
+function totalPaperAccountMetric(accounts, field) {
+  return sumDecimalValues(accounts.map((account) => account[field] || "0"));
+}
+
+function sumDecimalValues(values) {
+  const parsed = values.map(parseDecimalForSum);
+  const scale = parsed.reduce(
+    (maximum, value) => Math.max(maximum, value.scale),
+    0,
+  );
+  let total = 0n;
+  for (const value of parsed) {
+    total += value.coefficient * 10n ** BigInt(scale - value.scale);
+  }
+  const negative = total < 0n;
+  const digits = (negative ? -total : total).toString().padStart(scale + 1, "0");
+  if (scale === 0) {
+    return `${negative ? "-" : ""}${digits}`;
+  }
+  const whole = digits.slice(0, -scale);
+  const fraction = digits.slice(-scale).replace(/0+$/, "");
+  return `${negative ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
+}
+
+function parseDecimalForSum(value) {
+  const match = String(value).match(/^(-?)(\d+)(?:\.(\d+))?$/);
+  if (!match) {
+    return { coefficient: 0n, scale: 0 };
+  }
+  const fraction = match[3] || "";
+  const coefficient = BigInt(`${match[1]}${match[2]}${fraction}`);
+  return { coefficient, scale: fraction.length };
 }
 
 function renderReplayView() {
@@ -2649,11 +2876,12 @@ function renderSettingsView() {
         : [],
     ),
   );
+  const runtimeSettings = state.settings;
   return el("section", { className: "view-stack" }, [
     renderRegion({
       title: "访问与外壳",
       subtitle:
-        "这里只展示外壳可见设置；Bearer 只留在页内存，文件系统路径与适配器凭证保持隐藏。",
+        "\u53ea\u5c55\u793a\u53ef\u5b89\u5168\u6295\u5f71\u7684\u8fd0\u884c\u5143\u6570\u636e\uff1bBearer \u53ea\u7559\u5728\u9875\u5185\u5b58\uff0c\u51ed\u8bc1\u503c\u59cb\u7ec8\u4fdd\u6301\u9690\u85cf\u3002",
       body: el("div", { className: "detail-grid" }, [
         detailStat("产品版本", state.system?.product_version || "--"),
         detailStat("发布阶段", state.system?.release_stage || "--"),
@@ -2694,20 +2922,117 @@ function renderSettingsView() {
         ])),
       ]),
     }),
+    renderRuntimeSettingsRegion(runtimeSettings),
     renderRegion({
       title: "只读边界",
       subtitle:
-        "外壳默认只读；仅策略页可选用同源 trusted submit 控制 Paper owner，数据目录、日志路径和适配器凭证仍不投影到浏览器。",
+        "\u5916\u58f3\u9ed8\u8ba4\u53ea\u8bfb\uff1b\u4ec5\u7b56\u7565\u9875\u53ef\u9009\u7528\u540c\u6e90 trusted submit \u63a7\u5236 Paper owner\u3002\u9875\u9762\u53ef\u89c1\u8def\u5f84\u4e0e\u51ed\u8bc1\u914d\u7f6e\u72b6\u6001\uff0c\u4e0d\u53ef\u89c1\u4efb\u4f55\u51ed\u8bc1\u503c\u3002",
       body: el("div", { className: "detail-grid" }, [
         detailStat("HTML 路由", VIEW_IDS.size),
-        detailStat("API 路由", "8 GET + 可选 1 POST"),
+        detailStat("API 路由", "11 GET + 可选 1 POST"),
         detailStat("已见预警适配器", alertAdapters.length),
         detailStat("令牌持久化", "仅页内存"),
-        detailStat("目录", "未投影"),
-        detailStat("凭证", "未投影"),
+        detailStat("\u76ee\u5f55", runtimeSettings?.data_directory || "--"),
+        detailStat(
+          "\u51ed\u8bc1",
+          humanizeToken(
+            runtimeSettings?.credentials?.binance_testnet || "not_projected",
+          ),
+        ),
       ]),
     }),
   ]);
+}
+
+function renderRuntimeSettingsRegion(runtimeSettings) {
+  let body;
+  if (state.loads.settings === "error" && !runtimeSettings) {
+    body = renderError(state.errors.settings);
+  } else if (state.loads.settings === "loading" && !runtimeSettings) {
+    body = renderSkeleton(8);
+  } else if (!runtimeSettings) {
+    body = renderEmpty(
+      "\u5c1a\u672a\u53d6\u5f97\u8fd0\u884c\u8bbe\u7f6e\u6295\u5f71\u3002",
+      "\u5df2\u68c0\u67e5 /api/v1/settings\uff1b\u4e0d\u4f1a\u4ece\u6d4f\u89c8\u5668\u63a8\u65ad\u8def\u5f84\u6216\u51ed\u8bc1\u72b6\u6001\u3002",
+    );
+  } else {
+    const credentials = runtimeSettings.credentials || {};
+    const requestLimit = runtimeSettings.request_limit || {};
+    body = el("div", { className: "evidence-grid" }, [
+      renderSubregion(
+        "\u8fd0\u884c\u8def\u5f84\u4e0e\u65e5\u5fd7",
+        el("div", { className: "detail-grid" }, [
+          detailStat(
+            "\u6570\u636e\u76ee\u5f55",
+            runtimeSettings.data_directory || "\u672a\u914d\u7f6e",
+          ),
+          detailStat(
+            "Journal \u8def\u5f84",
+            runtimeSettings.journal_path || "\u672a\u914d\u7f6e",
+          ),
+          detailStat(
+            "\u65e5\u5fd7\u8f93\u51fa",
+            humanizeToken(runtimeSettings.log_sink || "not_projected"),
+          ),
+          detailStat(
+            "\u901a\u77e5\u8bc1\u636e",
+            humanizeToken(
+              runtimeSettings.notification_evidence || "not_projected",
+            ),
+          ),
+        ]),
+      ),
+      renderSubregion(
+        "\u51ed\u8bc1\u8fb9\u754c",
+        el("div", { className: "detail-grid" }, [
+          detailStat(
+            "Web Bearer",
+            humanizeToken(credentials.web_bearer || "not_projected"),
+          ),
+          detailStat(
+            "Binance Testnet",
+            humanizeToken(credentials.binance_testnet || "not_projected"),
+          ),
+          detailStat(
+            "Mainnet",
+            humanizeToken(credentials.mainnet || "not_accepted"),
+          ),
+          detailStat(
+            "\u72b6\u6001\u542b\u4e49",
+            "\u53ea\u8868\u793a\u914d\u7f6e\u5b8c\u6574\u6027\uff0c\u4e0d\u8fd4\u56de\u503c",
+          ),
+        ]),
+      ),
+      renderSubregion(
+        "\u8bbf\u95ee\u4e0e Paper \u6743\u9650",
+        el("div", { className: "detail-grid" }, [
+          detailStat(
+            "\u8bf7\u6c42\u4e0a\u9650",
+            requestLimit.maximum_requests
+              ? `${requestLimit.maximum_requests} / ${requestLimit.window_seconds || "--"}s`
+              : "--",
+          ),
+          detailStat(
+            "Paper principal",
+            runtimeSettings.paper_principal_id || "\u672a\u542f\u7528\u5199\u5165",
+          ),
+          detailStat(
+            "Paper profiles",
+            Array.isArray(runtimeSettings.paper_profiles)
+              ? runtimeSettings.paper_profiles.length
+              : 0,
+          ),
+          detailStat("Schema", runtimeSettings.schema_version ?? "--"),
+        ]),
+      ),
+    ]);
+  }
+  return renderRegion({
+    title: "\u8fd0\u884c\u8bbe\u7f6e\u6295\u5f71",
+    subtitle:
+      "\u8def\u5f84\u3001\u65e5\u5fd7\u53bb\u5411\u3001\u9650\u6d41\u4e0e\u51ed\u8bc1\u914d\u7f6e\u72b6\u6001\u6765\u81ea\u540e\u7aef\u53d7\u4fe1\u914d\u7f6e\uff1b\u4e0d\u5305\u542b\u79d8\u94a5\u6216\u4ee4\u724c\u5185\u5bb9\u3002",
+    body,
+  });
 }
 
 function renderSubregion(title, body) {
@@ -3334,6 +3659,7 @@ function renderStrategiesView() {
         renderStrategyTaskControl("grid"),
       ]),
     }),
+    renderStrategyConfigurationRegion(),
     renderRegion({
       title: "只读策略证据",
       subtitle:
@@ -3389,6 +3715,176 @@ function renderStrategiesView() {
               )
           : renderSkeleton(6),
     }),
+  ]);
+}
+
+function renderStrategyConfigurationRegion() {
+  const runtimeSettings = state.settings;
+  const profiles = Array.isArray(runtimeSettings?.paper_profiles)
+    ? runtimeSettings.paper_profiles
+    : [];
+  const latestMonitor = state.monitor?.latest || null;
+  const latestScanner = state.scanner?.latest || null;
+  const alertOccurrences = visibleAlertOccurrences(state.alerts);
+  const alertInstruments = uniqueValues(
+    alertOccurrences.map((occurrence) =>
+      occurrence.exchange && occurrence.symbol
+        ? `${occurrence.exchange}/${occurrence.symbol}`
+        : "",
+    ),
+  );
+  const alertKinds = uniqueValues(
+    alertOccurrences.map((occurrence) => occurrence.kind),
+  );
+  const alertAdapters = uniqueValues(
+    alertOccurrences.flatMap((occurrence) =>
+      Array.isArray(occurrence.deliveries)
+        ? occurrence.deliveries.map((delivery) => delivery.adapter_id)
+        : [],
+    ),
+  );
+
+  let profileBody;
+  if (state.loads.settings === "error" && !runtimeSettings) {
+    profileBody = renderError(state.errors.settings);
+  } else if (state.loads.settings === "loading" && !runtimeSettings) {
+    profileBody = renderSkeleton(6);
+  } else if (profiles.length === 0) {
+    profileBody = renderEmpty(
+      "\u5f53\u524d\u8fd0\u884c\u5b9e\u4f8b\u6ca1\u6709\u914d\u7f6e Paper profile\u3002",
+      "\u5df2\u68c0\u67e5 /api/v1/settings \u7684 paper_profiles\uff0c\u4e0d\u4f1a\u4ece\u8868\u5355\u9ed8\u8ba4\u503c\u63a8\u65ad\u540e\u7aef\u6240\u6709\u6743\u3002",
+    );
+  } else {
+    profileBody = renderPaperProfileTable(profiles);
+  }
+
+  return renderRegion({
+    title: "\u7b56\u7565\u914d\u7f6e\u4e0e\u751f\u6548\u8bc1\u636e",
+    subtitle:
+      "\u914d\u7f6e\u6587\u4ef6\u6765\u81ea\u53d7\u4fe1 settings\uff1b\u76d1\u63a7\u3001Scanner \u548c\u9884\u8b66\u53c2\u6570\u53ea\u5c55\u793a journal \u6700\u65b0 durable effective evidence\uff0c\u4e0d\u5192\u5145\u539f\u59cb\u914d\u7f6e\u3002",
+    body: el("div", { className: "evidence-grid" }, [
+      renderSubregion("Paper profiles", profileBody),
+      renderSubregion(
+        "\u5957\u5229\u76d1\u63a7\u751f\u6548\u8bc1\u636e",
+        el("div", { className: "detail-grid" }, [
+          detailStat(
+            "\u5de6\u817f",
+            latestMonitor?.left
+              ? `${latestMonitor.left.exchange}/${latestMonitor.left.symbol}`
+              : "--",
+          ),
+          detailStat(
+            "\u53f3\u817f",
+            latestMonitor?.right
+              ? `${latestMonitor.right.exchange}/${latestMonitor.right.symbol}`
+              : "--",
+          ),
+          detailStat(
+            "\u9608\u503c",
+            latestMonitor?.projection?.threshold_percent
+              ? `${latestMonitor.projection.threshold_percent}%`
+              : "--",
+          ),
+          detailStat(
+            "\u8fde\u7eed\u6027",
+            humanizeToken(
+              latestMonitor?.projection?.continuity || "not_available",
+            ),
+          ),
+        ]),
+      ),
+      renderSubregion(
+        "Scanner \u751f\u6548\u8bc1\u636e",
+        el("div", { className: "detail-grid" }, [
+          detailStat(
+            "\u6392\u5e8f\u7b56\u7565",
+            humanizeToken(latestScanner?.ranking_policy || "not_available"),
+          ),
+          detailStat(
+            "APR \u7a97\u53e3",
+            latestScanner?.apr_window_seconds
+              ? `${latestScanner.apr_window_seconds}s`
+              : "--",
+          ),
+          detailStat(
+            "\u6700\u5c0f\u5b8c\u6574\u5faa\u73af",
+            latestScanner?.min_complete_cycles ?? "--",
+          ),
+          detailStat(
+            "\u8fd4\u56de\u884c\u4e0a\u9650",
+            latestScanner?.row_limit ?? latestScanner?.rows?.length ?? "--",
+          ),
+        ]),
+      ),
+      renderSubregion(
+        "\u9884\u8b66\u751f\u6548\u8bc1\u636e",
+        el("div", { className: "detail-grid" }, [
+          detailStat(
+            "\u5df2\u89c2\u6d4b\u6807\u7684",
+            alertInstruments.length ? alertInstruments.join(", ") : "--",
+          ),
+          detailStat(
+            "\u5df2\u89c2\u6d4b\u7c7b\u578b",
+            alertKinds.length
+              ? alertKinds.map((kind) => humanizeToken(kind)).join(", ")
+              : "--",
+          ),
+          detailStat(
+            "\u5df2\u89c2\u6d4b\u9002\u914d\u5668",
+            alertAdapters.length ? alertAdapters.join(", ") : "--",
+          ),
+          detailStat(
+            "\u8bc1\u636e\u8fb9\u754c",
+            humanizeToken(state.alerts?.boundary?.kind || "snapshot_end"),
+          ),
+        ]),
+      ),
+    ]),
+  });
+}
+
+function renderPaperProfileTable(profiles) {
+  return el("div", { className: "table-wrap" }, [
+    el("table", {}, [
+      el("thead", {}, [
+        el("tr", {}, [
+          el("th", { attrs: { scope: "col" }, text: "\u7c7b\u578b / \u4efb\u52a1" }),
+          el("th", { attrs: { scope: "col" }, text: "\u7b56\u7565 / \u7248\u672c" }),
+          el("th", { attrs: { scope: "col" }, text: "\u914d\u7f6e\u8bc1\u636e" }),
+        ]),
+      ]),
+      el(
+        "tbody",
+        {},
+        profiles.map((profile) =>
+          el("tr", {}, [
+            el("td", {}, [
+              buildTag(humanizeToken(profile.kind), "info"),
+              el("div", { className: "mono", text: profile.task_id || "--" }),
+            ]),
+            el("td", {}, [
+              el("div", { className: "mono", text: profile.strategy_id || "--" }),
+              el("div", {
+                className: "muted mono",
+                text: profile.strategy_revision || "--",
+              }),
+            ]),
+            el("td", {}, [
+              el("div", {
+                className: "mono visually-contained",
+                text: Array.isArray(profile.configuration_files)
+                  ? profile.configuration_files.join(", ")
+                  : "--",
+              }),
+              el("div", {
+                className: "muted mono visually-contained",
+                text: profile.replay_file || "--",
+              }),
+            ]),
+          ]),
+        ),
+      ),
+    ]),
   ]);
 }
 
@@ -4160,6 +4656,8 @@ function hasAnyData() {
       state.alerts ||
       state.tasks ||
       state.scanner ||
+      state.risk ||
+      state.settings ||
       state.capabilities ||
       state.executions,
   );

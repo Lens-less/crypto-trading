@@ -16,7 +16,9 @@ use crypto_trading_cli::{
 use crypto_trading_control_plane::{SubmitDispatchOutcome, SubmitDispatcher, SubmitService};
 use crypto_trading_runtime::{FileJournalSnapshotSource, JournalSnapshotSource};
 use crypto_trading_web::{
-    ReadControlPlane, WebAccessPolicy, WebServerConfig, app_router, serve_with_shutdown,
+    CredentialConfiguration, CredentialSettings, NotificationEvidence, PaperProfileKind,
+    PaperProfileSettings, ReadControlPlane, RuntimeLogSink, SettingsResponse, WebAccessPolicy,
+    WebRequestRateLimiter, WebServerConfig, app_router_with_settings, serve_with_shutdown,
 };
 use uuid::Uuid;
 
@@ -28,7 +30,7 @@ const PAPER_WRITE_PRINCIPAL_ID: &str = "local-paper-operator";
 pub use paper_dispatcher::TrustedPaperSubmitDispatcher;
 pub use submit::{
     MAX_TRUSTED_SUBMIT_BODY_BYTES, TrustedSubmitApplication, TrustedSubmitIdentity,
-    bind_trusted_submit_app,
+    bind_trusted_submit_app, bind_trusted_submit_app_with_settings,
 };
 
 /// Local control-plane server with an explicit opt-in paper-only write mode.
@@ -191,6 +193,7 @@ async fn prepare(
         .context("failed to build the initial operator projection")?;
 
     let control_plane = Arc::new(control_plane);
+    let settings = runtime_settings(cli, write_mode.is_some());
     if let Some(write_mode) = write_mode {
         let dispatcher = Arc::new(TrustedPaperSubmitDispatcher::new(
             cli.journal_id,
@@ -202,12 +205,13 @@ async fn prepare(
             SubmitService::new(cli.journal_id, &cli.history_path, submit_dispatcher)
                 .context("failed to construct the trusted submit service")?,
         );
-        let application = bind_trusted_submit_app(
+        let application = bind_trusted_submit_app_with_settings(
             cli.port,
             control_plane,
             submit,
             write_mode.bearer_token.clone(),
             write_mode.identity.clone(),
+            settings,
         )
         .await?;
         let address = application.address();
@@ -223,8 +227,103 @@ async fn prepare(
     let address = listener
         .local_addr()
         .context("failed to inspect the bound loopback address")?;
-    let router = app_router(control_plane, access);
+    let router = app_router_with_settings(
+        control_plane,
+        access,
+        settings,
+        WebRequestRateLimiter::default(),
+    );
     Ok((listener, router, address, None))
+}
+
+fn runtime_settings(cli: &Cli, paper_writes_enabled: bool) -> SettingsResponse {
+    let mut paper_profiles = Vec::new();
+    if paper_writes_enabled {
+        if let (
+            Some(task_id),
+            Some(strategy_id),
+            Some(strategy_revision),
+            Some(config),
+            Some(replay),
+        ) = (
+            &cli.paper_write.paper_grid_task_id,
+            &cli.paper_write.paper_grid_strategy_id,
+            &cli.paper_write.paper_grid_strategy_revision,
+            &cli.paper_write.paper_grid_config,
+            &cli.paper_write.paper_grid_replay,
+        ) {
+            paper_profiles.push(PaperProfileSettings {
+                kind: PaperProfileKind::Grid,
+                task_id: task_id.clone(),
+                strategy_id: strategy_id.clone(),
+                strategy_revision: strategy_revision.clone(),
+                configuration_files: vec![config.display().to_string()],
+                replay_file: replay.display().to_string(),
+            });
+        }
+        if let (
+            Some(task_id),
+            Some(strategy_id),
+            Some(strategy_revision),
+            Some(arbitrage_config),
+            Some(monitor_config),
+            Some(replay),
+        ) = (
+            &cli.paper_write.paper_arbitrage_task_id,
+            &cli.paper_write.paper_arbitrage_strategy_id,
+            &cli.paper_write.paper_arbitrage_strategy_revision,
+            &cli.paper_write.paper_arbitrage_config,
+            &cli.paper_write.paper_arbitrage_monitor_config,
+            &cli.paper_write.paper_arbitrage_replay,
+        ) {
+            paper_profiles.push(PaperProfileSettings {
+                kind: PaperProfileKind::Arbitrage,
+                task_id: task_id.clone(),
+                strategy_id: strategy_id.clone(),
+                strategy_revision: strategy_revision.clone(),
+                configuration_files: vec![
+                    arbitrage_config.display().to_string(),
+                    monitor_config.display().to_string(),
+                ],
+                replay_file: replay.display().to_string(),
+            });
+        }
+    }
+    let data_directory = cli
+        .history_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .display()
+        .to_string();
+    SettingsResponse {
+        data_directory: Some(data_directory),
+        journal_path: Some(cli.history_path.display().to_string()),
+        log_sink: RuntimeLogSink::StdoutStderr,
+        notification_evidence: NotificationEvidence::JournalProjection,
+        credentials: CredentialSettings {
+            web_bearer: if cli.bearer_token_env.is_some() {
+                CredentialConfiguration::Configured
+            } else {
+                CredentialConfiguration::NotConfigured
+            },
+            binance_testnet: credential_pair_status("BINANCE_API_KEY", "BINANCE_API_SECRET"),
+            mainnet: CredentialConfiguration::NotAccepted,
+        },
+        paper_principal_id: paper_writes_enabled.then(|| PAPER_WRITE_PRINCIPAL_ID.to_owned()),
+        paper_profiles,
+        ..SettingsResponse::default()
+    }
+}
+
+fn credential_pair_status(key_name: &str, secret_name: &str) -> CredentialConfiguration {
+    let present =
+        |name: &str| env::var_os(name).is_some_and(|value| !value.as_encoded_bytes().is_empty());
+    match (present(key_name), present(secret_name)) {
+        (true, true) => CredentialConfiguration::Configured,
+        (false, false) => CredentialConfiguration::NotConfigured,
+        _ => CredentialConfiguration::Partial,
+    }
 }
 
 fn access_policy(cli: &Cli) -> Result<WebAccessPolicy> {
@@ -376,7 +475,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Cli, PAPER_WRITE_PRINCIPAL_ID, PaperWriteArgs, access_policy, prepare, write_mode_config,
+        Cli, PAPER_WRITE_PRINCIPAL_ID, PaperWriteArgs, access_policy, prepare, runtime_settings,
+        write_mode_config,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -485,6 +585,45 @@ mod tests {
         assert!(error.contains("require --bearer-token-env"));
     }
 
+    #[test]
+    fn configured_paper_profiles_are_visible_without_exposing_secrets() {
+        let cli = Cli::try_parse_from([
+            "crypto-trading-web",
+            "--history-path",
+            "var/history/operations.jsonl",
+            "--journal-id",
+            JOURNAL_ID,
+            "--bearer-token-env",
+            "CRYPTO_TRADING_WEB_TOKEN",
+            "--enable-paper-writes",
+            "--paper-grid-task-id",
+            "paper-grid-owner",
+            "--paper-grid-strategy-id",
+            "grid.strategy",
+            "--paper-grid-strategy-revision",
+            "grid.v1",
+            "--paper-grid-config",
+            "config/grid.yaml",
+            "--paper-grid-replay",
+            "fixtures/grid.jsonl",
+        ])
+        .unwrap();
+
+        let settings = runtime_settings(&cli, true);
+        assert_eq!(
+            settings.paper_principal_id.as_deref(),
+            Some(PAPER_WRITE_PRINCIPAL_ID)
+        );
+        assert_eq!(settings.paper_profiles.len(), 1);
+        assert_eq!(settings.paper_profiles[0].task_id, "paper-grid-owner");
+        assert_eq!(
+            settings.paper_profiles[0].configuration_files,
+            vec!["config/grid.yaml"]
+        );
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert!(!encoded.contains("CRYPTO_TRADING_WEB_TOKEN"));
+    }
+
     #[tokio::test]
     async fn offline_fixture_builds_the_loopback_application() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -501,6 +640,28 @@ mod tests {
         assert!(address.ip().is_loopback());
         assert!(dispatcher.is_none());
         assert_ne!(address.port(), 0);
+
+        let settings_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings_response.status(), StatusCode::OK);
+        let settings_body = to_bytes(settings_response.into_body(), 65_536)
+            .await
+            .unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&settings_body).unwrap();
+        assert_eq!(
+            settings["journal_path"],
+            cli.history_path.display().to_string()
+        );
+        assert_eq!(settings["credentials"]["mainnet"], "not_accepted");
+        assert!(settings["paper_principal_id"].is_null());
 
         let response = router
             .oneshot(

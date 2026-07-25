@@ -8,7 +8,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{
         Request, Response, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     },
 };
 use crypto_trading_control_plane::ReadControlPlane;
@@ -353,6 +353,131 @@ async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
 }
 
 #[tokio::test]
+async fn risk_endpoint_exposes_paper_reservations_and_account_exposure_read_only() {
+    let journal_id = fixed_uuid(1);
+    let reservation_id = fixed_uuid(31);
+    let batch_id = fixed_uuid(32);
+    let bytes = jsonl(&[json!({
+        "timestamp": "2026-07-25T00:00:00Z",
+        "strategy": "paper_account",
+        "symbol": "paper-main",
+        "decision": "paper_account_reserved",
+        "details": {
+            "schema_version": 1,
+            "journal_id": journal_id,
+            "account_id": "paper-main",
+            "initial_available": "1000",
+            "request": {
+                "reservation_id": reservation_id,
+                "task_id": "paper-grid-btc",
+                "idempotency_key": "grid/open/0001",
+                "batch_id": batch_id,
+                "cost_model": {
+                    "version": 1,
+                    "fee_bps": 10,
+                    "funding_buffer_bps": 5,
+                    "slippage_bps": 15
+                },
+                "legs": [{
+                    "index": 0,
+                    "exchange": "paper-binance",
+                    "symbol": "BTC-USDT",
+                    "market_type": "spot",
+                    "side": "buy",
+                    "reserved_notional": "100"
+                }]
+            },
+            "reserved_exposure": "100.30"
+        }
+    })]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.clone().oneshot(get("/api/v1/risk")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    let risk = response_json(response).await;
+    assert_eq!(risk["projection_status"], "complete");
+    assert_eq!(risk["accounts"][0]["account_id"], "paper-main");
+    assert_eq!(risk["accounts"][0]["available"], "899.70");
+    assert_eq!(risk["accounts"][0]["pending_reserved"], "100.30");
+    assert_eq!(
+        risk["accounts"][0]["reservations"][0]["reservation_id"],
+        reservation_id.to_string()
+    );
+
+    let write = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/risk")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn settings_are_bounded_read_only_metadata_without_credential_values() {
+    let app = fixture_app(Vec::new(), WebAccessPolicy::loopback_open());
+    let response = app.clone().oneshot(get("/api/v1/settings")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    let settings = response_json(response).await;
+    assert_eq!(settings["log_sink"], "stdout_stderr");
+    assert_eq!(settings["notification_evidence"], "journal_projection");
+    assert_eq!(settings["credentials"]["mainnet"], "not_accepted");
+    assert_eq!(
+        settings["request_limit"]["maximum_requests"],
+        crypto_trading_web::WEB_REQUEST_LIMIT_PER_MINUTE
+    );
+    assert_eq!(settings["request_limit"]["window_seconds"], 60);
+    let encoded = serde_json::to_string(&settings).unwrap();
+    for forbidden in ["api_key", "api_secret", "bearer_token"] {
+        assert!(!encoded.contains(forbidden));
+    }
+
+    let write = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn authenticated_api_requests_fail_with_retry_after_when_the_window_is_exhausted() {
+    let app = fixture_app(Vec::new(), WebAccessPolicy::loopback_open());
+    for _ in 0..crypto_trading_web::WEB_REQUEST_LIMIT_PER_MINUTE {
+        let response = app
+            .clone()
+            .oneshot(get("/api/v1/capabilities"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let limited = app.oneshot(get("/api/v1/capabilities")).await.unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = limited.headers()[RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((1..=60).contains(&retry_after));
+    assert_eq!(
+        response_json(limited).await["error"]["code"],
+        "rate_limited"
+    );
+}
+
+#[tokio::test]
 async fn executions_use_cursor_as_a_change_watermark_without_exposing_payloads() {
     let bytes = jsonl(&[decision_record(&json!({
         "api_key": "super-secret",
@@ -424,6 +549,12 @@ async fn optional_auth_never_prints_the_token_and_protects_every_route() {
     assert!(debug.contains("authentication_required: true"));
     assert!(!debug.contains(TOKEN));
     let app = fixture_app(Vec::new(), access);
+
+    let health = app.clone().oneshot(get("/api/v1/health")).await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let health = response_json(health).await;
+    assert_eq!(health["status"], "ready");
+    assert_eq!(health["live_trading_enabled"], false);
 
     let unauthorized = app.clone().oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use crypto_trading_runtime::{
     CapabilityError, CursorError, JournalPage, JournalPageBoundary, JournalReadError,
-    JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope, ReadModelError,
-    current_capability_manifest,
+    JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope,
+    PaperAccountProjectionError, ReadModelError, current_capability_manifest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,7 +34,8 @@ pub use crypto_trading_runtime::{
     AlertOccurrenceView, ArbitrageMonitorProjection, ArbitrageMonitorReadModel,
     ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState, MonitorContinuityState,
     MonitorFreshnessState, MonitorLegView, MonitorProjectionState, OperatorReadModel,
-    PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PriceAlertReadModel, ProjectionStatus,
+    PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PaperAccountReadModel,
+    PaperAccountSnapshot, PriceAlertReadModel, ProjectionStatus,
     READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit, ReadOnlyTaskFailure,
     ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
     ReadOnlyTaskSourceExit, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
@@ -44,7 +45,7 @@ pub use crypto_trading_runtime::{
     VirtualGridScannerReadModel,
 };
 
-pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
 
 /// Stable transport-independent classification for safe public error mapping.
@@ -106,6 +107,7 @@ impl ReadControlPlane {
         let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)?;
         let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)?;
         let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)?;
+        let paper_accounts = PaperAccountReadModel::from_legacy_snapshot(&journal)?;
         Ok(ControlPlaneSnapshot {
             schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
             capabilities: self.capabilities.clone(),
@@ -114,6 +116,7 @@ impl ReadControlPlane {
             alerts,
             tasks,
             scanner,
+            paper_accounts,
         })
     }
 
@@ -181,6 +184,8 @@ impl ReadControlPlane {
             .map_err(ControlPlaneReadError::Projection)?;
         let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)
             .map_err(ControlPlaneReadError::Projection)?;
+        let paper_accounts = PaperAccountReadModel::from_legacy_snapshot(&journal)
+            .map_err(ControlPlaneReadError::PaperAccountProjection)?;
         Ok(ControlPlaneRead {
             snapshot: ControlPlaneSnapshot {
                 schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
@@ -190,6 +195,7 @@ impl ReadControlPlane {
                 alerts,
                 tasks,
                 scanner,
+                paper_accounts,
             },
             events: control_plane_events_page(&page),
         })
@@ -228,6 +234,7 @@ pub struct ControlPlaneSnapshot {
     pub alerts: PriceAlertReadModel,
     pub tasks: ReadOnlyTaskReadModel,
     pub scanner: VirtualGridScannerReadModel,
+    pub paper_accounts: PaperAccountReadModel,
 }
 
 /// Payload-free notification that tells an adapter which snapshot fact changed.
@@ -289,20 +296,28 @@ pub enum ControlPlaneSnapshotError {
     Journal(#[from] JournalReadError),
     #[error(transparent)]
     Projection(#[from] ReadModelError),
+    #[error(transparent)]
+    PaperAccountProjection(#[from] PaperAccountProjectionError),
 }
 
 impl ControlPlaneSnapshotError {
     #[must_use]
     pub const fn kind(&self) -> ReadFailureKind {
         match self {
-            Self::Journal(source) | Self::Projection(ReadModelError::Journal(source)) => {
+            Self::Journal(source)
+            | Self::Projection(ReadModelError::Journal(source))
+            | Self::PaperAccountProjection(PaperAccountProjectionError::Journal(source)) => {
                 journal_failure_kind(source)
             }
             Self::Projection(
                 ReadModelError::BatchLimitExceeded { .. }
                 | ReadModelError::TaskLimitExceeded { .. },
             ) => ReadFailureKind::ResourceLimit,
-            Self::Projection(ReadModelError::NonAdvancingPage) => ReadFailureKind::InvalidJournal,
+            Self::Projection(ReadModelError::NonAdvancingPage)
+            | Self::PaperAccountProjection(
+                PaperAccountProjectionError::NonAdvancingPage
+                | PaperAccountProjectionError::ArithmeticOverflow,
+            ) => ReadFailureKind::InvalidJournal,
         }
     }
 }
@@ -333,6 +348,8 @@ pub enum ControlPlaneReadError {
     Journal(JournalReadError),
     #[error(transparent)]
     Projection(ReadModelError),
+    #[error(transparent)]
+    PaperAccountProjection(PaperAccountProjectionError),
 }
 
 impl ControlPlaneReadError {
@@ -340,14 +357,20 @@ impl ControlPlaneReadError {
     pub const fn kind(&self) -> ReadFailureKind {
         match self {
             Self::Cursor(source) => cursor_failure_kind(source),
-            Self::Journal(source) | Self::Projection(ReadModelError::Journal(source)) => {
+            Self::Journal(source)
+            | Self::Projection(ReadModelError::Journal(source))
+            | Self::PaperAccountProjection(PaperAccountProjectionError::Journal(source)) => {
                 journal_failure_kind(source)
             }
             Self::Projection(
                 ReadModelError::BatchLimitExceeded { .. }
                 | ReadModelError::TaskLimitExceeded { .. },
             ) => ReadFailureKind::ResourceLimit,
-            Self::Projection(ReadModelError::NonAdvancingPage) => ReadFailureKind::InvalidJournal,
+            Self::Projection(ReadModelError::NonAdvancingPage)
+            | Self::PaperAccountProjection(
+                PaperAccountProjectionError::NonAdvancingPage
+                | PaperAccountProjectionError::ArithmeticOverflow,
+            ) => ReadFailureKind::InvalidJournal,
         }
     }
 }

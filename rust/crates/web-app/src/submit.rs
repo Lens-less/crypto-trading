@@ -14,7 +14,8 @@ use axum::{
     http::{
         HeaderValue, StatusCode,
         header::{
-            AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE,
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, RETRY_AFTER,
+            WWW_AUTHENTICATE,
         },
     },
     middleware::{self, Next},
@@ -25,7 +26,10 @@ use crypto_trading_control_plane::{
     ReadControlPlane, SubmitEnvelope, SubmitFailureKind, SubmitPermission, SubmitReceipt,
     SubmitRole, SubmitService, SubmitStatus, SubmitValidationError,
 };
-use crypto_trading_web::{WebAccessPolicy, WebServerConfig, app_router};
+use crypto_trading_web::{
+    SettingsResponse, WebAccessPolicy, WebRequestRateLimiter, WebServerConfig,
+    app_router_with_settings,
+};
 use serde::Serialize;
 use tokio::net::TcpListener;
 
@@ -37,6 +41,7 @@ struct SubmitHttpState {
     service: Arc<SubmitService>,
     bearer_token: Arc<[u8]>,
     identity: TrustedSubmitIdentity,
+    rate_limiter: WebRequestRateLimiter,
 }
 
 /// Server-side identity and single-role grant bound to one bearer.
@@ -113,6 +118,30 @@ pub async fn bind_trusted_submit_app(
     bearer_token: String,
     identity: TrustedSubmitIdentity,
 ) -> Result<TrustedSubmitApplication> {
+    bind_trusted_submit_app_with_settings(
+        port,
+        control_plane,
+        service,
+        bearer_token,
+        identity,
+        SettingsResponse::default(),
+    )
+    .await
+}
+
+/// Binds the trusted application with operator-safe deployment metadata.
+///
+/// # Errors
+///
+/// Returns the same bounded startup failures as [`bind_trusted_submit_app`].
+pub async fn bind_trusted_submit_app_with_settings(
+    port: u16,
+    control_plane: Arc<ReadControlPlane>,
+    service: Arc<SubmitService>,
+    bearer_token: String,
+    identity: TrustedSubmitIdentity,
+    settings: SettingsResponse,
+) -> Result<TrustedSubmitApplication> {
     let read_access = WebAccessPolicy::bearer(bearer_token.clone())
         .context("trusted submit requires a valid bearer token")?;
     let read_journal_id = control_plane
@@ -129,16 +158,19 @@ pub async fn bind_trusted_submit_app(
     let address = listener
         .local_addr()
         .context("failed to inspect trusted submit loopback address")?;
+    let rate_limiter = WebRequestRateLimiter::default();
     let state = SubmitHttpState {
         service,
         bearer_token: Arc::from(bearer_token.into_bytes()),
         identity,
+        rate_limiter: rate_limiter.clone(),
     };
     let submit_router = Router::new()
         .route("/api/v1/submit", post(submit))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, authorize_submit));
-    let router = app_router(control_plane, read_access).merge(submit_router);
+    let router = app_router_with_settings(control_plane, read_access, settings, rate_limiter)
+        .merge(submit_router);
     Ok(TrustedSubmitApplication {
         listener,
         router,
@@ -154,6 +186,17 @@ async fn authorize_submit(
     if supplied_bearer(request.headers())
         .is_some_and(|supplied| constant_time_eq(state.bearer_token.as_ref(), supplied.as_bytes()))
     {
+        if let Err(retry_after) = state.rate_limiter.try_acquire() {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "the local API request limit was reached",
+            );
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+            return response;
+        }
         return next.run(request).await;
     }
     let mut response = error_response(

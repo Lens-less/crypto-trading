@@ -10,8 +10,12 @@ mod server;
 mod ui;
 
 pub use api::{
-    ExecutionsResponse, SystemResponse, WebAccessPolicy, WebAccessPolicyError, api_router,
+    CredentialConfiguration, CredentialSettings, ExecutionsResponse, NotificationEvidence,
+    PaperProfileKind, PaperProfileSettings, RequestLimitSettings, RuntimeLogSink,
+    SETTINGS_SCHEMA_VERSION, SettingsResponse, SystemResponse, WEB_REQUEST_LIMIT_PER_MINUTE,
+    WebAccessPolicy, WebAccessPolicyError, WebRequestRateLimiter, api_router,
+    api_router_with_settings,
 };
-pub use app::app_router;
+pub use app::{app_router, app_router_with_settings};
 pub use crypto_trading_control_plane::ReadControlPlane;
 pub use server::{DEFAULT_WEB_PORT, WebServerConfig, WebServerConfigError, serve_with_shutdown};

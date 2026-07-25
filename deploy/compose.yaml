@@ -5,6 +5,25 @@ services:
       dockerfile: Dockerfile
     image: crypto-trading:production-candidate
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - --max-time
+        - "3"
+        - http://127.0.0.1:8787/api/v1/health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
     network_mode: host
     read_only: true
     tmpfs:

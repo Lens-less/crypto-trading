@@ -1,11 +1,16 @@
-use std::{convert::Infallible, fmt, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
     extract::{Query, Request, State, rejection::QueryRejection},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE},
     },
     middleware::{self, Next},
     response::{
@@ -16,9 +21,9 @@ use axum::{
 };
 use crypto_trading_control_plane::{
     ArbitrageMonitorReadModel, CapabilityManifest, ControlPlaneEventsPage, ControlPlaneSnapshot,
-    ExecutionBatchState, OperatorReadModel, PriceAlertReadModel, ProjectionStatus,
-    ReadControlPlane, ReadFailureKind, ReadOnlyTaskReadModel, RecoveryDirective, ReleaseStage,
-    VirtualGridScannerReadModel,
+    ExecutionBatchState, OperatorReadModel, PaperAccountReadModel, PriceAlertReadModel,
+    ProjectionStatus, ReadControlPlane, ReadFailureKind, ReadOnlyTaskReadModel, RecoveryDirective,
+    ReleaseStage, VirtualGridScannerReadModel,
 };
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
@@ -31,6 +36,8 @@ const MAX_CURSOR_QUERY_BYTES: usize = 256;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+pub const SETTINGS_SCHEMA_VERSION: u16 = 1;
+pub const WEB_REQUEST_LIMIT_PER_MINUTE: u32 = 240;
 
 const CACHE_CONTROL_VALUE: &str = "no-store";
 const API_CONTENT_SECURITY_POLICY_VALUE: &str =
@@ -42,6 +49,13 @@ const PERMISSIONS_POLICY_VALUE: &str = "camera=(), microphone=(), geolocation=()
 struct ApiState {
     control_plane: Arc<ReadControlPlane>,
     authentication_required: bool,
+    settings: Arc<SettingsResponse>,
+}
+
+#[derive(Clone)]
+struct ApiAccessState {
+    access: WebAccessPolicy,
+    rate_limiter: WebRequestRateLimiter,
 }
 
 /// Optional bearer-token policy layered on top of mandatory loopback binding.
@@ -116,30 +130,220 @@ pub enum WebAccessPolicyError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialConfiguration {
+    Configured,
+    Partial,
+    NotConfigured,
+    NotAccepted,
+    NotProjected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLogSink {
+    StdoutStderr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationEvidence {
+    JournalProjection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperProfileKind {
+    Grid,
+    Arbitrage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaperProfileSettings {
+    pub kind: PaperProfileKind,
+    pub task_id: String,
+    pub strategy_id: String,
+    pub strategy_revision: String,
+    pub configuration_files: Vec<String>,
+    pub replay_file: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialSettings {
+    pub web_bearer: CredentialConfiguration,
+    pub binance_testnet: CredentialConfiguration,
+    pub mainnet: CredentialConfiguration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestLimitSettings {
+    pub maximum_requests: u32,
+    pub window_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsResponse {
+    pub schema_version: u16,
+    pub data_directory: Option<String>,
+    pub journal_path: Option<String>,
+    pub log_sink: RuntimeLogSink,
+    pub notification_evidence: NotificationEvidence,
+    pub credentials: CredentialSettings,
+    pub paper_principal_id: Option<String>,
+    pub paper_profiles: Vec<PaperProfileSettings>,
+    pub request_limit: RequestLimitSettings,
+}
+
+impl Default for SettingsResponse {
+    fn default() -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            data_directory: None,
+            journal_path: None,
+            log_sink: RuntimeLogSink::StdoutStderr,
+            notification_evidence: NotificationEvidence::JournalProjection,
+            credentials: CredentialSettings {
+                web_bearer: CredentialConfiguration::NotProjected,
+                binance_testnet: CredentialConfiguration::NotProjected,
+                mainnet: CredentialConfiguration::NotAccepted,
+            },
+            paper_principal_id: None,
+            paper_profiles: Vec::new(),
+            request_limit: WebRequestRateLimiter::default().settings(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WebRequestRateLimiter {
+    inner: Arc<Mutex<RequestWindow>>,
+    maximum_requests: u32,
+    window: Duration,
+}
+
+impl WebRequestRateLimiter {
+    #[must_use]
+    pub fn settings(&self) -> RequestLimitSettings {
+        RequestLimitSettings {
+            maximum_requests: self.maximum_requests,
+            window_seconds: self.window.as_secs(),
+        }
+    }
+
+    /// Consumes one request slot or returns a bounded Retry-After delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the number of whole seconds before the active window resets
+    /// after its request budget is exhausted.
+    pub fn try_acquire(&self) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut window = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let elapsed = now.saturating_duration_since(window.started_at);
+        if elapsed >= self.window {
+            window.started_at = now;
+            window.used = 0;
+        }
+        if window.used >= self.maximum_requests {
+            return Err(self.window.saturating_sub(elapsed).as_secs().max(1));
+        }
+        window.used = window.used.saturating_add(1);
+        Ok(())
+    }
+}
+
+impl Default for WebRequestRateLimiter {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RequestWindow {
+                started_at: Instant::now(),
+                used: 0,
+            })),
+            maximum_requests: WEB_REQUEST_LIMIT_PER_MINUTE,
+            window: Duration::from_secs(60),
+        }
+    }
+}
+
+struct RequestWindow {
+    started_at: Instant,
+    used: u32,
+}
+
 /// Builds the read-only API router. The resulting router has no missing state.
 pub fn api_router(control_plane: Arc<ReadControlPlane>, access: WebAccessPolicy) -> Router {
+    api_router_with_settings(control_plane, access, SettingsResponse::default())
+}
+
+/// Builds the read-only API router with trusted deployment metadata.
+pub fn api_router_with_settings(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    settings: SettingsResponse,
+) -> Router {
     Router::new()
-        .nest("/api/v1", api_routes(control_plane, access))
+        .nest(
+            "/api/v1",
+            api_routes_with_settings(
+                control_plane,
+                access,
+                settings,
+                WebRequestRateLimiter::default(),
+            ),
+        )
         .fallback(not_found)
         .layer(middleware::from_fn(add_security_headers))
 }
 
-pub(crate) fn api_routes(control_plane: Arc<ReadControlPlane>, access: WebAccessPolicy) -> Router {
+pub(crate) fn api_routes_with_settings(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    mut settings: SettingsResponse,
+    rate_limiter: WebRequestRateLimiter,
+) -> Router {
+    settings.request_limit = rate_limiter.settings();
     let state = ApiState {
         control_plane,
         authentication_required: access.authentication_required(),
+        settings: Arc::new(settings),
     };
-    Router::new()
+    let access_state = ApiAccessState {
+        access,
+        rate_limiter,
+    };
+    let protected = Router::new()
         .route("/system", get(system))
         .route("/capabilities", get(capabilities))
         .route("/monitor", get(monitor))
         .route("/alerts", get(alerts))
         .route("/tasks", get(tasks))
         .route("/scanner", get(scanner))
+        .route("/risk", get(risk))
+        .route("/settings", get(runtime_settings))
         .route("/executions", get(executions))
         .route("/events", get(events))
-        .layer(middleware::from_fn_with_state(access, authorize))
+        .layer(middleware::from_fn_with_state(access_state, authorize));
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn health(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
+    let snapshot = load_snapshot(state.control_plane).await?;
+    Ok(Json(HealthResponse {
+        schema_version: API_SCHEMA_VERSION,
+        status: HealthStatus::Ready,
+        live_trading_enabled: snapshot.capabilities.live_trading_enabled,
+    }))
 }
 
 async fn capabilities(State(state): State<ApiState>) -> Json<CapabilityManifest> {
@@ -176,6 +380,15 @@ async fn scanner(
 ) -> Result<Json<VirtualGridScannerReadModel>, ApiError> {
     let snapshot = load_snapshot(state.control_plane).await?;
     Ok(Json(snapshot.scanner))
+}
+
+async fn risk(State(state): State<ApiState>) -> Result<Json<PaperAccountReadModel>, ApiError> {
+    let snapshot = load_snapshot(state.control_plane).await?;
+    Ok(Json(snapshot.paper_accounts))
+}
+
+async fn runtime_settings(State(state): State<ApiState>) -> Json<SettingsResponse> {
+    Json((*state.settings).clone())
 }
 
 async fn executions(
@@ -348,19 +561,22 @@ async fn load_snapshot(
         .map_err(|error| ApiError::from_failure(error.kind()))
 }
 
-async fn authorize(
-    State(access): State<WebAccessPolicy>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if access.authorizes(&request) {
-        return next.run(request).await;
+async fn authorize(State(state): State<ApiAccessState>, request: Request, next: Next) -> Response {
+    if !state.access.authorizes(&request) {
+        let mut response = ApiError::unauthorized().into_response();
+        response
+            .headers_mut()
+            .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return response;
     }
-    let mut response = ApiError::unauthorized().into_response();
-    response
-        .headers_mut()
-        .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    response
+    if let Err(retry_after) = state.rate_limiter.try_acquire() {
+        let mut response = ApiError::rate_limited().into_response();
+        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(RETRY_AFTER, value);
+        }
+        return response;
+    }
+    next.run(request).await
 }
 
 pub(crate) async fn add_security_headers(request: Request, next: Next) -> Response {
@@ -410,6 +626,20 @@ struct ExecutionsQuery {
 #[serde(deny_unknown_fields)]
 struct EventsQuery {
     cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HealthStatus {
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthResponse {
+    schema_version: u16,
+    status: HealthStatus,
+    live_trading_enabled: bool,
 }
 
 /// Stable system summary for the Overview shell.
@@ -531,6 +761,14 @@ impl ApiError {
             StatusCode::BAD_REQUEST,
             "invalid_query",
             "query parameters are invalid",
+        )
+    }
+
+    const fn rate_limited() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "the local API request limit was reached",
         )
     }
 
