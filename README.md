@@ -145,6 +145,7 @@ cargo run --locked -- <COMMAND> --help
 
 ```text
 crypto-trading capabilities [--json]
+crypto-trading testnet-smoke [OPTIONS]
 crypto-trading grid <CONFIG> [OPTIONS]
 crypto-trading arbitrage [OPTIONS]
 crypto-trading monitor [OPTIONS]
@@ -155,6 +156,8 @@ crypto-trading config-check <PATHS>... [--json]
 ```
 
 `--debug`、`--debug-detail` 和 `--no-ui` 目前主要保留 CLI 兼容性，尚不会改变对应 handler 的行为。运行时日志过滤由 `RUST_LOG` 控制，例如 PowerShell 中可设置 `$env:RUST_LOG = "debug"`。
+
+`testnet-smoke` 只在显式选择远端探针时才出网：`--call-book-ticker` 会分别调用 Binance Spot 与 USD-M testnet 的 `bookTicker`，`--call-reconcile` 会在此基础上用 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 调 Binance testnet 的开放订单和持仓对账路由。该命令只产生留证输出，不会提交新订单。
 
 需要独立二进制时：
 

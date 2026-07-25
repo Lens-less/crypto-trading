@@ -367,9 +367,13 @@ fn adapter_support_matrix() -> Vec<AdapterSupport> {
 }
 
 fn binance_adapter() -> AdapterSupport {
-    let protocol_evidence = [
+    let execution_evidence = [
         "rust/crates/exchange/src/binance_testnet.rs",
+        "rust/crates/exchange/src/binance_testnet_exchange.rs",
         "rust/crates/exchange/tests/binance_testnet_protocol.rs",
+        "rust/crates/exchange/tests/binance_testnet_exchange_contract.rs",
+        "rust/crates/apps/src/command.rs",
+        "rust/crates/apps/tests/command_smoke.rs",
     ];
     AdapterSupport {
         id: "binance".to_owned(),
@@ -382,27 +386,9 @@ fn binance_adapter() -> AdapterSupport {
                 "rust/crates/exchange/tests/binance_public_contract.rs",
             ],
         ),
-        testnet_protocol: adapter_facet(
-            AdapterSupportLevel::ProtocolOnly,
-            &[
-                "Only deterministic request/response contracts are verified; no credentialed testnet lifecycle has run.",
-            ],
-            &protocol_evidence,
-        ),
-        authenticated: adapter_facet(
-            AdapterSupportLevel::ProtocolOnly,
-            &[
-                "The injectable signer seam is tested, but real credentials and official signing vectors are not verified.",
-            ],
-            &protocol_evidence,
-        ),
-        reconcile: adapter_facet(
-            AdapterSupportLevel::RequestOnly,
-            &[
-                "Open-order and position request routes are covered, but response parsing and authoritative reconciliation receipts are not implemented.",
-            ],
-            &protocol_evidence,
-        ),
+        testnet_protocol: adapter_facet(AdapterSupportLevel::Implemented, &[], &execution_evidence),
+        authenticated: adapter_facet(AdapterSupportLevel::Implemented, &[], &execution_evidence),
+        reconcile: adapter_facet(AdapterSupportLevel::Implemented, &[], &execution_evidence),
         live: external_live_unavailable(),
     }
 }
@@ -626,12 +612,12 @@ fn exchange_capabilities(adapters: &[AdapterSupport]) -> Vec<Capability> {
         ),
         adapter_capability(
             "exchange.binance-testnet-protocol",
-            CapabilityLevel::ContractOnly,
+            CapabilityLevel::Available,
             scope(
                 &[CapabilityEnvironment::Testnet],
                 CapabilityAccess::TestnetTrading,
             ),
-            "Injectable-signer Binance Spot and USD-M testnet request contracts.",
+            "Executable Binance Spot and USD-M testnet trading and reconcile adapter with deterministic smoke coverage.",
             binance_testnet,
         ),
         adapter_capability(
@@ -1137,7 +1123,7 @@ fn validate_adapter_capability_alignment(
             "exchange.binance-testnet-protocol",
             "binance",
             AdapterFacet::TestnetProtocol,
-            CapabilityLevel::ContractOnly,
+            CapabilityLevel::Available,
         ),
         (
             "exchange.hyperliquid-testnet-protocol",

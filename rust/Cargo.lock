@@ -419,6 +419,7 @@ dependencies = [
  "chrono",
  "crypto-trading-domain",
  "reqwest",
+ "ring",
  "rust_decimal",
  "serde",
  "serde_json",

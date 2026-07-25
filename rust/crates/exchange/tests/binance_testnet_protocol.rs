@@ -8,9 +8,9 @@ use crypto_trading_domain::{
     MarketType, Money, OrderIntent, Price, Quantity, Side, Symbol, TimeInForce,
 };
 use crypto_trading_exchange::{
-    BinanceProduct, BinanceRequestSigner, BinanceTestnetEndpoints, BinanceTestnetProtocol,
-    ExchangeError, ExchangeSymbol, ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules,
-    RemoteHttpMethod,
+    BinanceHmacSha256Signer, BinanceProduct, BinanceRequestSigner, BinanceServerOrderRef,
+    BinanceTestnetEndpoints, BinanceTestnetProtocol, ExchangeError, ExchangeSymbol,
+    ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules, RemoteHttpMethod,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -365,4 +365,132 @@ fn book_ticker_requests_are_unsigned_and_select_the_correct_product_route() {
     assert_eq!(spot.header("X-MBX-APIKEY"), None);
     assert_eq!(perpetual.header("X-MBX-APIKEY"), None);
     assert!(signer.payloads.lock().unwrap().is_empty());
+}
+
+#[test]
+fn official_hmac_vector_matches_binance_documentation() {
+    let signer = BinanceHmacSha256Signer::new(
+        "offline-api-key",
+        "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j",
+    )
+    .unwrap();
+
+    let signature = signer
+        .sign(
+            "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1&recvWindow=5000&timestamp=1499827319559",
+        )
+        .unwrap();
+
+    assert_eq!(
+        signature,
+        "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
+    );
+}
+
+#[test]
+fn open_orders_reconciliation_preserves_foreign_manual_orders() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+    let received_at = Utc.with_ymd_and_hms(2026, 7, 25, 8, 9, 10).unwrap();
+
+    let (orders, foreign_orders) = protocol
+        .parse_open_orders_response(
+            BinanceProduct::Spot,
+            br#"[
+                {
+                    "symbol":"BTCUSDT",
+                    "orderId":28,
+                    "clientOrderId":"0f3c807d-776f-4de4-85d0-93760a82dfcf",
+                    "transactTime":1722000000123,
+                    "price":"50000.10",
+                    "origQty":"0.0010",
+                    "executedQty":"0.0000",
+                    "cummulativeQuoteQty":"0.000000",
+                    "status":"NEW",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"BUY"
+                },
+                {
+                    "symbol":"BTCUSDT",
+                    "orderId":29,
+                    "clientOrderId":"manual-order",
+                    "transactTime":1722000000456,
+                    "price":"50001.00",
+                    "origQty":"0.0020",
+                    "executedQty":"0.0010",
+                    "cummulativeQuoteQty":"50.001",
+                    "status":"PARTIALLY_FILLED",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"SELL"
+                }
+            ]"#,
+            received_at,
+        )
+        .unwrap();
+
+    assert_eq!(orders.len(), 1);
+    assert_eq!(foreign_orders.len(), 1);
+    assert_eq!(orders[0].id, "binance:spot:BTCUSDT:28");
+    assert_eq!(foreign_orders[0].id, "binance:spot:BTCUSDT:29");
+    assert_eq!(
+        foreign_orders[0].client_order_id.as_deref(),
+        Some("manual-order")
+    );
+    assert_eq!(
+        foreign_orders[0].filled_quantity.as_decimal(),
+        decimal("0.0010")
+    );
+}
+
+#[test]
+fn positions_reconciliation_maps_signed_quantities_into_typed_positions() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+    let received_at = Utc.with_ymd_and_hms(2026, 7, 25, 8, 9, 10).unwrap();
+
+    let positions = protocol
+        .parse_positions_response(
+            br#"[
+                {
+                    "symbol":"BTCUSDT",
+                    "positionAmt":"0.005",
+                    "entryPrice":"50000.1",
+                    "markPrice":"50010.1",
+                    "updateTime":1722000000456
+                },
+                {
+                    "symbol":"BTCUSDT",
+                    "positionAmt":"0"
+                }
+            ]"#,
+            received_at,
+        )
+        .unwrap();
+
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].symbol.as_str(), "BTC-USDC-PERP");
+    assert_eq!(positions[0].side, crypto_trading_domain::PositionSide::Long);
+    assert_eq!(positions[0].quantity.as_decimal(), decimal("0.005"));
+}
+
+#[test]
+fn server_order_refs_round_trip_through_cancel_identity() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+
+    let order_ref = protocol
+        .parse_server_order_ref("binance:usdm:BTCUSDT:42")
+        .unwrap();
+
+    assert_eq!(
+        order_ref,
+        BinanceServerOrderRef {
+            symbol: Symbol::new("BTC-USDC-PERP").unwrap(),
+            market_type: MarketType::Perpetual,
+            wire_symbol: "BTCUSDT".to_owned(),
+            order_id: 42,
+        }
+    );
 }

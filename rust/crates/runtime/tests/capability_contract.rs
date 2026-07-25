@@ -298,13 +298,13 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
     assert_eq!(binance.public_data.level, AdapterSupportLevel::Implemented);
     assert_eq!(
         binance.testnet_protocol.level,
-        AdapterSupportLevel::ProtocolOnly
+        AdapterSupportLevel::Implemented
     );
     assert_eq!(
         binance.authenticated.level,
-        AdapterSupportLevel::ProtocolOnly
+        AdapterSupportLevel::Implemented
     );
-    assert_eq!(binance.reconcile.level, AdapterSupportLevel::RequestOnly);
+    assert_eq!(binance.reconcile.level, AdapterSupportLevel::Implemented);
     assert_eq!(binance.live.level, AdapterSupportLevel::Unavailable);
     assert_eq!(
         manifest
@@ -317,8 +317,8 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         manifest
             .capability("exchange.binance-testnet-protocol")
             .unwrap()
-            .blockers,
-        binance.testnet_protocol.blockers
+            .level,
+        CapabilityLevel::Available
     );
 
     let hyperliquid = manifest.adapter("hyperliquid").unwrap();
@@ -488,7 +488,7 @@ fn manifest_serialization_is_a_stable_machine_contract() {
             .iter()
             .find(|entry| entry["id"] == "binance")
             .unwrap()["testnet_protocol"]["level"],
-        "protocol-only"
+        "implemented"
     );
 
     let mut invalid_stage = value;

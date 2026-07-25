@@ -213,3 +213,33 @@ fn capabilities_supports_human_and_machine_readable_contracts() {
     };
     assert!(!args.json);
 }
+
+#[test]
+fn testnet_smoke_keeps_public_and_authenticated_probes_explicit() {
+    let cli = Cli::try_parse_from([
+        "crypto-trading",
+        "testnet-smoke",
+        "--call-book-ticker",
+        "--call-reconcile",
+        "--spot-symbol",
+        "BTC-USDC-SPOT",
+        "--perpetual-symbol",
+        "BTC-USDC-PERP",
+        "--wire-symbol",
+        "BTCUSDT",
+        "--timeout-ms",
+        "15000",
+        "--json",
+    ])
+    .unwrap();
+    let Command::TestnetSmoke(args) = cli.command else {
+        panic!("expected testnet-smoke command");
+    };
+    assert!(args.call_book_ticker);
+    assert!(args.call_reconcile);
+    assert_eq!(args.spot_symbol, "BTC-USDC-SPOT");
+    assert_eq!(args.perpetual_symbol, "BTC-USDC-PERP");
+    assert_eq!(args.wire_symbol, "BTCUSDT");
+    assert_eq!(args.timeout_ms, 15_000);
+    assert!(args.json);
+}

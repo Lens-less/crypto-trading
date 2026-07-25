@@ -2,23 +2,27 @@ use std::{fmt, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use crypto_trading_domain::{
-    MarketSnapshot, MarketType, Order, OrderIntent, OrderStatus, OrderType, Price, Quantity, Side,
-    TimeInForce,
+    MarketSnapshot, MarketType, Money, Order, OrderIntent, OrderStatus, OrderType, Position,
+    PositionSide, Price, Quantity, Side, Symbol, TimeInForce,
 };
+use ring::hmac;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::{
     BinanceProduct, BinanceTestnetEndpoints, ExchangeError, ExchangeOperation,
-    ExchangeOperationKey, ExchangeSymbolCatalog, InstrumentRuleCatalog, RemoteHttpMethod,
-    RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport, SubmissionDisposition,
-    TradingReceipt,
+    ExchangeOperationKey, ExchangeSymbolCatalog, ForeignOrder, InstrumentRuleCatalog,
+    RemoteHttpMethod, RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport,
+    SubmissionDisposition, TradingReceipt,
 };
 
 const EXCHANGE: &str = "binance";
 const DEFAULT_RECV_WINDOW_MS: u64 = 5_000;
 const MAX_RECV_WINDOW_MS: u64 = 60_000;
 const MAX_API_KEY_BYTES: usize = 1_024;
+const MAX_SECRET_BYTES: usize = 2_048;
 const MAX_SIGNATURE_BYTES: usize = 2_048;
+const MAX_SERVER_ORDER_REF_BYTES: usize = 128;
 
 /// Credential-backed signing seam for Binance authenticated requests.
 ///
@@ -34,6 +38,64 @@ pub trait BinanceRequestSigner: Send + Sync {
     ///
     /// Returns an exchange error when credentials or signing are unavailable.
     fn sign(&self, payload: &str) -> Result<String, ExchangeError>;
+}
+
+/// Production HMAC-SHA256 signer for Binance testnet requests.
+#[derive(Clone)]
+pub struct BinanceHmacSha256Signer {
+    api_key: String,
+    secret: hmac::Key,
+}
+
+impl fmt::Debug for BinanceHmacSha256Signer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BinanceHmacSha256Signer")
+            .field("api_key_bytes", &self.api_key.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BinanceHmacSha256Signer {
+    /// Builds a signer from one API key and one API secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] when either credential is
+    /// blank or structurally unsafe.
+    pub fn new(
+        api_key: impl Into<String>,
+        api_secret: impl Into<String>,
+    ) -> Result<Self, ExchangeError> {
+        let api_key = api_key.into();
+        let api_secret = api_secret.into();
+        validate_secret_text("Binance API key", &api_key, MAX_API_KEY_BYTES)?;
+        validate_secret_text("Binance API secret", &api_secret, MAX_SECRET_BYTES)?;
+        Ok(Self {
+            api_key,
+            secret: hmac::Key::new(hmac::HMAC_SHA256, api_secret.as_bytes()),
+        })
+    }
+}
+
+impl BinanceRequestSigner for BinanceHmacSha256Signer {
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    fn sign(&self, payload: &str) -> Result<String, ExchangeError> {
+        let signature = hmac::sign(&self.secret, payload.as_bytes());
+        Ok(hex_lower(signature.as_ref()))
+    }
+}
+
+/// Stable server-order identifier embedded in Binance typed receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceServerOrderRef {
+    pub symbol: Symbol,
+    pub market_type: MarketType,
+    pub wire_symbol: String,
+    pub order_id: u64,
 }
 
 /// Deterministic Binance Spot and USDⓈ-M testnet request protocol.
@@ -75,6 +137,12 @@ struct BinanceErrorWire {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BinanceServerTimeWire {
+    server_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BinanceOrderWire {
     symbol: String,
     order_id: u64,
@@ -101,6 +169,26 @@ struct BinanceOrderWire {
     side: String,
     #[serde(default)]
     reduce_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinancePositionWire {
+    symbol: String,
+    position_amt: String,
+    #[serde(default)]
+    position_side: String,
+    #[serde(default)]
+    entry_price: String,
+    #[serde(default)]
+    mark_price: String,
+    #[serde(default)]
+    update_time: Option<i64>,
+}
+
+enum ParsedBinanceOrder {
+    Owned(Order),
+    Foreign(ForeignOrder),
 }
 
 impl BinanceTestnetProtocol {
@@ -337,6 +425,36 @@ impl BinanceTestnetProtocol {
         )
     }
 
+    /// Dispatches one exact-symbol cancel-all request with conservative
+    /// unknown-outcome semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns request-validation/signing failures before dispatch and
+    /// [`ExchangeError::AmbiguousOutcome`] when neither the transport nor the
+    /// remote server proves whether the cancellation took effect.
+    pub async fn dispatch_cancel_all<T>(
+        &self,
+        transport: &T,
+        symbol: &crypto_trading_domain::Symbol,
+        market_type: MarketType,
+        timestamp_ms: u64,
+    ) -> Result<RemoteHttpResponse, ExchangeError>
+    where
+        T: RemoteHttpTransport + ?Sized,
+    {
+        let request = self.build_cancel_all_request(symbol, market_type, timestamp_ms)?;
+        classify_mutating_response(
+            transport.send(request).await,
+            ExchangeOperation::CancelAll,
+            None,
+            ExchangeOperationKey::CancelAll {
+                symbol: Some(symbol.clone()),
+                market_type: Some(market_type),
+            },
+        )
+    }
+
     /// Builds an authoritative open-orders query for one Binance product.
     ///
     /// # Errors
@@ -422,6 +540,27 @@ impl BinanceTestnetProtocol {
         ))
     }
 
+    /// Builds an unsigned server-time query for one Binance testnet product.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixed testnet route cannot be resolved.
+    pub fn build_server_time_request(
+        &self,
+        product: BinanceProduct,
+    ) -> Result<RemoteHttpRequest, ExchangeError> {
+        let path = match product {
+            BinanceProduct::Spot => "/api/v3/time",
+            BinanceProduct::UsdM => "/fapi/v1/time",
+        };
+        Ok(RemoteHttpRequest::new(
+            RemoteHttpMethod::Get,
+            self.endpoints.rest_url(product, path)?,
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
     /// Parses a Spot or USDⓈ-M `bookTicker` response through the exact reverse
     /// symbol catalog.
     ///
@@ -454,6 +593,21 @@ impl BinanceTestnetProtocol {
         Ok(snapshot)
     }
 
+    /// Parses a Binance server-time response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed or out-of-range
+    /// timestamps.
+    pub fn parse_server_time_response(
+        &self,
+        payload: &[u8],
+    ) -> Result<DateTime<Utc>, ExchangeError> {
+        let wire: BinanceServerTimeWire = serde_json::from_slice(payload)
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        parse_required_millis(wire.server_time)
+    }
+
     /// Parses a submit/cancel order object produced by this protocol into the
     /// shared typed receipt.
     ///
@@ -473,92 +627,154 @@ impl BinanceTestnetProtocol {
     ) -> Result<TradingReceipt, ExchangeError> {
         let wire: BinanceOrderWire = serde_json::from_slice(payload)
             .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
-        if wire.order_id == 0 {
+        let ParsedBinanceOrder::Owned(order) =
+            self.parse_wire_order(product, wire, received_at, false)?
+        else {
             return Err(ExchangeError::invalid_response(
                 EXCHANGE,
-                "Binance response contains a zero server order id",
+                "Binance order response must belong to an owned UUID-backed order",
+            ));
+        };
+        let (_, disposition) = parse_order_status_label(order.status)?;
+        Ok(TradingReceipt::Submitted { order, disposition })
+    }
+
+    /// Parses an authoritative open-orders response into owned and foreign
+    /// order sets without inventing UUID ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed arrays or
+    /// internally inconsistent order data.
+    pub fn parse_open_orders_response(
+        &self,
+        product: BinanceProduct,
+        payload: &[u8],
+        received_at: DateTime<Utc>,
+    ) -> Result<(Vec<Order>, Vec<ForeignOrder>), ExchangeError> {
+        let wires: Vec<BinanceOrderWire> = serde_json::from_slice(payload)
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        let mut orders = Vec::new();
+        let mut foreign_orders = Vec::new();
+        orders
+            .try_reserve(wires.len())
+            .map_err(|_| ExchangeError::unavailable("unable to reserve Binance owned orders"))?;
+        foreign_orders
+            .try_reserve(wires.len())
+            .map_err(|_| ExchangeError::unavailable("unable to reserve Binance foreign orders"))?;
+        for wire in wires {
+            match self.parse_wire_order(product, wire, received_at, true)? {
+                ParsedBinanceOrder::Owned(order) => orders.push(order),
+                ParsedBinanceOrder::Foreign(order) => foreign_orders.push(order),
+            }
+        }
+        Ok((orders, foreign_orders))
+    }
+
+    /// Parses a USD-M position-risk snapshot into typed positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed decimals or
+    /// symbol mismatches.
+    pub fn parse_positions_response(
+        &self,
+        payload: &[u8],
+        received_at: DateTime<Utc>,
+    ) -> Result<Vec<Position>, ExchangeError> {
+        let wires: Vec<BinancePositionWire> = serde_json::from_slice(payload)
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        let mut positions = Vec::new();
+        positions
+            .try_reserve(wires.len())
+            .map_err(|_| ExchangeError::unavailable("unable to reserve Binance positions"))?;
+        for wire in &wires {
+            let Some(position) = self.parse_position_wire(wire, received_at)? else {
+                continue;
+            };
+            positions.push(position);
+        }
+        Ok(positions)
+    }
+
+    /// Parses a stable server-order reference emitted by this protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for malformed or unknown
+    /// encoded identifiers.
+    pub fn parse_server_order_ref(
+        &self,
+        value: &str,
+    ) -> Result<BinanceServerOrderRef, ExchangeError> {
+        if value.is_empty() || value.len() > MAX_SERVER_ORDER_REF_BYTES {
+            return Err(ExchangeError::invalid(
+                "Binance server order reference exceeds the bounded identifier shape",
             ));
         }
-        let market_type = market_for_product(product);
+        let mut parts = value.split(':');
+        let exchange = parts.next();
+        let product = parts.next();
+        let wire_symbol = parts.next();
+        let order_id = parts.next();
+        if parts.next().is_some()
+            || exchange != Some(EXCHANGE)
+            || wire_symbol.is_none()
+            || product.is_none()
+            || order_id.is_none()
+        {
+            return Err(ExchangeError::invalid(
+                "Binance server order reference must use binance:{spot|usdm}:{wire_symbol}:{order_id}",
+            ));
+        }
+        let market_type = match product.unwrap_or_default() {
+            "spot" => MarketType::Spot,
+            "usdm" => MarketType::Perpetual,
+            _ => {
+                return Err(ExchangeError::invalid(
+                    "Binance server order reference uses an unknown product label",
+                ));
+            }
+        };
+        let wire_symbol = wire_symbol.unwrap_or_default();
+        validate_binance_wire_symbol(wire_symbol)?;
+        let order_id = order_id
+            .unwrap_or_default()
+            .parse::<u64>()
+            .map_err(|_| ExchangeError::invalid("Binance server order id must be an integer"))?;
+        if order_id == 0 {
+            return Err(ExchangeError::invalid(
+                "Binance server order id must not be zero",
+            ));
+        }
         let symbol = self
             .symbols
-            .to_standard(EXCHANGE, &wire.symbol, market_type)?
+            .to_standard(EXCHANGE, wire_symbol, market_type)?
             .clone();
-        let client_order_id = uuid::Uuid::parse_str(&wire.client_order_id).map_err(|_| {
-            ExchangeError::invalid_response(
-                EXCHANGE,
-                "Binance response client order id is not an owned UUID",
-            )
-        })?;
-        if client_order_id.is_nil() {
-            return Err(ExchangeError::invalid_response(
-                EXCHANGE,
-                "Binance response client order id must not be nil",
-            ));
-        }
-        let quantity = parse_quantity(&wire.orig_qty)?;
-        let filled_quantity = parse_quantity(&wire.executed_qty)?;
-        if filled_quantity > quantity {
-            return Err(ExchangeError::invalid_response(
-                EXCHANGE,
-                "Binance executed quantity exceeds original quantity",
-            ));
-        }
-        let side = parse_side(&wire.side)?;
-        let (order_type, price, time_in_force) =
-            parse_order_shape(&wire.order_type, &wire.price, &wire.time_in_force)?;
-        if product == BinanceProduct::Spot && wire.reduce_only {
-            return Err(ExchangeError::invalid_response(
-                EXCHANGE,
-                "Binance Spot response unexpectedly contains reduceOnly",
-            ));
-        }
-        let (status, disposition) = parse_order_status(&wire.status)?;
-        let average_fill_price = derive_average_fill_price(&wire, filled_quantity)?;
-        if !filled_quantity.as_decimal().is_zero()
-            && average_fill_price.is_none()
-            && status == OrderStatus::Filled
-        {
-            return Err(ExchangeError::invalid_response(
-                EXCHANGE,
-                "filled Binance order response is missing a positive average price",
-            ));
-        }
-        let created_at =
-            parse_optional_millis(wire.transact_time.or(wire.update_time), received_at)?;
-        let updated_at =
-            parse_optional_millis(wire.update_time.or(wire.transact_time), received_at)?;
-        let intent = OrderIntent {
-            client_order_id,
-            exchange: EXCHANGE.to_owned(),
+        Ok(BinanceServerOrderRef {
             symbol,
             market_type,
-            side,
-            order_type,
-            quantity,
-            price,
-            reduce_only: wire.reduce_only,
-            time_in_force,
-        };
-        let product_label = match product {
-            BinanceProduct::Spot => "spot",
-            BinanceProduct::UsdM => "usdm",
-        };
-        Ok(TradingReceipt::Submitted {
-            order: Order {
-                id: format!(
-                    "{EXCHANGE}:{product_label}:{}:{}",
-                    wire.symbol, wire.order_id
-                ),
-                intent,
-                filled_quantity,
-                average_fill_price,
-                status,
-                created_at,
-                updated_at,
-            },
-            disposition,
+            wire_symbol: wire_symbol.to_owned(),
+            order_id,
         })
+    }
+
+    /// Returns whether this protocol has an exact symbol mapping for one market.
+    pub fn supports_symbol_market(&self, symbol: &Symbol, market_type: MarketType) -> bool {
+        self.symbols.to_wire(EXCHANGE, symbol, market_type).is_ok()
+    }
+
+    /// Classifies one non-success Binance HTTP response without losing
+    /// bounded retry/backoff metadata.
+    pub fn remote_failure_from_response(response: &RemoteHttpResponse) -> ExchangeError {
+        remote_failure_from_response(response)
+    }
+
+    pub(crate) fn is_clock_skew_error(error: &ExchangeError) -> bool {
+        error
+            .remote_failure_metadata()
+            .and_then(|metadata| metadata.exchange_code.as_deref())
+            == Some("-1021")
     }
 
     fn signed_request(
@@ -621,15 +837,7 @@ fn classify_mutating_response(
     if response.is_success() {
         return Ok(response);
     }
-    let reason = exchange_error.map_or_else(
-        || format!("Binance request failed with HTTP {}", response.status()),
-        |error| bounded_reason(&format!("Binance error {}: {}", error.code, error.msg)),
-    );
-    Err(ExchangeError::remote_failure(
-        EXCHANGE,
-        Some(response.status()),
-        reason,
-    ))
+    Err(remote_failure_from_response(&response))
 }
 
 fn bounded_reason(reason: &str) -> String {
@@ -836,6 +1044,20 @@ fn parse_order_status(value: &str) -> Result<(OrderStatus, SubmissionDisposition
     Ok(result)
 }
 
+fn parse_order_status_label(
+    status: OrderStatus,
+) -> Result<(OrderStatus, SubmissionDisposition), ExchangeError> {
+    let label = match status {
+        OrderStatus::Pending => "PENDING_NEW",
+        OrderStatus::Open => "NEW",
+        OrderStatus::PartiallyFilled => "PARTIALLY_FILLED",
+        OrderStatus::Filled => "FILLED",
+        OrderStatus::Cancelled => "CANCELED",
+        OrderStatus::Rejected => "REJECTED",
+    };
+    parse_order_status(label)
+}
+
 fn parse_optional_millis(
     value: Option<i64>,
     fallback: DateTime<Utc>,
@@ -843,15 +1065,7 @@ fn parse_optional_millis(
     let Some(value) = value else {
         return Ok(fallback);
     };
-    if value < 0 {
-        return Err(ExchangeError::invalid_response(
-            EXCHANGE,
-            "Binance order timestamp must not be negative",
-        ));
-    }
-    DateTime::from_timestamp_millis(value).ok_or_else(|| {
-        ExchangeError::invalid_response(EXCHANGE, "Binance order timestamp is outside UTC range")
-    })
+    parse_required_millis(value)
 }
 
 fn decimal_is_zero(value: &str) -> bool {
@@ -895,4 +1109,222 @@ fn derive_average_fill_price(
     Price::new(average)
         .map(Some)
         .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))
+}
+
+impl BinanceTestnetProtocol {
+    fn parse_wire_order(
+        &self,
+        product: BinanceProduct,
+        wire: BinanceOrderWire,
+        received_at: DateTime<Utc>,
+        allow_foreign: bool,
+    ) -> Result<ParsedBinanceOrder, ExchangeError> {
+        if wire.order_id == 0 {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance response contains a zero server order id",
+            ));
+        }
+        let market_type = market_for_product(product);
+        let symbol = self
+            .symbols
+            .to_standard(EXCHANGE, &wire.symbol, market_type)?
+            .clone();
+        let quantity = parse_quantity(&wire.orig_qty)?;
+        let filled_quantity = parse_quantity(&wire.executed_qty)?;
+        if filled_quantity > quantity {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance executed quantity exceeds original quantity",
+            ));
+        }
+        let side = parse_side(&wire.side)?;
+        let (order_type, price, time_in_force) =
+            parse_order_shape(&wire.order_type, &wire.price, &wire.time_in_force)?;
+        if product == BinanceProduct::Spot && wire.reduce_only {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance Spot response unexpectedly contains reduceOnly",
+            ));
+        }
+        let (status, _) = parse_order_status(&wire.status)?;
+        let average_fill_price = derive_average_fill_price(&wire, filled_quantity)?;
+        if !filled_quantity.as_decimal().is_zero()
+            && average_fill_price.is_none()
+            && status == OrderStatus::Filled
+        {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "filled Binance order response is missing a positive average price",
+            ));
+        }
+        let created_at =
+            parse_optional_millis(wire.transact_time.or(wire.update_time), received_at)?;
+        let updated_at =
+            parse_optional_millis(wire.update_time.or(wire.transact_time), received_at)?;
+        let order_id = server_order_id(product, &wire.symbol, wire.order_id);
+        match uuid::Uuid::parse_str(&wire.client_order_id) {
+            Ok(client_order_id) if !client_order_id.is_nil() => {
+                Ok(ParsedBinanceOrder::Owned(Order {
+                    id: order_id,
+                    intent: OrderIntent {
+                        client_order_id,
+                        exchange: EXCHANGE.to_owned(),
+                        symbol,
+                        market_type,
+                        side,
+                        order_type,
+                        quantity,
+                        price,
+                        reduce_only: wire.reduce_only,
+                        time_in_force,
+                    },
+                    filled_quantity,
+                    average_fill_price,
+                    status,
+                    created_at,
+                    updated_at,
+                }))
+            }
+            _ if allow_foreign => Ok(ParsedBinanceOrder::Foreign(ForeignOrder {
+                id: order_id,
+                client_order_id: (!wire.client_order_id.trim().is_empty())
+                    .then_some(wire.client_order_id),
+                exchange: EXCHANGE.to_owned(),
+                symbol,
+                market_type,
+                side,
+                order_type,
+                quantity,
+                price,
+                reduce_only: wire.reduce_only,
+                time_in_force,
+                filled_quantity,
+                average_fill_price,
+                status,
+                created_at,
+                updated_at,
+            })),
+            _ => Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance response client order id is not an owned UUID",
+            )),
+        }
+    }
+
+    fn parse_position_wire(
+        &self,
+        wire: &BinancePositionWire,
+        received_at: DateTime<Utc>,
+    ) -> Result<Option<Position>, ExchangeError> {
+        let symbol = self
+            .symbols
+            .to_standard(EXCHANGE, &wire.symbol, MarketType::Perpetual)?
+            .clone();
+        let signed_quantity = wire.position_amt.parse::<Decimal>().map_err(|_| {
+            ExchangeError::invalid_response(EXCHANGE, "invalid Binance position size")
+        })?;
+        if signed_quantity.is_zero() {
+            return Ok(None);
+        }
+        let side = match wire.position_side.as_str() {
+            "LONG" => PositionSide::Long,
+            "SHORT" => PositionSide::Short,
+            _ if signed_quantity.is_sign_positive() => PositionSide::Long,
+            _ => PositionSide::Short,
+        };
+        let quantity = Quantity::new(signed_quantity.abs())
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        let entry_price = parse_optional_decimal_price(&wire.entry_price)?;
+        let mark_price = parse_optional_decimal_price(&wire.mark_price)?;
+        let unrealized_pnl = unrealized_pnl(side, quantity.as_decimal(), entry_price, mark_price)?;
+        Ok(Some(Position {
+            exchange: EXCHANGE.to_owned(),
+            symbol,
+            market_type: MarketType::Perpetual,
+            side,
+            quantity,
+            entry_price,
+            mark_price,
+            unrealized_pnl,
+            updated_at: parse_optional_millis(wire.update_time, received_at)?,
+        }))
+    }
+}
+
+fn parse_required_millis(value: i64) -> Result<DateTime<Utc>, ExchangeError> {
+    if value < 0 {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            "Binance timestamp must not be negative",
+        ));
+    }
+    DateTime::from_timestamp_millis(value).ok_or_else(|| {
+        ExchangeError::invalid_response(EXCHANGE, "Binance timestamp is outside UTC range")
+    })
+}
+
+fn parse_optional_decimal_price(value: &str) -> Result<Option<Price>, ExchangeError> {
+    if value.is_empty() || decimal_is_zero(value) {
+        return Ok(None);
+    }
+    parse_price(value).map(Some)
+}
+
+fn unrealized_pnl(
+    side: PositionSide,
+    quantity: Decimal,
+    entry_price: Option<Price>,
+    mark_price: Option<Price>,
+) -> Result<Money, ExchangeError> {
+    let Some((entry, mark)) = entry_price.zip(mark_price) else {
+        return Ok(Money::default());
+    };
+    let pnl = match side {
+        PositionSide::Long => mark
+            .as_decimal()
+            .checked_sub(entry.as_decimal())
+            .and_then(|difference| difference.checked_mul(quantity)),
+        PositionSide::Short => entry
+            .as_decimal()
+            .checked_sub(mark.as_decimal())
+            .and_then(|difference| difference.checked_mul(quantity)),
+        PositionSide::Flat => Some(Decimal::ZERO),
+    }
+    .ok_or_else(|| {
+        ExchangeError::invalid_response(EXCHANGE, "Binance unrealized PnL overflowed")
+    })?;
+    Ok(Money::new(pnl))
+}
+
+fn server_order_id(product: BinanceProduct, wire_symbol: &str, order_id: u64) -> String {
+    let product_label = match product {
+        BinanceProduct::Spot => "spot",
+        BinanceProduct::UsdM => "usdm",
+    };
+    format!("{EXCHANGE}:{product_label}:{wire_symbol}:{order_id}")
+}
+
+fn remote_failure_from_response(response: &RemoteHttpResponse) -> ExchangeError {
+    let exchange_error = serde_json::from_slice::<BinanceErrorWire>(response.body()).ok();
+    let reason = exchange_error.as_ref().map_or_else(
+        || format!("Binance request failed with HTTP {}", response.status()),
+        |error| bounded_reason(&format!("Binance error {}: {}", error.code, error.msg)),
+    );
+    let mut failure = ExchangeError::remote_failure(EXCHANGE, Some(response.status()), reason)
+        .with_remote_metadata(response.remote_failure_metadata());
+    if let Some(error) = exchange_error {
+        failure = failure.with_exchange_code(error.code.to_string());
+    }
+    failure
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }

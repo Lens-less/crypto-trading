@@ -277,6 +277,7 @@ impl SubscriptionReceipt {
 pub enum ExchangeMode {
     Paper,
     ReadOnly,
+    Testnet,
     Live,
 }
 

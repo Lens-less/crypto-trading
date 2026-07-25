@@ -15,6 +15,9 @@ pub struct Cli {
 pub enum Command {
     /// Report the runtime's machine-checkable capability and authority manifest.
     Capabilities(CapabilitiesArgs),
+    /// Run bounded Binance testnet connectivity and reconcile smoke checks.
+    #[command(name = "testnet-smoke")]
+    TestnetSmoke(TestnetSmokeArgs),
     /// Run or inspect a grid strategy.
     Grid(GridArgs),
     /// Run the segmented arbitrage engine.
@@ -39,6 +42,31 @@ pub struct CapabilitiesArgs {
     /// Emit the stable versioned JSON manifest.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TestnetSmokeArgs {
+    /// Emit a machine-readable summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Call Binance Spot and USD-M testnet `bookTicker` once each.
+    #[arg(long)]
+    pub call_book_ticker: bool,
+    /// Call authenticated Binance testnet reconcile routes with env credentials.
+    #[arg(long)]
+    pub call_reconcile: bool,
+    /// Standard spot symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDC-SPOT")]
+    pub spot_symbol: String,
+    /// Standard perpetual symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDC-PERP")]
+    pub perpetual_symbol: String,
+    /// Exact Binance wire symbol used for both spot and perpetual probes.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Total HTTP timeout for each remote call in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Args)]

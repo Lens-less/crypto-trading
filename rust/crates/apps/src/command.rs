@@ -20,7 +20,12 @@ use crypto_trading_config::{
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
 };
-use crypto_trading_exchange::{PaperExchange, SubmissionDisposition, TradingReceipt};
+use crypto_trading_exchange::{
+    BinanceHmacSha256Signer, BinanceProduct, BinanceRequestSigner, BinanceTestnetEndpoints,
+    BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeHandle, ExchangeSymbol,
+    ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules, PaperExchange, ReconcileScope,
+    RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition, TradingReceipt,
+};
 use crypto_trading_runtime::{
     DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
     ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataError,
@@ -38,7 +43,7 @@ use serde_json::{Value, json};
 
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
-    MonitorMode, PriceAlertArgs, ScannerArgs, VolumeMakerArgs,
+    MonitorMode, PriceAlertArgs, ScannerArgs, TestnetSmokeArgs, VolumeMakerArgs,
 };
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
@@ -61,6 +66,7 @@ use crate::task_host::{
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Capabilities(args) => run_capabilities(&args),
+        Command::TestnetSmoke(args) => run_testnet_smoke(&args).await,
         Command::ConfigCheck(args) => check_configs(&args),
         Command::Grid(args) => run_grid(args).await,
         Command::Arbitrage(args) => run_arbitrage(&args).await,
@@ -118,6 +124,252 @@ fn run_capabilities(args: &CapabilitiesArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+struct BinanceSmokeSymbols {
+    spot: Symbol,
+    perpetual: Symbol,
+    wire_symbol: String,
+}
+
+async fn run_testnet_smoke(args: &TestnetSmokeArgs) -> Result<()> {
+    if !args.call_book_ticker && !args.call_reconcile {
+        bail!(
+            "testnet-smoke is inert unless --call-book-ticker and/or --call-reconcile is selected"
+        );
+    }
+    if args.timeout_ms == 0 {
+        bail!("--timeout-ms must be greater than zero");
+    }
+
+    let symbols = BinanceSmokeSymbols {
+        spot: Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?,
+        perpetual: Symbol::new(args.perpetual_symbol.clone())
+            .context("invalid --perpetual-symbol")?,
+        wire_symbol: args.wire_symbol.clone(),
+    };
+    let transport = Arc::new(ReqwestHttpTransport::new(StdDuration::from_millis(
+        args.timeout_ms,
+    ))?);
+
+    let mut checks = Vec::new();
+
+    if args.call_book_ticker {
+        checks.push(run_book_ticker_check(&transport, &symbols).await?);
+    }
+
+    if args.call_reconcile {
+        checks.push(run_reconcile_check(&transport, &symbols).await?);
+    }
+
+    if args.json {
+        let report = json!({
+            "exchange": "binance",
+            "timeout_ms": args.timeout_ms,
+            "checks": checks,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    print_testnet_smoke_checks(&checks);
+    Ok(())
+}
+
+async fn run_book_ticker_check(
+    transport: &Arc<ReqwestHttpTransport>,
+    symbols: &BinanceSmokeSymbols,
+) -> Result<Value> {
+    let signer = Arc::new(BinanceHmacSha256Signer::new(
+        "offline-api-key",
+        "offline-api-secret",
+    )?);
+    let protocol = build_binance_testnet_protocol(signer, symbols)?;
+    let spot =
+        fetch_binance_book_ticker(&protocol, transport, &symbols.spot, MarketType::Spot).await?;
+    let perpetual = fetch_binance_book_ticker(
+        &protocol,
+        transport,
+        &symbols.perpetual,
+        MarketType::Perpetual,
+    )
+    .await?;
+    Ok(json!({
+        "name": "book-ticker",
+        "spot": spot,
+        "perpetual": perpetual,
+    }))
+}
+
+async fn run_reconcile_check(
+    transport: &Arc<ReqwestHttpTransport>,
+    symbols: &BinanceSmokeSymbols,
+) -> Result<Value> {
+    let (api_key, api_secret) = load_binance_testnet_credentials()?;
+    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+    let protocol = build_binance_testnet_protocol(signer, symbols)?;
+    let exchange = BinanceTestnetExchange::new(protocol, transport.clone());
+    let spot_orders = exchange
+        .reconcile(ReconcileScope::Orders {
+            symbol: Some(symbols.spot.clone()),
+        })
+        .await?;
+    let perpetual_orders = exchange
+        .reconcile(ReconcileScope::Orders {
+            symbol: Some(symbols.perpetual.clone()),
+        })
+        .await?;
+    let positions = exchange
+        .reconcile(ReconcileScope::Positions {
+            symbol: Some(symbols.perpetual.clone()),
+        })
+        .await?;
+    Ok(json!({
+        "name": "reconcile",
+        "spot_orders": summarize_reconcile_receipt(&spot_orders),
+        "perpetual_orders": summarize_reconcile_receipt(&perpetual_orders),
+        "positions": summarize_reconcile_receipt(&positions),
+    }))
+}
+
+fn print_testnet_smoke_checks(checks: &[Value]) {
+    println!(
+        "binance testnet smoke completed: checks={}",
+        checks
+            .iter()
+            .map(|check| check["name"].as_str().unwrap_or("unknown"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for check in checks {
+        match check["name"].as_str() {
+            Some("book-ticker") => {
+                println!(
+                    "book-ticker spot={} bid={} ask={} | perpetual={} bid={} ask={}",
+                    check["spot"]["symbol"].as_str().unwrap_or("?"),
+                    check["spot"]["bid"].as_str().unwrap_or("?"),
+                    check["spot"]["ask"].as_str().unwrap_or("?"),
+                    check["perpetual"]["symbol"].as_str().unwrap_or("?"),
+                    check["perpetual"]["bid"].as_str().unwrap_or("?"),
+                    check["perpetual"]["ask"].as_str().unwrap_or("?"),
+                );
+            }
+            Some("reconcile") => {
+                println!(
+                    "reconcile spot_orders={} spot_foreign={} perpetual_orders={} perpetual_foreign={} positions={}",
+                    check["spot_orders"]["orders"].as_u64().unwrap_or(0),
+                    check["spot_orders"]["foreign_orders"].as_u64().unwrap_or(0),
+                    check["perpetual_orders"]["orders"].as_u64().unwrap_or(0),
+                    check["perpetual_orders"]["foreign_orders"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    check["positions"]["positions"].as_u64().unwrap_or(0),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn load_binance_testnet_credentials() -> Result<(String, String)> {
+    let auth =
+        load_exchange_auth_from_str("binance", "binance:\n  api_key: \"\"\n  api_secret: \"\"\n")
+            .context("failed to load Binance credential overrides from the environment")?;
+    let api_key = auth
+        .api_key
+        .expose_secret()
+        .context("testnet-smoke --call-reconcile requires BINANCE_API_KEY")?
+        .to_owned();
+    let api_secret = auth
+        .api_secret
+        .expose_secret()
+        .context("testnet-smoke --call-reconcile requires BINANCE_API_SECRET")?
+        .to_owned();
+    Ok((api_key, api_secret))
+}
+
+fn build_binance_testnet_protocol<S>(
+    signer: Arc<S>,
+    symbols: &BinanceSmokeSymbols,
+) -> Result<BinanceTestnetProtocol>
+where
+    S: BinanceRequestSigner + 'static,
+{
+    let tick_size = Price::new(Decimal::new(1, 1)).expect("0.1 must be valid");
+    let spot_quantity = Quantity::new(Decimal::new(1, 4)).expect("0.0001 must be valid");
+    let perpetual_quantity = Quantity::new(Decimal::new(1, 3)).expect("0.001 must be valid");
+    let min_notional = Money::new(Decimal::new(5, 0));
+    let catalog = ExchangeSymbolCatalog::new(vec![
+        ExchangeSymbol::new(
+            "binance",
+            symbols.spot.clone(),
+            MarketType::Spot,
+            &symbols.wire_symbol,
+        )?,
+        ExchangeSymbol::new(
+            "binance",
+            symbols.perpetual.clone(),
+            MarketType::Perpetual,
+            &symbols.wire_symbol,
+        )?,
+    ])?;
+    let rules = InstrumentRuleCatalog::new(vec![
+        InstrumentRules::new(
+            "binance",
+            symbols.spot.clone(),
+            MarketType::Spot,
+            tick_size,
+            spot_quantity,
+            spot_quantity,
+            min_notional,
+        )?,
+        InstrumentRules::new(
+            "binance",
+            symbols.perpetual.clone(),
+            MarketType::Perpetual,
+            tick_size,
+            perpetual_quantity,
+            perpetual_quantity,
+            min_notional,
+        )?,
+    ])?;
+    BinanceTestnetProtocol::authenticated(
+        BinanceTestnetEndpoints::official(),
+        catalog,
+        rules,
+        signer,
+    )
+    .context("failed to build Binance testnet smoke protocol")
+}
+
+async fn fetch_binance_book_ticker(
+    protocol: &BinanceTestnetProtocol,
+    transport: &ReqwestHttpTransport,
+    symbol: &Symbol,
+    market_type: MarketType,
+) -> Result<MarketSnapshot> {
+    let request = protocol.build_book_ticker_request(symbol, market_type)?;
+    let product = match market_type {
+        MarketType::Spot => BinanceProduct::Spot,
+        MarketType::Perpetual => BinanceProduct::UsdM,
+    };
+    let response = transport.send(request).await?;
+    if !response.is_success() {
+        return Err(BinanceTestnetProtocol::remote_failure_from_response(&response).into());
+    }
+    let received_at = response.server_time().unwrap_or_else(Utc::now);
+    protocol
+        .parse_book_ticker(product, response.body(), received_at)
+        .map_err(Into::into)
+}
+
+fn summarize_reconcile_receipt(receipt: &crypto_trading_exchange::ReconcileReceipt) -> Value {
+    json!({
+        "orders": receipt.orders.len(),
+        "foreign_orders": receipt.foreign_orders.len(),
+        "positions": receipt.positions.len(),
+        "observed_at": receipt.observed_at,
+    })
 }
 
 #[derive(Debug)]

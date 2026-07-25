@@ -22,7 +22,7 @@ Status meanings:
 | Adapter | Public data | Testnet protocol | Authenticated | Reconcile | Live |
 | --- | --- | --- | --- | --- | --- |
 | Backpack | config-only | unavailable | config-only | unavailable | unavailable |
-| Binance | implemented | protocol-only | protocol-only | request-only | unavailable |
+| Binance | implemented | implemented | implemented | implemented | unavailable |
 | EdgeX | config-only | unavailable | config-only | unavailable | unavailable |
 | GRVT | config-only | unavailable | config-only | unavailable | unavailable |
 | Hyperliquid | unavailable | protocol-only | protocol-only | request-only | unavailable |

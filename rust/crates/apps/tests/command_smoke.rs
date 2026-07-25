@@ -62,8 +62,8 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
     assert!(adapters.iter().any(|entry| {
         entry["id"] == "binance"
             && entry["public_data"]["level"] == "implemented"
-            && entry["testnet_protocol"]["level"] == "protocol-only"
-            && entry["reconcile"]["level"] == "request-only"
+            && entry["testnet_protocol"]["level"] == "implemented"
+            && entry["reconcile"]["level"] == "implemented"
             && entry["live"]["level"] == "unavailable"
     }));
     let capabilities = payload["capabilities"].as_array().unwrap();
@@ -97,9 +97,7 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
         "{stdout}"
     );
     assert!(
-        stdout.contains(
-            "binance\timplemented\tprotocol-only\tprotocol-only\trequest-only\tunavailable"
-        ),
+        stdout.contains("binance\timplemented\timplemented\timplemented\timplemented\tunavailable"),
         "{stdout}"
     );
     assert!(
@@ -110,6 +108,20 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
         stdout.contains("runtime.live\truntime\tunavailable\tmainnet-trading\tmainnet\t"),
         "{stdout}"
     );
+}
+
+#[test]
+fn testnet_smoke_requires_an_explicit_network_probe() {
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("testnet-smoke")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--call-book-ticker"), "{stderr}");
+    assert!(stderr.contains("--call-reconcile"), "{stderr}");
 }
 
 #[test]
