@@ -9,11 +9,10 @@ license.workspace = true
 chrono.workspace = true
 crypto-trading-runtime = { path = "../runtime" }
 serde.workspace = true
-thiserror.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

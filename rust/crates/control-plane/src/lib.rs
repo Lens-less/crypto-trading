@@ -23,8 +23,10 @@ use uuid::Uuid;
 mod submit;
 
 pub use submit::{
-    SUBMIT_SCHEMA_VERSION, SubmitCommand, SubmitEnvelope, SubmitPermission, SubmitRiskConfirmation,
-    SubmitRole, SubmitValidationError,
+    SUBMIT_JOURNAL_PROJECTION, SUBMIT_JOURNAL_SOURCE, SUBMIT_SCHEMA_VERSION, SubmitCommand,
+    SubmitDispatchFuture, SubmitDispatchOutcome, SubmitDispatcher, SubmitEnvelope,
+    SubmitFailureKind, SubmitPermission, SubmitReceipt, SubmitRiskConfirmation, SubmitRole,
+    SubmitService, SubmitServiceError, SubmitStatus, SubmitValidationError,
 };
 
 pub use crypto_trading_runtime::{

@@ -395,6 +395,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
@@ -480,8 +481,11 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "crypto-trading-control-plane",
  "crypto-trading-runtime",
  "crypto-trading-web",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tracing-subscriber",

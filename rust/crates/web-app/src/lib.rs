@@ -15,6 +15,13 @@ use crypto_trading_web::{
 };
 use uuid::Uuid;
 
+mod submit;
+
+pub use submit::{
+    MAX_TRUSTED_SUBMIT_BODY_BYTES, TrustedSubmitApplication, TrustedSubmitIdentity,
+    bind_trusted_submit_app,
+};
+
 /// Local read-only control-plane server.
 #[derive(Clone, Debug, Parser)]
 #[command(
