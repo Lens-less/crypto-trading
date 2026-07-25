@@ -28,7 +28,7 @@ pub use grid::{
 };
 pub use risk::{AccountRiskSnapshot, RiskDecision, RiskEngine, RiskLimits, RiskRejection};
 pub use virtual_grid::{
-    AprCalculator, GridFill, Rating, RatingGrade, VirtualGrid, VirtualGridConfig,
+    AprCalculator, GridFill, Rating, RatingGrade, VirtualGrid, VirtualGridConfig, VirtualGridCross,
 };
 pub use volume_maker::{
     VolumeMakerMode, VolumeMakerPlanConfig, VolumeMakerState, VolumeMakerStrategy,

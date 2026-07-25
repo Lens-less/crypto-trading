@@ -26,6 +26,12 @@ pub enum GridFill {
     Sell,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualGridCross {
+    pub side: GridFill,
+    pub trigger_price: Price,
+}
+
 /// A deterministic two-sided paper grid used for volatility scoring.
 #[derive(Debug, Clone)]
 pub struct VirtualGrid {
@@ -333,6 +339,24 @@ impl VirtualGrid {
         new_price: Price,
         timestamp: DateTime<Utc>,
     ) -> Result<Option<GridFill>, StrategyError> {
+        Ok(self
+            .consume_crosses_at(new_price, timestamp)?
+            .last()
+            .map(|cross| cross.side))
+    }
+
+    /// Applies one price observation and returns every crossed pending level in
+    /// deterministic execution order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrategyError`] for non-monotonic timestamps or a derived
+    /// pending price outside the domain.
+    pub fn consume_crosses_at(
+        &mut self,
+        new_price: Price,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<VirtualGridCross>, StrategyError> {
         if timestamp < self.last_update_at {
             return Err(StrategyError::InvalidConfig(
                 "virtual grid timestamps must be monotonic",
@@ -345,27 +369,39 @@ impl VirtualGrid {
         let mut next_pending_sell = self.pending_sell_price;
         let mut next_buy_crosses = self.buy_crosses;
         let mut next_sell_crosses = self.sell_crosses;
-        let mut fill = None;
+        let mut crosses = Vec::new();
+        let cross_capacity = usize::try_from(self.grid_count).map_err(|_| {
+            StrategyError::InvalidConfig("virtual grid cross capacity is unsupported")
+        })?;
+        crosses
+            .try_reserve_exact(cross_capacity)
+            .map_err(|_| StrategyError::InvalidConfig("virtual grid cross allocation failed"))?;
         for _ in 0..self.grid_count {
-            if self.consume_buy_level(
+            if let Some(trigger_price) = self.consume_buy_level(
                 observed_price,
                 lower_bound,
                 &mut next_pending_buy,
                 &mut next_pending_sell,
                 &mut next_buy_crosses,
             )? {
-                fill = Some(GridFill::Buy);
+                crosses.push(VirtualGridCross {
+                    side: GridFill::Buy,
+                    trigger_price,
+                });
                 continue;
             }
 
-            if self.consume_sell_level(
+            if let Some(trigger_price) = self.consume_sell_level(
                 observed_price,
                 upper_bound,
                 &mut next_pending_buy,
                 &mut next_pending_sell,
                 &mut next_sell_crosses,
             )? {
-                fill = Some(GridFill::Sell);
+                crosses.push(VirtualGridCross {
+                    side: GridFill::Sell,
+                    trigger_price,
+                });
                 continue;
             }
 
@@ -392,7 +428,7 @@ impl VirtualGrid {
                 self.cycle_events.push_back(timestamp);
             }
         }
-        Ok(fill)
+        Ok(crosses)
     }
 
     /// Calculates rolling-window annualized return at `now`.
@@ -506,11 +542,12 @@ impl VirtualGrid {
         next_pending_buy: &mut Price,
         next_pending_sell: &mut Price,
         next_buy_crosses: &mut u64,
-    ) -> Result<bool, StrategyError> {
+    ) -> Result<Option<Price>, StrategyError> {
         let next_pending_buy_value = next_pending_buy.as_decimal();
         if next_pending_buy_value < lower_bound || observed_price > next_pending_buy_value {
-            return Ok(false);
+            return Ok(None);
         }
+        let trigger_price = *next_pending_buy;
 
         *next_pending_sell = Self::price(
             next_pending_buy_value
@@ -534,7 +571,7 @@ impl VirtualGrid {
                 .ok_or(StrategyError::InvalidFinancialValue(
                     "virtual grid buy cross count",
                 ))?;
-        Ok(true)
+        Ok(Some(trigger_price))
     }
 
     fn consume_sell_level(
@@ -544,11 +581,12 @@ impl VirtualGrid {
         next_pending_buy: &mut Price,
         next_pending_sell: &mut Price,
         next_sell_crosses: &mut u64,
-    ) -> Result<bool, StrategyError> {
+    ) -> Result<Option<Price>, StrategyError> {
         let next_pending_sell_value = next_pending_sell.as_decimal();
         if next_pending_sell_value > upper_bound || observed_price < next_pending_sell_value {
-            return Ok(false);
+            return Ok(None);
         }
+        let trigger_price = *next_pending_sell;
 
         *next_pending_buy = Self::price(
             next_pending_sell_value
@@ -572,7 +610,7 @@ impl VirtualGrid {
                 .ok_or(StrategyError::InvalidFinancialValue(
                     "virtual grid sell cross count",
                 ))?;
-        Ok(true)
+        Ok(Some(trigger_price))
     }
 
     fn reserve_cycle_events(&mut self, completed_cycle_count: u64) -> Result<usize, StrategyError> {

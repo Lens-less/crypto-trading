@@ -158,6 +158,91 @@ fn virtual_grid_consumes_all_crossed_pending_levels_in_one_atomic_price_jump() {
 }
 
 #[test]
+fn virtual_grid_reports_every_crossed_level_in_execution_order() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+    let mut grid = VirtualGrid::new(
+        VirtualGridConfig {
+            symbol: Symbol::new("BTC").unwrap(),
+            initial_price: price("100"),
+            grid_width_percent: decimal("10"),
+            grid_interval_percent: Decimal::ONE,
+        },
+        started_at,
+    )
+    .unwrap();
+
+    let buy_crosses = grid
+        .consume_crosses_at(price("97"), started_at + Duration::seconds(70))
+        .unwrap();
+    assert_eq!(buy_crosses.len(), 3);
+    assert_eq!(buy_crosses[0].side, GridFill::Buy);
+    assert_eq!(buy_crosses[0].trigger_price, price("99"));
+    assert_eq!(buy_crosses[1].trigger_price, price("98"));
+    assert_eq!(buy_crosses[2].trigger_price, price("97"));
+
+    let sell_crosses = grid
+        .consume_crosses_at(price("100"), started_at + Duration::seconds(80))
+        .unwrap();
+    assert_eq!(sell_crosses.len(), 3);
+    assert_eq!(sell_crosses[0].side, GridFill::Sell);
+    assert_eq!(sell_crosses[0].trigger_price, price("98"));
+    assert_eq!(sell_crosses[1].trigger_price, price("99"));
+    assert_eq!(sell_crosses[2].trigger_price, price("100"));
+}
+
+#[test]
+fn virtual_grid_cross_stream_preserves_no_cross_and_single_cross_semantics() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+    let config = VirtualGridConfig {
+        symbol: Symbol::new("BTC").unwrap(),
+        initial_price: price("100"),
+        grid_width_percent: decimal("10"),
+        grid_interval_percent: Decimal::ONE,
+    };
+    let mut stream_grid = VirtualGrid::new(config.clone(), started_at).unwrap();
+    let mut compatibility_grid = VirtualGrid::new(config, started_at).unwrap();
+
+    assert!(
+        stream_grid
+            .consume_crosses_at(price("100.5"), started_at + Duration::seconds(10))
+            .unwrap()
+            .is_empty()
+    );
+    let crosses = stream_grid
+        .consume_crosses_at(price("99"), started_at + Duration::seconds(20))
+        .unwrap();
+    assert_eq!(
+        crosses,
+        vec![crypto_trading_strategy::VirtualGridCross {
+            side: GridFill::Buy,
+            trigger_price: price("99"),
+        }]
+    );
+
+    assert_eq!(
+        compatibility_grid
+            .update_price_at(price("100.5"), started_at + Duration::seconds(10))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        compatibility_grid
+            .update_price_at(price("99"), started_at + Duration::seconds(20))
+            .unwrap(),
+        Some(GridFill::Buy)
+    );
+    assert_eq!(stream_grid.buy_crosses(), compatibility_grid.buy_crosses());
+    assert_eq!(
+        stream_grid.pending_buy_price(),
+        compatibility_grid.pending_buy_price()
+    );
+    assert_eq!(
+        stream_grid.pending_sell_price(),
+        compatibility_grid.pending_sell_price()
+    );
+}
+
+#[test]
 fn apr_and_recent_cycles_never_observe_events_after_the_query_time() {
     let started_at = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
     let mut grid = VirtualGrid::new(
