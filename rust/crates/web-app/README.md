@@ -7,7 +7,7 @@ live-trading flag and exposes no command route.
 From the `rust/` workspace:
 
 ```powershell
-cargo +1.85.0 run -p crypto-trading-web-app --bin crypto-trading-web -- `
+cargo +1.89.0 run -p crypto-trading-web-app --bin crypto-trading-web -- `
   --history-path fixtures/m2-operator-journal.jsonl `
   --journal-id 44444444-4444-4444-8444-444444444444 `
   --port 8787
@@ -20,7 +20,7 @@ and pass only its name:
 
 ```powershell
 $env:CRYPTO_TRADING_WEB_TOKEN = '<generated secret>'
-cargo +1.85.0 run -p crypto-trading-web-app --bin crypto-trading-web -- `
+cargo +1.89.0 run -p crypto-trading-web-app --bin crypto-trading-web -- `
   --history-path fixtures/m2-operator-journal.jsonl `
   --journal-id 44444444-4444-4444-8444-444444444444 `
   --bearer-token-env CRYPTO_TRADING_WEB_TOKEN

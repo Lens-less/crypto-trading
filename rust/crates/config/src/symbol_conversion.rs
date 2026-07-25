@@ -325,19 +325,19 @@ fn insert_forward(
         symbol: wire_symbol.clone(),
     };
 
-    if let Some(existing) = conversions.standard_to_exchange.get(&standard_key) {
-        if existing != &wire_symbol {
-            return Err(ConfigError::Validation(format!(
-                "conflicting forward mapping for {exchange}/{standard_symbol}"
-            )));
-        }
+    if let Some(existing) = conversions.standard_to_exchange.get(&standard_key)
+        && existing != &wire_symbol
+    {
+        return Err(ConfigError::Validation(format!(
+            "conflicting forward mapping for {exchange}/{standard_symbol}"
+        )));
     }
-    if let Some(existing) = conversions.exchange_to_standard.get(&wire_key) {
-        if existing != &standard_symbol {
-            return Err(ConfigError::Validation(format!(
-                "ambiguous reverse mapping for {exchange}/{wire_symbol}"
-            )));
-        }
+    if let Some(existing) = conversions.exchange_to_standard.get(&wire_key)
+        && existing != &standard_symbol
+    {
+        return Err(ConfigError::Validation(format!(
+            "ambiguous reverse mapping for {exchange}/{wire_symbol}"
+        )));
     }
 
     ensure_room(
@@ -374,12 +374,12 @@ fn insert_reverse(
         market_type,
         symbol: wire_symbol.clone(),
     };
-    if let Some(existing) = conversions.exchange_to_standard.get(&wire_key) {
-        if existing != &standard_symbol {
-            return Err(ConfigError::Validation(format!(
-                "ambiguous reverse mapping for {exchange}/{wire_symbol}"
-            )));
-        }
+    if let Some(existing) = conversions.exchange_to_standard.get(&wire_key)
+        && existing != &standard_symbol
+    {
+        return Err(ConfigError::Validation(format!(
+            "ambiguous reverse mapping for {exchange}/{wire_symbol}"
+        )));
     }
 
     let standard_key = StandardKey {

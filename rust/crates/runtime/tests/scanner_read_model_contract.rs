@@ -82,7 +82,7 @@ fn checked_web_fixture_projects_three_ordered_rows() {
 #[test]
 fn crlf_is_accepted_without_changing_the_projection() {
     let value = scanner_record("scan-crlf", &valid_rows(), 0);
-    let lf = jsonl(&[value.clone()]);
+    let lf = jsonl(std::slice::from_ref(&value));
     let crlf = String::from_utf8(lf.clone())
         .unwrap()
         .replace('\n', "\r\n")

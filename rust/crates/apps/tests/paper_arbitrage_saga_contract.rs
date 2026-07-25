@@ -584,11 +584,10 @@ async fn outcome_journal_failure_preserves_receipts_and_restart_never_resubmits(
     assert!(!display.contains("BTC-USDT"));
     assert!(!display.contains("TradingReceipt"));
 
-    let PaperArbitrageSagaError::OutcomeJournal {
-        outcome: crypto_trading_cli::PaperArbitragePreservedOutcome::Completed(receipts),
-        ..
-    } = error
-    else {
+    let PaperArbitrageSagaError::OutcomeJournal { outcome, .. } = error else {
+        panic!("completed receipts must survive an outcome journal failure");
+    };
+    let crypto_trading_cli::PaperArbitragePreservedOutcome::Completed(receipts) = *outcome else {
         panic!("completed receipts must survive an outcome journal failure");
     };
     assert_eq!(receipts.len(), 2);

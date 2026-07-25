@@ -1,7 +1,7 @@
 # crypto-trading
 
 [![Rust quality gates](https://github.com/Lens-less/crypto-trading/actions/workflows/rust.yml/badge.svg)](https://github.com/Lens-less/crypto-trading/actions/workflows/rust.yml)
-![MSRV](https://img.shields.io/badge/Rust-1.85.0%2B-000000?logo=rust)
+![MSRV](https://img.shields.io/badge/Rust-1.89.0%2B-000000?logo=rust)
 ![Execution status](https://img.shields.io/badge/execution-paper%20only-orange)
 
 一个 Rust-first 的多交易所策略内核，专注于配置兼容、确定性策略计算、受控的 paper one-shot 执行，以及为人工恢复分析保留上下文的可审计 JSONL 运行记录。
@@ -63,7 +63,7 @@ Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Va
 - [Rustup](https://rustup.rs/)
 - Windows PowerShell、Linux 或 macOS
 
-仓库通过 [`rust/rust-toolchain.toml`](rust/rust-toolchain.toml) 固定 Rust `1.85.0`，并声明 `rustfmt` 与 `clippy`。进入 `rust/` 后，Rustup 会自动选择所需工具链。
+仓库通过 [`rust/rust-toolchain.toml`](rust/rust-toolchain.toml) 固定 Rust `1.89.0`，并声明 `rustfmt` 与 `clippy`。进入 `rust/` 后，Rustup 会自动选择所需工具链。
 
 本文的 `config-check`、Grid paper 和 Arbitrage paper 示例都不需要交易所凭证，也不会连接私有交易 API。
 
@@ -289,17 +289,17 @@ crypto-trading/
 在 `rust/` 目录运行完整本地门禁：
 
 ```bash
-cargo +1.85.0 check --workspace --all-targets --all-features --locked
-cargo +1.85.0 fmt --all -- --check
-cargo +1.85.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo +1.85.0 test --workspace --all-targets --all-features --locked
-cargo +1.85.0 build --release --workspace --all-features --locked
-cargo +1.85.0 test --doc --workspace --all-features --locked
+cargo +1.89.0 check --workspace --all-targets --all-features --locked
+cargo +1.89.0 fmt --all -- --check
+cargo +1.89.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.89.0 test --workspace --all-targets --all-features --locked
+cargo +1.89.0 build --release --workspace --all-features --locked
+cargo +1.89.0 test --doc --workspace --all-features --locked
 ```
 
 CI 还会：
 
-- 在 Ubuntu 与 Windows 上分别运行 Rust `1.85.0` 和 stable。
+- 在 Ubuntu 与 Windows 上分别运行 Rust `1.89.0` 和 stable。
 - 使用 `Cargo.lock` 固定依赖解析。
 - 拒绝 Clippy warning。
 - 执行 RustSec advisory audit。

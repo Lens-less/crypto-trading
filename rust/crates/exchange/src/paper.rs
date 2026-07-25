@@ -423,13 +423,12 @@ impl PaperExchange {
         }
         if let Some(existing) = state.snapshots.iter().find(|existing| {
             existing.symbol == snapshot.symbol && existing.market_type == snapshot.market_type
-        }) {
-            if snapshot.timestamp <= existing.timestamp {
-                return Err(ExchangeError::invalid(format!(
-                    "stale or duplicate snapshot for {}: {} is not after {}",
-                    snapshot.symbol, snapshot.timestamp, existing.timestamp
-                )));
-            }
+        }) && snapshot.timestamp <= existing.timestamp
+        {
+            return Err(ExchangeError::invalid(format!(
+                "stale or duplicate snapshot for {}: {} is not after {}",
+                snapshot.symbol, snapshot.timestamp, existing.timestamp
+            )));
         }
 
         let mut candidate = state.clone();
@@ -668,10 +667,10 @@ impl PaperExchange {
         let snapshot_index = state.snapshots.iter().position(|snapshot| {
             snapshot.symbol == intent.symbol && snapshot.market_type == intent.market_type
         });
-        if let Some(snapshot) = snapshot_index.map(|index| &state.snapshots[index]) {
-            if let Some(reason) = self.freshness_violation(snapshot, now) {
-                return Err(ExchangeError::rejected(reason));
-            }
+        if let Some(snapshot) = snapshot_index.map(|index| &state.snapshots[index])
+            && let Some(reason) = self.freshness_violation(snapshot, now)
+        {
+            return Err(ExchangeError::rejected(reason));
         }
         self.validate_instrument_rules(
             &intent,
@@ -1293,12 +1292,12 @@ fn apply_fill(
     } else {
         let new_position_index = state.positions.len();
         state.positions.push(position);
-        if let Some(indexes) = position_indexes {
-            if indexes.insert(position_key, new_position_index).is_some() {
-                return Err(ExchangeError::invariant(
-                    "paper position index unexpectedly replaced an entry",
-                ));
-            }
+        if let Some(indexes) = position_indexes
+            && indexes.insert(position_key, new_position_index).is_some()
+        {
+            return Err(ExchangeError::invariant(
+                "paper position index unexpectedly replaced an entry",
+            ));
         }
     }
     Ok(())

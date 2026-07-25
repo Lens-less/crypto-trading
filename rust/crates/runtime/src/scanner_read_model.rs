@@ -323,10 +323,10 @@ fn parse_scanner_event(event: &OperationEventEnvelope) -> Result<Option<VirtualG
         if !identities.insert(identity) {
             return Err(());
         }
-        if let Some(previous) = projected_rows.last() {
-            if compare_rows(previous, &row)? == Ordering::Greater {
-                return Err(());
-            }
+        if let Some(previous) = projected_rows.last()
+            && compare_rows(previous, &row)? == Ordering::Greater
+        {
+            return Err(());
         }
         projected_rows.push(row);
     }

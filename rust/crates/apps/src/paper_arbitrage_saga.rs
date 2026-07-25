@@ -276,7 +276,7 @@ impl DurablePaperArbitrageSaga {
                 .await
                 {
                     return Err(PaperArbitrageSagaError::OutcomeJournal {
-                        outcome: PaperArbitragePreservedOutcome::Completed(receipts),
+                        outcome: Box::new(PaperArbitragePreservedOutcome::Completed(receipts)),
                         source,
                     });
                 }
@@ -288,7 +288,7 @@ impl DurablePaperArbitrageSaga {
                     .await;
                 if let Err(source) = finalization {
                     return Err(PaperArbitrageSagaError::AccountFinalization {
-                        outcome: PaperArbitragePreservedOutcome::Completed(receipts),
+                        outcome: Box::new(PaperArbitragePreservedOutcome::Completed(receipts)),
                         source,
                     });
                 }
@@ -307,7 +307,7 @@ impl DurablePaperArbitrageSaga {
                 .await
                 {
                     return Err(PaperArbitrageSagaError::OutcomeJournal {
-                        outcome: PaperArbitragePreservedOutcome::Incomplete(receipts),
+                        outcome: Box::new(PaperArbitragePreservedOutcome::Incomplete(receipts)),
                         source,
                     });
                 }
@@ -316,7 +316,7 @@ impl DurablePaperArbitrageSaga {
                     .await
                 {
                     return Err(PaperArbitrageSagaError::AccountFinalization {
-                        outcome: PaperArbitragePreservedOutcome::Incomplete(receipts),
+                        outcome: Box::new(PaperArbitragePreservedOutcome::Incomplete(receipts)),
                         source,
                     });
                 }
@@ -330,7 +330,7 @@ impl DurablePaperArbitrageSaga {
                         .await
                 {
                     return Err(PaperArbitrageSagaError::OutcomeJournal {
-                        outcome: PaperArbitragePreservedOutcome::Failed(error),
+                        outcome: Box::new(PaperArbitragePreservedOutcome::Failed(error)),
                         source,
                     });
                 }
@@ -340,7 +340,7 @@ impl DurablePaperArbitrageSaga {
                     .await
                 {
                     return Err(PaperArbitrageSagaError::AccountFinalization {
-                        outcome: PaperArbitragePreservedOutcome::Failed(error),
+                        outcome: Box::new(PaperArbitragePreservedOutcome::Failed(error)),
                         source,
                     });
                 }
@@ -664,11 +664,11 @@ pub enum PaperArbitrageSagaError {
     Execution(RuntimeError),
     Incomplete(Vec<TradingReceipt>),
     OutcomeJournal {
-        outcome: PaperArbitragePreservedOutcome,
+        outcome: Box<PaperArbitragePreservedOutcome>,
         source: HistoryError,
     },
     AccountFinalization {
-        outcome: PaperArbitragePreservedOutcome,
+        outcome: Box<PaperArbitragePreservedOutcome>,
         source: PaperAccountError,
     },
     SnapshotTaskFailed,

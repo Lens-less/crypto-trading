@@ -578,15 +578,15 @@ impl MarketDataBook {
             .ok_or(MarketDataError::GenerationExhausted)?;
 
         let entry = &mut self.entries[index];
-        if let Some(last_received_at) = entry.status_changed_at {
-            if observation.received_at < last_received_at {
-                entry.continuity = MarketContinuity::OutOfOrderReceipt {
-                    last_received_at,
-                    observed_received_at: observation.received_at,
-                };
-                self.generation = next_generation;
-                return Ok(MarketDataUpdate::IgnoredOutOfOrderReceipt);
-            }
+        if let Some(last_received_at) = entry.status_changed_at
+            && observation.received_at < last_received_at
+        {
+            entry.continuity = MarketContinuity::OutOfOrderReceipt {
+                last_received_at,
+                observed_received_at: observation.received_at,
+            };
+            self.generation = next_generation;
+            return Ok(MarketDataUpdate::IgnoredOutOfOrderReceipt);
         }
         let mut accepted_continuity = MarketContinuity::Continuous;
         if let Some(last) = &entry.last {

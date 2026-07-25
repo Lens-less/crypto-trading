@@ -22,10 +22,10 @@
 在本目录运行：
 
 ```powershell
-cargo +1.85.0 check --workspace --all-targets --all-features --locked
-cargo +1.85.0 fmt --all -- --check
-cargo +1.85.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo +1.85.0 test --workspace --all-targets --all-features --locked
+cargo +1.89.0 check --workspace --all-targets --all-features --locked
+cargo +1.89.0 fmt --all -- --check
+cargo +1.89.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.89.0 test --workspace --all-targets --all-features --locked
 ```
 
 ## 命令示例

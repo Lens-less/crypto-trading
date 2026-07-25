@@ -7,10 +7,10 @@
 //! is unsupported and must remain unavailable at CLI/service boundaries.
 //!
 //! The repository keeps that boundary explicit instead of inventing a
-//! lockfile-based lease. With `rust-version = 1.85.0`,
-//! `unsafe_code = "forbid"`, and no extra file-locking dependency,
-//! `std::fs::File::lock` is still unstable, so this module cannot honestly
-//! promise recoverable cross-process writer exclusion yet.
+//! lockfile-based lease. `rust-version = 1.89.0` makes `std::fs::File::lock`
+//! available without any new dependency, but this module has not yet been
+//! wired to use it, so it cannot honestly promise recoverable cross-process
+//! writer exclusion yet (tracked in the M4 execution plan).
 
 use std::{
     collections::HashMap,
@@ -509,9 +509,9 @@ impl PaperAccountAuthority {
     /// Every paper-account fact is bound to `journal_id`; reopening a history
     /// under another generation degrades the projection and closes writes.
     /// This does not provide a cross-process file lock. Callers must keep this
-    /// authority inaccessible from multi-process CLI/service write surfaces. On
-    /// Rust 1.85.0 the standard-library file-lock API is still unstable, so
-    /// this restriction is deliberate rather than an accidental omission.
+    /// authority inaccessible from multi-process CLI/service write surfaces
+    /// until the M4 execution plan's cross-process writer lock lands; this
+    /// restriction is deliberate rather than an accidental omission.
     ///
     /// # Errors
     ///
@@ -1335,10 +1335,10 @@ fn require_money_strings_for_reserved(details: &Value) -> Result<(), ()> {
 
 fn require_money_strings_for_transition(details: &Value) -> Result<(), ()> {
     let details = details.as_object().ok_or(())?;
-    if let Some(value) = details.get("confirmed_exposure") {
-        if !value.is_null() {
-            require_money_string(Some(value))?;
-        }
+    if let Some(value) = details.get("confirmed_exposure")
+        && !value.is_null()
+    {
+        require_money_string(Some(value))?;
     }
     Ok(())
 }

@@ -105,10 +105,10 @@ pub struct DecisionRecord {
 /// journal or an external single-writer service.
 ///
 /// This crate intentionally does not emulate an OS file lease with lockfiles or
-/// PID metadata. Under the current repository constraints (`rust-version =
-/// 1.85.0`, `unsafe_code = "forbid"`, and no new dependency for platform file
-/// locking), `std::fs::File::lock` is still unstable, so a recoverable
-/// cross-process writer exclusion cannot be claimed honestly here.
+/// PID metadata. `rust-version = 1.89.0` makes `std::fs::File::lock` available
+/// without any new dependency, but this crate has not yet been wired to use
+/// it, so a recoverable cross-process writer exclusion cannot be claimed
+/// honestly here yet (tracked in the M4 execution plan).
 ///
 /// Locks are keyed by normalized paths rather than filesystem object identity.
 /// Existing hard links and paths retargeted after construction can therefore
@@ -227,12 +227,12 @@ impl JsonlHistory {
         }
 
         let _guard = self.path_lock.lock().await;
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(HistoryError::CreateDirectory)?;
-            }
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(HistoryError::CreateDirectory)?;
         }
 
         let mut file = tokio::fs::OpenOptions::new()

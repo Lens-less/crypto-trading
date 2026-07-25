@@ -695,7 +695,7 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
             ),
             "Authoritative account equity, margin, global exposure, and pending-order reservations.",
             &[
-                "A journal-backed process-local paper-only reservation authority owns conservative available/pending/uncertain/committed capacity, but it has no cross-process writer exclusion; on Rust 1.85.0 the standard-library file-lock API remains unstable, so this crate does not claim a recoverable std-only multi-process lease. It also does not own exchange equity, margin, mark-to-market, position truth, or testnet/mainnet state.",
+                "A journal-backed process-local paper-only reservation authority owns conservative available/pending/uncertain/committed capacity, but it has no cross-process writer exclusion yet; rust-version 1.89.0 makes the standard-library file-lock API available, but this crate has not yet been wired to use it, so it does not claim a recoverable multi-process lease. It also does not own exchange equity, margin, mark-to-market, position truth, or testnet/mainnet state.",
             ],
             &[
                 "rust/crates/strategy/src/risk.rs",
