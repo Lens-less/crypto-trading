@@ -565,11 +565,19 @@ fn publish_runtime_failure(
 
 /// Bounded evidence policy used by the offline verifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestnetSoakSampleCoverageRequirement {
+    NotRequired,
+    AllKinds,
+}
+
+/// Bounded evidence policy used by the offline verifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TestnetSoakEvidenceRequirements {
     minimum_duration: Duration,
     minimum_successful_probes: u64,
     require_clean_stop: bool,
     require_unclean_restart: bool,
+    sample_coverage: TestnetSoakSampleCoverageRequirement,
 }
 
 impl TestnetSoakEvidenceRequirements {
@@ -589,6 +597,7 @@ impl TestnetSoakEvidenceRequirements {
             minimum_successful_probes,
             true,
             true,
+            TestnetSoakSampleCoverageRequirement::AllKinds,
         )
     }
 
@@ -602,6 +611,7 @@ impl TestnetSoakEvidenceRequirements {
         minimum_successful_probes: u64,
         require_clean_stop: bool,
         require_unclean_restart: bool,
+        sample_coverage: TestnetSoakSampleCoverageRequirement,
     ) -> Result<Self, TestnetSoakEvidenceError> {
         if minimum_duration > MAX_EVIDENCE_DURATION
             || minimum_successful_probes
@@ -614,6 +624,7 @@ impl TestnetSoakEvidenceRequirements {
             minimum_successful_probes,
             require_clean_stop,
             require_unclean_restart,
+            sample_coverage,
         })
     }
 }
@@ -625,15 +636,27 @@ pub enum TestnetSoakEvidenceViolation {
     MinimumSuccessfulProbes,
     CleanStopMissing,
     UncleanRestartMissing,
+    SpotBookTickerMissing,
+    UsdMBookTickerMissing,
+    AuthenticatedReconcileMissing,
 }
 
-/// Machine-readable, secret-free projection of one task's evidence.
+/// Per-kind successful probe counts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TestnetSoakSampleCounts {
+    pub spot_book_ticker: u64,
+    pub usd_m_book_ticker: u64,
+    pub authenticated_reconcile: u64,
+}
+
+/// Machine-readable copy of the applied evidence policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TestnetSoakEvidencePolicySummary {
     pub minimum_duration_seconds: u64,
     pub minimum_successful_probes: u64,
     pub require_clean_stop: bool,
     pub require_unclean_restart: bool,
+    pub sample_coverage: TestnetSoakSampleCoverageRequirement,
 }
 
 /// Machine-readable, secret-free projection of one task's evidence.
@@ -644,6 +667,7 @@ pub struct TestnetSoakEvidenceSummary {
     pub requirements: TestnetSoakEvidencePolicySummary,
     pub observed_duration_seconds: u64,
     pub successful_probe_count: u64,
+    pub sample_counts: TestnetSoakSampleCounts,
     pub failed_probe_count: u64,
     pub clean_stop_observed: bool,
     pub unclean_restart_count: u32,
@@ -663,9 +687,15 @@ impl TestnetSoakEvidenceSummary {
                 "minimum_successful_probes": self.requirements.minimum_successful_probes,
                 "require_clean_stop": self.requirements.require_clean_stop,
                 "require_unclean_restart": self.requirements.require_unclean_restart,
+                "sample_coverage": sample_coverage_label(self.requirements.sample_coverage),
             },
             "observed_duration_seconds": self.observed_duration_seconds,
             "successful_probe_count": self.successful_probe_count,
+            "sample_counts": {
+                "spot_book_ticker": self.sample_counts.spot_book_ticker,
+                "usd_m_book_ticker": self.sample_counts.usd_m_book_ticker,
+                "authenticated_reconcile": self.sample_counts.authenticated_reconcile,
+            },
             "failed_probe_count": self.failed_probe_count,
             "clean_stop_observed": self.clean_stop_observed,
             "unclean_restart_count": self.unclean_restart_count,
@@ -708,6 +738,20 @@ pub fn verify_testnet_soak_evidence(
     if requirements.require_unclean_restart && projection.unclean_restart_count == 0 {
         violations.push(TestnetSoakEvidenceViolation::UncleanRestartMissing);
     }
+    if matches!(
+        requirements.sample_coverage,
+        TestnetSoakSampleCoverageRequirement::AllKinds
+    ) {
+        if projection.sample_counts.spot_book_ticker == 0 {
+            violations.push(TestnetSoakEvidenceViolation::SpotBookTickerMissing);
+        }
+        if projection.sample_counts.usd_m_book_ticker == 0 {
+            violations.push(TestnetSoakEvidenceViolation::UsdMBookTickerMissing);
+        }
+        if projection.sample_counts.authenticated_reconcile == 0 {
+            violations.push(TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing);
+        }
+    }
     Ok(TestnetSoakEvidenceSummary {
         schema_version: TESTNET_SOAK_SCHEMA_VERSION,
         task_id: task_id.to_owned(),
@@ -716,9 +760,11 @@ pub fn verify_testnet_soak_evidence(
             minimum_successful_probes: requirements.minimum_successful_probes,
             require_clean_stop: requirements.require_clean_stop,
             require_unclean_restart: requirements.require_unclean_restart,
+            sample_coverage: requirements.sample_coverage,
         },
         observed_duration_seconds,
         successful_probe_count: projection.successful_probe_count,
+        sample_counts: projection.sample_counts,
         failed_probe_count: projection.failed_probe_count,
         clean_stop_observed,
         unclean_restart_count: projection.unclean_restart_count,
@@ -735,6 +781,7 @@ struct EvidenceProjection {
     segment_last_probe_at: Option<DateTime<Utc>>,
     observed_active_seconds: u64,
     successful_probe_count: u64,
+    sample_counts: TestnetSoakSampleCounts,
     failed_probe_count: u64,
     consecutive_failure_count: u16,
     unclean_restart_count: u32,
@@ -752,6 +799,7 @@ impl EvidenceProjection {
         self.segment_last_probe_at = None;
         self.observed_active_seconds = 0;
         self.successful_probe_count = 0;
+        self.sample_counts = TestnetSoakSampleCounts::default();
         self.failed_probe_count = 0;
         self.consecutive_failure_count = 0;
         self.unclean_restart_count = 0;
@@ -804,8 +852,11 @@ fn project_records(
         let Some(record_task_id) = record.details.get("task_id").and_then(Value::as_str) else {
             return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
         };
-        validate_task_id(record_task_id)
+        let normalized_task_id = validate_task_id(record_task_id)
             .map_err(|_| TestnetSoakEvidenceError::InvalidSoakRecord)?;
+        if normalized_task_id != record_task_id {
+            return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
+        }
         if record_task_id != task_id {
             continue;
         }
@@ -899,6 +950,16 @@ fn project_probe_success(
         .ok_or(TestnetSoakEvidenceError::InvalidSoakRecord)?;
     projection.successful_probe_count = projection
         .successful_probe_count
+        .checked_add(1)
+        .ok_or(TestnetSoakEvidenceError::CounterOverflow)?;
+    let sample_count = match sample {
+        TestnetSoakSample::SpotBookTicker => &mut projection.sample_counts.spot_book_ticker,
+        TestnetSoakSample::UsdMBookTicker => &mut projection.sample_counts.usd_m_book_ticker,
+        TestnetSoakSample::AuthenticatedReconcile => {
+            &mut projection.sample_counts.authenticated_reconcile
+        }
+    };
+    *sample_count = sample_count
         .checked_add(1)
         .ok_or(TestnetSoakEvidenceError::CounterOverflow)?;
     projection.consecutive_failure_count = 0;
@@ -1155,6 +1216,13 @@ fn parse_sample(value: &str) -> Option<TestnetSoakSample> {
     }
 }
 
+const fn sample_coverage_label(requirement: TestnetSoakSampleCoverageRequirement) -> &'static str {
+    match requirement {
+        TestnetSoakSampleCoverageRequirement::NotRequired => "not_required",
+        TestnetSoakSampleCoverageRequirement::AllKinds => "all_kinds",
+    }
+}
+
 const fn probe_failure_label(failure: TestnetSoakProbeFailure) -> &'static str {
     match failure {
         TestnetSoakProbeFailure::Transport => "transport",
@@ -1196,11 +1264,15 @@ const fn evidence_violation_label(violation: TestnetSoakEvidenceViolation) -> &'
         TestnetSoakEvidenceViolation::MinimumSuccessfulProbes => "minimum_successful_probes",
         TestnetSoakEvidenceViolation::CleanStopMissing => "clean_stop_missing",
         TestnetSoakEvidenceViolation::UncleanRestartMissing => "unclean_restart_missing",
+        TestnetSoakEvidenceViolation::SpotBookTickerMissing => "spot_book_ticker_missing",
+        TestnetSoakEvidenceViolation::UsdMBookTickerMissing => "usd_m_book_ticker_missing",
+        TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing => {
+            "authenticated_reconcile_missing"
+        }
     }
 }
 
 /// Bounded owner error. Error strings never contain probe or response text.
-#[derive(Debug)]
 pub enum TestnetSoakTaskError {
     InvalidConfig,
     Evidence(TestnetSoakEvidenceError),
@@ -1210,6 +1282,12 @@ pub enum TestnetSoakTaskError {
     TaskPanicked,
     TaskCancelled,
     PreviouslyFailed(TestnetSoakTaskFailure),
+}
+
+impl fmt::Debug for TestnetSoakTaskError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 impl TestnetSoakTaskError {

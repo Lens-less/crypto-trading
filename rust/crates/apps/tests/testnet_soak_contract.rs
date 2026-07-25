@@ -38,8 +38,9 @@ use serde_json::{Value, json};
 use testnet_soak::{
     TestnetSoakEvidenceError, TestnetSoakEvidenceRequirements, TestnetSoakEvidenceViolation,
     TestnetSoakProbe, TestnetSoakProbeFailure, TestnetSoakProbeFuture, TestnetSoakSample,
-    TestnetSoakTask, TestnetSoakTaskConfig, TestnetSoakTaskError, TestnetSoakTaskExit,
-    TestnetSoakTaskFailure, TestnetSoakTaskPhase, verify_testnet_soak_evidence,
+    TestnetSoakSampleCoverageRequirement, TestnetSoakTask, TestnetSoakTaskConfig,
+    TestnetSoakTaskError, TestnetSoakTaskExit, TestnetSoakTaskFailure, TestnetSoakTaskPhase,
+    verify_testnet_soak_evidence,
 };
 
 static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(1);
@@ -125,7 +126,14 @@ async fn successful_probe_and_stop_produce_verifiable_evidence() {
     let summary = verify_testnet_soak_evidence(
         &path,
         "binance-testnet-24h",
-        TestnetSoakEvidenceRequirements::new(Duration::ZERO, 1, true, false).unwrap(),
+        TestnetSoakEvidenceRequirements::new(
+            Duration::ZERO,
+            1,
+            true,
+            false,
+            TestnetSoakSampleCoverageRequirement::NotRequired,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(summary.requirements_met);
@@ -286,7 +294,14 @@ async fn startup_detects_a_prior_running_fact_without_inventing_a_kill() {
     let summary = verify_testnet_soak_evidence(
         &path,
         "binance-testnet-restart",
-        TestnetSoakEvidenceRequirements::new(Duration::ZERO, 1, true, true).unwrap(),
+        TestnetSoakEvidenceRequirements::new(
+            Duration::ZERO,
+            1,
+            true,
+            true,
+            TestnetSoakSampleCoverageRequirement::NotRequired,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(summary.requirements_met);
@@ -306,10 +321,16 @@ async fn twenty_four_hour_evidence_passes_and_stricter_policy_reports_violations
         .append_batch(&[
             fact(started_at, task_id, "testnet_soak_started", Value::Null),
             fact(
-                started_at + ChronoDuration::hours(12),
+                started_at + ChronoDuration::hours(6),
                 task_id,
                 "testnet_soak_probe_succeeded",
                 json!({"sample": "spot_book_ticker"}),
+            ),
+            fact(
+                started_at + ChronoDuration::hours(12),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "usd_m_book_ticker"}),
             ),
             fact(
                 started_at + ChronoDuration::hours(12),
@@ -342,18 +363,33 @@ async fn twenty_four_hour_evidence_passes_and_stricter_policy_reports_violations
     let passing = verify_testnet_soak_evidence(
         &path,
         task_id,
-        TestnetSoakEvidenceRequirements::new(Duration::from_secs(24 * 60 * 60), 2, true, true)
-            .unwrap(),
+        TestnetSoakEvidenceRequirements::new(
+            Duration::from_secs(24 * 60 * 60),
+            3,
+            true,
+            true,
+            TestnetSoakSampleCoverageRequirement::AllKinds,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(passing.requirements_met);
     assert_eq!(passing.observed_duration_seconds, 25 * 60 * 60);
+    assert_eq!(passing.sample_counts.spot_book_ticker, 1);
+    assert_eq!(passing.sample_counts.usd_m_book_ticker, 1);
+    assert_eq!(passing.sample_counts.authenticated_reconcile, 1);
 
     let failing = verify_testnet_soak_evidence(
         &path,
         task_id,
-        TestnetSoakEvidenceRequirements::new(Duration::from_secs(26 * 60 * 60), 3, true, true)
-            .unwrap(),
+        TestnetSoakEvidenceRequirements::new(
+            Duration::from_secs(26 * 60 * 60),
+            4,
+            true,
+            true,
+            TestnetSoakSampleCoverageRequirement::AllKinds,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(!failing.requirements_met);
@@ -363,6 +399,72 @@ async fn twenty_four_hour_evidence_passes_and_stricter_policy_reports_violations
             TestnetSoakEvidenceViolation::MinimumDuration,
             TestnetSoakEvidenceViolation::MinimumSuccessfulProbes,
         ]
+    );
+}
+
+#[tokio::test]
+async fn public_only_samples_do_not_satisfy_the_production_policy() {
+    let path = history_path("soak-public-only");
+    let history = JsonlHistory::new(&path);
+    let task_id = "binance-testnet-public-only";
+    let started_at = Utc::now() - ChronoDuration::hours(25);
+    history
+        .append_batch(&[
+            fact(started_at, task_id, "testnet_soak_started", Value::Null),
+            fact(
+                started_at + ChronoDuration::hours(6),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "spot_book_ticker"}),
+            ),
+            fact(
+                started_at + ChronoDuration::hours(12),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "usd_m_book_ticker"}),
+            ),
+            fact(
+                started_at + ChronoDuration::hours(12),
+                task_id,
+                "testnet_soak_unclean_restart_detected",
+                Value::Null,
+            ),
+            fact(
+                started_at + ChronoDuration::hours(12),
+                task_id,
+                "testnet_soak_started",
+                Value::Null,
+            ),
+            fact(
+                started_at + ChronoDuration::hours(25),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "spot_book_ticker"}),
+            ),
+            fact(
+                started_at + ChronoDuration::hours(25),
+                task_id,
+                "testnet_soak_stopped",
+                json!({"exit": "stop_requested"}),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let summary = verify_testnet_soak_evidence(
+        &path,
+        task_id,
+        TestnetSoakEvidenceRequirements::twenty_four_hour(3).unwrap(),
+    )
+    .unwrap();
+    assert!(!summary.requirements_met);
+    assert_eq!(summary.observed_duration_seconds, 25 * 60 * 60);
+    assert_eq!(summary.sample_counts.spot_book_ticker, 2);
+    assert_eq!(summary.sample_counts.usd_m_book_ticker, 1);
+    assert_eq!(summary.sample_counts.authenticated_reconcile, 0);
+    assert_eq!(
+        summary.violations,
+        vec![TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing]
     );
 }
 
@@ -406,7 +508,14 @@ async fn a_long_offline_gap_does_not_count_toward_twenty_four_hours() {
     let summary = verify_testnet_soak_evidence(
         &path,
         task_id,
-        TestnetSoakEvidenceRequirements::twenty_four_hour(1).unwrap(),
+        TestnetSoakEvidenceRequirements::new(
+            Duration::from_secs(24 * 60 * 60),
+            1,
+            true,
+            true,
+            TestnetSoakSampleCoverageRequirement::NotRequired,
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(!summary.requirements_met);
@@ -419,10 +528,74 @@ async fn a_long_offline_gap_does_not_count_toward_twenty_four_hours() {
     assert_eq!(summary.unclean_restart_count, 1);
 }
 
+#[tokio::test]
+async fn a_clean_stop_from_an_older_campaign_does_not_cover_the_latest_run() {
+    let path = history_path("soak-stale-clean-stop");
+    let history = JsonlHistory::new(&path);
+    let task_id = "binance-testnet-stale-clean-stop";
+    let started_at = Utc::now() - ChronoDuration::hours(2);
+    history
+        .append_batch(&[
+            fact(started_at, task_id, "testnet_soak_started", Value::Null),
+            fact(
+                started_at + ChronoDuration::hours(1),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "spot_book_ticker"}),
+            ),
+            fact(
+                started_at + ChronoDuration::hours(1),
+                task_id,
+                "testnet_soak_stopped",
+                json!({"exit": "stop_requested"}),
+            ),
+            fact(
+                started_at + ChronoDuration::hours(2),
+                task_id,
+                "testnet_soak_started",
+                Value::Null,
+            ),
+            fact(
+                started_at + ChronoDuration::hours(2),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "usd_m_book_ticker"}),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let summary = verify_testnet_soak_evidence(
+        &path,
+        task_id,
+        TestnetSoakEvidenceRequirements::new(
+            Duration::ZERO,
+            1,
+            true,
+            false,
+            TestnetSoakSampleCoverageRequirement::NotRequired,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!summary.requirements_met);
+    assert!(!summary.clean_stop_observed);
+    assert_eq!(
+        summary.violations,
+        vec![TestnetSoakEvidenceViolation::CleanStopMissing]
+    );
+}
+
 #[test]
 fn corrupt_partial_and_oversized_evidence_fail_closed() {
-    let requirements =
-        TestnetSoakEvidenceRequirements::new(Duration::ZERO, 0, false, false).unwrap();
+    let requirements = TestnetSoakEvidenceRequirements::new(
+        Duration::ZERO,
+        0,
+        false,
+        false,
+        TestnetSoakSampleCoverageRequirement::NotRequired,
+    )
+    .unwrap();
 
     let malformed = history_path("soak-malformed");
     fs::write(&malformed, b"{not-json}\n").unwrap();
