@@ -87,34 +87,73 @@ fn apr_and_rating_match_legacy_golden_values() {
 }
 
 #[test]
-fn failed_price_update_leaves_the_entire_grid_state_unchanged() {
+fn virtual_grid_rejects_configs_whose_first_pending_levels_fall_outside_the_domain() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+    let result = VirtualGrid::new(
+        VirtualGridConfig {
+            symbol: Symbol::new("BTC").unwrap(),
+            initial_price: price("100"),
+            grid_width_percent: decimal("10"),
+            grid_interval_percent: decimal("6"),
+        },
+        started_at,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn virtual_grid_consumes_all_crossed_pending_levels_in_one_atomic_price_jump() {
     let started_at = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
     let mut grid = VirtualGrid::new(
         VirtualGridConfig {
             symbol: Symbol::new("BTC").unwrap(),
-            initial_price: price("1"),
-            grid_width_percent: decimal("100"),
-            grid_interval_percent: decimal("75"),
+            initial_price: price("100"),
+            grid_width_percent: decimal("10"),
+            grid_interval_percent: Decimal::ONE,
         },
         started_at,
     )
     .unwrap();
 
-    assert!(
-        grid.update_price_at(price("0.25"), started_at + Duration::seconds(10))
-            .is_err()
+    assert_eq!(
+        grid.update_price_at(price("95"), started_at + Duration::seconds(70))
+            .unwrap(),
+        Some(GridFill::Buy)
     );
-    assert_eq!(grid.current_price(), price("1"));
-    assert_eq!(grid.pending_buy_price(), price("0.25"));
-    assert_eq!(grid.pending_sell_price(), price("1.75"));
-    assert_eq!(grid.buy_crosses(), 0);
+    assert_eq!(grid.current_price(), price("95"));
+    assert_eq!(grid.pending_buy_price(), price("94"));
+    assert_eq!(grid.pending_sell_price(), price("96"));
+    assert_eq!(grid.buy_crosses(), 5);
     assert_eq!(grid.sell_crosses(), 0);
     assert_eq!(grid.complete_cycles(), 0);
-
     assert_eq!(
-        grid.update_price_at(price("1"), started_at + Duration::seconds(5))
+        grid.calculate_apr_at(started_at + Duration::seconds(70), Duration::hours(1))
             .unwrap(),
-        None
+        Decimal::ZERO
+    );
+    assert_eq!(
+        grid.update_price_at(price("100"), started_at + Duration::seconds(70))
+            .unwrap(),
+        Some(GridFill::Sell)
+    );
+    assert_eq!(grid.current_price(), price("100"));
+    assert_eq!(grid.pending_buy_price(), price("99"));
+    assert_eq!(grid.pending_sell_price(), price("101"));
+    assert_eq!(grid.buy_crosses(), 5);
+    assert_eq!(grid.sell_crosses(), 5);
+    assert_eq!(grid.complete_cycles(), 5);
+    assert_eq!(
+        grid.recent_cycles_at(started_at + Duration::seconds(70), Duration::hours(1)),
+        5
+    );
+    let apr = grid
+        .calculate_apr_at(started_at + Duration::seconds(120), Duration::hours(1))
+        .unwrap();
+    assert_eq!(grid.cycles_per_hour().round_dp(4), decimal("150.0000"));
+    assert_eq!(
+        apr,
+        AprCalculator::annualized(Decimal::ONE, decimal("10"), grid.cycles_per_hour()).unwrap()
     );
 }
 

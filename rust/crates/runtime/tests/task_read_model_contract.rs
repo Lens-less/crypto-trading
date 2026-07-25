@@ -10,7 +10,8 @@ use uuid::Uuid;
 #[test]
 fn lifecycle_projects_exact_sources_and_a_terminal_task() {
     let snapshot = snapshot(jsonl(&[
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_registered",
             "registered",
             0,
@@ -19,7 +20,8 @@ fn lifecycle_projects_exact_sources_and_a_terminal_task() {
             None,
             "2026-07-25T00:00:00Z",
         ),
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_running",
             "running",
             0,
@@ -28,7 +30,8 @@ fn lifecycle_projects_exact_sources_and_a_terminal_task() {
             None,
             "2026-07-25T00:00:01Z",
         ),
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_checkpointed",
             "running",
             2,
@@ -37,7 +40,8 @@ fn lifecycle_projects_exact_sources_and_a_terminal_task() {
             None,
             "2026-07-25T00:00:02Z",
         ),
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_stopping",
             "stopping",
             2,
@@ -46,7 +50,8 @@ fn lifecycle_projects_exact_sources_and_a_terminal_task() {
             None,
             "2026-07-25T00:00:03Z",
         ),
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_stopped",
             "stopped",
             2,
@@ -89,7 +94,8 @@ fn lifecycle_projects_exact_sources_and_a_terminal_task() {
 #[test]
 fn nonterminal_durable_state_is_recovered_as_unverified_not_auto_resumed() {
     let bytes = jsonl(&[
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_registered",
             "registered",
             0,
@@ -98,7 +104,8 @@ fn nonterminal_durable_state_is_recovered_as_unverified_not_auto_resumed() {
             None,
             "2026-07-25T00:00:00Z",
         ),
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_running",
             "running",
             0,
@@ -107,7 +114,8 @@ fn nonterminal_durable_state_is_recovered_as_unverified_not_auto_resumed() {
             None,
             "2026-07-25T00:00:01Z",
         ),
-        task_record(
+        task_record_with_kind(
+            "arbitrage_monitor",
             "task_checkpointed",
             "running",
             1,
@@ -128,6 +136,39 @@ fn nonterminal_durable_state_is_recovered_as_unverified_not_auto_resumed() {
         ReadOnlyTaskRecovery::Investigate
     );
     assert_eq!(restarted.tasks[0].processed_event_count, 1);
+}
+
+#[test]
+fn arbitrage_paper_kind_reuses_the_same_durable_recovery_contract() {
+    let snapshot = snapshot(jsonl(&[
+        task_record_with_kind(
+            "arbitrage_paper",
+            "task_registered",
+            "registered",
+            0,
+            registered_sources(),
+            None,
+            None,
+            "2026-07-25T00:00:00Z",
+        ),
+        task_record_with_kind(
+            "arbitrage_paper",
+            "task_running",
+            "running",
+            0,
+            running_sources(0, "unknown", "unknown"),
+            None,
+            None,
+            "2026-07-25T00:00:01Z",
+        ),
+    ]));
+
+    let model = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.tasks.len(), 1);
+    assert_eq!(model.tasks[0].kind, ReadOnlyTaskKind::ArbitragePaper);
+    assert_eq!(model.tasks[0].phase, ReadOnlyTaskPhase::Running);
+    assert_eq!(model.tasks[0].recovery, ReadOnlyTaskRecovery::Investigate);
 }
 
 #[test]
@@ -447,6 +488,29 @@ fn task_record(
     failure: Option<&str>,
     timestamp: &str,
 ) -> Value {
+    task_record_with_kind(
+        "arbitrage_monitor",
+        decision,
+        phase,
+        processed_event_count,
+        sources,
+        exit,
+        failure,
+        timestamp,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn task_record_with_kind(
+    task_kind: &str,
+    decision: &str,
+    phase: &str,
+    processed_event_count: u64,
+    sources: Value,
+    exit: Option<&str>,
+    failure: Option<&str>,
+    timestamp: &str,
+) -> Value {
     let mut record = json!({
         "timestamp": timestamp,
         "strategy": "read_only_task",
@@ -455,7 +519,7 @@ fn task_record(
         "details": {
             "schema_version": 1,
             "task_id": "arb-btc-usdt",
-            "task_kind": "arbitrage_monitor",
+            "task_kind": task_kind,
             "phase": phase,
             "processed_event_count": processed_event_count,
             "sources": Value::Null,

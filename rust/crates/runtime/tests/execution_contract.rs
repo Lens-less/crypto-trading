@@ -362,6 +362,32 @@ struct DeadlineRecordingExchange {
     remaining_millis: AtomicUsize,
 }
 
+struct RecordingPaperExchange {
+    inner: PaperExchange,
+    fail_execute: bool,
+    reconcile_scopes: Mutex<Vec<ReconcileScope>>,
+    execute_calls: AtomicUsize,
+}
+
+impl RecordingPaperExchange {
+    fn new(exchange: &str, fail_execute: bool) -> Self {
+        Self {
+            inner: PaperExchange::new(exchange, NonZeroUsize::new(8).unwrap()).unwrap(),
+            fail_execute,
+            reconcile_scopes: Mutex::new(Vec::new()),
+            execute_calls: AtomicUsize::new(0),
+        }
+    }
+
+    async fn publish_snapshot(&self, snapshot: MarketSnapshot) {
+        self.inner.publish_snapshot(snapshot).await.unwrap();
+    }
+
+    fn reconcile_scopes(&self) -> Vec<ReconcileScope> {
+        self.reconcile_scopes.lock().unwrap().clone()
+    }
+}
+
 impl DeadlineRecordingExchange {
     const fn new() -> Self {
         Self {
@@ -477,6 +503,33 @@ impl ExchangeHandle for StatusOnlyExchange {
             latest_market_timestamp: None,
             open_orders: 0,
         })
+    }
+}
+
+#[async_trait]
+impl ExchangeHandle for RecordingPaperExchange {
+    async fn execute(&self, command: TradingCommand) -> Result<TradingReceipt, ExchangeError> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_execute {
+            return Err(ExchangeError::rejected("scripted adapter failure"));
+        }
+        self.inner.execute(command).await
+    }
+
+    async fn reconcile(&self, scope: ReconcileScope) -> Result<ReconcileReceipt, ExchangeError> {
+        self.reconcile_scopes.lock().unwrap().push(scope.clone());
+        self.inner.reconcile(scope).await
+    }
+
+    async fn subscribe(
+        &self,
+        subscription: MarketSubscription,
+    ) -> Result<SubscriptionReceipt, ExchangeError> {
+        self.inner.subscribe(subscription).await
+    }
+
+    async fn status(&self) -> Result<ExchangeStatus, ExchangeError> {
+        self.inner.status().await
     }
 }
 
@@ -858,6 +911,83 @@ async fn partial_execution_keeps_batch_identity_index_and_unattempted_intents() 
     assert_eq!(actual_unattempted, vec![unattempted]);
     assert_eq!(reconciliation.len(), 1);
     assert!(reconciliation[0].result.is_ok());
+}
+
+#[tokio::test]
+async fn exchange_router_partial_execution_reconciles_each_prevalidated_adapter_once() {
+    let now = Utc::now();
+    let symbol = Symbol::new("BTC-USDT").unwrap();
+    let alpha = Arc::new(RecordingPaperExchange::new("alpha", false));
+    let beta = Arc::new(RecordingPaperExchange::new("beta", true));
+    alpha
+        .publish_snapshot(snapshot_for("alpha", symbol.clone(), now))
+        .await;
+    beta.publish_snapshot(snapshot_for("beta", symbol.clone(), now))
+        .await;
+
+    let first = OrderIntent::market(
+        "alpha",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(decimal("0.01")).unwrap(),
+    );
+    let failed = OrderIntent::market(
+        "beta",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(decimal("0.02")).unwrap(),
+    );
+    let unattempted = OrderIntent::market(
+        "alpha",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(decimal("0.03")).unwrap(),
+    );
+    let batch_id = Uuid::new_v4();
+    let batch = ExecutionBatch::new(
+        batch_id,
+        vec![first.clone(), failed.clone(), unattempted.clone()],
+    )
+    .unwrap();
+    let policy = policy(
+        now,
+        vec![
+            snapshot_for("alpha", symbol.clone(), now),
+            snapshot_for("beta", symbol, now),
+        ],
+    );
+    let mut router = ExchangeRouter::new(ExecutionMode::Paper, policy);
+    router.register("alpha", Arc::clone(&alpha));
+    router.register("beta", Arc::clone(&beta));
+
+    let error = router.execute_batch(batch).await.unwrap_err();
+    let RuntimeError::PartialExecution {
+        batch_id: actual_batch_id,
+        failed_index,
+        completed,
+        failed_intent,
+        unattempted: actual_unattempted,
+        reconciliation,
+        ..
+    } = error
+    else {
+        panic!("expected a structured partial execution outcome");
+    };
+
+    assert_eq!(actual_batch_id, batch_id);
+    assert_eq!(failed_index, 1);
+    assert_eq!(completed.len(), 1);
+    assert_eq!(*failed_intent, failed);
+    assert_eq!(actual_unattempted, vec![unattempted]);
+    assert_eq!(reconciliation.len(), 2);
+    assert!(reconciliation.iter().all(|entry| entry.result.is_ok()));
+    assert_eq!(alpha.execute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(beta.execute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(alpha.reconcile_scopes(), vec![ReconcileScope::All]);
+    assert_eq!(beta.reconcile_scopes(), vec![ReconcileScope::All]);
 }
 
 #[tokio::test]

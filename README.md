@@ -31,13 +31,13 @@
 
 | CLI 命令 | 配置能力 | Paper one-shot | 连续运行 | Live | 当前行为 |
 | --- | --- | --- | --- | --- | --- |
-| `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；发现不支持配置、读取错误或预算耗尽时非零退出 |
+| `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；对 public path loaders、public from_str loaders 和 shared raw reader 统一施加 1 MiB / YAML 读入护栏；发现不支持配置、读取错误或预算耗尽时非零退出 |
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
-| `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量，并通过策略、白名单和风险门禁 |
+| `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
 | `monitor` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验后明确报告运行时尚未实现并非零退出 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
 | `price-alert` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验后失败关闭 |
-| `scanner` | 检查显式配置路径 | 不可用 | 不可用 | 不可用 | 报告 scanner 运行时尚未实现 |
+| `scanner` | 检查显式配置路径 | 不可用 | 不可用 | 不可用 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态退出 |
 
 Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Variational
 出现在配置或冻结的 Python tree 中，只表示兼容/迁移范围，不表示对应私有交易适配器已经可以实盘下单。
@@ -48,7 +48,7 @@ Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Va
 
 - **精确领域类型**：价格、数量和金额使用 `rust_decimal`，关键算术使用受检操作，不以二进制浮点承担交易计算。
 - **纯策略内核**：固定网格、分段套利、价格提醒、做量和虚拟网格逻辑与 I/O 分离，便于确定性测试。
-- **可验证的 PaperExchange**：覆盖订单状态、盘口深度消耗、GTC/IOC/FOK 语义、持仓和失败原子性。
+- **可验证的 PaperExchange**：覆盖订单状态、盘口深度消耗、GTC/IOC/FOK 语义、spot sell inventory 与 reduce-only capacity 的进程内预留、部分成交收缩、撤单释放和 flat position 清理；但不包含 cash/margin ledger、fees/funding/slippage/queue impact、持久化 / 跨进程持仓或风险预留。
 - **失败关闭的执行边界**：未授权模式、过期行情、产品身份不匹配、深度不足、风险超限和未实现适配器都在提交前拒绝。
 - **可审计执行历史**：先写入 `execution_planned`，再写入 `execution_completed`、`execution_partial` 或 `execution_incomplete`。
 - **有界资源使用**：配置、历史记录、批次、actor 队列、HTTP 响应和聚合输出都有显式上限。
@@ -184,9 +184,11 @@ rust/config/
 
 - 单份配置最大 `1 MiB`。
 - YAML anchor/alias 不受支持。
+- public path loaders、public `from_str` loaders 和 shared raw reader 共享同一套 `1 MiB` / YAML 读入护栏。
 - Paper one-shot 只接受 `runtime-executable` strict schema；拼错或未消费字段会在写入 history 前失败。
 - 批量检查最多保留 512 条摘要，文本与 JSON 输出各有 `1 MiB` 预算。
 - 目录扫描或输出预算耗尽时会停止并非零退出，不会声称剩余文件已经检查。
+- `scanner` 显式配置只做有界存在性 / 读取安全检查，不做 schema/runtime validation；它以非零状态报告未实现。
 
 Rust 程序只读取**进程环境变量**，不会自动加载 `.env`。例如：
 
@@ -204,13 +206,14 @@ cargo run --locked -- config-check config/exchanges/paradex_config.yaml
 ## 安全模型与 Paper 限制
 
 1. **Live 永远失败关闭**：风险确认短语只建立显式授权意图，不会绕过尚未完成的适配器、风控和对账门禁。
-2. **每个进程从空 paper 账本开始**：当前 one-shot 不读取真实余额、真实持仓、未成交单或其他进程的 reservation。
-3. **网格是挂单语义验证**：它根据一个显式参考价规划 resting orders，不代表真实撮合或账户风险已经验证。
-4. **套利使用显式顶层盘口**：调用方必须给出双边 bid/ask 和四侧可用数量；模型不等价于完整深度、延迟和滑点仿真。
-5. **Paper 不计算真实交易成本**：手续费、资金费率、网络延迟、队列优先级和市场冲击不在当前结果中。
-6. **不完整执行不得直接重试**：先根据 history 中的批次、腿和对账摘要确认状态，否则可能重复提交。
+2. **每个进程从空 paper 账本开始**：当前 one-shot 不读取真实余额、真实持仓、未成交单或其他进程的 reservation；Grid 也不做账户级 pending-order risk reservation。
+3. **网格是挂单语义验证**：它根据一个显式参考价规划 resting orders，不代表真实撮合、账户风险或跨进程仓位已经验证。
+4. **套利使用显式顶层盘口**：调用方必须给出双边 bid/ask 和四侧可用数量；`strategy_key` 是配置选择器，不是腿 symbol 的别名；模型不等价于完整深度、延迟和滑点仿真。
+5. **仓位上限不是账户预算**：`max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不限制整个批次或账户的总毛名义价值；`equity` 与 `available_balance` 也尚未参与资金或保证金门禁。
+6. **Paper 不计算真实交易成本**：手续费、资金费率、网络延迟、队列优先级和市场冲击不在当前结果中。
+7. **不完整执行不得直接重试**：先根据 history 中的批次、腿和对账摘要确认状态，否则可能重复提交。
 
-更完整的门禁与剩余风险见 [`rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-14.md`](rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-14.md)。
+更完整的门禁与剩余风险见 [`rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。
 
 ## 架构
 
@@ -259,7 +262,7 @@ Rust workspace 包含六个 crate：
 | `execution_partial` | 提交过程报错且已有部分结果，同时保存有界对账摘要 |
 | `execution_incomplete` | 提交返回，但结果数量或状态不足以判定完整成功 |
 
-历史写入有单条、单批和单文件上限；单文件达到 `64 MiB` 后失败关闭，目前不自动轮转。历史串行化只保证同一进程内的路径别名协调，写入故障仍可能留下不完整尾部，因此不应把同一文件当作跨进程事务日志。
+历史写入在构造时固定相对路径；单条、单批和单文件上限仍然存在，单文件达到 `64 MiB` 后失败关闭，目前不自动轮转。同一进程内的路径别名锁协调已改进，但没有跨进程 OS lock、轮转或 transactional saga。取消、进程死亡或抢占中断都可能留下 planned-only 状态，重试前必须先 reconcile。
 
 ## 项目结构
 
@@ -348,11 +351,12 @@ CI 还会：
 
 - [`rust/README.md`](rust/README.md)：详细命令、配置分类和安全边界。
 - [`rust/RUST_REFACTOR_PLAN.md`](rust/RUST_REFACTOR_PLAN.md)：Rust-first 迁移目标、模块设计与验收门槛。
-- [`rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-14.md`](rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-14.md)：审计复核、修复证据和剩余 NO-GO 项。
+- [`rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)：审计复核、修复证据和剩余 NO-GO 项。
 - [`archive/README.md`](archive/README.md)：旧 Python tree 的来源提交和完整性校验。
+- [`LICENSE`](LICENSE)：仓库根目录的权威 MIT 许可证文本。
 
 ## 许可与免责声明
 
-Rust workspace 的 package metadata 当前声明为 MIT；仓库尚未提供独立的根级 `LICENSE` 文件，正式再分发前应补充并确认权威许可证文本。
+Rust workspace 的 package metadata 当前声明为 MIT，仓库根目录也已提供 [`LICENSE`](LICENSE)；正式再分发时以该文件为权威许可证文本。
 
 本项目仅用于软件工程、策略研究和 paper 模拟，不构成投资建议。数字资产交易具有高风险，任何使用者都应独立评估并承担由配置、部署或交易决策产生的后果。

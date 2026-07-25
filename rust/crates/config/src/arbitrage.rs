@@ -40,15 +40,23 @@ impl ArbitrageConfig {
     ///
     /// Legacy documents remain parseable for inventory and migration, but
     /// only explicitly enabled, non-monitoring segmented profiles with
-    /// non-empty exchange and symbol allowlists may cross the strategy
+    /// non-empty exchange and symbol allowlists, at least one enabled symbol
+    /// strategy, and a positive resolved risk limit may cross the strategy
     /// boundary.
     ///
     /// # Errors
     ///
     /// Returns an error when arbitrage is disabled, monitor-only mode is
     /// active, the configured mode is not implemented by the Rust runtime, or
-    /// an operator allowlist is empty or contains a blank exchange name.
+    /// an operator allowlist is empty or contains a blank exchange name, the
+    /// resolved position limit is missing or non-positive, or no symbol
+    /// strategy is enabled for execution.
     pub fn validate_execution_controls(&self) -> ConfigResult<()> {
+        self.validate_strategy_selection_controls()?;
+        self.validate_execution_risk_limit()
+    }
+
+    fn validate_strategy_selection_controls(&self) -> ConfigResult<()> {
         if !self.enabled {
             return Err(ConfigError::Validation(
                 "arbitrage execution is disabled".to_owned(),
@@ -84,7 +92,25 @@ impl ArbitrageConfig {
                 "arbitrage symbol allowlist must not be empty".to_owned(),
             ));
         }
+        if !self.symbol_configs.values().any(|config| config.enabled) {
+            return Err(ConfigError::Validation(
+                "arbitrage executable config requires at least one enabled symbol strategy"
+                    .to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    fn validate_execution_risk_limit(&self) -> ConfigResult<()> {
+        match self.max_position_value {
+            Some(value) if value > Decimal::ZERO => Ok(()),
+            Some(_) => Err(ConfigError::Validation(
+                "arbitrage max_position_value must be positive".to_owned(),
+            )),
+            None => Err(ConfigError::Validation(
+                "arbitrage max_position_value is required for execution".to_owned(),
+            )),
+        }
     }
 
     /// Resolves the effective strategy configuration for one explicitly named
@@ -95,7 +121,7 @@ impl ArbitrageConfig {
     /// Returns an error when the key is absent, disabled, or resolves to an
     /// invalid runtime strategy configuration.
     pub fn resolve_for_strategy(&self, strategy_key: &Symbol) -> ConfigResult<Self> {
-        self.validate_execution_controls()?;
+        self.validate_strategy_selection_controls()?;
         let symbol_config = self.symbol_configs.get(strategy_key).ok_or_else(|| {
             ConfigError::Validation(format!(
                 "arbitrage strategy key {strategy_key} is not configured"
@@ -123,6 +149,7 @@ impl ArbitrageConfig {
         if let Some(value) = symbol_config.max_position_value {
             effective.max_position_value = Some(value);
         }
+        effective.validate_execution_controls()?;
         effective.validate_strategy_values()?;
         Ok(effective)
     }

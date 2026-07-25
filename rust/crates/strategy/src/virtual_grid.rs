@@ -109,6 +109,17 @@ impl VirtualGrid {
                 "virtual grid interval must be positive",
             ));
         }
+        let interval_span = config
+            .grid_interval_percent
+            .checked_mul(Decimal::from(2))
+            .ok_or(StrategyError::InvalidFinancialValue(
+                "virtual grid interval span",
+            ))?;
+        if interval_span > config.grid_width_percent {
+            return Err(StrategyError::InvalidConfig(
+                "virtual grid interval must fit inside width",
+            ));
+        }
         Ok(())
     }
 
@@ -141,6 +152,13 @@ impl VirtualGrid {
             )?,
             "virtual grid pending sell price",
         )?;
+        if pending_buy_price.as_decimal() < lower_value
+            || pending_sell_price.as_decimal() > upper_value
+        {
+            return Err(StrategyError::InvalidConfig(
+                "virtual grid pending levels must stay within width",
+            ));
+        }
 
         Ok(VirtualGridGeometry {
             lower_price: Self::price(lower_value, "virtual grid lower price")?,
@@ -303,8 +321,8 @@ impl VirtualGrid {
         self.estimated_apr
     }
 
-    /// Processes at most one fill per snapshot, matching the legacy ticker seam.
-    /// Applies one price observation and processes at most one pending fill.
+    /// Applies one price observation and processes every deterministically crossed
+    /// in-range pending level in one atomic update.
     ///
     /// # Errors
     ///
@@ -320,68 +338,47 @@ impl VirtualGrid {
                 "virtual grid timestamps must be monotonic",
             ));
         }
+        let lower_bound = self.lower_price.as_decimal();
+        let upper_bound = self.upper_price.as_decimal();
+        let observed_price = new_price.as_decimal();
         let mut next_pending_buy = self.pending_buy_price;
         let mut next_pending_sell = self.pending_sell_price;
         let mut next_buy_crosses = self.buy_crosses;
         let mut next_sell_crosses = self.sell_crosses;
         let mut fill = None;
+        for _ in 0..self.grid_count {
+            if self.consume_buy_level(
+                observed_price,
+                lower_bound,
+                &mut next_pending_buy,
+                &mut next_pending_sell,
+                &mut next_buy_crosses,
+            )? {
+                fill = Some(GridFill::Buy);
+                continue;
+            }
 
-        if new_price <= next_pending_buy {
-            let fill_price = self.pending_buy_price.as_decimal();
-            next_pending_sell = Self::price(
-                fill_price.checked_add(self.grid_interval_value).ok_or(
-                    StrategyError::InvalidFinancialValue("virtual grid pending sell price"),
-                )?,
-                "virtual grid pending sell price",
-            )?;
-            next_pending_buy = Self::price(
-                fill_price.checked_sub(self.grid_interval_value).ok_or(
-                    StrategyError::InvalidFinancialValue("virtual grid pending buy price"),
-                )?,
-                "virtual grid pending buy price",
-            )?;
-            next_buy_crosses =
-                next_buy_crosses
-                    .checked_add(1)
-                    .ok_or(StrategyError::InvalidFinancialValue(
-                        "virtual grid buy cross count",
-                    ))?;
-            fill = Some(GridFill::Buy);
-        } else if new_price >= next_pending_sell {
-            let fill_price = self.pending_sell_price.as_decimal();
-            next_pending_buy = Self::price(
-                fill_price.checked_sub(self.grid_interval_value).ok_or(
-                    StrategyError::InvalidFinancialValue("virtual grid pending buy price"),
-                )?,
-                "virtual grid pending buy price",
-            )?;
-            next_pending_sell = Self::price(
-                fill_price.checked_add(self.grid_interval_value).ok_or(
-                    StrategyError::InvalidFinancialValue("virtual grid pending sell price"),
-                )?,
-                "virtual grid pending sell price",
-            )?;
-            next_sell_crosses =
-                next_sell_crosses
-                    .checked_add(1)
-                    .ok_or(StrategyError::InvalidFinancialValue(
-                        "virtual grid sell cross count",
-                    ))?;
-            fill = Some(GridFill::Sell);
+            if self.consume_sell_level(
+                observed_price,
+                upper_bound,
+                &mut next_pending_buy,
+                &mut next_pending_sell,
+                &mut next_sell_crosses,
+            )? {
+                fill = Some(GridFill::Sell);
+                continue;
+            }
+
+            break;
         }
 
         let next_complete_cycles = next_buy_crosses.min(next_sell_crosses);
-        let completed_cycle = next_complete_cycles > self.complete_cycles;
-        if completed_cycle {
-            if self.cycle_events.len() >= MAX_VIRTUAL_GRID_CYCLE_EVENTS {
-                return Err(StrategyError::InvalidConfig(
-                    "virtual grid cycle history exceeds the business limit",
-                ));
-            }
-            self.cycle_events
-                .try_reserve(1)
-                .map_err(|_| StrategyError::InvalidConfig("virtual grid cycle history is full"))?;
-        }
+        let completed_cycle_count = next_complete_cycles
+            .checked_sub(self.complete_cycles)
+            .ok_or(StrategyError::InvalidFinancialValue(
+                "virtual grid complete cycle count",
+            ))?;
+        let completed_cycle_count_usize = self.reserve_cycle_events(completed_cycle_count)?;
 
         self.current_price = new_price;
         self.last_update_at = timestamp;
@@ -390,8 +387,10 @@ impl VirtualGrid {
         self.buy_crosses = next_buy_crosses;
         self.sell_crosses = next_sell_crosses;
         self.complete_cycles = next_complete_cycles;
-        if completed_cycle {
-            self.cycle_events.push_back(timestamp);
+        if completed_cycle_count_usize > 0 {
+            for _ in 0..completed_cycle_count_usize {
+                self.cycle_events.push_back(timestamp);
+            }
         }
         Ok(fill)
     }
@@ -498,6 +497,108 @@ impl VirtualGrid {
 
     fn price(value: Decimal, name: &'static str) -> Result<Price, StrategyError> {
         Price::new(value).map_err(|_| StrategyError::InvalidFinancialValue(name))
+    }
+
+    fn consume_buy_level(
+        &self,
+        observed_price: Decimal,
+        lower_bound: Decimal,
+        next_pending_buy: &mut Price,
+        next_pending_sell: &mut Price,
+        next_buy_crosses: &mut u64,
+    ) -> Result<bool, StrategyError> {
+        let next_pending_buy_value = next_pending_buy.as_decimal();
+        if next_pending_buy_value < lower_bound || observed_price > next_pending_buy_value {
+            return Ok(false);
+        }
+
+        *next_pending_sell = Self::price(
+            next_pending_buy_value
+                .checked_add(self.grid_interval_value)
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "virtual grid pending sell price",
+                ))?,
+            "virtual grid pending sell price",
+        )?;
+        *next_pending_buy = Self::price(
+            next_pending_buy_value
+                .checked_sub(self.grid_interval_value)
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "virtual grid pending buy price",
+                ))?,
+            "virtual grid pending buy price",
+        )?;
+        *next_buy_crosses =
+            next_buy_crosses
+                .checked_add(1)
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "virtual grid buy cross count",
+                ))?;
+        Ok(true)
+    }
+
+    fn consume_sell_level(
+        &self,
+        observed_price: Decimal,
+        upper_bound: Decimal,
+        next_pending_buy: &mut Price,
+        next_pending_sell: &mut Price,
+        next_sell_crosses: &mut u64,
+    ) -> Result<bool, StrategyError> {
+        let next_pending_sell_value = next_pending_sell.as_decimal();
+        if next_pending_sell_value > upper_bound || observed_price < next_pending_sell_value {
+            return Ok(false);
+        }
+
+        *next_pending_buy = Self::price(
+            next_pending_sell_value
+                .checked_sub(self.grid_interval_value)
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "virtual grid pending buy price",
+                ))?,
+            "virtual grid pending buy price",
+        )?;
+        *next_pending_sell = Self::price(
+            next_pending_sell_value
+                .checked_add(self.grid_interval_value)
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "virtual grid pending sell price",
+                ))?,
+            "virtual grid pending sell price",
+        )?;
+        *next_sell_crosses =
+            next_sell_crosses
+                .checked_add(1)
+                .ok_or(StrategyError::InvalidFinancialValue(
+                    "virtual grid sell cross count",
+                ))?;
+        Ok(true)
+    }
+
+    fn reserve_cycle_events(&mut self, completed_cycle_count: u64) -> Result<usize, StrategyError> {
+        if completed_cycle_count == 0 {
+            return Ok(0);
+        }
+
+        let completed_cycle_count_usize = usize::try_from(completed_cycle_count).map_err(|_| {
+            StrategyError::InvalidConfig("virtual grid cycle history exceeds the business limit")
+        })?;
+        let next_cycle_len = self
+            .cycle_events
+            .len()
+            .checked_add(completed_cycle_count_usize)
+            .ok_or(StrategyError::InvalidConfig(
+                "virtual grid cycle history exceeds the business limit",
+            ))?;
+        if next_cycle_len > MAX_VIRTUAL_GRID_CYCLE_EVENTS {
+            return Err(StrategyError::InvalidConfig(
+                "virtual grid cycle history exceeds the business limit",
+            ));
+        }
+        self.cycle_events
+            .try_reserve(completed_cycle_count_usize)
+            .map_err(|_| StrategyError::InvalidConfig("virtual grid cycle history is full"))?;
+        Ok(completed_cycle_count_usize)
     }
 }
 

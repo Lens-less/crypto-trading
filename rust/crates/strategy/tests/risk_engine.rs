@@ -48,6 +48,32 @@ fn setup() -> (
     (now, symbol, market, account)
 }
 
+fn assert_rejects_single_and_batch(
+    engine: &RiskEngine,
+    intent: &OrderIntent,
+    account: &AccountRiskSnapshot,
+    positions: &[Position],
+    market: &MarketSnapshot,
+    now: chrono::DateTime<Utc>,
+    rejection: &RiskRejection,
+) {
+    let expected = RiskDecision::Rejected(rejection.clone());
+    assert_eq!(
+        engine.authorize(intent, account, positions, market, now),
+        expected
+    );
+    assert_eq!(
+        engine.authorize_batch(
+            std::slice::from_ref(intent),
+            account,
+            positions,
+            std::slice::from_ref(market),
+            now,
+        ),
+        expected
+    );
+}
+
 #[test]
 fn kill_switch_rejects_before_all_other_checks() {
     let (now, symbol, market, mut account) = setup();
@@ -170,6 +196,133 @@ fn future_position_data_is_rejected_as_stale() {
     assert_eq!(
         engine.authorize(&intent, &account, &[position], &market, now),
         RiskDecision::Rejected(RiskRejection::StalePositionData)
+    );
+}
+
+#[test]
+fn conflicting_long_and_short_positions_fail_closed() {
+    let (now, symbol, market, account) = setup();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let positions = [
+        Position {
+            exchange: "paper".to_owned(),
+            symbol: symbol.clone(),
+            market_type: MarketType::Perpetual,
+            side: PositionSide::Long,
+            quantity: quantity("1"),
+            entry_price: Some(price("100")),
+            mark_price: Some(price("100")),
+            unrealized_pnl: Money::default(),
+            updated_at: now,
+        },
+        Position {
+            exchange: "paper".to_owned(),
+            symbol: symbol.clone(),
+            market_type: MarketType::Perpetual,
+            side: PositionSide::Short,
+            quantity: quantity("1"),
+            entry_price: Some(price("100")),
+            mark_price: Some(price("100")),
+            unrealized_pnl: Money::default(),
+            updated_at: now,
+        },
+    ];
+    let intent = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("0.1"),
+    );
+
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &account,
+        &positions,
+        &market,
+        now,
+        &RiskRejection::InvalidQuantity,
+    );
+}
+
+#[test]
+fn flat_position_with_non_zero_quantity_is_rejected() {
+    let (now, symbol, market, account) = setup();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let positions = [Position {
+        exchange: "paper".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Perpetual,
+        side: PositionSide::Flat,
+        quantity: quantity("1"),
+        entry_price: Some(price("100")),
+        mark_price: Some(price("100")),
+        unrealized_pnl: Money::default(),
+        updated_at: now,
+    }];
+    let intent = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("0.1"),
+    );
+
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &account,
+        &positions,
+        &market,
+        now,
+        &RiskRejection::InvalidQuantity,
+    );
+}
+
+#[test]
+fn non_flat_position_with_zero_quantity_is_rejected() {
+    let (now, symbol, market, account) = setup();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let positions = [Position {
+        exchange: "paper".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Perpetual,
+        side: PositionSide::Long,
+        quantity: quantity("0"),
+        entry_price: Some(price("100")),
+        mark_price: Some(price("100")),
+        unrealized_pnl: Money::default(),
+        updated_at: now,
+    }];
+    let intent = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Sell,
+        quantity("0.1"),
+    );
+
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &account,
+        &positions,
+        &market,
+        now,
+        &RiskRejection::InvalidQuantity,
     );
 }
 

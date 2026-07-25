@@ -198,6 +198,116 @@ fn scanner_checks_an_explicit_config_path_before_failing_closed() {
 }
 
 #[test]
+fn scanner_reports_unavailable_validation_for_an_arbitrary_existing_file() {
+    let config = write_temp("scanner-arbitrary-config", "txt", "not scanner yaml\n");
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("scanner")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    std::fs::remove_file(config).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("only completed file-access and input-safety checks"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("no scanner config parsing or schema validation was performed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("scanner runtime is unavailable"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn grid_once_history_failures_do_not_print_success_markers() {
+    let history = temp_path("grid-history-dir", "dir");
+    std::fs::create_dir(&history).unwrap();
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .args([
+            "grid",
+            "config/grid/paper-once-btc.yaml",
+            "--price",
+            "110",
+            "--once",
+            "--history-path",
+        ])
+        .arg(&history)
+        .output()
+        .unwrap();
+
+    std::fs::remove_dir(&history).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_no_success_markers(&stdout);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("failed to open history file"), "{stderr}");
+    assert!(stderr.contains("(os error"), "{stderr}");
+}
+
+#[test]
+fn arbitrage_once_history_failures_do_not_print_success_markers() {
+    let history = temp_path("arbitrage-history-dir", "dir");
+    std::fs::create_dir(&history).unwrap();
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .args([
+            "arbitrage",
+            "--config",
+            "config/arbitrage/paper-once-eth.yaml",
+            "--monitor-config",
+            "config/arbitrage/paper-monitor-eth.yaml",
+            "--once",
+            "--left-exchange",
+            "paper-left",
+            "--left-symbol",
+            "ETH-USDC-PERP",
+            "--left-bid",
+            "99.9",
+            "--left-ask",
+            "100",
+            "--left-bid-quantity",
+            "1",
+            "--left-ask-quantity",
+            "1",
+            "--right-exchange",
+            "paper-right",
+            "--right-symbol",
+            "ETH-USDC-PERP",
+            "--right-bid",
+            "101",
+            "--right-ask",
+            "101.1",
+            "--right-bid-quantity",
+            "1",
+            "--right-ask-quantity",
+            "1",
+            "--history-path",
+        ])
+        .arg(&history)
+        .output()
+        .unwrap();
+
+    std::fs::remove_dir(&history).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_no_success_markers(&stdout);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("failed to open history file"), "{stderr}");
+    assert!(stderr.contains("(os error"), "{stderr}");
+}
+
+#[test]
 fn grid_price_without_once_is_rejected_without_history() {
     let history = temp_path("grid-price-without-once", "jsonl");
     let output = Command::new(binary())
@@ -1687,4 +1797,13 @@ fn assert_grid_orders_are_resting(path: &Path, receipt_count: usize) {
         Some(0),
         "{body}"
     );
+}
+
+fn assert_no_success_markers(stdout: &str) {
+    for marker in ["valid:", "paper placement simulated", "paper executed:"] {
+        assert!(
+            !stdout.contains(marker),
+            "unexpected success marker {marker:?} in stdout: {stdout}"
+        );
+    }
 }

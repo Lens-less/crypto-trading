@@ -7,13 +7,13 @@
 | 命令 | 配置检查 | Paper 单次执行 | 连续运行 | Live 执行 | 当前行为 |
 | --- | --- | --- | --- | --- | --- |
 | `capabilities [--json]` | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
-| `config-check` | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
+| `config-check` | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；public path loaders、public `from_str` loaders 和 shared raw reader 共享 1 MiB / YAML 读入护栏；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
 | `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
-| `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、风险上限、监控白名单和 `symbol_configs` 策略键 |
+| `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
 | `monitor` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
 | `volume-maker` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
 | `price-alert` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
-| `scanner` | 路径存在性 | 否 | 否 | 否 | 以非零状态报告运行时尚未实现 |
+| `scanner` | 路径存在性 | 否 | 否 | 否 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态报告运行时尚未实现 |
 
 `grid` 和 `arbitrage` 的 one-shot 执行会先持久化 `execution_planned`（批次 ID 及全部 client order ID/legs），再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。后两者都会非零退出，且不得直接重试。
 
@@ -56,7 +56,7 @@ cargo run -- config-check $configs --json
 - `auxiliary`：日志、市场元数据、符号转换或 strict monitor companion 等辅助文件；它本身不是可独立启动的策略运行配置。
 - `unsupported`：未知、缺失或违反当前强校验的配置；批量检查最终非零退出。
 
-辅助配置必须同时满足保留文件名和最小内容 schema；文件名不能把交易配置伪装为 `auxiliary`。单份输入最多 1 MiB，YAML anchor/alias 不受支持；批量检查最多保留 512 条摘要，JSON 与文本输出各自最多 1 MiB。达到摘要数或输出预算后，检查会停止、追加终止错误并非零退出，不会声称剩余路径已经检查。
+辅助配置必须同时满足保留文件名和最小内容 schema；文件名不能把交易配置伪装为 `auxiliary`。单份输入最多 1 MiB，YAML anchor/alias 不受支持；public path loaders、public `from_str` loaders 和 shared raw reader 共用同一套 1 MiB / YAML 读入护栏；批量检查最多保留 512 条摘要，JSON 与文本输出各自最多 1 MiB。达到摘要数或输出预算后，检查会停止、追加终止错误并非零退出，不会声称剩余路径已经检查。
 
 Grid paper 单次挂单模拟（`--once` 与 `--price` 必须成对出现；当前不模拟账户级风险）：
 
@@ -78,7 +78,7 @@ cargo run -- arbitrage `
   --right-bid-quantity 10 --right-ask-quantity 10
 ```
 
-带 `--once` 的命令只接受 `runtime-executable` 的 strict schema；含未消费或拼错字段的 legacy 配置会在写 history 前失败关闭。flat 与 `default_config` 的兼容数值别名若同时出现，必须在 Decimal/整数语义上相等，否则按冲突失败关闭。若两条套利腿的 symbol 不同，必须显式传入 `--strategy-key`；该键必须存在于 `symbol_configs` 且 `enabled: true`。CLI、套利配置和 monitor 配置中的 exchange/symbol 白名单都会在生成意图后、提交前再次校验。可执行配置还必须提供正数 `max_position_value`（兼容嵌套 risk 配置，并可由策略项覆盖）；四侧盘口深度会在写入计划前按订单方向聚合校验，缺失或不足时失败关闭。CLI 和 config crate 的公开文件 loader 均拒绝超过 1 MiB 的单份配置。
+带 `--once` 的命令只接受 `runtime-executable` 的 strict schema；含未消费或拼错字段的 legacy 配置会在写 history 前失败关闭。flat 与 `default_config` 的兼容数值别名若同时出现，必须在 Decimal/整数语义上相等，否则按冲突失败关闭。若两条套利腿的 symbol 不同，必须显式传入 `--strategy-key`；该键是配置选择器而不是腿 symbol 的别名，且必须存在于 `symbol_configs` 且 `enabled: true`。CLI、套利配置和 monitor 配置中的 exchange/symbol 白名单都会在生成意图后、提交前再次校验。可执行配置还必须提供正数 `max_position_value`（兼容嵌套 risk 配置，并可由策略项覆盖）；四侧盘口深度会在写入计划前按订单方向聚合校验，缺失或不足时失败关闭。CLI 和 config crate 的公开文件 loader 以及共享 raw reader 均拒绝超过 1 MiB 的单份配置。
 
 ## 凭证与环境变量
 
@@ -97,9 +97,9 @@ cargo run -- config-check config/exchanges/paradex_config.yaml
 
 - 默认且当前唯一可下单的模式是可重复验证的 paper one-shot。
 - 不受支持的连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
-- 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、单批仓位价值门禁、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
-- 单批仓位价值门禁只覆盖当前空仓 one-shot paper；它不代表跨进程仓位、挂单 reservation、多腿补偿或真实账户风控已经完成。
-- Grid one-shot 当前用于验证网格规划与 paper 挂单语义，尚未接入权威账户风险或 pending-order reservation；不得据此开放连续或 live 网格。
+- 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、正的 `max_position_value`、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
+- `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；`equity` 与 `available_balance` 也尚未参与资金或保证金校验。它不代表跨进程仓位、账户资金、挂单风险 reservation、多腿补偿或真实账户风控已经完成。
+- Grid one-shot 当前用于验证网格规划与 paper 挂单语义，尚未接入权威账户风险或 pending-order reservation；不得据此开放连续或 live 网格，也不要把它解释为账户级 pending-order 风险预留。
 - 历史 Python 实现冻结在 `../archive/python-legacy/`，不得作为当前 Rust 入口。
 
-架构、兼容面和验收门槛见 [`RUST_REFACTOR_PLAN.md`](RUST_REFACTOR_PLAN.md)。
+架构、兼容面和验收门槛见 [`RUST_REFACTOR_PLAN.md`](RUST_REFACTOR_PLAN.md)；审计复核、修复证据和剩余 NO-GO 项见 [`RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。

@@ -15,6 +15,7 @@ const EXCHANGE: &str = "binance";
 const DEFAULT_BASE_URL: &str = "https://data-api.binance.vision";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
+const MAX_ERROR_REASON_TEXT_BYTES: usize = 256;
 
 /// Read-only Binance Spot public-market-data adapter.
 #[derive(Debug, Clone)]
@@ -31,6 +32,12 @@ struct BookTickerWire {
     bid_qty: String,
     ask_price: String,
     ask_qty: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceErrorWire {
+    code: i64,
+    msg: String,
 }
 
 impl BinancePublicExchange {
@@ -87,7 +94,7 @@ impl BinancePublicExchange {
     /// HTTP responses, and [`ExchangeError::InvalidResponse`] for malformed or
     /// mismatched response data.
     pub async fn fetch_snapshot(&self, symbol: &Symbol) -> Result<MarketSnapshot, ExchangeError> {
-        let mut response = self
+        let response = self
             .client
             .get(self.book_ticker_url.clone())
             .query(&[("symbol", symbol.as_str())])
@@ -95,13 +102,23 @@ impl BinancePublicExchange {
             .await
             .map_err(|error| ExchangeError::remote_failure(EXCHANGE, None, error.to_string()))?;
         let status = response.status();
+        let payload = Self::read_response_body(response).await?;
+
         if !status.is_success() {
-            return Err(ExchangeError::remote_failure(
+            return Err(Self::map_remote_failure(status, &payload));
+        }
+        let snapshot = Self::parse_book_ticker(&payload, Utc::now())?;
+        if snapshot.symbol != *symbol {
+            return Err(ExchangeError::invalid_response(
                 EXCHANGE,
-                Some(status.as_u16()),
-                status.canonical_reason().unwrap_or("HTTP request failed"),
+                format!("requested symbol {symbol}, received {}", snapshot.symbol),
             ));
         }
+        Ok(snapshot)
+    }
+
+    async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, ExchangeError> {
+        let status = response.status();
         if let Some(content_length) = response.content_length() {
             let requested = usize::try_from(content_length).unwrap_or(usize::MAX);
             if requested > MAX_RESPONSE_BODY_BYTES {
@@ -135,14 +152,84 @@ impl BinancePublicExchange {
             })?;
             payload.extend_from_slice(&chunk);
         }
-        let snapshot = Self::parse_book_ticker(&payload, Utc::now())?;
-        if snapshot.symbol != *symbol {
-            return Err(ExchangeError::invalid_response(
-                EXCHANGE,
-                format!("requested symbol {symbol}, received {}", snapshot.symbol),
-            ));
+        Ok(payload)
+    }
+
+    fn map_remote_failure(status: reqwest::StatusCode, payload: &[u8]) -> ExchangeError {
+        if let Ok(error) = serde_json::from_slice::<BinanceErrorWire>(payload) {
+            let reason = Self::bounded_reason(
+                &format!("Binance error {}", error.code),
+                Some(&error.msg),
+                false,
+            );
+            return ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), reason);
         }
-        Ok(snapshot)
+
+        let status_reason = status.canonical_reason().unwrap_or("HTTP request failed");
+        let reason = match Self::bounded_error_text(payload) {
+            Some((text, was_truncated)) => {
+                Self::bounded_reason(status_reason, Some(&text), was_truncated)
+            }
+            None => status_reason.to_owned(),
+        };
+        ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), reason)
+    }
+
+    fn bounded_error_text(payload: &[u8]) -> Option<(String, bool)> {
+        let limit = payload.len().min(MAX_ERROR_REASON_TEXT_BYTES);
+        let slice = &payload[..limit];
+        let was_truncated = payload.len() > MAX_ERROR_REASON_TEXT_BYTES;
+        let text = match std::str::from_utf8(slice) {
+            Ok(text) => text.to_owned(),
+            Err(error) if error.error_len().is_none() && was_truncated => {
+                let valid_prefix = &slice[..error.valid_up_to()];
+                String::from_utf8_lossy(valid_prefix).into_owned()
+            }
+            Err(_) => String::from_utf8_lossy(slice).into_owned(),
+        };
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return None;
+        }
+        Some((text, was_truncated))
+    }
+
+    fn bounded_reason(prefix: &str, detail: Option<&str>, force_ellipsis: bool) -> String {
+        let Some(detail) = detail else {
+            return Self::bounded_text(prefix, MAX_ERROR_REASON_TEXT_BYTES, false);
+        };
+        let head = format!("{prefix}: ");
+        let available = MAX_ERROR_REASON_TEXT_BYTES.saturating_sub(head.len());
+        if available == 0 {
+            return Self::bounded_text(prefix, MAX_ERROR_REASON_TEXT_BYTES, true);
+        }
+        let detail = Self::bounded_text(detail, available, force_ellipsis);
+        if detail.is_empty() {
+            return Self::bounded_text(prefix, MAX_ERROR_REASON_TEXT_BYTES, false);
+        }
+        format!("{head}{detail}")
+    }
+
+    fn bounded_text(text: &str, max_bytes: usize, force_ellipsis: bool) -> String {
+        if text.len() <= max_bytes && !force_ellipsis {
+            return text.to_owned();
+        }
+        if max_bytes == 0 {
+            return String::new();
+        }
+        if max_bytes <= 3 {
+            return ".".repeat(max_bytes);
+        }
+
+        let content_limit = max_bytes.saturating_sub(3);
+        let mut end = text.len().min(content_limit);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+
+        let mut bounded = text[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+        bounded.push_str("...");
+        bounded
     }
 
     /// Parses the documented Binance `bookTicker` object using exact decimals.

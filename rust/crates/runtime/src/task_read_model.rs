@@ -48,6 +48,7 @@ impl ReadOnlyTaskReadModel {
 #[serde(rename_all = "snake_case")]
 pub enum ReadOnlyTaskKind {
     ArbitrageMonitor,
+    ArbitragePaper,
 }
 
 /// Last durably recorded aggregate phase.
@@ -76,6 +77,7 @@ pub enum ReadOnlyTaskExit {
     StopRequested,
     SourceEnded,
     ShutdownTimedOut,
+    Completed,
 }
 
 /// Bounded failure bucket. Raw remote, panic, filesystem, and adapter text is
@@ -89,6 +91,11 @@ pub enum ReadOnlyTaskFailure {
     JournalUnavailable,
     TaskPanicked,
     TaskCancelled,
+    InvalidRequest,
+    RecoveryRequired,
+    AccountContract,
+    ExecutionIncomplete,
+    ExecutionFailed,
 }
 
 /// Last durably recorded source-supervisor phase.
@@ -388,6 +395,7 @@ fn parse_task_fact(
     let task_id = required_text(details, "task_id")?;
     let kind = match required_text(details, "task_kind")?.as_str() {
         "arbitrage_monitor" => ReadOnlyTaskKind::ArbitrageMonitor,
+        "arbitrage_paper" => ReadOnlyTaskKind::ArbitragePaper,
         _ => return Err(()),
     };
     let phase_text = required_text(details, "phase")?;
@@ -663,7 +671,11 @@ const fn recovery_for(
     match (phase, exit) {
         (
             ReadOnlyTaskPhase::Stopped,
-            Some(ReadOnlyTaskExit::StopRequested | ReadOnlyTaskExit::SourceEnded),
+            Some(
+                ReadOnlyTaskExit::StopRequested
+                | ReadOnlyTaskExit::SourceEnded
+                | ReadOnlyTaskExit::Completed,
+            ),
         ) => ReadOnlyTaskRecovery::None,
         _ => ReadOnlyTaskRecovery::Investigate,
     }
@@ -686,6 +698,7 @@ fn optional_exit(value: &Value) -> Result<Option<ReadOnlyTaskExit>, ()> {
             "stop_requested" => Ok(ReadOnlyTaskExit::StopRequested),
             "source_ended" => Ok(ReadOnlyTaskExit::SourceEnded),
             "shutdown_timed_out" => Ok(ReadOnlyTaskExit::ShutdownTimedOut),
+            "completed" => Ok(ReadOnlyTaskExit::Completed),
             _ => Err(()),
         })
         .transpose()
@@ -700,6 +713,11 @@ fn optional_failure(value: &Value) -> Result<Option<ReadOnlyTaskFailure>, ()> {
             "journal_unavailable" => Ok(ReadOnlyTaskFailure::JournalUnavailable),
             "task_panicked" => Ok(ReadOnlyTaskFailure::TaskPanicked),
             "task_cancelled" => Ok(ReadOnlyTaskFailure::TaskCancelled),
+            "invalid_request" => Ok(ReadOnlyTaskFailure::InvalidRequest),
+            "recovery_required" => Ok(ReadOnlyTaskFailure::RecoveryRequired),
+            "account_contract" => Ok(ReadOnlyTaskFailure::AccountContract),
+            "execution_incomplete" => Ok(ReadOnlyTaskFailure::ExecutionIncomplete),
+            "execution_failed" => Ok(ReadOnlyTaskFailure::ExecutionFailed),
             _ => Err(()),
         })
         .transpose()

@@ -461,18 +461,24 @@ impl PaperExchange {
                 continue;
             };
             let remaining = remaining_quantity(&candidate.orders[index])?;
-            if intent.reduce_only
-                && !reduces_position_by(&candidate, &intent, remaining, Some(&position_indexes))
-            {
-                let order = &mut candidate.orders[index];
-                order.status = OrderStatus::Cancelled;
-                order.updated_at = now;
-                continue;
-            }
-            if intent.market_type == MarketType::Spot
-                && intent.side == Side::Sell
-                && spot_inventory_quantity(&candidate, &intent, Some(&position_indexes)).is_zero()
-            {
+            let available = if intent.reduce_only {
+                available_reduce_only_quantity(
+                    &candidate,
+                    &intent,
+                    Some(candidate.orders[index].id.as_str()),
+                    Some(&position_indexes),
+                )?
+            } else if intent.market_type == MarketType::Spot && intent.side == Side::Sell {
+                available_spot_inventory(
+                    &candidate,
+                    &intent,
+                    Some(candidate.orders[index].id.as_str()),
+                    Some(&position_indexes),
+                )?
+            } else {
+                remaining
+            };
+            if available.is_zero() {
                 let order = &mut candidate.orders[index];
                 order.status = OrderStatus::Cancelled;
                 order.updated_at = now;
@@ -481,7 +487,7 @@ impl PaperExchange {
             let fill_quantity = executable_quantity(
                 &candidate,
                 &intent,
-                remaining,
+                remaining.min(available),
                 &candidate.snapshots[snapshot_index],
                 Some(&position_indexes),
             );
@@ -643,7 +649,8 @@ impl PaperExchange {
             ));
         }
         if intent.reduce_only
-            && !reduces_position_by(&state, &intent, intent.quantity.as_decimal(), None)
+            && available_reduce_only_quantity(&state, &intent, None, None)?
+                < intent.quantity.as_decimal()
         {
             return Err(ExchangeError::rejected(
                 "reduce-only order would increase or reverse the position",
@@ -651,7 +658,7 @@ impl PaperExchange {
         }
         if intent.market_type == MarketType::Spot
             && intent.side == Side::Sell
-            && spot_inventory_quantity(&state, &intent, None).is_zero()
+            && available_spot_inventory(&state, &intent, None, None)? < intent.quantity.as_decimal()
         {
             return Err(ExchangeError::rejected(
                 "spot sell requires available long inventory",
@@ -969,6 +976,93 @@ fn remaining_quantity(order: &Order) -> Result<Decimal, ExchangeError> {
         .ok_or_else(|| ExchangeError::invariant("paper order filled quantity exceeds requested"))
 }
 
+fn is_active_order(order: &Order) -> bool {
+    matches!(
+        order.status,
+        OrderStatus::Pending | OrderStatus::Open | OrderStatus::PartiallyFilled
+    )
+}
+
+fn remaining_reservation_capacity(total: Decimal, reserved: Decimal) -> Decimal {
+    if reserved >= total {
+        Decimal::ZERO
+    } else {
+        total - reserved
+    }
+}
+
+fn reserved_quantity_by<F>(
+    state: &PaperState,
+    current_order_id: Option<&str>,
+    mut predicate: F,
+) -> Result<Decimal, ExchangeError>
+where
+    F: FnMut(&Order) -> bool,
+{
+    let mut reserved = Decimal::ZERO;
+    let mut found_current = current_order_id.is_none();
+    for order in &state.orders {
+        if current_order_id.is_some_and(|order_id| order.id == order_id) {
+            found_current = true;
+            break;
+        }
+        if !is_active_order(order) {
+            continue;
+        }
+        if !predicate(order) {
+            continue;
+        }
+        reserved = reserved
+            .checked_add(remaining_quantity(order)?)
+            .ok_or_else(|| ExchangeError::invariant("paper reservation quantity overflowed"))?;
+    }
+    if !found_current {
+        return Err(ExchangeError::invariant(format!(
+            "paper reservation lookup could not find current order {current_order_id:?}"
+        )));
+    }
+    Ok(reserved)
+}
+
+fn available_spot_inventory(
+    state: &PaperState,
+    intent: &OrderIntent,
+    current_order_id: Option<&str>,
+    position_indexes: Option<&PositionIndex>,
+) -> Result<Decimal, ExchangeError> {
+    let inventory = spot_inventory_quantity(state, intent, position_indexes);
+    let reserved = reserved_quantity_by(state, current_order_id, |order| {
+        order.intent.market_type == MarketType::Spot
+            && order.intent.side == Side::Sell
+            && order.intent.symbol == intent.symbol
+    })?;
+    Ok(remaining_reservation_capacity(inventory, reserved))
+}
+
+fn available_reduce_only_quantity(
+    state: &PaperState,
+    intent: &OrderIntent,
+    current_order_id: Option<&str>,
+    position_indexes: Option<&PositionIndex>,
+) -> Result<Decimal, ExchangeError> {
+    let Some(position) = position_for_intent(state, intent, position_indexes) else {
+        return Ok(Decimal::ZERO);
+    };
+    let signed = signed_quantity(position);
+    let total = match intent.side {
+        Side::Buy if signed.is_sign_negative() => signed.abs(),
+        Side::Sell if signed.is_sign_positive() => signed.abs(),
+        _ => return Ok(Decimal::ZERO),
+    };
+    let reserved = reserved_quantity_by(state, current_order_id, |order| {
+        order.intent.reduce_only
+            && order.intent.side == intent.side
+            && order.intent.symbol == intent.symbol
+            && order.intent.market_type == intent.market_type
+    })?;
+    Ok(remaining_reservation_capacity(total, reserved))
+}
+
 fn executable_quantity(
     state: &PaperState,
     intent: &OrderIntent,
@@ -1069,22 +1163,6 @@ fn spot_inventory_quantity(
         .map_or(Decimal::ZERO, |position| position.quantity.as_decimal())
 }
 
-fn reduces_position_by(
-    state: &PaperState,
-    intent: &OrderIntent,
-    requested: Decimal,
-    position_indexes: Option<&PositionIndex>,
-) -> bool {
-    let Some(position) = position_for_intent(state, intent, position_indexes) else {
-        return false;
-    };
-    let signed = signed_quantity(position);
-    match intent.side {
-        Side::Buy => signed.is_sign_negative() && requested <= signed.abs(),
-        Side::Sell => signed.is_sign_positive() && requested <= signed.abs(),
-    }
-}
-
 fn build_position_index(positions: &[Position]) -> Result<PositionIndex, ExchangeError> {
     let mut indexes = PositionIndex::new();
     indexes
@@ -1125,6 +1203,28 @@ fn signed_quantity(position: &Position) -> Decimal {
     }
 }
 
+fn remove_position(
+    state: &mut PaperState,
+    index: usize,
+    position_indexes: Option<&mut PositionIndex>,
+) -> Result<(), ExchangeError> {
+    let removed = state.positions.swap_remove(index);
+    if let Some(indexes) = position_indexes {
+        let removed_key = (removed.symbol, removed.market_type);
+        if indexes.remove(&removed_key).is_none() {
+            return Err(ExchangeError::invariant(
+                "paper position index is missing a removed entry",
+            ));
+        }
+        if index < state.positions.len() {
+            let swapped = &state.positions[index];
+            let swapped_key = (swapped.symbol.clone(), swapped.market_type);
+            indexes.insert(swapped_key, index);
+        }
+    }
+    Ok(())
+}
+
 fn apply_fill(
     state: &mut PaperState,
     intent: &OrderIntent,
@@ -1162,11 +1262,15 @@ fn apply_fill(
     let new_signed = old_signed
         .checked_add(delta)
         .ok_or_else(|| ExchangeError::invariant("paper position quantity overflowed"))?;
+    if new_signed.is_zero() {
+        if let Some(index) = position_index {
+            remove_position(state, index, position_indexes)?;
+        }
+        return Ok(());
+    }
     let old_entry = existing.as_ref().and_then(|position| position.entry_price);
     let entry = calculate_entry(old_signed, old_entry, delta, fill_price, new_signed)?;
-    let side = if new_signed.is_zero() {
-        PositionSide::Flat
-    } else if new_signed.is_sign_positive() {
+    let side = if new_signed.is_sign_positive() {
         PositionSide::Long
     } else {
         PositionSide::Short

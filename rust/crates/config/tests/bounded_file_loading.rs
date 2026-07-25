@@ -5,9 +5,12 @@ use std::{
 };
 
 use crypto_trading_config::{
-    ConfigError, ConfigResult, EnvProvider, load_arbitrage_config, load_exchange_auth,
-    load_exchange_auth_with_env, load_grid_config, load_monitor_config, load_price_alert_config,
-    load_symbol_conversions, load_volume_maker_config,
+    ConfigError, ConfigResult, EnvProvider, load_arbitrage_config, load_arbitrage_config_from_str,
+    load_exchange_auth, load_exchange_auth_from_str, load_exchange_auth_from_str_with_env,
+    load_exchange_auth_with_env, load_grid_config, load_grid_config_from_str, load_monitor_config,
+    load_monitor_config_from_str, load_price_alert_config, load_price_alert_config_from_str,
+    load_symbol_conversions, load_symbol_conversions_from_str, load_volume_maker_config,
+    load_volume_maker_config_from_str, read_bounded_config,
 };
 
 const MAX_CONFIG_FILE_BYTES: usize = 1_048_576;
@@ -34,6 +37,7 @@ fn every_public_path_loader_rejects_files_over_one_mebibyte() {
         load_grid_config(&path).unwrap_err(),
         load_monitor_config(&path).unwrap_err(),
         load_price_alert_config(&path).unwrap_err(),
+        read_bounded_config(&path).unwrap_err(),
         load_symbol_conversions(&path).unwrap_err(),
         load_volume_maker_config(&path).unwrap_err(),
     ];
@@ -44,6 +48,123 @@ fn every_public_path_loader_rejects_files_over_one_mebibyte() {
     }
 
     fs::remove_file(path).unwrap();
+}
+
+fn pad_yaml_to_size(mut yaml: String, size: usize) -> String {
+    assert!(yaml.len() <= size, "fixture larger than target size");
+    yaml.push_str(&" ".repeat(size - yaml.len()));
+    yaml
+}
+
+fn assert_path_and_from_str_loader_boundary_behavior(
+    label: &str,
+    fixture: &str,
+    path_loader: impl Fn(&Path) -> ConfigResult<()>,
+    from_str_loader: impl Fn(&str) -> ConfigResult<()>,
+) {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(fixture);
+    let fixture_yaml = fs::read_to_string(&fixture_path).unwrap();
+    let exact = pad_yaml_to_size(fixture_yaml, MAX_CONFIG_FILE_BYTES);
+    assert_eq!(exact.len(), MAX_CONFIG_FILE_BYTES);
+
+    let path = temp_path(label);
+    fs::write(&path, &exact).unwrap();
+    assert!(
+        path_loader(&path).is_ok(),
+        "{fixture} path loader rejected exact boundary"
+    );
+    assert!(
+        from_str_loader(&exact).is_ok(),
+        "{fixture} from_str loader rejected exact boundary"
+    );
+
+    let oversized = format!("{exact} ");
+    let path_error = path_loader(&path_with_contents(&path, &oversized)).unwrap_err();
+    let from_str_error = from_str_loader(&oversized).unwrap_err();
+
+    for error in [path_error, from_str_error] {
+        let message = error.to_string();
+        assert!(message.contains("maximum is 1048576"), "{message}");
+    }
+
+    fs::remove_file(path).unwrap();
+}
+
+fn path_with_contents(path: &Path, contents: &str) -> PathBuf {
+    fs::write(path, contents).unwrap();
+    path.to_path_buf()
+}
+
+#[test]
+fn raw_bounded_reader_accepts_the_exact_byte_limit() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("config/grid/lighter-long-perp-btc.yaml");
+    let exact = pad_yaml_to_size(
+        fs::read_to_string(&fixture_path).unwrap(),
+        MAX_CONFIG_FILE_BYTES,
+    );
+    let path = temp_path("raw-reader-boundary");
+    fs::write(&path, &exact).unwrap();
+
+    let result = read_bounded_config(&path).unwrap();
+
+    assert_eq!(result.len(), MAX_CONFIG_FILE_BYTES);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn every_public_from_str_loader_matches_path_loader_size_boundaries() {
+    assert_path_and_from_str_loader_boundary_behavior(
+        "arbitrage-from-str-boundary",
+        "config/arbitrage/arbitrage_segmented.yaml",
+        |path| load_arbitrage_config(path).map(|_| ()),
+        |yaml| load_arbitrage_config_from_str(yaml).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "auth-from-str-boundary",
+        "config/exchanges/lighter_config.yaml",
+        |path| load_exchange_auth(path, "lighter").map(|_| ()),
+        |yaml| load_exchange_auth_from_str("lighter", yaml).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "auth-from-str-with-env-boundary",
+        "config/exchanges/lighter_config.yaml",
+        |path| load_exchange_auth_with_env(path, "lighter", &EmptyEnvironment).map(|_| ()),
+        |yaml| load_exchange_auth_from_str_with_env("lighter", yaml, &EmptyEnvironment).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "grid-from-str-boundary",
+        "config/grid/lighter-long-perp-btc.yaml",
+        |path| load_grid_config(path).map(|_| ()),
+        |yaml| load_grid_config_from_str(yaml).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "monitor-from-str-boundary",
+        "config/arbitrage/monitor.yaml",
+        |path| load_monitor_config(path).map(|_| ()),
+        |yaml| load_monitor_config_from_str(yaml).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "price-alert-from-str-boundary",
+        "config/price_alert/binance_alert.yaml",
+        |path| load_price_alert_config(path).map(|_| ()),
+        |yaml| load_price_alert_config_from_str(yaml).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "symbol-conversion-from-str-boundary",
+        "config/symbol_conversion.yaml",
+        |path| load_symbol_conversions(path).map(|_| ()),
+        |yaml| load_symbol_conversions_from_str(yaml).map(|_| ()),
+    );
+    assert_path_and_from_str_loader_boundary_behavior(
+        "volume-maker-from-str-boundary",
+        "config/volume_maker/lighter_volume_maker.yaml",
+        |path| load_volume_maker_config(path).map(|_| ()),
+        |yaml| load_volume_maker_config_from_str(yaml).map(|_| ()),
+    );
 }
 
 #[test]
@@ -61,6 +182,7 @@ fn every_public_path_loader_rejects_yaml_anchors_before_schema_parsing() {
         load_grid_config(&path).unwrap_err(),
         load_monitor_config(&path).unwrap_err(),
         load_price_alert_config(&path).unwrap_err(),
+        read_bounded_config(&path).unwrap_err(),
         load_symbol_conversions(&path).unwrap_err(),
         load_volume_maker_config(&path).unwrap_err(),
     ];
@@ -127,6 +249,11 @@ fn every_public_path_loader_allows_literal_tokens_inside_block_scalars() {
         "price-alert-block",
         "config/price_alert/binance_alert.yaml",
         |path| load_price_alert_config(path),
+    );
+    assert_path_loader_allows_block_scalar(
+        "raw-reader-block",
+        "config/grid/lighter-long-perp-btc.yaml",
+        |path| read_bounded_config(path),
     );
     assert_path_loader_allows_block_scalar(
         "symbol-conversion-block",

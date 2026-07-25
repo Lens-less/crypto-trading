@@ -2,8 +2,6 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
-    fs::File,
-    io::Read,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
@@ -15,7 +13,7 @@ use crypto_trading_config::{
     ArbitrageConfig, GridConfig, MonitorConfig, load_arbitrage_config_from_str,
     load_exchange_auth_from_str, load_grid_config_from_str, load_monitor_config_from_str,
     load_price_alert_config_from_str, load_symbol_conversions_from_str,
-    load_volume_maker_config_from_str, reject_yaml_anchors_and_aliases,
+    load_volume_maker_config_from_str, read_bounded_config,
 };
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
@@ -131,7 +129,7 @@ async fn run_grid(args: GridArgs) -> Result<()> {
     };
     let config = load_grid_config_from_str(&body)
         .with_context(|| format!("failed to load grid config {}", args.config.display()))?;
-    println!(
+    let valid_message = format!(
         "valid: grid {} exchange={} symbol={} mode={:?} market={:?}",
         args.config.display(),
         config.exchange,
@@ -144,11 +142,14 @@ async fn run_grid(args: GridArgs) -> Result<()> {
             .price
             .context("--once requires --price so the paper run has an explicit snapshot")?;
         let execution = execute_grid_paper(&config, price, &args.history_path).await?;
+        println!("{valid_message}");
         println!(
             "paper placement simulated: {} orders at snapshot price={price}; history={}",
             execution.receipts.len(),
             args.history_path.display()
         );
+    } else {
+        println!("{valid_message}");
     }
     Ok(())
 }
@@ -178,7 +179,7 @@ async fn run_arbitrage(args: &ArbitrageArgs) -> Result<()> {
             args.monitor_config.display()
         )
     })?;
-    println!(
+    let valid_message = format!(
         "valid: arbitrage {} monitor={} exchanges={} symbols={} mode=paper",
         args.config.display(),
         args.monitor_config.display(),
@@ -200,6 +201,7 @@ async fn run_arbitrage(args: &ArbitrageArgs) -> Result<()> {
         &args.history_path,
     )
     .await?;
+    println!("{valid_message}");
     println!(
         "paper executed: decision={:?} segment={} receipts={}; history={}",
         decision.kind,
@@ -363,6 +365,14 @@ fn run_scanner(args: &ScannerArgs) -> Result<()> {
         if !metadata.is_file() {
             bail!("scanner config {} must be a file", path.display());
         }
+        read_bounded_config(path).map_err(anyhow::Error::msg)?;
+        bail!(
+            "scanner config {} only completed file-access and input-safety checks; no scanner config parsing or schema validation was performed; scanner runtime is unavailable (requested exchange={:?} duration={:?} log={:?})",
+            path.display(),
+            args.exchange,
+            args.duration,
+            args.log_level
+        );
     }
     bail!(
         "scanner runtime is unavailable (requested exchange={:?} duration={:?} log={:?})",
@@ -1214,7 +1224,6 @@ fn collect_config_report(inputs: &[PathBuf]) -> Result<ConfigCheckReport> {
 const MAX_CONFIG_CHECK_ENTRIES: usize = 4_096;
 const MAX_CONFIG_CHECK_ERRORS: usize = 128;
 const MAX_CONFIG_CHECK_DEPTH: usize = 32;
-const MAX_CONFIG_FILE_BYTES: usize = 1_048_576;
 const MAX_CONFIG_CHECK_SUMMARIES: usize = 512;
 const MAX_CONFIG_CHECK_OUTPUT_BYTES: usize = 1_048_576;
 const MAX_CONFIG_CHECK_TERMINAL_RESERVE_BYTES: usize = 16_384;
@@ -1997,56 +2006,6 @@ fn validated_paper_runtime_body(path: &Path, schema: PaperRuntimeSchema) -> Resu
     Ok(body)
 }
 
-fn read_bounded_config(path: &Path) -> std::result::Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        bounded_text(
-            &format!("failed to inspect: {error}"),
-            MAX_CONFIG_MESSAGE_BYTES,
-        )
-    })?;
-    if metadata.len() > u64::try_from(MAX_CONFIG_FILE_BYTES).unwrap_or(u64::MAX) {
-        return Err(format!(
-            "configuration file has {} bytes; maximum is {MAX_CONFIG_FILE_BYTES}",
-            metadata.len()
-        ));
-    }
-
-    let file = File::open(path).map_err(|error| {
-        bounded_text(
-            &format!("failed to read: {error}"),
-            MAX_CONFIG_MESSAGE_BYTES,
-        )
-    })?;
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(metadata.len())
-            .unwrap_or(MAX_CONFIG_FILE_BYTES)
-            .min(MAX_CONFIG_FILE_BYTES)
-            .saturating_add(1),
-    );
-    file.take(u64::try_from(MAX_CONFIG_FILE_BYTES).unwrap_or(u64::MAX) + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            bounded_text(
-                &format!("failed to read: {error}"),
-                MAX_CONFIG_MESSAGE_BYTES,
-            )
-        })?;
-    if bytes.len() > MAX_CONFIG_FILE_BYTES {
-        return Err(format!(
-            "configuration file exceeded the {MAX_CONFIG_FILE_BYTES}-byte read limit"
-        ));
-    }
-    let body = String::from_utf8(bytes).map_err(|error| {
-        bounded_text(
-            &format!("configuration is not valid UTF-8: {error}"),
-            MAX_CONFIG_MESSAGE_BYTES,
-        )
-    })?;
-    reject_yaml_anchors_and_aliases(&body)
-        .map_err(|error| bounded_text(&error.to_string(), MAX_CONFIG_MESSAGE_BYTES))?;
-    Ok(body)
-}
-
 fn paper_runtime_schema_issues(
     schema: PaperRuntimeSchema,
     document: &serde_yaml::Value,
@@ -2532,14 +2491,15 @@ mod tests {
     use super::{
         ConfigCheckReport, ConfigDiscovery, ExecutionOutcomeJournalError, MAX_CONFIG_CHECK_ENTRIES,
         MAX_CONFIG_CHECK_ERRORS, MAX_CONFIG_CHECK_OUTPUT_BYTES, MAX_CONFIG_CHECK_SUMMARIES,
-        MAX_CONFIG_DETAIL_BYTES, MAX_CONFIG_FILE_BYTES, MAX_CONFIG_SCHEMA_ISSUE_BYTES,
-        MAX_CONFIG_SCHEMA_ISSUES, MAX_RECEIPT_SUMMARY_RECEIPTS, MAX_RECONCILIATION_SUMMARY_ORDERS,
+        MAX_CONFIG_DETAIL_BYTES, MAX_CONFIG_SCHEMA_ISSUE_BYTES, MAX_CONFIG_SCHEMA_ISSUES,
+        MAX_RECEIPT_SUMMARY_RECEIPTS, MAX_RECONCILIATION_SUMMARY_ORDERS,
         MAX_RECONCILIATION_SUMMARY_POSITIONS, PaperRuntimeSchema, PreservedExecutionOutcome,
         append_execution_planned, auxiliary_config_kind, bounded_issue_detail,
         collect_config_report, config_summary, execution_batch, execution_error_summary,
         finish_arbitrage_execution, finish_execution, inspect_config, paper_runtime_schema_issues,
-        plan_grid_intents, receipt_summary, reject_yaml_anchors_and_aliases, render_config_summary,
+        plan_grid_intents, receipt_summary, render_config_summary,
     };
+    use crypto_trading_config::reject_yaml_anchors_and_aliases;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
@@ -2898,7 +2858,7 @@ grid_system:
     #[test]
     fn config_inspection_rejects_a_file_over_the_byte_limit() {
         let path = temp_path("oversized.yaml");
-        std::fs::write(&path, vec![b' '; MAX_CONFIG_FILE_BYTES + 1]).unwrap();
+        std::fs::write(&path, vec![b' '; 1_048_577]).unwrap();
 
         let summary = inspect_config(&path);
 

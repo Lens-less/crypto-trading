@@ -142,6 +142,185 @@ async fn one_shot_fetch_uses_only_the_public_book_ticker_endpoint() {
 }
 
 #[tokio::test]
+async fn non_success_binance_json_errors_preserve_http_status_and_exchange_code() {
+    for (status_line, status_code, body, expected_code, expected_msg) in [
+        (
+            "429 Too Many Requests",
+            429_u16,
+            r#"{"code":-1003,"msg":"Too many requests queued."}"#,
+            "-1003",
+            "Too many requests queued.",
+        ),
+        (
+            "418 I'm a teapot",
+            418_u16,
+            r#"{"code":-1003,"msg":"Way too much request weight used; IP banned until 1721323200000."}"#,
+            "-1003",
+            "Way too much request weight used; IP banned until 1721323200000.",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_owned();
+        let status_line = status_line.to_owned();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+        let error = exchange
+            .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                ExchangeError::RemoteFailure {
+                    exchange,
+                    status: Some(code),
+                    reason,
+                } if exchange == "binance"
+                    && *code == status_code
+                    && reason.contains(expected_code)
+                    && reason.contains(expected_msg)
+            ),
+            "unexpected error: {error:?}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn non_json_error_bodies_fall_back_to_a_bounded_text_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let body = "<html><body><h1>temporarily unavailable</h1></body></html>";
+        let response = format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ExchangeError::RemoteFailure {
+                exchange,
+                status: Some(502),
+                reason,
+            } if exchange == "binance"
+                && reason.contains("temporarily unavailable")
+                && reason.len() < 512
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn oversized_binance_json_error_msg_is_truncated_safely() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let msg = "\u{4E2D}".repeat(200);
+        let body = format!(r#"{{"code":-1003,"msg":"{msg}"}}"#);
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ExchangeError::RemoteFailure {
+                exchange,
+                status: Some(429),
+                reason,
+            } if exchange == "binance"
+                && reason.contains("-1003")
+                && reason.ends_with("...")
+                && !reason.contains(char::REPLACEMENT_CHARACTER)
+                && reason.len() <= 256
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn non_json_unicode_body_truncation_does_not_emit_replacement_characters() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let mut body = vec![b'a'; 255];
+        body.extend_from_slice("\u{4E2D}".as_bytes());
+        body.extend_from_slice(b" tail");
+        let header = format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ExchangeError::RemoteFailure {
+                exchange,
+                status: Some(502),
+                reason,
+            } if exchange == "binance"
+                && reason.starts_with("Bad Gateway: ")
+                && reason.ends_with("...")
+                && !reason.contains(char::REPLACEMENT_CHARACTER)
+                && reason.len() <= 256
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn oversized_content_length_is_rejected_before_reading_the_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -151,6 +330,43 @@ async fn oversized_content_length_is_rejected_before_reading_the_body() {
         let _ = stream.read(&mut request).unwrap();
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n";
         stream.write_all(response).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            ExchangeError::ResourceLimit {
+                resource: "Binance response body",
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn oversized_chunked_error_body_is_stopped_at_the_streaming_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let body = vec![b'x'; 1_048_577];
+        let header = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&body);
+        let _ = stream.write_all(b"\r\n0\r\n\r\n");
     });
     let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
 

@@ -18,7 +18,7 @@ pub use auth::{
 };
 pub use error::{ConfigError, ConfigResult};
 pub use grid::{GridConfig, GridMode, load_grid_config, load_grid_config_from_str};
-pub use input::reject_yaml_anchors_and_aliases;
+pub use input::{read_bounded_config, reject_yaml_anchors_and_aliases};
 pub use monitor::{MonitorConfig, load_monitor_config, load_monitor_config_from_str};
 pub use supporting::{
     PriceAlertConfig, PriceAlertSymbolConfig, PriceThresholdConfig, VolatilityAlertConfig,

@@ -63,6 +63,46 @@ fn checked_in_symbol_mapping_loads_and_keeps_explicit_precedence() {
 }
 
 #[test]
+fn exchange_to_standard_lookups_are_case_insensitive_for_explicit_entries() {
+    let mappings = load_symbol_conversions_from_str(
+        r"
+symbol_mappings:
+  exchange_to_standard:
+    lighter:
+      xbt: BTC-USDC-PERP
+    backpack:
+      sol_usdc: SOL-USDC-SPOT
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        mappings.to_standard("lighter", "XBT", MarketType::Perpetual),
+        Some("BTC-USDC-PERP".into())
+    );
+    assert_eq!(
+        mappings.to_standard("lighter", "xbt", MarketType::Perpetual),
+        Some("BTC-USDC-PERP".into())
+    );
+    assert_eq!(
+        mappings.to_standard("backpack", "SoL_UsDc", MarketType::Spot),
+        Some("SOL-USDC-SPOT".into())
+    );
+    assert_eq!(
+        mappings.to_standard("lighter", "btc", MarketType::Perpetual),
+        None
+    );
+    assert_eq!(
+        mappings.to_standard("backpack", "btc_usdc_perp", MarketType::Perpetual),
+        None
+    );
+    assert_eq!(
+        mappings.to_standard("paradex", "btc-usd-perp", MarketType::Perpetual),
+        None
+    );
+}
+
+#[test]
 fn one_wire_symbol_can_be_catalogued_for_spot_and_perpetual() {
     let mappings = load_symbol_conversions_from_str(
         r"

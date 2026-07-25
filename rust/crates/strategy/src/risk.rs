@@ -96,6 +96,23 @@ impl InstrumentKey {
 struct ProjectedPosition {
     signed_quantity: Decimal,
     stale: bool,
+    observed_side: Option<DirectionalPositionSide>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionalPositionSide {
+    Long,
+    Short,
+}
+
+impl DirectionalPositionSide {
+    const fn from_position_side(side: PositionSide) -> Option<Self> {
+        match side {
+            PositionSide::Long => Some(Self::Long),
+            PositionSide::Short => Some(Self::Short),
+            PositionSide::Flat => None,
+        }
+    }
 }
 
 impl RiskEngine {
@@ -196,19 +213,14 @@ impl RiskEngine {
         }
         for position in positions {
             let key = InstrumentKey::from_position(position);
-            let signed = match Self::signed_position(position) {
-                Ok(signed) => signed,
-                Err(rejection) => return RiskDecision::Rejected(rejection),
-            };
             let entry = projected.entry(key).or_insert(ProjectedPosition {
                 signed_quantity: Decimal::ZERO,
                 stale: false,
+                observed_side: None,
             });
-            let Some(total) = entry.signed_quantity.checked_add(signed) else {
-                return RiskDecision::Rejected(RiskRejection::ArithmeticOverflow);
-            };
-            entry.signed_quantity = total;
-            entry.stale |= self.is_stale(position.updated_at, now);
+            if let Err(rejection) = self.accumulate_position(entry, position, now) {
+                return RiskDecision::Rejected(rejection);
+            }
         }
 
         let mut market_by_key = HashMap::<InstrumentKey, &MarketSnapshot>::new();
@@ -232,6 +244,7 @@ impl RiskEngine {
             let current = projected.get(&key).copied().unwrap_or(ProjectedPosition {
                 signed_quantity: Decimal::ZERO,
                 stale: false,
+                observed_side: None,
             });
             let next = match self.authorize_projected(intent, market, current, now) {
                 Ok(next) => next,
@@ -242,6 +255,7 @@ impl RiskEngine {
                 ProjectedPosition {
                     signed_quantity: next,
                     stale: false,
+                    observed_side: None,
                 },
             );
         }
@@ -276,29 +290,49 @@ impl RiskEngine {
         let mut current = ProjectedPosition {
             signed_quantity: Decimal::ZERO,
             stale: false,
+            observed_side: None,
         };
         for position in positions.iter().filter(|position| {
             position.exchange == intent.exchange
                 && position.symbol == intent.symbol
                 && position.market_type == intent.market_type
         }) {
-            current.stale |= self.is_stale(position.updated_at, now);
-            current.signed_quantity = current
-                .signed_quantity
-                .checked_add(Self::signed_position(position)?)
-                .ok_or(RiskRejection::ArithmeticOverflow)?;
+            self.accumulate_position(&mut current, position, now)?;
         }
         Ok(current)
+    }
+
+    fn accumulate_position(
+        &self,
+        current: &mut ProjectedPosition,
+        position: &Position,
+        now: DateTime<Utc>,
+    ) -> Result<(), RiskRejection> {
+        current.stale |= self.is_stale(position.updated_at, now);
+        let signed_quantity = Self::signed_position(position)?;
+        if let Some(side) = DirectionalPositionSide::from_position_side(position.side) {
+            match current.observed_side {
+                Some(existing) if existing != side => return Err(RiskRejection::InvalidQuantity),
+                Some(_) => {}
+                None => current.observed_side = Some(side),
+            }
+        }
+        current.signed_quantity = current
+            .signed_quantity
+            .checked_add(signed_quantity)
+            .ok_or(RiskRejection::ArithmeticOverflow)?;
+        Ok(())
     }
 
     fn signed_position(position: &Position) -> Result<Decimal, RiskRejection> {
         let quantity = position.quantity.as_decimal();
         match position.side {
-            PositionSide::Long => Ok(quantity),
-            PositionSide::Short => Decimal::ZERO
+            PositionSide::Long if quantity > Decimal::ZERO => Ok(quantity),
+            PositionSide::Short if quantity > Decimal::ZERO => Decimal::ZERO
                 .checked_sub(quantity)
                 .ok_or(RiskRejection::ArithmeticOverflow),
-            PositionSide::Flat => Ok(Decimal::ZERO),
+            PositionSide::Flat if quantity.is_zero() => Ok(Decimal::ZERO),
+            _ => Err(RiskRejection::InvalidQuantity),
         }
     }
 

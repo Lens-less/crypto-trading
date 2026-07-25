@@ -358,14 +358,12 @@ async fn snapshot_crossing_indexes_multiple_positions_and_updates_new_entries() 
             .all(|order| order.status == OrderStatus::Filled)
     );
     let positions = paper.positions().await;
-    assert_eq!(positions.len(), 3);
+    assert_eq!(positions.len(), 2);
     let btc_positions = positions
         .iter()
         .filter(|position| position.symbol == Symbol::new("BTC-USDT").unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(btc_positions.len(), 1);
-    assert_eq!(btc_positions[0].side, PositionSide::Flat);
-    assert_eq!(btc_positions[0].quantity.as_decimal(), Decimal::ZERO);
+    assert!(btc_positions.is_empty());
 }
 
 #[tokio::test]
@@ -474,22 +472,33 @@ async fn concurrent_reduce_only_orders_cannot_reverse_a_position() {
         .await
         .unwrap();
 
-    for client_order_id in [
-        "d9428888-122b-11e1-b85c-61cd3cbb3210",
-        "d9428888-122b-11e1-b85c-61cd3cbb3211",
-    ] {
-        let mut close = OrderIntent::limit(
-            "paper",
-            Symbol::new("BTC-USDT").unwrap(),
-            MarketType::Perpetual,
-            Side::Sell,
-            Quantity::new(decimal("1")).unwrap(),
-            Price::new(decimal("110")).unwrap(),
-        );
-        close.client_order_id = Uuid::parse_str(client_order_id).unwrap();
-        close.reduce_only = true;
-        paper.execute(TradingCommand::Submit(close)).await.unwrap();
-    }
+    let mut first = OrderIntent::limit(
+        "paper",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(decimal("1")).unwrap(),
+        Price::new(decimal("110")).unwrap(),
+    );
+    first.client_order_id = Uuid::parse_str("d9428888-122b-11e1-b85c-61cd3cbb3210").unwrap();
+    first.reduce_only = true;
+    paper.execute(TradingCommand::Submit(first)).await.unwrap();
+
+    let mut second = OrderIntent::limit(
+        "paper",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(decimal("1")).unwrap(),
+        Price::new(decimal("110")).unwrap(),
+    );
+    second.client_order_id = Uuid::parse_str("d9428888-122b-11e1-b85c-61cd3cbb3211").unwrap();
+    second.reduce_only = true;
+    let error = paper
+        .execute(TradingCommand::Submit(second))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
 
     paper
         .publish_snapshot(snapshot("110", "111", "2026-07-14T01:01:00Z"))
@@ -498,10 +507,8 @@ async fn concurrent_reduce_only_orders_cannot_reverse_a_position() {
 
     let orders = paper.orders().await;
     assert_eq!(orders[1].status, OrderStatus::Filled);
-    assert_eq!(orders[2].status, OrderStatus::Cancelled);
-    let positions = paper.positions().await;
-    assert_eq!(positions[0].side, PositionSide::Flat);
-    assert_eq!(positions[0].quantity.as_decimal(), Decimal::ZERO);
+    assert_eq!(orders.len(), 2);
+    assert!(paper.positions().await.is_empty());
 }
 
 #[tokio::test]
@@ -1050,6 +1057,552 @@ async fn spot_sell_without_inventory_is_rejected() {
     assert!(matches!(error, ExchangeError::Rejected { .. }));
     assert!(paper.orders().await.is_empty());
     assert!(paper.positions().await.is_empty());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn spot_resting_sells_reserve_inventory_until_partial_fill_is_cancelled() {
+    let paper = paper_at("2026-07-14T05:10:00Z");
+    let symbol = Symbol::new("BTC-USDT").unwrap();
+    let mut spot = MarketSnapshot::new(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Price::new(decimal("99")).unwrap(),
+        Price::new(decimal("101")).unwrap(),
+        timestamp("2026-07-14T05:10:00Z"),
+    )
+    .unwrap();
+    spot.bid_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    spot.ask_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    paper.publish_snapshot(spot).await.unwrap();
+
+    let mut buy = OrderIntent::market(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    buy.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10360").unwrap();
+    paper.execute(TradingCommand::Submit(buy)).await.unwrap();
+
+    let mut first = OrderIntent::limit(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+        Price::new(decimal("110")).unwrap(),
+    );
+    first.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10361").unwrap();
+    let receipt = paper.execute(TradingCommand::Submit(first)).await.unwrap();
+    assert_eq!(
+        receipt.submission_disposition(),
+        Some(SubmissionDisposition::Open)
+    );
+
+    let mut second = OrderIntent::limit(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+        Price::new(decimal("110")).unwrap(),
+    );
+    second.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10362").unwrap();
+    let error = paper
+        .execute(TradingCommand::Submit(second.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+
+    let mut fill = MarketSnapshot::new(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Price::new(decimal("110")).unwrap(),
+        Price::new(decimal("111")).unwrap(),
+        timestamp("2026-07-14T05:11:00Z"),
+    )
+    .unwrap();
+    fill.bid_quantity = Some(Quantity::new(decimal("0.4")).unwrap());
+    fill.ask_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    paper.publish_snapshot(fill).await.unwrap();
+
+    let partial = paper.orders().await.remove(1);
+    assert_eq!(partial.status, OrderStatus::PartiallyFilled);
+    assert_eq!(partial.filled_quantity.as_decimal(), decimal("0.4"));
+    assert_eq!(
+        paper.positions().await[0].quantity.as_decimal(),
+        decimal("0.6")
+    );
+
+    let error = paper
+        .execute(TradingCommand::Submit(second.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+
+    let TradingReceipt::Cancelled {
+        orders,
+        disposition,
+    } = paper
+        .execute(TradingCommand::CancelAll {
+            symbol: Some(symbol.clone()),
+            market_type: Some(MarketType::Spot),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("cancel all must return a cancellation receipt")
+    };
+    assert_eq!(disposition, CancellationDisposition::Cancelled);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].status, OrderStatus::Cancelled);
+    assert_eq!(orders[0].filled_quantity.as_decimal(), decimal("0.4"));
+    assert_eq!(
+        orders[0].average_fill_price.unwrap().as_decimal(),
+        decimal("110")
+    );
+
+    let mut third = second;
+    third.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10363").unwrap();
+    third.quantity = Quantity::new(decimal("0.6")).unwrap();
+    let receipt = paper.execute(TradingCommand::Submit(third)).await.unwrap();
+    assert_eq!(
+        receipt.submission_disposition(),
+        Some(SubmissionDisposition::Open)
+    );
+}
+
+#[tokio::test]
+async fn reduce_only_resting_orders_reserve_reducible_quantity_until_cancelled() {
+    let paper = paper_at("2026-07-14T05:20:00Z");
+    let symbol = Symbol::new("BTC-USDT").unwrap();
+    paper
+        .publish_snapshot(snapshot("99", "101", "2026-07-14T05:20:00Z"))
+        .await
+        .unwrap();
+
+    let mut opening = market_buy();
+    opening.quantity = Quantity::new(Decimal::ONE).unwrap();
+    paper
+        .execute(TradingCommand::Submit(opening))
+        .await
+        .unwrap();
+
+    let mut first = OrderIntent::limit(
+        "paper",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+        Price::new(decimal("110")).unwrap(),
+    );
+    first.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10364").unwrap();
+    first.reduce_only = true;
+    let receipt = paper.execute(TradingCommand::Submit(first)).await.unwrap();
+    assert_eq!(
+        receipt.submission_disposition(),
+        Some(SubmissionDisposition::Open)
+    );
+
+    let mut second = OrderIntent::limit(
+        "paper",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+        Price::new(decimal("110")).unwrap(),
+    );
+    second.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10365").unwrap();
+    second.reduce_only = true;
+    let error = paper
+        .execute(TradingCommand::Submit(second.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "110",
+            "0.4",
+            "111",
+            "10",
+            "2026-07-14T05:21:00Z",
+        ))
+        .await
+        .unwrap();
+    let partial = paper.orders().await.remove(1);
+    assert_eq!(partial.status, OrderStatus::PartiallyFilled);
+    assert_eq!(partial.filled_quantity.as_decimal(), decimal("0.4"));
+    assert_eq!(
+        paper.positions().await[0].quantity.as_decimal(),
+        decimal("0.6")
+    );
+    assert_eq!(
+        paper.positions().await[0].entry_price.unwrap().as_decimal(),
+        decimal("101")
+    );
+
+    let error = paper
+        .execute(TradingCommand::Submit(second.clone()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+
+    let TradingReceipt::Cancelled {
+        orders,
+        disposition,
+    } = paper
+        .execute(TradingCommand::CancelAll {
+            symbol: Some(symbol.clone()),
+            market_type: Some(MarketType::Perpetual),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("cancel all must return a cancellation receipt")
+    };
+    assert_eq!(disposition, CancellationDisposition::Cancelled);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].status, OrderStatus::Cancelled);
+    assert_eq!(orders[0].filled_quantity.as_decimal(), decimal("0.4"));
+    assert_eq!(
+        orders[0].average_fill_price.unwrap().as_decimal(),
+        decimal("110")
+    );
+
+    let mut third = second;
+    third.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10366").unwrap();
+    third.quantity = Quantity::new(decimal("0.6")).unwrap();
+    let receipt = paper.execute(TradingCommand::Submit(third)).await.unwrap();
+    assert_eq!(
+        receipt.submission_disposition(),
+        Some(SubmissionDisposition::Open)
+    );
+}
+
+#[tokio::test]
+async fn earlier_reduce_only_order_keeps_priority_after_non_reduce_sell_consumes_capacity() {
+    let paper = paper_at("2026-07-14T05:25:00Z");
+    let symbol = Symbol::new("BTC-USDT").unwrap();
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "99",
+            "10",
+            "101",
+            "10",
+            "2026-07-14T05:25:00Z",
+        ))
+        .await
+        .unwrap();
+
+    let mut opening = market_buy();
+    opening.quantity = Quantity::new(decimal("2")).unwrap();
+    paper
+        .execute(TradingCommand::Submit(opening))
+        .await
+        .unwrap();
+
+    for client_order_id in [
+        "4d36e96e-e325-11ce-bfc1-08002be10371",
+        "4d36e96e-e325-11ce-bfc1-08002be10372",
+    ] {
+        let mut close = OrderIntent::limit(
+            "paper",
+            symbol.clone(),
+            MarketType::Perpetual,
+            Side::Sell,
+            Quantity::new(Decimal::ONE).unwrap(),
+            Price::new(decimal("110")).unwrap(),
+        );
+        close.client_order_id = Uuid::parse_str(client_order_id).unwrap();
+        close.reduce_only = true;
+        let receipt = paper.execute(TradingCommand::Submit(close)).await.unwrap();
+        assert_eq!(
+            receipt.submission_disposition(),
+            Some(SubmissionDisposition::Open)
+        );
+    }
+
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "105",
+            "10",
+            "106",
+            "10",
+            "2026-07-14T05:26:00Z",
+        ))
+        .await
+        .unwrap();
+    let mut non_reduce = OrderIntent::market(
+        "paper",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    non_reduce.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10373").unwrap();
+    paper
+        .execute(TradingCommand::Submit(non_reduce))
+        .await
+        .unwrap();
+    assert_eq!(
+        paper.positions().await[0].quantity.as_decimal(),
+        Decimal::ONE
+    );
+
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "110",
+            "1",
+            "111",
+            "10",
+            "2026-07-14T05:27:00Z",
+        ))
+        .await
+        .unwrap();
+
+    let orders = paper.orders().await;
+    assert_eq!(orders[1].status, OrderStatus::Filled);
+    assert_eq!(orders[2].status, OrderStatus::Cancelled);
+    assert_eq!(orders[3].status, OrderStatus::Filled);
+    assert!(paper.positions().await.is_empty());
+}
+
+#[tokio::test]
+async fn earlier_spot_sell_keeps_priority_when_crossing_depth_is_scarce() {
+    let paper = paper_at("2026-07-14T05:28:00Z");
+    let symbol = Symbol::new("BTC-USDT").unwrap();
+    let mut spot = MarketSnapshot::new(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Price::new(decimal("99")).unwrap(),
+        Price::new(decimal("101")).unwrap(),
+        timestamp("2026-07-14T05:28:00Z"),
+    )
+    .unwrap();
+    spot.bid_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    spot.ask_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    paper.publish_snapshot(spot).await.unwrap();
+
+    let mut buy = OrderIntent::market(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Buy,
+        Quantity::new(decimal("2")).unwrap(),
+    );
+    buy.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10374").unwrap();
+    paper.execute(TradingCommand::Submit(buy)).await.unwrap();
+
+    for client_order_id in [
+        "4d36e96e-e325-11ce-bfc1-08002be10375",
+        "4d36e96e-e325-11ce-bfc1-08002be10376",
+    ] {
+        let mut sell = OrderIntent::limit(
+            "paper",
+            symbol.clone(),
+            MarketType::Spot,
+            Side::Sell,
+            Quantity::new(Decimal::ONE).unwrap(),
+            Price::new(decimal("110")).unwrap(),
+        );
+        sell.client_order_id = Uuid::parse_str(client_order_id).unwrap();
+        let receipt = paper.execute(TradingCommand::Submit(sell)).await.unwrap();
+        assert_eq!(
+            receipt.submission_disposition(),
+            Some(SubmissionDisposition::Open)
+        );
+    }
+
+    let mut fill = MarketSnapshot::new(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        Price::new(decimal("110")).unwrap(),
+        Price::new(decimal("111")).unwrap(),
+        timestamp("2026-07-14T05:29:00Z"),
+    )
+    .unwrap();
+    fill.bid_quantity = Some(Quantity::new(Decimal::ONE).unwrap());
+    fill.ask_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    paper.publish_snapshot(fill).await.unwrap();
+
+    let orders = paper.orders().await;
+    assert_eq!(orders[1].status, OrderStatus::Filled);
+    assert_eq!(orders[2].status, OrderStatus::Open);
+    assert_eq!(
+        paper.positions().await[0].quantity.as_decimal(),
+        Decimal::ONE
+    );
+
+    let TradingReceipt::Cancelled {
+        orders,
+        disposition,
+    } = paper
+        .execute(TradingCommand::CancelAll {
+            symbol: Some(symbol),
+            market_type: Some(MarketType::Spot),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("cancel all must return a cancellation receipt")
+    };
+    assert_eq!(disposition, CancellationDisposition::Cancelled);
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].status, OrderStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn partial_reduction_preserves_entry_price_and_reversal_resets_it() {
+    let paper = paper_at("2026-07-14T05:30:00Z");
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "99",
+            "10",
+            "101",
+            "10",
+            "2026-07-14T05:30:00Z",
+        ))
+        .await
+        .unwrap();
+
+    let mut opening = market_buy();
+    opening.quantity = Quantity::new(decimal("2")).unwrap();
+    paper
+        .execute(TradingCommand::Submit(opening))
+        .await
+        .unwrap();
+
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "103",
+            "1",
+            "104",
+            "10",
+            "2026-07-14T05:31:00Z",
+        ))
+        .await
+        .unwrap();
+    let mut partial_reduce = OrderIntent::market(
+        "paper",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    partial_reduce.client_order_id =
+        Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10367").unwrap();
+    partial_reduce.reduce_only = true;
+    paper
+        .execute(TradingCommand::Submit(partial_reduce))
+        .await
+        .unwrap();
+    let reduced = paper.positions().await.remove(0);
+    assert_eq!(reduced.side, PositionSide::Long);
+    assert_eq!(reduced.quantity.as_decimal(), Decimal::ONE);
+    assert_eq!(reduced.entry_price.unwrap().as_decimal(), decimal("101"));
+
+    paper
+        .publish_snapshot(snapshot_with_depth(
+            "97",
+            "10",
+            "98",
+            "10",
+            "2026-07-14T05:32:00Z",
+        ))
+        .await
+        .unwrap();
+    let mut reverse = OrderIntent::market(
+        "paper",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(decimal("2")).unwrap(),
+    );
+    reverse.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10368").unwrap();
+    paper
+        .execute(TradingCommand::Submit(reverse))
+        .await
+        .unwrap();
+    let reversed = paper.positions().await.remove(0);
+    assert_eq!(reversed.side, PositionSide::Short);
+    assert_eq!(reversed.quantity.as_decimal(), Decimal::ONE);
+    assert_eq!(reversed.entry_price.unwrap().as_decimal(), decimal("97"));
+}
+
+#[tokio::test]
+async fn flat_positions_do_not_consume_active_position_capacity_or_reconcile_rows() {
+    let paper = paper_with_limits_at(
+        "2026-07-14T05:40:00Z",
+        PaperLedgerLimits::new(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap(),
+    );
+    let btc = snapshot("99", "101", "2026-07-14T05:40:00Z");
+    paper.publish_snapshot(btc).await.unwrap();
+    let mut eth = MarketSnapshot::new(
+        "paper",
+        Symbol::new("ETH-USDT").unwrap(),
+        MarketType::Perpetual,
+        Price::new(decimal("49")).unwrap(),
+        Price::new(decimal("51")).unwrap(),
+        timestamp("2026-07-14T05:40:00Z"),
+    )
+    .unwrap();
+    eth.bid_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    eth.ask_quantity = Some(Quantity::new(decimal("10")).unwrap());
+    paper.publish_snapshot(eth).await.unwrap();
+
+    let mut btc_buy = market_buy();
+    btc_buy.quantity = Quantity::new(Decimal::ONE).unwrap();
+    paper
+        .execute(TradingCommand::Submit(btc_buy))
+        .await
+        .unwrap();
+    let mut btc_sell = OrderIntent::market(
+        "paper",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    btc_sell.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10369").unwrap();
+    paper
+        .execute(TradingCommand::Submit(btc_sell))
+        .await
+        .unwrap();
+
+    assert!(paper.positions().await.is_empty());
+    let reconciled = paper
+        .reconcile(ReconcileScope::Positions { symbol: None })
+        .await
+        .unwrap();
+    assert!(reconciled.positions.is_empty());
+
+    let mut eth_buy = OrderIntent::market(
+        "paper",
+        Symbol::new("ETH-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    eth_buy.client_order_id = Uuid::parse_str("4d36e96e-e325-11ce-bfc1-08002be10370").unwrap();
+    paper
+        .execute(TradingCommand::Submit(eth_buy))
+        .await
+        .unwrap();
+    let positions = paper.positions().await;
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].symbol, Symbol::new("ETH-USDT").unwrap());
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, fs, path::PathBuf, str::FromStr};
 
 use crypto_trading_config::{
-    EnvProvider, GridMode, load_arbitrage_config_from_str, load_exchange_auth_from_str_with_env,
-    load_grid_config_from_str, load_monitor_config_from_str,
+    ConfigError, EnvProvider, GridMode, load_arbitrage_config_from_str,
+    load_exchange_auth_from_str_with_env, load_grid_config_from_str, load_monitor_config_from_str,
 };
 use crypto_trading_domain::{MarketType, Symbol};
 use rust_decimal::Decimal;
@@ -133,6 +133,58 @@ paradex:
     assert_eq!(auth.jwt_token.expose_secret(), Some("yaml-jwt"));
     assert_eq!(auth.l2_address.as_deref(), Some("yaml-address"));
     assert!(!format!("{auth:?}").contains("yaml-api-key"));
+}
+
+#[test]
+fn exchange_auth_env_unsigned_integer_overrides_reject_invalid_numbers() {
+    let yaml = r"
+exchange_id: lighter
+api_config:
+  auth:
+    api_key_private_key: yaml-secret
+    account_index: 2
+    api_key_index: 3
+";
+
+    for (key, value) in [
+        ("LIGHTER_ACCOUNT_INDEX", "-1"),
+        ("LIGHTER_API_KEY_INDEX", "18446744073709551616"),
+    ] {
+        let mut env = TestEnv::default();
+        env.0.insert(key.into(), value.into());
+
+        let error = load_exchange_auth_from_str_with_env("lighter", yaml, &env).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidEnvironmentNumber { key: ref actual_key } if actual_key == key
+        ));
+    }
+}
+
+#[test]
+fn exchange_auth_blank_environment_values_do_not_override_yaml() {
+    let yaml = r"
+exchange_id: lighter
+api_config:
+  auth:
+    api_key_private_key: yaml-secret
+    account_index: 2
+    api_key_index: 3
+";
+
+    let mut env = TestEnv::default();
+    env.0
+        .insert("LIGHTER_API_KEY_PRIVATE_KEY".into(), "   ".into());
+    env.0.insert("LIGHTER_ACCOUNT_INDEX".into(), "\t".into());
+    env.0.insert("LIGHTER_API_KEY_INDEX".into(), "\n".into());
+
+    let auth = load_exchange_auth_from_str_with_env("lighter", yaml, &env).unwrap();
+    assert_eq!(
+        auth.api_key_private_key.expose_secret(),
+        Some("yaml-secret")
+    );
+    assert_eq!(auth.account_index, Some(2));
+    assert_eq!(auth.api_key_index, Some(3));
 }
 
 #[test]
@@ -309,6 +361,56 @@ symbols: []
 }
 
 #[test]
+fn arbitrage_execution_controls_require_enabled_symbol_scope_and_positive_risk_limits() {
+    let config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [lighter, paradex]
+symbols: [BTC-USDC-PERP]
+symbol_configs:
+  BTC-USDC-PERP:
+    enabled: true
+",
+    )
+    .unwrap();
+
+    let error = config.validate_execution_controls().unwrap_err();
+    assert!(error.to_string().contains("max_position_value"), "{error}");
+
+    let mut config = config;
+    config.max_position_value = Some(Decimal::from(10));
+    config
+        .symbol_configs
+        .get_mut(&Symbol::new("BTC-USDC-PERP").unwrap())
+        .unwrap()
+        .enabled = false;
+
+    let error = config.validate_execution_controls().unwrap_err();
+    assert!(
+        error.to_string().contains("enabled symbol strategy"),
+        "{error}"
+    );
+
+    config
+        .symbol_configs
+        .get_mut(&Symbol::new("BTC-USDC-PERP").unwrap())
+        .unwrap()
+        .enabled = true;
+    config.max_position_value = Some(Decimal::ZERO);
+
+    let error = config.validate_execution_controls().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("max_position_value must be positive"),
+        "{error}"
+    );
+}
+
+#[test]
 fn symbol_resolution_cannot_bypass_disabled_top_level_controls() {
     let config = load_arbitrage_config_from_str(
         r"
@@ -338,7 +440,7 @@ enabled: true
 system_mode:
   monitor_only: false
 exchanges: [lighter, paradex]
-symbols: [PAXG-USD-PERP]
+symbols: [PAXG-USD-PERP, BTC-USDC-PERP]
 default_config:
   grid_config:
     initial_spread_threshold: 0.10
@@ -372,6 +474,53 @@ symbol_configs:
     assert_eq!(
         effective.base_quantity.as_decimal(),
         Decimal::from_str("0.04").unwrap()
+    );
+    assert_eq!(effective.max_position_value, Some(Decimal::from(250)));
+}
+
+#[test]
+fn arbitrage_resolve_allows_symbol_risk_override_without_top_level_cap() {
+    let mut config = load_arbitrage_config_from_str(
+        r"
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [lighter, paradex]
+symbols: [AAA-PERP, BBB-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.10
+    grid_step: 0.10
+    max_segments: 2
+  quantity_config:
+    base_quantity: 1
+symbol_configs:
+  CROSS_PAIR:
+    enabled: true
+    risk_config:
+      max_position_value: 250
+",
+    )
+    .unwrap();
+    let key = Symbol::new("CROSS_PAIR").unwrap();
+
+    config.max_position_value = Some(Decimal::ZERO);
+    let error = config.validate_execution_controls().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("max_position_value must be positive"),
+        "{error}"
+    );
+
+    let effective = config.resolve_for_strategy(&key).unwrap();
+
+    assert_eq!(
+        effective.symbols,
+        vec![
+            Symbol::new("AAA-PERP").unwrap(),
+            Symbol::new("BBB-PERP").unwrap()
+        ]
     );
     assert_eq!(effective.max_position_value, Some(Decimal::from(250)));
 }
@@ -415,6 +564,8 @@ default_config:
 symbol_configs:
   PAXG-USD-PERP:
     enabled: false
+  BTC-USDC-PERP:
+    enabled: true
 ",
     )
     .unwrap();
@@ -425,7 +576,7 @@ symbol_configs:
     assert!(disabled.to_string().contains("disabled"));
 
     let missing = config
-        .resolve_for_strategy(&Symbol::new("BTC-USDC-PERP").unwrap())
+        .resolve_for_strategy(&Symbol::new("ETH-USDC-PERP").unwrap())
         .unwrap_err();
     assert!(missing.to_string().contains("not configured"));
 }

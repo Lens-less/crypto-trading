@@ -3,24 +3,32 @@ name: Rust quality gates
 on:
   push:
     paths:
+      - "README.md"
+      - "LICENSE"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
       - "rust/crates/**"
       - "rust/config/**"
       - "rust/README.md"
+      - "rust/RUST_REFACTOR_PLAN.md"
+      - "rust/RUST_PROJECT_AUDIT*.md"
       - "docs/adapter-support.md"
       - "docs/plans/2026-07-24-project-alignment-web-goal-plan.md"
       - "docs/research/upstream-repository-alignment.md"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
+      - "README.md"
+      - "LICENSE"
       - "rust/Cargo.toml"
       - "rust/Cargo.lock"
       - "rust/rust-toolchain.toml"
       - "rust/crates/**"
       - "rust/config/**"
       - "rust/README.md"
+      - "rust/RUST_REFACTOR_PLAN.md"
+      - "rust/RUST_PROJECT_AUDIT*.md"
       - "docs/adapter-support.md"
       - "docs/plans/2026-07-24-project-alignment-web-goal-plan.md"
       - "docs/research/upstream-repository-alignment.md"

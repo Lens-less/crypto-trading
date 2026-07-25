@@ -52,10 +52,37 @@ pub(crate) fn read_config_file(path: &Path) -> ConfigResult<String> {
     })
 }
 
+/// Reads a configuration file with the shared bounded-input safety checks.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the file cannot be read as UTF-8 text, exceeds
+/// the bounded size limit, or contains rejected YAML anchors or aliases.
+pub fn read_bounded_config(path: impl AsRef<Path>) -> ConfigResult<String> {
+    let yaml = read_config_file(path.as_ref())?;
+    validate_bounded_yaml_text(&yaml)?;
+    Ok(yaml)
+}
+
 pub(crate) fn parse_yaml<T: DeserializeOwned>(yaml: &str) -> ConfigResult<T> {
+    let yaml = validate_bounded_yaml_text(yaml)?;
+    Ok(serde_yaml::from_str(yaml)?)
+}
+
+fn validate_bounded_yaml_text(yaml: &str) -> ConfigResult<&str> {
+    reject_oversized_config_input(yaml.len())?;
     let yaml = normalize_utf8_bom(yaml);
     reject_normalized_yaml_anchors_and_aliases(yaml)?;
-    Ok(serde_yaml::from_str(yaml)?)
+    Ok(yaml)
+}
+
+fn reject_oversized_config_input(byte_len: usize) -> ConfigResult<()> {
+    if byte_len > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::Validation(format!(
+            "configuration input has {byte_len} bytes; maximum is {MAX_CONFIG_FILE_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects YAML anchors and aliases before deserialization.

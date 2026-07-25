@@ -58,6 +58,11 @@ default_config:
     first_close_ratio: 0.4
   quantity_config:
     base_quantity: 2
+  risk_config:
+    max_position_value: 100
+symbol_configs:
+  BTC:
+    enabled: true
 ",
     )
     .unwrap();
@@ -126,6 +131,66 @@ base_quantity: 2
 }
 
 #[test]
+fn arbitrage_public_conversion_requires_executable_symbol_scope_and_risk_limits() {
+    let base = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [BTC]
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+max_position_value: 10
+symbol_configs:
+  BTC:
+    enabled: true
+",
+    )
+    .unwrap();
+
+    let mut no_enabled_strategy = base.clone();
+    no_enabled_strategy
+        .symbol_configs
+        .get_mut(&Symbol::new("BTC").unwrap())
+        .unwrap()
+        .enabled = false;
+    assert!(ArbitrageStrategy::try_from(&no_enabled_strategy).is_err());
+
+    let mut non_positive_risk_limit = base;
+    non_positive_risk_limit.max_position_value = Some(Decimal::ZERO);
+    assert!(ArbitrageStrategy::try_from(&non_positive_risk_limit).is_err());
+}
+
+#[test]
+fn arbitrage_public_conversion_rejects_missing_unresolved_risk_cap() {
+    let config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [BTC]
+min_spread_pct: 0.5
+grid_step: 0.2
+max_segments: 3
+base_quantity: 2
+symbol_configs:
+  BTC:
+    enabled: true
+",
+    )
+    .unwrap();
+
+    let error = ArbitrageStrategy::try_from(&config).unwrap_err();
+    assert!(error.to_string().contains("execution controls"), "{error}");
+}
+
+#[test]
 fn arbitrage_config_conversion_enforces_snapshot_allowlists() {
     let config = load_arbitrage_config_from_str(
         r"
@@ -139,6 +204,10 @@ min_spread_pct: 0.5
 grid_step: 0.2
 max_segments: 3
 base_quantity: 2
+max_position_value: 100
+symbol_configs:
+  BTC:
+    enabled: true
 ",
     )
     .unwrap();
@@ -173,6 +242,74 @@ base_quantity: 2
         .evaluate_pair(&ArbitrageState::default(), &unknown_symbol, &right)
         .unwrap_err();
     assert!(error.to_string().contains("symbol ETH"), "{error}");
+}
+
+#[test]
+fn arbitrage_resolved_selector_preserves_leg_allowlist_and_override_cap() {
+    let mut config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [AAA-PERP, BBB-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.5
+    grid_step: 0.2
+    max_segments: 3
+  quantity_config:
+    base_quantity: 2
+symbol_configs:
+  CROSS_PAIR:
+    enabled: true
+    grid_config:
+      initial_spread_threshold: 0.5
+      grid_step: 0.2
+      max_segments: 3
+    quantity_config:
+      base_quantity: 2
+    risk_config:
+      max_position_value: 25
+",
+    )
+    .unwrap();
+    let selector = Symbol::new("CROSS_PAIR").unwrap();
+    config.max_position_value = Some(Decimal::ZERO);
+
+    let error = ArbitrageStrategy::try_from(&config).unwrap_err();
+    assert!(error.to_string().contains("execution controls"), "{error}");
+
+    let effective = config.resolve_for_strategy(&selector).unwrap();
+    assert_eq!(
+        effective.symbols,
+        vec![
+            Symbol::new("AAA-PERP").unwrap(),
+            Symbol::new("BBB-PERP").unwrap()
+        ]
+    );
+    assert_eq!(effective.max_position_value, Some(decimal("25")));
+
+    let strategy = ArbitrageStrategy::try_from(&effective).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 7, 14, 2, 30, 0).unwrap();
+    let snapshot = |exchange: &str, symbol: &str, bid: &str, ask: &str| {
+        MarketSnapshot::new(
+            exchange,
+            Symbol::new(symbol).unwrap(),
+            MarketType::Perpetual,
+            price(bid),
+            price(ask),
+            now,
+        )
+        .unwrap()
+    };
+
+    let left = snapshot("left", "AAA-PERP", "99", "100");
+    let right = snapshot("right", "BBB-PERP", "102", "103");
+    strategy
+        .evaluate_pair(&ArbitrageState::default(), &left, &right)
+        .unwrap();
 }
 
 #[test]
