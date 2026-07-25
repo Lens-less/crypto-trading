@@ -19,10 +19,13 @@ pub const MAX_HISTORY_BATCH_BYTES: usize = 8_388_608;
 pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1_024 * 1_024;
 
 type PathLock = AsyncMutex<()>;
+type CrossProcessLeaseState = StdMutex<Option<Arc<CrossProcessHistoryLease>>>;
 const MIN_PATH_LOCK_CLEANUP_SIZE: usize = 64;
 const DEAD_PATH_LOCK_CLEANUP_THRESHOLD: usize = 64;
+const HISTORY_CROSS_PROCESS_LOCK_SUFFIX: &str = "jsonl.lock";
 static DEAD_PATH_LOCK_HINT: AtomicUsize = AtomicUsize::new(0);
 static PATH_LOCKS: OnceLock<StdMutex<PathLockRegistry>> = OnceLock::new();
+static CROSS_PROCESS_LEASE_STATES: OnceLock<StdMutex<CrossProcessLeaseRegistry>> = OnceLock::new();
 
 struct ByteBudgetWriter {
     bytes: Vec<u8>,
@@ -72,6 +75,89 @@ impl Write for ByteBudgetWriter {
     }
 }
 
+#[derive(Debug)]
+struct CrossProcessHistoryLease {
+    _lock_path: PathBuf,
+    lock_file: std::fs::File,
+}
+
+impl Drop for CrossProcessHistoryLease {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CrossProcessLeaseFailure {
+    CreateDirectory {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    Open {
+        path: PathBuf,
+        kind: io::ErrorKind,
+        message: String,
+    },
+    Claim {
+        path: PathBuf,
+        kind: io::ErrorKind,
+        message: String,
+    },
+    Busy {
+        path: PathBuf,
+    },
+}
+
+impl CrossProcessLeaseFailure {
+    fn from_create_directory(source: &io::Error) -> Self {
+        Self::CreateDirectory {
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+
+    fn from_open(path: PathBuf, source: &io::Error) -> Self {
+        Self::Open {
+            path,
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+
+    fn from_claim(path: PathBuf, source: &io::Error) -> Self {
+        Self::Claim {
+            path,
+            kind: source.kind(),
+            message: source.to_string(),
+        }
+    }
+
+    fn into_history_error(self) -> HistoryError {
+        match self {
+            Self::CreateDirectory { kind, message } => {
+                HistoryError::CreateDirectory(io::Error::new(kind, message))
+            }
+            Self::Open {
+                path,
+                kind,
+                message,
+            } => HistoryError::LockOpen {
+                path,
+                source: io::Error::new(kind, message),
+            },
+            Self::Claim {
+                path,
+                kind,
+                message,
+            } => HistoryError::LockClaim {
+                path,
+                source: io::Error::new(kind, message),
+            },
+            Self::Busy { path } => HistoryError::CrossProcessLockBusy { path },
+        }
+    }
+}
+
 struct PathLockRegistry {
     locks: HashMap<PathBuf, Weak<PathLock>>,
     next_cleanup_size: usize,
@@ -81,6 +167,20 @@ impl Default for PathLockRegistry {
     fn default() -> Self {
         Self {
             locks: HashMap::new(),
+            next_cleanup_size: MIN_PATH_LOCK_CLEANUP_SIZE,
+        }
+    }
+}
+
+struct CrossProcessLeaseRegistry {
+    leases: HashMap<PathBuf, Weak<CrossProcessLeaseState>>,
+    next_cleanup_size: usize,
+}
+
+impl Default for CrossProcessLeaseRegistry {
+    fn default() -> Self {
+        Self {
+            leases: HashMap::new(),
             next_cleanup_size: MIN_PATH_LOCK_CLEANUP_SIZE,
         }
     }
@@ -100,15 +200,9 @@ pub struct DecisionRecord {
 /// Every successful append is flushed and `sync_data` is completed before the
 /// call returns. Clones and separately constructed handles for the same
 /// canonical path share one in-process lock, including lexical aliases and
-/// aliases through an existing parent directory. Cross-process writers are not
-/// serialized; recovery-critical multi-process deployments need a transactional
-/// journal or an external single-writer service.
-///
-/// This crate intentionally does not emulate an OS file lease with lockfiles or
-/// PID metadata. `rust-version = 1.89.0` makes `std::fs::File::lock` available
-/// without any new dependency, but this crate has not yet been wired to use
-/// it, so a recoverable cross-process writer exclusion cannot be claimed
-/// honestly here yet (tracked in the M4 execution plan).
+/// aliases through an existing parent directory. Cross-process writers share a
+/// dedicated sibling lock file and fail closed immediately when another
+/// process already owns that lease.
 ///
 /// Locks are keyed by normalized paths rather than filesystem object identity.
 /// Existing hard links and paths retargeted after construction can therefore
@@ -118,6 +212,8 @@ pub struct DecisionRecord {
 pub struct JsonlHistory {
     path: PathBuf,
     path_lock: Arc<PathLock>,
+    cross_process_lease_state: Arc<CrossProcessLeaseState>,
+    startup_failure: Option<CrossProcessLeaseFailure>,
 }
 
 impl Drop for JsonlHistory {
@@ -132,8 +228,15 @@ impl JsonlHistory {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = stable_history_path(&path.into());
         let lock_key = normalized_lock_key(&path);
-        let path_lock = shared_path_lock(lock_key);
-        Self { path, path_lock }
+        let path_lock = shared_path_lock(lock_key.clone());
+        let cross_process_lease_state = shared_cross_process_lease_state(lock_key);
+        let startup_failure = prime_cross_process_lease(&path, &cross_process_lease_state).err();
+        Self {
+            path,
+            path_lock,
+            cross_process_lease_state,
+            startup_failure,
+        }
     }
 
     #[must_use]
@@ -234,6 +337,7 @@ impl JsonlHistory {
                 .await
                 .map_err(HistoryError::CreateDirectory)?;
         }
+        let _lease = self.active_cross_process_lease()?;
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -256,6 +360,24 @@ impl JsonlHistory {
         file.flush().await.map_err(HistoryError::Flush)?;
         file.sync_data().await.map_err(HistoryError::Sync)
     }
+
+    fn active_cross_process_lease(&self) -> Result<Arc<CrossProcessHistoryLease>, HistoryError> {
+        if let Some(failure) = self.startup_failure.clone() {
+            return Err(failure.into_history_error());
+        }
+
+        self.cross_process_lease_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| HistoryError::LockClaim {
+                path: history_lock_path(&self.path),
+                source: io::Error::other(
+                    "history writer lease was not available after successful startup",
+                ),
+            })
+    }
 }
 
 fn stable_history_path(path: &Path) -> PathBuf {
@@ -264,6 +386,62 @@ fn stable_history_path(path: &Path) -> PathBuf {
 
 pub(crate) fn stable_history_path_for_read(path: &Path) -> PathBuf {
     stable_history_path(path)
+}
+
+fn history_lock_path(history_path: &Path) -> PathBuf {
+    let file_name = history_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.jsonl");
+    history_path.with_file_name(format!("{file_name}.{HISTORY_CROSS_PROCESS_LOCK_SUFFIX}"))
+}
+
+fn prime_cross_process_lease(
+    history_path: &Path,
+    lease_state: &CrossProcessLeaseState,
+) -> Result<(), CrossProcessLeaseFailure> {
+    let mut lease_state = lease_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = lease_state.as_ref() {
+        let _ = existing;
+        return Ok(());
+    }
+    if let Some(parent) = history_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|source| CrossProcessLeaseFailure::from_create_directory(&source))?;
+    }
+
+    let lease = Arc::new(acquire_cross_process_lease(history_path)?);
+    *lease_state = Some(lease);
+    Ok(())
+}
+
+fn acquire_cross_process_lease(
+    history_path: &Path,
+) -> Result<CrossProcessHistoryLease, CrossProcessLeaseFailure> {
+    let lock_path = history_lock_path(history_path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| CrossProcessLeaseFailure::from_open(lock_path.clone(), &source))?;
+    match lock_file.try_lock() {
+        Ok(()) => Ok(CrossProcessHistoryLease {
+            _lock_path: lock_path,
+            lock_file,
+        }),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(CrossProcessLeaseFailure::Busy { path: lock_path })
+        }
+        Err(std::fs::TryLockError::Error(source)) => {
+            Err(CrossProcessLeaseFailure::from_claim(lock_path, &source))
+        }
+    }
 }
 
 fn absolute_key(path: &Path) -> PathBuf {
@@ -355,6 +533,39 @@ fn shared_path_lock(path: PathBuf) -> Arc<PathLock> {
     lock
 }
 
+fn shared_cross_process_lease_state(path: PathBuf) -> Arc<CrossProcessLeaseState> {
+    let registry = CROSS_PROCESS_LEASE_STATES
+        .get_or_init(|| StdMutex::new(CrossProcessLeaseRegistry::default()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cleanup_for_growth = registry.leases.len() >= registry.next_cleanup_size;
+    let dead_cleanup_threshold = registry
+        .leases
+        .len()
+        .saturating_div(4)
+        .max(DEAD_PATH_LOCK_CLEANUP_THRESHOLD);
+    let cleanup_for_dead_handles =
+        DEAD_PATH_LOCK_HINT.load(Ordering::Relaxed) >= dead_cleanup_threshold;
+    if cleanup_for_growth || cleanup_for_dead_handles {
+        DEAD_PATH_LOCK_HINT.swap(0, Ordering::Relaxed);
+        registry
+            .leases
+            .retain(|_, lease_state| lease_state.strong_count() > 0);
+        registry.next_cleanup_size = registry
+            .leases
+            .len()
+            .saturating_mul(2)
+            .max(MIN_PATH_LOCK_CLEANUP_SIZE);
+    }
+    if let Some(existing) = registry.leases.get(&path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let lease_state = Arc::new(StdMutex::new(None));
+    registry.leases.insert(path, Arc::downgrade(&lease_state));
+    lease_state
+}
+
 #[derive(Debug, Error)]
 pub enum HistoryError {
     #[error("history record {index} has {bytes} bytes; maximum is {limit}")]
@@ -392,6 +603,20 @@ pub enum HistoryError {
     Flush(std::io::Error),
     #[error("failed to sync history data: {0}")]
     Sync(std::io::Error),
+    #[error("failed to open history writer lock {path}: {source}")]
+    LockOpen {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to claim history writer lock {path}: {source}")]
+    LockClaim {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("history writer lock is already held for {path}")]
+    CrossProcessLockBusy { path: PathBuf },
 }
 
 #[cfg(test)]
@@ -417,8 +642,7 @@ mod tests {
         assert!(Arc::ptr_eq(&direct.path_lock, &alias.path_lock));
 
         drop((direct, dot_alias, alias));
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(any(unix, windows))]

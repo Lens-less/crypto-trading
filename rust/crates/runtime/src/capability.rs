@@ -674,10 +674,11 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
             CapabilityArea::History,
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Paper], CapabilityAccess::Local),
-            "Bounded planned, completed, partial, and incomplete execution JSONL records.",
+            "Bounded planned, completed, partial, and incomplete execution JSONL records with a cross-process single-writer lease.",
             &[],
             &[
                 "rust/crates/runtime/src/history.rs",
+                "rust/crates/runtime/tests/history_writer_lock_contract.rs",
                 "rust/crates/runtime/tests/execution_contract.rs",
             ],
         ),
@@ -695,7 +696,7 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
             ),
             "Authoritative account equity, margin, global exposure, and pending-order reservations.",
             &[
-                "A journal-backed process-local paper-only reservation authority owns conservative available/pending/uncertain/committed capacity, but it has no cross-process writer exclusion yet; rust-version 1.89.0 makes the standard-library file-lock API available, but this crate has not yet been wired to use it, so it does not claim a recoverable multi-process lease. It also does not own exchange equity, margin, mark-to-market, position truth, or testnet/mainnet state.",
+                "A journal-backed paper-only reservation authority owns conservative available/pending/uncertain/committed capacity. The previous 'no cross-process writer exclusion' gap is closed by the shared history writer lease, but this authority still does not own exchange equity, margin, mark-to-market, position truth, or any testnet/mainnet state.",
             ],
             &[
                 "rust/crates/strategy/src/risk.rs",
@@ -892,7 +893,7 @@ fn scanner_capability() -> Capability {
             "Scanner configuration schema and CLI/service bootstrap are not implemented; the existing CLI remains fail-closed.",
             "No real-time market discovery, continuous scanner supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
             "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
-            "The JSONL journal serializes writers only inside one process and has no rotation or compaction.",
+            "The JSONL journal now enforces a cross-process single-writer lease, but it still has no rotation or compaction.",
         ],
         &[
             "rust/crates/apps/src/scanner.rs",
