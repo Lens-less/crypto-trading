@@ -1453,6 +1453,11 @@ fn execution_error_summary(error: &RuntimeError, expected_batch_id: &str) -> (&'
                         .iter()
                         .take(MAX_RECONCILIATION_SUMMARY_ORDERS)
                         .collect::<Vec<_>>();
+                    let foreign_orders = receipt
+                        .foreign_orders
+                        .iter()
+                        .take(MAX_RECONCILIATION_SUMMARY_ORDERS)
+                        .collect::<Vec<_>>();
                     let positions = receipt
                         .positions
                         .iter()
@@ -1466,6 +1471,9 @@ fn execution_error_summary(error: &RuntimeError, expected_batch_id: &str) -> (&'
                     "orders": orders,
                     "orders_total": receipt.orders.len(),
                     "orders_truncated": receipt.orders.len() > MAX_RECONCILIATION_SUMMARY_ORDERS,
+                    "foreign_orders": foreign_orders,
+                    "foreign_orders_total": receipt.foreign_orders.len(),
+                    "foreign_orders_truncated": receipt.foreign_orders.len() > MAX_RECONCILIATION_SUMMARY_ORDERS,
                     "positions": positions,
                     "positions_total": receipt.positions.len(),
                     "positions_truncated": receipt.positions.len() > MAX_RECONCILIATION_SUMMARY_POSITIONS,
@@ -2848,11 +2856,12 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use crypto_trading_config::load_grid_config_from_str;
     use crypto_trading_domain::{
-        MarketType, Money, Order, OrderIntent, OrderStatus, Position, PositionSide, Quantity, Side,
-        Symbol,
+        MarketType, Money, Order, OrderIntent, OrderStatus, OrderType, Position, PositionSide,
+        Price, Quantity, Side, Symbol, TimeInForce,
     };
     use crypto_trading_exchange::{
-        ExchangeError, ReconcileReceipt, ReconcileScope, SubmissionDisposition, TradingReceipt,
+        ExchangeError, ForeignOrder, ReconcileReceipt, ReconcileScope, SubmissionDisposition,
+        TradingReceipt,
     };
     use crypto_trading_runtime::{
         ExecutionBatch, JsonlHistory, ReconciliationObservation, RuntimeError,
@@ -2899,6 +2908,28 @@ mod tests {
         Order {
             id: format!("order-{index}"),
             intent: test_intent("paper"),
+            filled_quantity: Quantity::default(),
+            average_fill_price: None,
+            status: OrderStatus::Open,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_foreign_order(index: usize) -> ForeignOrder {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+        ForeignOrder {
+            id: format!("foreign-order-{index}"),
+            client_order_id: Some(format!("manual-{index}")),
+            exchange: "paper".to_owned(),
+            symbol: Symbol::new("BTC-USDC-PERP").unwrap(),
+            market_type: MarketType::Perpetual,
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            quantity: Quantity::new(Decimal::ONE).unwrap(),
+            price: Some(Price::new(Decimal::new(50_000, 0)).unwrap()),
+            reduce_only: false,
+            time_in_force: TimeInForce::Gtc,
             filled_quantity: Quantity::default(),
             average_fill_price: None,
             status: OrderStatus::Open,
@@ -2993,6 +3024,7 @@ grid_system:
         let orders = (0..=MAX_RECONCILIATION_SUMMARY_ORDERS)
             .map(test_order)
             .collect::<Vec<_>>();
+        let foreign_orders = vec![test_foreign_order(0)];
         let positions = (0..=MAX_RECONCILIATION_SUMMARY_POSITIONS)
             .map(|index| Position {
                 exchange: "paper".to_owned(),
@@ -3017,6 +3049,7 @@ grid_system:
                 result: Ok(ReconcileReceipt {
                     scope: ReconcileScope::All,
                     orders,
+                    foreign_orders,
                     positions,
                     observed_at,
                 }),
@@ -3038,6 +3071,12 @@ grid_system:
             MAX_RECONCILIATION_SUMMARY_ORDERS
         );
         assert_eq!(observation["orders_truncated"], true);
+        assert_eq!(observation["foreign_orders_total"].as_u64(), Some(1));
+        assert_eq!(
+            observation["foreign_orders"][0]["client_order_id"],
+            json!("manual-0")
+        );
+        assert_eq!(observation["foreign_orders_truncated"], false);
         assert_eq!(
             observation["positions_total"].as_u64(),
             Some(u64::try_from(MAX_RECONCILIATION_SUMMARY_POSITIONS + 1).unwrap())

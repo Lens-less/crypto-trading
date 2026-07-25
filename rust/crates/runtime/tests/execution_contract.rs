@@ -425,6 +425,7 @@ impl ExchangeHandle for DeadlineRecordingExchange {
         Ok(ReconcileReceipt {
             scope,
             orders: Vec::new(),
+            foreign_orders: Vec::new(),
             positions: Vec::new(),
             observed_at: Utc::now(),
         })

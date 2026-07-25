@@ -510,6 +510,11 @@ fn execution_error_summary(error: &RuntimeError, expected_batch_id: &str) -> (&'
                         .iter()
                         .take(MAX_RECONCILIATION_SUMMARY_ORDERS)
                         .collect::<Vec<_>>();
+                    let foreign_orders = receipt
+                        .foreign_orders
+                        .iter()
+                        .take(MAX_RECONCILIATION_SUMMARY_ORDERS)
+                        .collect::<Vec<_>>();
                     let positions = receipt
                         .positions
                         .iter()
@@ -523,6 +528,9 @@ fn execution_error_summary(error: &RuntimeError, expected_batch_id: &str) -> (&'
                         "orders": orders,
                         "orders_total": receipt.orders.len(),
                         "orders_truncated": receipt.orders.len() > MAX_RECONCILIATION_SUMMARY_ORDERS,
+                        "foreign_orders": foreign_orders,
+                        "foreign_orders_total": receipt.foreign_orders.len(),
+                        "foreign_orders_truncated": receipt.foreign_orders.len() > MAX_RECONCILIATION_SUMMARY_ORDERS,
                         "positions": positions,
                         "positions_total": receipt.positions.len(),
                         "positions_truncated": receipt.positions.len() > MAX_RECONCILIATION_SUMMARY_POSITIONS,

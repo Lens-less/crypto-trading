@@ -1,11 +1,18 @@
 use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::Url;
 
-use crate::ExchangeError;
+use crate::{
+    ExchangeError,
+    error::{RemoteFailureMetadata, RemoteRetryAfter},
+};
 
 const MAX_REMOTE_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_REMOTE_METADATA_HEADERS: usize = 8;
+const MAX_REMOTE_HEADER_NAME_BYTES: usize = 64;
+const MAX_REMOTE_HEADER_VALUE_BYTES: usize = 512;
 
 /// Minimal HTTP methods required by exchange REST protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +99,7 @@ impl fmt::Debug for RemoteHttpRequest {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RemoteHttpResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -100,6 +108,14 @@ impl fmt::Debug for RemoteHttpResponse {
         formatter
             .debug_struct("RemoteHttpResponse")
             .field("status", &self.status)
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .field("body_bytes", &self.body.len())
             .finish()
     }
@@ -114,6 +130,21 @@ impl RemoteHttpResponse {
     /// Returns [`ExchangeError::InvalidResponse`] for an invalid HTTP status and
     /// [`ExchangeError::ResourceLimit`] for an oversized body.
     pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Result<Self, ExchangeError> {
+        Self::new_with_headers(status, Vec::new(), body)
+    }
+
+    /// Builds a response fixture or transport result while preserving response
+    /// headers for later exchange-specific classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for an invalid HTTP status and
+    /// [`ExchangeError::ResourceLimit`] for an oversized body.
+    pub fn new_with_headers(
+        status: u16,
+        headers: impl IntoIterator<Item = (String, String)>,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<Self, ExchangeError> {
         if !(100..=599).contains(&status) {
             return Err(ExchangeError::invalid_response(
                 "http",
@@ -128,11 +159,28 @@ impl RemoteHttpResponse {
                 body.len(),
             ));
         }
-        Ok(Self { status, body })
+        Ok(Self {
+            status,
+            headers: bounded_metadata_headers(headers)?,
+            body,
+        })
     }
 
     pub const fn status(&self) -> u16 {
         self.status
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub fn headers(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
     pub fn body(&self) -> &[u8] {
@@ -141,6 +189,22 @@ impl RemoteHttpResponse {
 
     pub const fn is_success(&self) -> bool {
         self.status >= 200 && self.status < 300
+    }
+
+    pub fn retry_after(&self) -> Option<RemoteRetryAfter> {
+        parse_retry_after(self.header("retry-after")?)
+    }
+
+    pub fn server_time(&self) -> Option<DateTime<Utc>> {
+        parse_http_date(self.header("date")?)
+    }
+
+    pub fn remote_failure_metadata(&self) -> RemoteFailureMetadata {
+        RemoteFailureMetadata {
+            exchange_code: None,
+            retry_after: self.retry_after(),
+            server_time: self.server_time(),
+        }
     }
 }
 
@@ -218,6 +282,19 @@ impl RemoteHttpTransport for ReqwestHttpTransport {
             }
         }
         let mut body = Vec::new();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                if !is_retained_metadata_header(name.as_str()) {
+                    return None;
+                }
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect::<Vec<_>>();
         while let Some(chunk) = response
             .chunk()
             .await
@@ -242,6 +319,91 @@ impl RemoteHttpTransport for ReqwestHttpTransport {
             })?;
             body.extend_from_slice(&chunk);
         }
-        RemoteHttpResponse::new(status, body)
+        RemoteHttpResponse::new_with_headers(status, headers, body)
     }
+}
+
+fn parse_retry_after(value: &str) -> Option<RemoteRetryAfter> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(RemoteRetryAfter::Seconds(seconds));
+    }
+    parse_http_date(value).map(RemoteRetryAfter::At)
+}
+
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn bounded_metadata_headers(
+    headers: impl IntoIterator<Item = (String, String)>,
+) -> Result<Vec<(String, String)>, ExchangeError> {
+    let mut retained = Vec::new();
+    retained
+        .try_reserve_exact(MAX_REMOTE_METADATA_HEADERS)
+        .map_err(|_| {
+            ExchangeError::unavailable("unable to reserve bounded remote response metadata")
+        })?;
+    for (name, value) in headers {
+        if !is_retained_metadata_header(&name) {
+            continue;
+        }
+        let normalized_name = name.trim().to_ascii_lowercase();
+        let normalized_value = value.trim();
+        if normalized_name.is_empty()
+            || normalized_name.len() > MAX_REMOTE_HEADER_NAME_BYTES
+            || !normalized_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ExchangeError::invalid_response(
+                "http",
+                "remote response metadata header name is invalid",
+            ));
+        }
+        if normalized_value.len() > MAX_REMOTE_HEADER_VALUE_BYTES
+            || normalized_value
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+        {
+            return Err(ExchangeError::resource_limit(
+                "remote response metadata header value",
+                MAX_REMOTE_HEADER_VALUE_BYTES,
+                normalized_value.len(),
+            ));
+        }
+        if retained
+            .iter()
+            .any(|(existing, _)| existing == &normalized_name)
+        {
+            return Err(ExchangeError::invalid_response(
+                "http",
+                "remote response contains duplicate metadata headers",
+            ));
+        }
+        if retained.len() == MAX_REMOTE_METADATA_HEADERS {
+            return Err(ExchangeError::resource_limit(
+                "remote response metadata headers",
+                MAX_REMOTE_METADATA_HEADERS,
+                retained.len().saturating_add(1),
+            ));
+        }
+        retained.push((normalized_name, normalized_value.to_owned()));
+    }
+    Ok(retained)
+}
+
+fn is_retained_metadata_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "date"
+            | "retry-after"
+            | "x-mbx-used-weight"
+            | "x-mbx-used-weight-1m"
+            | "x-mbx-order-count-10s"
+            | "x-mbx-order-count-1m"
+            | "x-mbx-order-count-1d"
+            | "x-response-time"
+    )
 }

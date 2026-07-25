@@ -876,6 +876,7 @@ impl ExchangeHandle for PaperExchange {
         Ok(ReconcileReceipt {
             scope,
             orders,
+            foreign_orders: Vec::new(),
             positions,
             observed_at,
         })

@@ -17,7 +17,7 @@ pub use binance::BinancePublicExchange;
 pub use binance_testnet::{BinanceRequestSigner, BinanceTestnetProtocol};
 pub use bounded::BoundedExchangeHandle;
 pub use endpoint::{BinanceProduct, BinanceTestnetEndpoints, HyperliquidTestnetEndpoint};
-pub use error::{ExchangeError, ExchangeOperation};
+pub use error::{ExchangeError, ExchangeOperation, RemoteFailureMetadata, RemoteRetryAfter};
 pub use hyperliquid_testnet::{
     HyperliquidAction, HyperliquidAsset, HyperliquidAssetCatalog, HyperliquidRequestSigner,
     HyperliquidSignature, HyperliquidTestnetProtocol,
@@ -27,8 +27,8 @@ pub use instrument::{
 };
 pub use model::{
     CancellationDisposition, ExchangeAvailability, ExchangeMode, ExchangeOperationKey,
-    ExchangeStatus, MarketSubscription, ReconcileReceipt, ReconcileScope, SubmissionDisposition,
-    SubscriptionReceipt, TradingCommand, TradingReceipt,
+    ExchangeStatus, ForeignOrder, MarketSubscription, ReconcileReceipt, ReconcileScope,
+    SubmissionDisposition, SubscriptionReceipt, TradingCommand, TradingReceipt,
 };
 pub use paper::{PaperExchange, PaperLedgerLimits};
 pub use remote::{

@@ -187,6 +187,7 @@ async fn non_success_binance_json_errors_preserve_http_status_and_exchange_code(
                     exchange,
                     status: Some(code),
                     reason,
+                    ..
                 } if exchange == "binance"
                     && *code == status_code
                     && reason.contains(expected_code)
@@ -227,6 +228,7 @@ async fn non_json_error_bodies_fall_back_to_a_bounded_text_reason() {
                 exchange,
                 status: Some(502),
                 reason,
+                ..
             } if exchange == "binance"
                 && reason.contains("temporarily unavailable")
                 && reason.len() < 512
@@ -266,6 +268,7 @@ async fn oversized_binance_json_error_msg_is_truncated_safely() {
                 exchange,
                 status: Some(429),
                 reason,
+                ..
             } if exchange == "binance"
                 && reason.contains("-1003")
                 && reason.ends_with("...")
@@ -309,6 +312,7 @@ async fn non_json_unicode_body_truncation_does_not_emit_replacement_characters()
                 exchange,
                 status: Some(502),
                 reason,
+                ..
             } if exchange == "binance"
                 && reason.starts_with("Bad Gateway: ")
                 && reason.ends_with("...")

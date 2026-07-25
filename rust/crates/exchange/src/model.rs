@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
-use crypto_trading_domain::{MarketSnapshot, MarketType, Order, OrderIntent, Position, Symbol};
+use crypto_trading_domain::{
+    MarketSnapshot, MarketType, Order, OrderIntent, OrderStatus, OrderType, Position, Price,
+    Quantity, Side, Symbol, TimeInForce,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -118,11 +121,43 @@ pub enum ReconcileScope {
     Positions { symbol: Option<Symbol> },
 }
 
+/// Order state observed on a venue that cannot honestly be mapped to an
+/// owned UUID-backed [`Order`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignOrder {
+    pub id: String,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    pub exchange: String,
+    pub symbol: Symbol,
+    #[serde(default)]
+    pub market_type: MarketType,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub quantity: Quantity,
+    #[serde(default)]
+    pub price: Option<Price>,
+    #[serde(default)]
+    pub reduce_only: bool,
+    #[serde(default)]
+    pub time_in_force: TimeInForce,
+    #[serde(default)]
+    pub filled_quantity: Quantity,
+    #[serde(default)]
+    pub average_fill_price: Option<Price>,
+    #[serde(default)]
+    pub status: OrderStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Authoritative state observed at one logical adapter time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileReceipt {
     pub scope: ReconcileScope,
     pub orders: Vec<Order>,
+    #[serde(default)]
+    pub foreign_orders: Vec<ForeignOrder>,
     pub positions: Vec<Position>,
     pub observed_at: DateTime<Utc>,
 }

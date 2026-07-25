@@ -83,6 +83,7 @@ impl ExchangeHandle for BlockingExchange {
         Ok(ReconcileReceipt {
             scope,
             orders: Vec::new(),
+            foreign_orders: Vec::new(),
             positions: Vec::new(),
             observed_at: chrono::Utc::now(),
         })
@@ -251,6 +252,7 @@ impl ExchangeHandle for QuarantineExchange {
         Ok(ReconcileReceipt {
             scope: self.reconcile_scope_override.clone().unwrap_or(scope),
             orders: Vec::new(),
+            foreign_orders: Vec::new(),
             positions: Vec::new(),
             observed_at,
         })

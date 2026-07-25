@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use thiserror::Error;
@@ -28,6 +29,35 @@ impl std::fmt::Display for ExchangeOperation {
             Self::PublishSnapshot => "publish_snapshot",
         };
         formatter.write_str(value)
+    }
+}
+
+/// Structured backoff data carried from a remote failure response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteRetryAfter {
+    Seconds(u64),
+    At(DateTime<Utc>),
+}
+
+/// Optional exchange-specific metadata attached to a remote failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteFailureMetadata {
+    pub exchange_code: Option<String>,
+    pub retry_after: Option<RemoteRetryAfter>,
+    pub server_time: Option<DateTime<Utc>>,
+}
+
+impl RemoteFailureMetadata {
+    fn merge_from(&mut self, other: Self) {
+        if other.exchange_code.is_some() {
+            self.exchange_code = other.exchange_code;
+        }
+        if other.retry_after.is_some() {
+            self.retry_after = other.retry_after;
+        }
+        if other.server_time.is_some() {
+            self.server_time = other.server_time;
+        }
     }
 }
 
@@ -77,6 +107,7 @@ pub enum ExchangeError {
         exchange: String,
         status: Option<u16>,
         reason: String,
+        metadata: RemoteFailureMetadata,
     },
 
     #[error("market-data subscriber lagged and skipped {skipped} snapshots")]
@@ -139,6 +170,50 @@ impl ExchangeError {
             exchange: exchange.to_owned(),
             status,
             reason: reason.into(),
+            metadata: RemoteFailureMetadata::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_remote_metadata(mut self, metadata: RemoteFailureMetadata) -> Self {
+        if let Self::RemoteFailure {
+            metadata: current, ..
+        } = &mut self
+        {
+            current.merge_from(metadata);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_exchange_code(self, exchange_code: impl Into<String>) -> Self {
+        self.with_remote_metadata(RemoteFailureMetadata {
+            exchange_code: Some(exchange_code.into()),
+            ..RemoteFailureMetadata::default()
+        })
+    }
+
+    #[must_use]
+    pub fn with_retry_after(self, retry_after: RemoteRetryAfter) -> Self {
+        self.with_remote_metadata(RemoteFailureMetadata {
+            retry_after: Some(retry_after),
+            ..RemoteFailureMetadata::default()
+        })
+    }
+
+    #[must_use]
+    pub fn with_server_time(self, server_time: DateTime<Utc>) -> Self {
+        self.with_remote_metadata(RemoteFailureMetadata {
+            server_time: Some(server_time),
+            ..RemoteFailureMetadata::default()
+        })
+    }
+
+    #[must_use]
+    pub fn remote_failure_metadata(&self) -> Option<&RemoteFailureMetadata> {
+        match self {
+            Self::RemoteFailure { metadata, .. } => Some(metadata),
+            _ => None,
         }
     }
 }
