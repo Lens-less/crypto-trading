@@ -80,6 +80,20 @@ fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
     }
 }
 
+fn wait_for_journal_fact(history: &Path, needle: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(history).is_ok_and(|journal| journal.contains(needle)) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "journal never contained {needle:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn write_history(path: &Path, records: &[DecisionRecord]) {
     let body = records
         .iter()
@@ -223,6 +237,7 @@ fn serve_status_and_stop_work_with_the_hidden_fixture_probe() {
     let status_stdout = String::from_utf8(status.stdout).unwrap();
     assert!(status_stdout.contains("phase=running"), "{status_stdout}");
     assert!(status_stdout.contains(&format!("task_id={task_id}")));
+    wait_for_journal_fact(&history, "\"probe_failure\":\"transport\"");
 
     let stop = Command::new(binary())
         .current_dir(repo_root())

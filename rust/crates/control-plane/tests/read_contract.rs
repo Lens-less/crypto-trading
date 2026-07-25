@@ -8,9 +8,9 @@ use crypto_trading_control_plane::{
     ControlPlaneEventsError, ReadControlPlane, ReadFailureKind,
 };
 use crypto_trading_runtime::{
-    CapabilityLevel, CursorError, ExecutionBatch, ExecutionBatchState, JournalPageBoundary,
-    JournalSnapshot, JournalSnapshotSource, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
-    ProjectionStatus,
+    CapabilityAccess, CapabilityEnvironment, CapabilityLevel, CursorError, ExecutionBatch,
+    ExecutionBatchState, JournalPageBoundary, JournalSnapshot, JournalSnapshotSource,
+    PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, ProjectionStatus,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -45,8 +45,17 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
     assert_eq!(first.capabilities, *control_plane.capabilities());
     assert!(!first.capabilities.live_trading_enabled);
     let web = first.capabilities.capability("control-plane.web").unwrap();
-    assert_eq!(web.level, CapabilityLevel::ReadOnly);
-    assert!(web.blockers.is_empty());
+    assert_eq!(web.level, CapabilityLevel::Available);
+    assert_eq!(
+        web.scope.environments,
+        vec![CapabilityEnvironment::Offline, CapabilityEnvironment::Paper]
+    );
+    assert_eq!(web.scope.access, CapabilityAccess::PaperTrading);
+    assert!(
+        web.blockers
+            .iter()
+            .any(|blocker| blocker.contains("mainnet authority are not exposed"))
+    );
     assert!(
         web.evidence
             .iter()

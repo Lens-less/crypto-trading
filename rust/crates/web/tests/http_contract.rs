@@ -42,7 +42,14 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
         .iter()
         .find(|item| item["id"] == "control-plane.web")
         .unwrap();
-    assert_eq!(web["level"], "read-only");
+    assert_eq!(web["level"], "available");
+    assert_eq!(web["scope"]["environments"], json!(["offline", "paper"]));
+    assert_eq!(web["scope"]["access"], "paper-trading");
+    assert!(web["blockers"].as_array().unwrap().iter().any(|blocker| {
+        blocker
+            .as_str()
+            .is_some_and(|text| text.contains("mainnet authority are not exposed"))
+    }));
 
     let system = app.oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(system.status(), StatusCode::OK);
