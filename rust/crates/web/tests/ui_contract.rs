@@ -95,7 +95,7 @@ async fn shell_assets_are_same_origin_and_serve_expected_mime_types() {
 }
 
 #[tokio::test]
-async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
+async fn embedded_assets_lock_the_operator_design_and_secret_boundary() {
     let app = fixture_app(Vec::new(), WebAccessPolicy::loopback_open());
     let html = response_text(
         app.clone()
@@ -145,7 +145,6 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
         "document.cookie",
         ".innerHTML",
         "insertAdjacentHTML",
-        "method: \"POST\"",
         "method: \"PUT\"",
         "method: \"PATCH\"",
         "method: \"DELETE\"",
@@ -185,8 +184,115 @@ async fn embedded_assets_lock_the_read_only_design_and_secret_boundary() {
     assert_alert_surface_contract(&javascript, &css);
     assert_task_surface_contract(&javascript, &css);
     assert_scanner_surface_contract(&javascript, &css);
+    assert_trusted_submit_surface_contract(&javascript);
+    assert_m6_information_architecture_contract(&javascript, &css);
     assert!(javascript.contains("kill_switch"));
     assert_protected_state_contract(&javascript);
+}
+
+fn assert_trusted_submit_surface_contract(javascript: &str) {
+    for required in [
+        "/api/v1/submit",
+        "method: \"POST\"",
+        "schema_version: SUBMIT_SCHEMA_VERSION",
+        "local-paper-operator",
+        "paper_operator",
+        "paper_only",
+        "start_paper_arbitrage",
+        "start_paper_grid",
+        "stop_task",
+        "cancel_task",
+        "journal_projection",
+        "source",
+        "outcome_unknown",
+        "pendingSubmission",
+        "lockedByOutcomeUnknown",
+        "baselineTaskFingerprint",
+        "function taskProjectionFingerprint(task)",
+        "function syncStrategySubmitLocks()",
+        "function validateSubmitReceipt(receipt, envelope)",
+        "function updateStrategySubmitField(",
+        "acceptedStatuses: [422]",
+        "[\"running\", \"stopped\", \"failed\"].includes(task.phase)",
+        "state.tasks?.projection_status !== \"complete\"",
+        "secure_random_unavailable",
+        "/api/v1/tasks",
+    ] {
+        assert!(
+            javascript.contains(required),
+            "browser asset is missing trusted submit contract {required}"
+        );
+    }
+    for forbidden in [
+        "reconciliation_evidence_verified",
+        "reconcile_release",
+        "record_reconcile_failure",
+        "role\":\"reconciler\"",
+        "live_enable",
+        "order_submit",
+    ] {
+        assert!(
+            !javascript.contains(forbidden),
+            "browser asset must not expose forbidden submit surface {forbidden}"
+        );
+    }
+
+    let (_, reset_tail) = javascript
+        .split_once("function resetStrategySubmitTransientState()")
+        .expect("transient reset helper");
+    let (reset_body, _) = reset_tail
+        .split_once("function latestTaskForKind(")
+        .expect("latest task helper follows transient reset");
+    assert!(
+        !reset_body.contains("form.pendingSubmission = null"),
+        "authentication changes must retain the pending envelope identity"
+    );
+}
+
+fn assert_m6_information_architecture_contract(javascript: &str, css: &str) {
+    for required in [
+        "[\"strategies\", \"策略\"]",
+        "[\"risk\", \"风险\"]",
+        "[\"replay\", \"回放\"]",
+        "[\"settings\", \"设置\"]",
+        "function renderStrategiesView()",
+        "function renderRiskView()",
+        "function renderReplayView()",
+        "function renderSettingsView()",
+        "策略运行面",
+        "只读策略证据",
+        "风险总览",
+        "恢复账本",
+        "回放快照",
+        "历史投影时间",
+        "访问与外壳",
+        "只读边界",
+    ] {
+        assert!(
+            javascript.contains(required),
+            "browser asset is missing M6 information architecture contract {required}"
+        );
+    }
+    assert_eq!(
+        javascript
+            .matches("function renderStrategiesView()")
+            .count(),
+        1,
+        "the strategies surface must have one authoritative renderer"
+    );
+    for untranslated in [
+        "Strategy surfaces",
+        "Risk overview",
+        "Replay snapshot",
+        "Access and shell",
+    ] {
+        assert!(
+            !javascript.contains(untranslated),
+            "Chinese-first operator surface retains untranslated heading {untranslated}"
+        );
+    }
+    assert!(css.contains(".subregion {"));
+    assert!(css.contains("grid-template-columns: repeat(3, minmax(0, 1fr));"));
 }
 
 fn assert_monitor_surface_contract(javascript: &str, css: &str) {

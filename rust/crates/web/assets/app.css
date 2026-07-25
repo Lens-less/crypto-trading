@@ -127,6 +127,19 @@ label {
   gap: 8px;
 }
 
+.confirm-row {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.confirm-row input {
+  width: auto;
+  min-height: 20px;
+  margin: 2px 0 0;
+  padding: 0;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

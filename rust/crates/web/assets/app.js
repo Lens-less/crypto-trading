@@ -39,6 +39,10 @@ const BATCH_FILTER_IDS = new Set([
 const MAX_ALERT_OCCURRENCES = 256;
 const TRUSTED_ALERT_PROJECTION_IDS = new Set(["complete", "windowed"]);
 const TOKEN_LABELS = new Map([
+  ["paper_operator", "\u7eb8\u9762\u64cd\u4f5c\u5458"],
+  ["paper_only", "\u4ec5 Paper"],
+  ["applied", "\u5df2\u5199\u5165"],
+  ["rejected", "\u5df2\u62d2\u7edd"],
   ["complete", "完整"],
   ["degraded", "降级"],
   ["windowed", "窗口化"],
@@ -70,6 +74,12 @@ const TOKEN_LABELS = new Map([
   ["not-applicable", "不适用"],
 ]);
 for (const [token, label] of [
+  ["arbitrage_paper", "Paper \u5957\u5229"],
+  ["grid_paper", "Paper \u7f51\u683c"],
+  ["start_paper_arbitrage", "\u542f\u52a8\u5957\u5229"],
+  ["start_paper_grid", "\u542f\u52a8\u7f51\u683c"],
+  ["stop_task", "\u505c\u6b62\u4efb\u52a1"],
+  ["cancel_task", "\u53d6\u6d88\u4efb\u52a1"],
   ["pending", "最后记录：未决"],
   ["dropped", "已丢弃"],
   ["succeeded", "已送达"],
@@ -125,6 +135,31 @@ const STREAM_RETRY_BASE_MS = 1500;
 const STREAM_RETRY_MAX_MS = 10000;
 const STALE_AFTER_MS = 15000;
 const REFETCH_DEBOUNCE_MS = 180;
+const SUBMIT_SCHEMA_VERSION = 1;
+const SUBMIT_PRINCIPAL_ID = "local-paper-operator";
+const SUBMIT_ROLE = "paper_operator";
+const SUBMIT_RISK_CONFIRMATION = "paper_only";
+const DEFAULT_STRATEGY_REVISION = "2026-07-25";
+const STRATEGY_CONTROL_DEFS = {
+  arbitrage: {
+    title: "\u5957\u5229 Paper \u4efb\u52a1",
+    taskKind: "arbitrage_paper",
+    defaultStrategyId: "paper-arbitrage",
+    startCommandKind: "start_paper_arbitrage",
+    startLabel: "\u542f\u52a8\u5957\u5229",
+    summary:
+      "\u53ea\u63d0\u4ea4 Paper \u5957\u5229\u4efb\u52a1\u7684 start/stop/cancel\uff0c\u4e0d\u5f00\u653e\u5b9e\u76d8\u3001\u5bf9\u8d26\u6216\u4e0b\u5355\u63a7\u5236\u3002",
+  },
+  grid: {
+    title: "\u7f51\u683c Paper \u4efb\u52a1",
+    taskKind: "grid_paper",
+    defaultStrategyId: "paper-grid",
+    startCommandKind: "start_paper_grid",
+    startLabel: "\u542f\u52a8\u7f51\u683c",
+    summary:
+      "\u53ea\u63d0\u4ea4 Paper \u7f51\u683c\u4efb\u52a1\u7684 start/stop/cancel\uff0c\u4e0d\u63d0\u4f9b live\u3001reconcile \u6216\u4e0b\u5355\u6743\u9650\u3002",
+  },
+};
 
 const dom = {
   spine: document.querySelector("#risk-spine"),
@@ -156,6 +191,7 @@ const state = {
   drawerReturnBatch: "",
   drawerReturnAction: "detail",
   drawerFocusedBatch: "",
+  strategySubmit: createStrategySubmitState(),
   loads: {
     system: "idle",
     monitor: "idle",
@@ -284,6 +320,7 @@ function stopStream() {
 function clearProtectedState() {
   state.sessionGeneration += 1;
   stopStream();
+  resetStrategySubmitTransientState();
   if (state.refreshTimer) {
     window.clearTimeout(state.refreshTimer);
     state.refreshTimer = 0;
@@ -759,23 +796,36 @@ function parseSseChunk(chunk) {
   return message.data || message.id || message.event !== "message" ? message : null;
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, options = {}) {
+  const {
+    method = "GET",
+    body,
+    headers: extraHeaders = {},
+    signal,
+    acceptedStatuses = [],
+  } = options;
   const headers = {
     Accept: "application/json",
+    ...extraHeaders,
   };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
   if (state.authToken) {
     headers.Authorization = `Bearer ${state.authToken}`;
   }
   const response = await fetch(url, {
-    method: "GET",
+    method,
     cache: "no-store",
     headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   let payload = null;
   if (response.headers.get("content-type")?.includes("application/json")) {
     payload = await response.json();
   }
-  if (!response.ok) {
+  if (!response.ok && !acceptedStatuses.includes(response.status)) {
     throw new ApiProblem(
       payload?.error?.code || "internal_error",
       payload?.error?.message || "The request could not be completed.",
@@ -799,8 +849,377 @@ function normalizeError(error) {
   );
 }
 
+function createStrategySubmitState() {
+  return {
+    arbitrage: createStrategySubmitModel(
+      STRATEGY_CONTROL_DEFS.arbitrage.defaultStrategyId,
+    ),
+    grid: createStrategySubmitModel(STRATEGY_CONTROL_DEFS.grid.defaultStrategyId),
+  };
+}
+
+function createStrategySubmitModel(defaultStrategyId) {
+  return {
+    taskId: "",
+    strategyId: defaultStrategyId,
+    strategyRevision: DEFAULT_STRATEGY_REVISION,
+    confirmed: false,
+    inFlight: false,
+    pendingAction: "",
+    pendingSubmission: null,
+    lockedByOutcomeUnknown: false,
+    lastAction: "",
+    lastReceipt: null,
+    lastError: null,
+  };
+}
+
+function resetStrategySubmitTransientState() {
+  for (const form of Object.values(state.strategySubmit)) {
+    form.inFlight = false;
+    form.pendingAction = "";
+    form.confirmed = false;
+    form.lastAction = form.pendingSubmission?.commandKind || "";
+    form.lastReceipt = null;
+    form.lastError = null;
+  }
+}
+
+function latestTaskForKind(taskKind) {
+  const tasks = (state.tasks?.tasks || []).filter((task) => task.kind === taskKind);
+  if (tasks.length === 0) {
+    return null;
+  }
+  return tasks
+    .slice()
+    .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))[0];
+}
+
+function validateBoundedIdentity(value, label) {
+  const raw = String(value || "");
+  if (!raw) {
+    throw new ApiProblem("invalid_input", `${label}\u4e0d\u80fd\u4e3a\u7a7a\u3002`, 0);
+  }
+  if (raw.trim() !== raw) {
+    throw new ApiProblem(
+      "invalid_input",
+      `${label}\u4e0d\u80fd\u5305\u542b\u9996\u5c3e\u7a7a\u683c\u3002`,
+      0,
+    );
+  }
+  if (/[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new ApiProblem(
+      "invalid_input",
+      `${label}\u4e0d\u80fd\u5305\u542b\u63a7\u5236\u5b57\u7b26\u3002`,
+      0,
+    );
+  }
+  if (new TextEncoder().encode(raw).length > 128) {
+    throw new ApiProblem(
+      "invalid_input",
+      `${label}\u5fc5\u987b\u4fdd\u6301\u5728 128 \u5b57\u8282\u4ee5\u5185\u3002`,
+      0,
+    );
+  }
+  return raw;
+}
+
+function requirePaperConfirmation(form) {
+  if (!form.confirmed) {
+    throw new ApiProblem(
+      "paper_confirmation_required",
+      "\u8bf7\u5148\u663e\u5f0f\u786e\u8ba4\u8fd9\u662f Paper-only \u6307\u4ee4\u3002",
+      0,
+    );
+  }
+}
+
+function randomCommandId() {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.getRandomValues) {
+    throw new ApiProblem(
+      "secure_random_unavailable",
+      "当前浏览器无法提供安全随机源，不能生成受信 command_id。",
+      0,
+    );
+  }
+  if (typeof cryptoApi.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  cryptoApi.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+  return [
+    hex.slice(0, 4).join(""),
+    hex.slice(4, 6).join(""),
+    hex.slice(6, 8).join(""),
+    hex.slice(8, 10).join(""),
+    hex.slice(10, 16).join(""),
+  ].join("-");
+}
+
+function strategySubmitSnapshotKey(taskId, strategyId, strategyRevision) {
+  return JSON.stringify([taskId, strategyId, strategyRevision]);
+}
+
+function taskProjectionFingerprint(task) {
+  if (!task) {
+    return null;
+  }
+  return JSON.stringify([
+    task.first_sequence ?? null,
+    task.last_sequence ?? null,
+    task.updated_at ?? null,
+    task.phase ?? null,
+    task.recovery ?? null,
+  ]);
+}
+
+function clearStrategySubmissionState(form, { keepFeedback = false } = {}) {
+  form.inFlight = false;
+  form.pendingAction = "";
+  form.pendingSubmission = null;
+  form.lockedByOutcomeUnknown = false;
+  if (!keepFeedback) {
+    form.lastAction = "";
+    form.lastReceipt = null;
+    form.lastError = null;
+  }
+}
+
+function updateStrategySubmitField(formKey, field, value) {
+  const form = state.strategySubmit[formKey];
+  if (!form || form[field] === value) {
+    return;
+  }
+  form[field] = value;
+  clearStrategySubmissionState(form);
+  render();
+}
+
+function syncStrategySubmitLocks() {
+  if (
+    state.loads.tasks !== "ready" ||
+    state.tasks?.projection_status !== "complete"
+  ) {
+    return;
+  }
+  for (const [formKey, form] of Object.entries(state.strategySubmit)) {
+    if (!form.lockedByOutcomeUnknown || !form.pendingSubmission) {
+      continue;
+    }
+    const pendingTaskId = form.pendingSubmission.envelope.target_task_id;
+    const matchedTask = (state.tasks?.tasks || []).find((task) => {
+      const projectionAdvanced =
+        taskProjectionFingerprint(task) !==
+        form.pendingSubmission.baselineTaskFingerprint;
+      const expectedPhase =
+        form.pendingSubmission.action === "start"
+          ? ["running", "stopped", "failed"].includes(task.phase)
+          : ["stopped", "failed"].includes(task.phase);
+      return (
+        task.task_id === pendingTaskId &&
+        task.kind === STRATEGY_CONTROL_DEFS[formKey].taskKind &&
+        projectionAdvanced &&
+        expectedPhase
+      );
+    });
+    if (matchedTask) {
+      form.lockedByOutcomeUnknown = false;
+      form.pendingSubmission = null;
+    }
+  }
+}
+
+function buildSubmitEnvelope(formKey, action) {
+  const form = state.strategySubmit[formKey];
+  const definition = STRATEGY_CONTROL_DEFS[formKey];
+  const taskId = validateBoundedIdentity(form.taskId, "task_id");
+  const strategyId = validateBoundedIdentity(form.strategyId, "strategy_id");
+  const strategyRevision = validateBoundedIdentity(
+    form.strategyRevision,
+    "strategy_revision",
+  );
+  requirePaperConfirmation(form);
+  const snapshotKey = strategySubmitSnapshotKey(
+    taskId,
+    strategyId,
+    strategyRevision,
+  );
+  if (form.pendingSubmission && form.pendingSubmission.snapshotKey === snapshotKey) {
+    if (form.lockedByOutcomeUnknown) {
+      throw new ApiProblem(
+        "outcome_unknown_locked",
+        "\u4e0a\u4e00\u6b21\u7ed3\u679c\u4ecd\u4e3a outcome_unknown\uff1b\u8bf7\u5148\u6838\u5bf9 /api/v1/tasks\uff0c\u6216\u660e\u786e\u4fee\u6539 task_id / strategy_id / strategy_revision \u540e\u518d\u751f\u6210\u65b0\u6307\u4ee4\u3002",
+        0,
+      );
+    }
+    if (form.pendingSubmission.action === action) {
+      return form.pendingSubmission;
+    }
+    throw new ApiProblem(
+      "pending_submission_locked",
+      "\u5f53\u524d\u8868\u5355\u4ecd\u4fdd\u7559\u4e0a\u4e00\u6b21\u672a\u95ed\u5408\u7684 submit envelope\uff1b\u5728 /api/v1/tasks \u786e\u8ba4\u7ed3\u679c\u6216\u4fee\u6539 task_id / strategy_id / strategy_revision \u4e4b\u524d\uff0c\u53ea\u80fd\u91cd\u8bd5\u540c\u4e00\u4e2a\u52a8\u4f5c\u3002",
+      0,
+    );
+  }
+  const commandId = randomCommandId();
+  const commandKind =
+    action === "start"
+      ? definition.startCommandKind
+      : action === "stop"
+        ? "stop_task"
+        : "cancel_task";
+  const command =
+    action === "start"
+      ? {
+          kind: commandKind,
+          strategy_id: strategyId,
+          strategy_revision: strategyRevision,
+        }
+      : { kind: commandKind };
+  const baselineTask = (state.tasks?.tasks || []).find(
+    (task) =>
+      task.task_id === taskId &&
+      task.kind === definition.taskKind,
+  );
+  return {
+    action,
+    snapshotKey,
+    commandKind,
+    baselineTaskFingerprint: taskProjectionFingerprint(baselineTask),
+    envelope: {
+      schema_version: SUBMIT_SCHEMA_VERSION,
+      command_id: commandId,
+      idempotency_key: `paper-${commandKind}-${commandId}`,
+      target_task_id: taskId,
+      permission: {
+        principal_id: SUBMIT_PRINCIPAL_ID,
+        role: SUBMIT_ROLE,
+      },
+      risk_confirmation: SUBMIT_RISK_CONFIRMATION,
+      command,
+    },
+  };
+}
+
+function validateSubmitReceipt(receipt, envelope) {
+  const validStatuses = new Set(["applied", "rejected", "outcome_unknown"]);
+  if (
+    !receipt ||
+    receipt.schema_version !== SUBMIT_SCHEMA_VERSION ||
+    receipt.command_id !== envelope.command_id ||
+    receipt.target_task_id !== envelope.target_task_id ||
+    !validStatuses.has(receipt.status) ||
+    receipt.source !== "durable_journal" ||
+    receipt.journal_projection !== "submit_command_v1"
+  ) {
+    throw new ApiProblem(
+      "invalid_submit_receipt",
+      "受信 submit 返回了无法验证的 receipt；已保留原 envelope，请先核对 durable journal。",
+      0,
+    );
+  }
+  return receipt;
+}
+
+async function submitStrategyCommand(formKey, action) {
+  const form = state.strategySubmit[formKey];
+  if (!form || form.inFlight) {
+    return;
+  }
+  const generation = state.sessionGeneration;
+  let submission;
+  try {
+    submission = buildSubmitEnvelope(formKey, action);
+  } catch (error) {
+    form.lastError = normalizeError(error);
+    render();
+    return;
+  }
+  form.inFlight = true;
+  form.pendingAction = action;
+  form.pendingSubmission = submission;
+  form.lastAction = submission.commandKind;
+  form.lastError = null;
+  render();
+  try {
+    const receipt = validateSubmitReceipt(
+      await fetchJson("/api/v1/submit", {
+        method: "POST",
+        body: submission.envelope,
+        acceptedStatuses: [422],
+      }),
+      submission.envelope,
+    );
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    form.lastReceipt = receipt;
+    form.lastError = null;
+    form.lockedByOutcomeUnknown = receipt?.status === "outcome_unknown";
+    if (!form.lockedByOutcomeUnknown) {
+      form.pendingSubmission = null;
+    }
+    announce(
+      receipt?.status === "outcome_unknown"
+        ? "\u53d7\u4fe1 Paper \u6307\u4ee4\u5df2\u5199\u5165 durable journal\uff0c\u8bf7\u5148\u6838\u5bf9 /api/v1/tasks \u540e\u518d\u51b3\u5b9a\u4e0b\u4e00\u6b65\u3002"
+        : `\u53d7\u4fe1 Paper \u6307\u4ee4\u5df2\u5199\u5165 durable journal\uff1a${submitCommandLabel(
+            submission.commandKind,
+          )}\u3002`,
+    );
+    void refreshOperationalTruth();
+  } catch (error) {
+    if (generation !== state.sessionGeneration) {
+      return;
+    }
+    const problem = normalizeError(error);
+    markAuthenticationRequired(problem);
+    if (generation === state.sessionGeneration) {
+      form.lastError = problem;
+    }
+  } finally {
+    if (generation === state.sessionGeneration) {
+      form.inFlight = false;
+      form.pendingAction = "";
+      render();
+    }
+  }
+}
+
+function submitCommandLabel(commandKind) {
+  switch (commandKind) {
+    case "start_paper_arbitrage":
+      return "\u542f\u52a8\u5957\u5229";
+    case "start_paper_grid":
+      return "\u542f\u52a8\u7f51\u683c";
+    case "stop_task":
+      return "\u505c\u6b62\u4efb\u52a1";
+    case "cancel_task":
+      return "\u53d6\u6d88\u4efb\u52a1";
+    default:
+      return commandKind;
+  }
+}
+
+function submitReceiptTone(status) {
+  switch (status) {
+    case "applied":
+      return "success";
+    case "rejected":
+      return "danger";
+    case "outcome_unknown":
+      return "warning";
+    default:
+      return "neutral";
+  }
+}
+
 function render() {
   state.renderedStale = isStale();
+  syncStrategySubmitLocks();
   renderSpine();
   renderHeader();
   renderMain();
@@ -882,10 +1301,10 @@ function renderSpineStatusBlock() {
 
 function renderNavigationBlock() {
   const entries = [
-    ["strategies", "Strategies"],
-    ["risk", "Risk"],
-    ["replay", "Replay"],
-    ["settings", "Settings"],
+    ["strategies", "策略"],
+    ["risk", "风险"],
+    ["replay", "回放"],
+    ["settings", "设置"],
     ["overview", "总览"],
     ["scanner", "扫描"],
     ["alerts", "预警"],
@@ -982,10 +1401,10 @@ function renderAccessBlock() {
 
 function renderHeader() {
   const currentPage = {
-    strategies: "Read-only strategy surfaces grounded in the current journal projection.",
-    risk: "Fail-closed risk status, recovery pressure, and bounded authority evidence.",
-    replay: "Historical snapshots and event-watermark context; not a live matching replay.",
-    settings: "Read-only shell, access, and projection boundary settings available to this page.",
+    strategies: "策略证据与受信 Paper 任务控制；不开放 live 或 reconcile。",
+    risk: "关闭优先的风险状态、恢复压力与有界权限证据。",
+    replay: "历史快照与事件水位上下文；不是实时撮合回放。",
+    settings: "本页可见的只读外壳、访问策略与投影边界。",
     alerts: "有界价格预警投影、确认状态与本地通知结果。",
     overview: "跨域读取模型与风险优先的运行事实。",
     scanner: "离线确定性虚拟网格排行，以及可审计的 APR 与评分证据。",
@@ -2112,109 +2531,28 @@ function renderIntegrationsView() {
   ]);
 }
 
-function renderStrategiesView() {
-  const capabilities = capabilityRowsFor("strategy");
-  const taskKinds = uniqueValues((state.tasks?.tasks || []).map((task) => task.kind));
-  const batchStrategies = uniqueValues(
-    (state.executions?.operator?.batches || []).map((batch) => batch.strategy),
-  );
-  const latestAlert = latestAlertOccurrence();
-  const latestScanner = state.scanner?.latest || null;
-  const latestMonitor = state.monitor?.latest || null;
-  return el("section", { className: "view-stack" }, [
-    renderRegion({
-      title: "Strategy surfaces",
-      subtitle:
-        "Current strategy evidence only. This page exposes no start, stop, replay-submit, or order authority.",
-      body: el("div", { className: "detail-grid" }, [
-        detailStat("Monitor", latestMonitor ? humanizeToken(latestMonitor.state) : "unavailable"),
-        detailStat("Scanner rows", latestScanner?.rows?.length || 0),
-        detailStat("Alert occurrences", visibleAlertOccurrences(state.alerts).length),
-        detailStat("Task kinds", taskKinds.length),
-        detailStat("Batch strategies", batchStrategies.length),
-        detailStat("Strategy capabilities", capabilities.length),
-      ]),
-    }),
-    renderRegion({
-      title: "Read-only strategy evidence",
-      subtitle:
-        "Each surface reflects the last bounded fact available from the current journal snapshot and fails closed when data is missing.",
-      body: el("div", { className: "evidence-grid" }, [
-        renderSubregion("Arbitrage monitor", el("div", { className: "detail-grid" }, [
-          detailStat("Projection", humanizeToken(state.monitor?.projection_status || "unavailable")),
-          detailStat(
-            "Pair",
-            latestMonitor
-              ? `${latestMonitor.left.exchange}/${latestMonitor.left.symbol} -> ${latestMonitor.right.exchange}/${latestMonitor.right.symbol}`
-              : "--",
-          ),
-          detailStat("Recorded", latestMonitor ? formatDateTime(latestMonitor.recorded_at) : "--"),
-          detailStat("Sequence", latestMonitor?.monitor_sequence ?? "--"),
-        ])),
-        renderSubregion("Virtual grid scanner", el("div", { className: "detail-grid" }, [
-          detailStat("Projection", humanizeToken(state.scanner?.projection_status || "unavailable")),
-          detailStat("Run ID", latestScanner?.run_id || "--"),
-          detailStat(
-            "Leader",
-            latestScanner?.rows?.[0] ? scannerMarketLabel(latestScanner.rows[0]) : "--",
-          ),
-          detailStat("Recorded", latestScanner ? formatDateTime(latestScanner.recorded_at) : "--"),
-        ])),
-        renderSubregion("Price alerts", el("div", { className: "detail-grid" }, [
-          detailStat("Projection", alertProjectionLabel(state.alerts)),
-          detailStat("Latest sequence", latestAlert?.alert_sequence ?? "--"),
-          detailStat("Pending deliveries", countPendingAlertDeliveries(state.alerts)),
-          detailStat("Recorded", latestAlert ? formatDateTime(latestAlert.recorded_at) : "--"),
-        ])),
-        renderSubregion("Execution ledger", el("div", { className: "detail-grid" }, [
-          detailStat("Batches", state.executions?.operator?.batches?.length || 0),
-          detailStat("Strategies", batchStrategies.length),
-          detailStat("Recovery required", state.system?.recovery_required_count ?? "--"),
-          detailStat("Projection", humanizeToken(state.system?.projection_status || "unavailable")),
-        ])),
-      ]),
-    }),
-    renderRegion({
-      title: "Strategy capability ledger",
-      subtitle:
-        "Capabilities are sourced from the same bounded manifest used by CLI and HTTP surfaces.",
-      body:
-        state.loads.capabilities === "error" && !state.capabilities
-          ? renderError(state.errors.capabilities)
-          : state.capabilities
-          ? capabilities.length > 0
-            ? renderCapabilityTable(capabilities)
-            : renderEmpty(
-                "No strategy capabilities are available in the current manifest.",
-                "Checked /api/v1/capabilities for area=strategy.",
-              )
-          : renderSkeleton(6),
-    }),
-  ]);
-}
-
 function renderRiskView() {
   const riskyBatches = attentionBatches();
   const tasks = attentionTasks();
   const capabilities = capabilityRowsFor("risk");
   return el("section", { className: "view-stack" }, [
     renderRegion({
-      title: "Risk overview",
+      title: "风险总览",
       subtitle:
-        "Fail-closed risk status only. Missing reservation, kill-switch, or credential facts are left unavailable rather than inferred.",
+        "只展示关闭优先的风险状态；预留、Kill switch 或凭证事实缺失时保持不可用，不做推断。",
       body: el("div", { className: "detail-grid" }, [
         detailStat("Kill switch", humanizeToken(state.system?.kill_switch || "not_available")),
-        detailStat("Recovery required", state.system?.recovery_required_count ?? "--"),
-        detailStat("Conflicts", state.system?.conflict_count ?? "--"),
-        detailStat("Task investigations", tasks.length),
-        detailStat("Risk capabilities", capabilities.length),
-        detailStat("Projection", humanizeToken(state.system?.projection_status || "unavailable")),
+        detailStat("需要恢复", state.system?.recovery_required_count ?? "--"),
+        detailStat("冲突", state.system?.conflict_count ?? "--"),
+        detailStat("待调查任务", tasks.length),
+        detailStat("风险能力", capabilities.length),
+        detailStat("投影", humanizeToken(state.system?.projection_status || "unavailable")),
       ]),
     }),
     renderRegion({
-      title: "Recovery ledger",
+      title: "恢复账本",
       subtitle:
-        "Batches shown here require investigation or reconciliation. This page does not expose retry, release, or submit actions.",
+        "这里的批次需要调查或对账；本页不提供重试、释放或提交操作。",
       body:
         state.loads.executions === "error" && !state.executions
           ? renderError(state.errors.executions)
@@ -2223,14 +2561,14 @@ function renderRiskView() {
           : riskyBatches.length > 0
           ? renderBatchTable(riskyBatches, { condensed: false })
           : renderEmpty(
-              "No execution batches currently project recovery pressure.",
-              "Checked operator.batches for recovery != none or state conflict/partial/failed/outcome_unknown.",
+              "当前没有投影出恢复压力的执行批次。",
+              "已检查 operator.batches 中 recovery 非 none 或状态为 conflict/partial/failed/outcome_unknown 的记录。",
             ),
     }),
     renderRegion({
-      title: "Task investigation ledger",
+      title: "任务调查账本",
       subtitle:
-        "Durable task lifecycle facts may indicate that manual verification is still required after a stop or failure boundary.",
+        "持久任务生命周期可能表明停止或失败后仍需人工核验。",
       body:
         state.loads.tasks === "error" && !state.tasks
           ? renderError(state.errors.tasks)
@@ -2239,14 +2577,14 @@ function renderRiskView() {
           : tasks.length > 0
           ? renderTaskAttentionTable(tasks)
           : renderEmpty(
-              "No tasks currently require investigation.",
-              "Checked /api/v1/tasks for recovery=investigate, failure, or failed phase.",
+              "当前没有需要调查的任务。",
+              "已检查 /api/v1/tasks 中 recovery=investigate、failure 或 failed 阶段。",
             ),
     }),
     renderRegion({
-      title: "Risk capability ledger",
+      title: "风险能力账本",
       subtitle:
-        "Current manifest evidence for risk-owned authority. Unavailable remains neutral and explicit.",
+        "展示当前清单中由风险域拥有的权限证据；不可用状态保持中性且明确。",
       body:
         state.loads.capabilities === "error" && !state.capabilities
           ? renderError(state.errors.capabilities)
@@ -2254,8 +2592,8 @@ function renderRiskView() {
           ? capabilities.length > 0
             ? renderCapabilityTable(capabilities)
             : renderEmpty(
-                "The current manifest does not expose additional risk capability rows.",
-                "Checked /api/v1/capabilities for area=risk.",
+                "当前清单没有额外的风险能力项。",
+                "已检查 /api/v1/capabilities 中 area=risk 的记录。",
               )
           : renderSkeleton(6),
     }),
@@ -2266,35 +2604,35 @@ function renderReplayView() {
   const page = state.lastPage;
   return el("section", { className: "view-stack" }, [
     renderRegion({
-      title: "Replay snapshot",
+      title: "回放快照",
       subtitle:
-        "This surface shows historical snapshots and cursor watermarks only. It is not a live matching replay and it cannot submit work.",
+        "这里只展示历史快照与游标水位；不是实时撮合回放，也不能提交工作。",
       body: el("div", { className: "detail-grid" }, [
         detailStat("Journal", state.system?.journal_id || "--"),
-        detailStat("Head sequence", state.system?.head_sequence ?? "--"),
-        detailStat("Cursor", state.cursor || "--"),
-        detailStat("Event page", page?.events?.length || 0),
-        detailStat("Boundary", humanizeToken(page?.boundary?.kind || "snapshot_end")),
-        detailStat("Stream", eventStreamLabel()),
+        detailStat("头部序号", state.system?.head_sequence ?? "--"),
+        detailStat("游标", state.cursor || "--"),
+        detailStat("事件页", page?.events?.length || 0),
+        detailStat("边界", humanizeToken(page?.boundary?.kind || "snapshot_end")),
+        detailStat("事件流", eventStreamLabel()),
       ]),
     }),
     renderRegion({
-      title: "Historical surface timestamps",
+      title: "历史投影时间",
       subtitle:
-        "Each row names the last retained fact for one read-only projection so operators can inspect what period the page is actually describing.",
+        "每行标出一个只读投影最后保留的事实，便于确认页面实际描述的时间范围。",
       body: renderReplaySurfaceTable(),
     }),
     renderRegion({
-      title: "Recent operation events",
+      title: "最近操作事件",
       subtitle:
-        "Event metadata is bounded and scrubbed. Deep links remain shareable because the cursor stays in page memory only.",
+        "事件元数据经过有界与脱敏处理；游标只保留在页面内存中，不进入分享链接。",
       body:
         page
           ? page.events.length > 0
             ? renderNoticeTable(page)
             : renderEmpty(
-                "No new operation events follow the current cursor watermark.",
-                `Checked boundary ${humanizeToken(page.boundary?.kind || "snapshot_end")}.`,
+                "当前游标水位之后没有新的操作事件。",
+                `已检查边界：${humanizeToken(page.boundary?.kind || "snapshot_end")}。`,
               )
           : state.loads.executions === "error"
           ? renderError(state.errors.executions)
@@ -2313,60 +2651,60 @@ function renderSettingsView() {
   );
   return el("section", { className: "view-stack" }, [
     renderRegion({
-      title: "Access and shell",
+      title: "访问与外壳",
       subtitle:
-        "Only settings already surfaced to the read-only shell are shown here. Secrets, filesystem paths, and adapter credentials remain intentionally hidden.",
+        "这里只展示外壳可见设置；Bearer 只留在页内存，文件系统路径与适配器凭证保持隐藏。",
       body: el("div", { className: "detail-grid" }, [
-        detailStat("Product version", state.system?.product_version || "--"),
-        detailStat("Release stage", state.system?.release_stage || "--"),
-        detailStat("Access scope", state.system?.access_scope || "--"),
-        detailStat("Auth required", state.system?.authentication_required ? "true" : "false"),
-        detailStat("Bearer bound", state.authToken ? "in-memory" : "not bound"),
-        detailStat("Event stream", eventStreamLabel()),
+        detailStat("产品版本", state.system?.product_version || "--"),
+        detailStat("发布阶段", state.system?.release_stage || "--"),
+        detailStat("访问范围", state.system?.access_scope || "--"),
+        detailStat("需要认证", state.system?.authentication_required ? "是" : "否"),
+        detailStat("Bearer 绑定", state.authToken ? "仅页内存" : "未绑定"),
+        detailStat("事件流", eventStreamLabel()),
       ]),
     }),
     renderRegion({
-      title: "Projection sources",
+      title: "投影来源",
       subtitle:
-        "These are the bounded journals and read-model watermarks currently available to the embedded shell.",
+        "以下为嵌入式外壳当前可见的有界 journal 与读取模型水位。",
       body: el("div", { className: "evidence-grid" }, [
-        renderSubregion("System", el("div", { className: "detail-grid" }, [
+        renderSubregion("系统", el("div", { className: "detail-grid" }, [
           detailStat("Journal", state.system?.journal_id || "--"),
-          detailStat("Head", state.system?.head_sequence ?? "--"),
-          detailStat("Projection", humanizeToken(state.system?.projection_status || "unavailable")),
-          detailStat("Updated", state.lastSnapshotAt ? formatDateTime(state.lastSnapshotAt) : "--"),
+          detailStat("头部序号", state.system?.head_sequence ?? "--"),
+          detailStat("投影", humanizeToken(state.system?.projection_status || "unavailable")),
+          detailStat("更新时间", state.lastSnapshotAt ? formatDateTime(state.lastSnapshotAt) : "--"),
         ])),
-        renderSubregion("Monitor", el("div", { className: "detail-grid" }, [
+        renderSubregion("监控", el("div", { className: "detail-grid" }, [
           detailStat("Journal", state.monitor?.journal_id || "--"),
-          detailStat("Head", state.monitor?.journal_head_sequence ?? "--"),
-          detailStat("Projection", humanizeToken(state.monitor?.projection_status || "unavailable")),
-          detailStat("Latest", state.monitor?.latest ? formatDateTime(state.monitor.latest.recorded_at) : "--"),
+          detailStat("头部序号", state.monitor?.journal_head_sequence ?? "--"),
+          detailStat("投影", humanizeToken(state.monitor?.projection_status || "unavailable")),
+          detailStat("最新记录", state.monitor?.latest ? formatDateTime(state.monitor.latest.recorded_at) : "--"),
         ])),
-        renderSubregion("Alerts", el("div", { className: "detail-grid" }, [
+        renderSubregion("预警", el("div", { className: "detail-grid" }, [
           detailStat("Journal", state.alerts?.journal_id || "--"),
-          detailStat("Head", state.alerts?.journal_head_sequence ?? "--"),
-          detailStat("Projection", alertProjectionLabel(state.alerts)),
-          detailStat("Boundary", humanizeToken(state.alerts?.boundary?.kind || "snapshot_end")),
+          detailStat("头部序号", state.alerts?.journal_head_sequence ?? "--"),
+          detailStat("投影", alertProjectionLabel(state.alerts)),
+          detailStat("边界", humanizeToken(state.alerts?.boundary?.kind || "snapshot_end")),
         ])),
-        renderSubregion("Tasks / scanner", el("div", { className: "detail-grid" }, [
-          detailStat("Task head", state.tasks?.journal_head_sequence ?? "--"),
-          detailStat("Task projection", humanizeToken(state.tasks?.projection_status || "unavailable")),
-          detailStat("Scanner head", state.scanner?.journal_head_sequence ?? "--"),
-          detailStat("Scanner projection", humanizeToken(state.scanner?.projection_status || "unavailable")),
+        renderSubregion("任务 / Scanner", el("div", { className: "detail-grid" }, [
+          detailStat("任务头部序号", state.tasks?.journal_head_sequence ?? "--"),
+          detailStat("任务投影", humanizeToken(state.tasks?.projection_status || "unavailable")),
+          detailStat("Scanner 头部序号", state.scanner?.journal_head_sequence ?? "--"),
+          detailStat("Scanner 投影", humanizeToken(state.scanner?.projection_status || "unavailable")),
         ])),
       ]),
     }),
     renderRegion({
-      title: "Read-only boundaries",
+      title: "只读边界",
       subtitle:
-        "The shell exposes only same-origin read endpoints. Data directories, log file paths, and adapter credential state are not projected to the browser in this release.",
+        "外壳默认只读；仅策略页可选用同源 trusted submit 控制 Paper owner，数据目录、日志路径和适配器凭证仍不投影到浏览器。",
       body: el("div", { className: "detail-grid" }, [
-        detailStat("HTML routes", VIEW_IDS.size),
-        detailStat("API routes", 8),
-        detailStat("Alert adapters seen", alertAdapters.length),
-        detailStat("Token persistence", "page memory only"),
-        detailStat("Directories", "not projected"),
-        detailStat("Credentials", "not projected"),
+        detailStat("HTML 路由", VIEW_IDS.size),
+        detailStat("API 路由", "8 GET + 可选 1 POST"),
+        detailStat("已见预警适配器", alertAdapters.length),
+        detailStat("令牌持久化", "仅页内存"),
+        detailStat("目录", "未投影"),
+        detailStat("凭证", "未投影"),
       ]),
     }),
   ]);
@@ -2384,10 +2722,10 @@ function renderTaskAttentionTable(tasks) {
     el("table", {}, [
       el("thead", {}, [
         el("tr", {}, [
-          el("th", { attrs: { scope: "col" }, text: "Task" }),
-          el("th", { attrs: { scope: "col" }, text: "Phase" }),
-          el("th", { attrs: { scope: "col" }, text: "Recovery" }),
-          el("th", { attrs: { scope: "col" }, text: "Updated" }),
+          el("th", { attrs: { scope: "col" }, text: "任务" }),
+          el("th", { attrs: { scope: "col" }, text: "阶段" }),
+          el("th", { attrs: { scope: "col" }, text: "恢复" }),
+          el("th", { attrs: { scope: "col" }, text: "更新时间" }),
         ]),
       ]),
       el(
@@ -2418,19 +2756,19 @@ function renderReplaySurfaceTable() {
   const latestAlert = latestAlertOccurrence();
   const rows = [
     [
-      "Monitor",
+      "监控",
       humanizeToken(state.monitor?.projection_status || "unavailable"),
       state.monitor?.latest ? formatDateTime(state.monitor.latest.recorded_at) : "--",
       state.monitor?.latest?.source_sequence ?? "--",
     ],
     [
-      "Alerts",
+      "预警",
       alertProjectionLabel(state.alerts),
       latestAlert ? formatDateTime(latestAlert.recorded_at) : "--",
       latestAlert?.source_sequence ?? "--",
     ],
     [
-      "Tasks",
+      "任务",
       humanizeToken(state.tasks?.projection_status || "unavailable"),
       latestTaskUpdateAt(),
       latestTaskSequence(),
@@ -2442,7 +2780,7 @@ function renderReplaySurfaceTable() {
       state.scanner?.latest?.source_sequence ?? "--",
     ],
     [
-      "Executions",
+      "执行",
       humanizeToken(state.system?.projection_status || "unavailable"),
       state.lastSnapshotAt ? formatDateTime(state.lastSnapshotAt) : "--",
       state.system?.head_sequence ?? "--",
@@ -2452,10 +2790,10 @@ function renderReplaySurfaceTable() {
     el("table", {}, [
       el("thead", {}, [
         el("tr", {}, [
-          el("th", { attrs: { scope: "col" }, text: "Surface" }),
-          el("th", { attrs: { scope: "col" }, text: "Projection" }),
-          el("th", { attrs: { scope: "col" }, text: "Latest fact" }),
-          el("th", { attrs: { scope: "col" }, text: "Sequence" }),
+          el("th", { attrs: { scope: "col" }, text: "运行面" }),
+          el("th", { attrs: { scope: "col" }, text: "投影" }),
+          el("th", { attrs: { scope: "col" }, text: "最新事实" }),
+          el("th", { attrs: { scope: "col" }, text: "序号" }),
         ]),
       ]),
       el(
@@ -2962,6 +3300,311 @@ function filteredCapabilities() {
 
 function capabilityRowsFor(area) {
   return (state.capabilities?.capabilities || []).filter((capability) => capability.area === area);
+}
+
+function renderStrategiesView() {
+  const capabilities = capabilityRowsFor("strategy");
+  const taskKinds = uniqueValues((state.tasks?.tasks || []).map((task) => task.kind));
+  const batchStrategies = uniqueValues(
+    (state.executions?.operator?.batches || []).map((batch) => batch.strategy),
+  );
+  const latestAlert = latestAlertOccurrence();
+  const latestScanner = state.scanner?.latest || null;
+  const latestMonitor = state.monitor?.latest || null;
+  return el("section", { className: "view-stack" }, [
+    renderRegion({
+      title: "策略运行面",
+      subtitle:
+        "\u8fd9\u91cc\u540c\u65f6\u5c55\u793a\u5f53\u524d\u7b56\u7565\u8bc1\u636e\u4e0e\u53d7\u4fe1 Paper submit \u63a7\u5236\uff1b\u53ea\u5141\u8bb8 Grid / Arbitrage \u7684 paper task lifecycle\uff0c\u4e0d\u5f00\u653e live\u3001reconcile \u6216\u4e0b\u5355\u63a7\u5236\u3002",
+      body: el("div", { className: "detail-grid" }, [
+        detailStat("\u76d1\u63a7", latestMonitor ? humanizeToken(latestMonitor.state) : "\u6682\u4e0d\u53ef\u7528"),
+        detailStat("Scanner \u884c\u6570", latestScanner?.rows?.length || 0),
+        detailStat("\u9884\u8b66\u4e8b\u4ef6", visibleAlertOccurrences(state.alerts).length),
+        detailStat("\u4efb\u52a1\u7c7b\u578b", taskKinds.length),
+        detailStat("\u6279\u6b21\u7b56\u7565", batchStrategies.length),
+        detailStat("\u7b56\u7565\u80fd\u529b", capabilities.length),
+      ]),
+    }),
+    renderRegion({
+      title: "Paper 任务控制",
+      subtitle:
+        "\u6240\u6709\u52a8\u4f5c\u90fd\u901a\u8fc7 /api/v1/submit \u53d1\u9001 SubmitEnvelope v1\uff0c\u56fa\u5b9a principal_id=local-paper-operator\uff0crole=paper_operator\uff0crisk_confirmation=paper_only\u3002",
+      body: el("div", { className: "evidence-grid" }, [
+        renderStrategyTaskControl("arbitrage"),
+        renderStrategyTaskControl("grid"),
+      ]),
+    }),
+    renderRegion({
+      title: "只读策略证据",
+      subtitle:
+        "\u6bcf\u4e2a\u533a\u57df\u53ea\u53cd\u6620\u5f53\u524d journal \u5feb\u7167\u4e2d\u6700\u540e\u4e00\u6761\u6709\u754c\u4e8b\u5b9e\uff1b\u6570\u636e\u7f3a\u5931\u65f6\u4fdd\u6301\u5173\u95ed\u3002",
+      body: el("div", { className: "evidence-grid" }, [
+        renderSubregion("\u5957\u5229\u76d1\u63a7", el("div", { className: "detail-grid" }, [
+          detailStat("\u6295\u5f71", humanizeToken(state.monitor?.projection_status || "unavailable")),
+          detailStat(
+            "\u4ea4\u6613\u5bf9",
+            latestMonitor
+              ? `${latestMonitor.left.exchange}/${latestMonitor.left.symbol} -> ${latestMonitor.right.exchange}/${latestMonitor.right.symbol}`
+              : "--",
+          ),
+          detailStat("\u8bb0\u5f55\u65f6\u95f4", latestMonitor ? formatDateTime(latestMonitor.recorded_at) : "--"),
+          detailStat("\u5e8f\u53f7", latestMonitor?.monitor_sequence ?? "--"),
+        ])),
+        renderSubregion("\u865a\u62df\u7f51\u683c Scanner", el("div", { className: "detail-grid" }, [
+          detailStat("\u6295\u5f71", humanizeToken(state.scanner?.projection_status || "unavailable")),
+          detailStat("\u8fd0\u884c ID", latestScanner?.run_id || "--"),
+          detailStat(
+            "\u9996\u4f4d\u6807\u7684",
+            latestScanner?.rows?.[0] ? scannerMarketLabel(latestScanner.rows[0]) : "--",
+          ),
+          detailStat("\u8bb0\u5f55\u65f6\u95f4", latestScanner ? formatDateTime(latestScanner.recorded_at) : "--"),
+        ])),
+        renderSubregion("\u4ef7\u683c\u9884\u8b66", el("div", { className: "detail-grid" }, [
+          detailStat("\u6295\u5f71", alertProjectionLabel(state.alerts)),
+          detailStat("\u6700\u65b0\u5e8f\u53f7", latestAlert?.alert_sequence ?? "--"),
+          detailStat("\u5f85\u786e\u8ba4\u6295\u9012", countPendingAlertDeliveries(state.alerts)),
+          detailStat("\u8bb0\u5f55\u65f6\u95f4", latestAlert ? formatDateTime(latestAlert.recorded_at) : "--"),
+        ])),
+        renderSubregion("\u6267\u884c\u8d26\u672c", el("div", { className: "detail-grid" }, [
+          detailStat("\u6279\u6b21", state.executions?.operator?.batches?.length || 0),
+          detailStat("\u7b56\u7565", batchStrategies.length),
+          detailStat("\u9700\u8981\u6062\u590d", state.system?.recovery_required_count ?? "--"),
+          detailStat("\u6295\u5f71", humanizeToken(state.system?.projection_status || "unavailable")),
+        ])),
+      ]),
+    }),
+    renderRegion({
+      title: "策略能力账本",
+      subtitle:
+        "\u80fd\u529b\u9879\u6765\u81ea CLI \u4e0e HTTP \u5171\u7528\u7684\u540c\u4e00\u4efd\u6709\u754c\u6e05\u5355\u3002",
+      body:
+        state.loads.capabilities === "error" && !state.capabilities
+          ? renderError(state.errors.capabilities)
+          : state.capabilities
+          ? capabilities.length > 0
+            ? renderCapabilityTable(capabilities)
+            : renderEmpty(
+                "\u5f53\u524d\u80fd\u529b\u6e05\u5355\u4e2d\u6ca1\u6709\u7b56\u7565\u80fd\u529b\u9879\u3002",
+                "\u5df2\u68c0\u67e5 /api/v1/capabilities \u4e2d area=strategy \u7684\u8bb0\u5f55\u3002",
+              )
+          : renderSkeleton(6),
+    }),
+  ]);
+}
+
+function renderStrategyTaskControl(formKey) {
+  const definition = STRATEGY_CONTROL_DEFS[formKey];
+  const form = state.strategySubmit[formKey];
+  const latestTask = latestTaskForKind(definition.taskKind);
+  const authBlocked = state.authRequired && !state.authToken;
+  const readbackBlocked =
+    state.loads.tasks !== "ready" ||
+    state.tasks?.projection_status !== "complete";
+  const actionDisabled =
+    authBlocked ||
+    readbackBlocked ||
+    form.inFlight ||
+    form.lockedByOutcomeUnknown;
+  const fieldDisabled = form.inFlight;
+  return renderSubregion(definition.title, el("div", { className: "view-stack" }, [
+    el("p", { className: "muted", text: definition.summary }),
+    latestTask
+      ? el("div", { className: "detail-grid" }, [
+          detailStat("\u6700\u8fd1 task_id", latestTask.task_id || "--"),
+          detailStat("\u6301\u4e45\u9636\u6bb5", humanizeToken(latestTask.phase)),
+          detailStat("\u6062\u590d\u5224\u65ad", humanizeToken(latestTask.recovery)),
+          detailStat("\u66f4\u65b0\u65f6\u95f4", formatDateTime(latestTask.updated_at)),
+        ])
+      : renderEmpty(
+          "\u5c1a\u672a\u89c2\u5bdf\u5230\u8fd9\u7c7b Paper \u4efb\u52a1\u7684 durable \u5feb\u7167\u3002",
+          "\u5982\u9700 start / stop / cancel\uff0c\u8bf7\u663e\u5f0f\u586b\u5199 task_id\u3001strategy_id \u548c strategy_revision\u3002",
+        ),
+    el("div", { className: "support-grid" }, [
+      renderStrategyTextField(
+        "\u4efb\u52a1 ID / task_id",
+        form.taskId,
+        formKey === "grid" ? "paper-grid-btc-usdt" : "paper-arbitrage-btc-usdt",
+        fieldDisabled,
+        (value) => updateStrategySubmitField(formKey, "taskId", value),
+      ),
+      renderStrategyTextField(
+        "\u7b56\u7565 ID / strategy_id",
+        form.strategyId,
+        definition.defaultStrategyId,
+        fieldDisabled,
+        (value) => updateStrategySubmitField(formKey, "strategyId", value),
+      ),
+      renderStrategyTextField(
+        "\u7248\u672c / strategy_revision",
+        form.strategyRevision,
+        DEFAULT_STRATEGY_REVISION,
+        fieldDisabled,
+        (value) => updateStrategySubmitField(formKey, "strategyRevision", value),
+      ),
+    ]),
+    el("label", { className: "confirm-row" }, [
+      el("input", {
+        attrs: {
+          type: "checkbox",
+          checked: form.confirmed ? "checked" : null,
+        },
+        onchange: (event) => {
+          form.confirmed = event.target.checked;
+          render();
+        },
+      }),
+      el("span", {
+        text:
+          "\u6211\u786e\u8ba4\u8fd9\u662f paper_only \u6307\u4ee4\uff0c\u53ea\u64cd\u4f5c Paper \u4efb\u52a1\uff0c\u4e0d\u542f\u7528\u5b9e\u76d8\u6216\u5bf9\u8d26\u91ca\u653e\u3002",
+      }),
+    ]),
+    el("p", {
+      className: "field-help",
+      text: form.lockedByOutcomeUnknown
+        ? "\u5f53\u524d\u8868\u5355\u56e0 outcome_unknown \u88ab\u9501\u5b9a\uff1b\u8bf7\u5148\u6838\u5bf9 /api/v1/tasks\uff0c\u6216\u8005\u660e\u786e\u4fee\u6539 task_id / strategy_id / strategy_revision \u540e\u518d\u751f\u6210\u65b0 ID\u3002"
+        : authBlocked
+        ? "\u5f53\u524d submit \u9700\u8981 Bearer\uff1b\u4ee4\u724c\u53ea\u4fdd\u5b58\u5728 state.authToken \u7684\u9875\u9762\u5185\u5b58\uff0c\u4e0d\u5199\u5165 DOM \u6216\u4efb\u4f55\u6d4f\u89c8\u5668\u6301\u4e45\u5316\u5b58\u50a8\u3002"
+        : readbackBlocked
+        ? "\u4efb\u52a1\u6295\u5f71\u5c1a\u672a\u5c31\u7eea\u6216\u5df2\u964d\u7ea7\uff1b\u5728 /api/v1/tasks \u6062\u590d complete \u4e4b\u524d\u7981\u6b62\u63d0\u4ea4\u3002"
+        : "首次动作会生成 UUID command_id 和幂等键；仅在提交中、网络结果未知或 durable receipt 为 outcome_unknown 时，未修改的同动作重试才复用原身份。已拒绝 / 已写入属于闭合结果，再次点击会生成新指令。",
+    }),
+    el("div", { className: "inline-button-row" }, [
+      renderStrategyActionButton(formKey, "start", definition.startLabel, actionDisabled),
+      renderStrategyActionButton(formKey, "stop", "\u505c\u6b62\u4efb\u52a1", actionDisabled),
+      renderStrategyActionButton(formKey, "cancel", "\u53d6\u6d88\u4efb\u52a1", actionDisabled),
+    ]),
+    renderStrategySubmitResult(form),
+  ]));
+}
+
+function renderStrategyTextField(label, value, placeholder, disabled, onChange) {
+  return el("label", {}, [
+    el("span", { className: "compact-label", text: label }),
+    el("input", {
+      attrs: {
+        type: "text",
+        value,
+        placeholder,
+        autocomplete: "off",
+        spellcheck: "false",
+        disabled: disabled ? "true" : null,
+      },
+      oninput: (event) => {
+        onChange(event.target.value);
+      },
+    }),
+  ]);
+}
+
+function renderStrategyActionButton(formKey, action, label, disabled) {
+  const form = state.strategySubmit[formKey];
+  const active = form.inFlight && form.pendingAction === action;
+  const lockedToAnotherAction =
+    Boolean(form.pendingSubmission) &&
+    !form.lockedByOutcomeUnknown &&
+    form.pendingSubmission.action !== action;
+  return el("button", {
+    className: action === "stop" ? "secondary" : action === "cancel" ? "ghost" : "",
+    attrs: {
+      type: "button",
+      disabled: disabled || lockedToAnotherAction ? "true" : null,
+      "aria-busy": active ? "true" : null,
+    },
+    text: active ? "\u63d0\u4ea4\u4e2d\u2026" : label,
+    onclick: () => {
+      void submitStrategyCommand(formKey, action);
+    },
+  });
+}
+
+function renderStrategySubmitResult(form) {
+  if (form.lastError) {
+    return el("div", { className: "error-state" }, [
+      el("div", { className: "tag-row" }, [
+        buildTag(
+          form.lastAction ? submitCommandLabel(form.lastAction) : "\u53d7\u4fe1 submit",
+          "danger",
+        ),
+        buildTag(form.lastError.code || "invalid_input", "warning"),
+      ]),
+      el("p", { text: form.lastError.message }),
+      form.pendingSubmission
+        ? el("div", { className: "detail-grid" }, [
+            detailStat(
+              "command_id",
+              form.pendingSubmission.envelope.command_id || "--",
+            ),
+            detailStat(
+              "idempotency_key",
+              form.pendingSubmission.envelope.idempotency_key || "--",
+            ),
+            detailStat(
+              "task_id",
+              form.pendingSubmission.envelope.target_task_id || "--",
+            ),
+            detailStat(
+              "动作",
+              submitCommandLabel(form.pendingSubmission.commandKind),
+            ),
+          ])
+        : null,
+      form.pendingSubmission
+        ? el("p", {
+            className: "muted",
+            text:
+              "\u5f53\u524d\u9519\u8bef\u4ecd\u4fdd\u7559\u540c\u4e00\u4e2a pending envelope\uff1b\u53ea\u8981 task_id / strategy_id / strategy_revision \u4e0d\u53d8\uff0c\u4e0b\u4e00\u6b21\u540c\u52a8\u4f5c\u4f1a\u590d\u7528\u76f8\u540c\u7684 command_id \u548c idempotency_key\u3002",
+          })
+        : null,
+      form.lastError.status
+        ? el("p", {
+            className: "muted mono",
+            text: `HTTP ${form.lastError.status}`,
+          })
+        : null,
+    ]);
+  }
+  if (form.lastReceipt) {
+    return el("div", { className: "view-stack" }, [
+      el("div", { className: "tag-row" }, [
+        buildTag(submitCommandLabel(form.lastAction), "info"),
+        buildTag(
+          humanizeToken(form.lastReceipt.status),
+          submitReceiptTone(form.lastReceipt.status),
+        ),
+      ]),
+      el("div", { className: "detail-grid" }, [
+        detailStat("command_id", form.lastReceipt.command_id || "--"),
+        detailStat("task_id", form.lastReceipt.target_task_id || "--"),
+        detailStat(
+          "journal_projection",
+          form.lastReceipt.journal_projection || "--",
+        ),
+        detailStat("source", form.lastReceipt.source || "--"),
+        detailStat(
+          "status",
+          humanizeToken(form.lastReceipt.status || "--"),
+        ),
+      ]),
+      form.lastReceipt.status === "outcome_unknown"
+        ? el("p", {
+            className: "muted",
+            text:
+              "\u201coutcome_unknown\u201d \u8868\u793a submit \u5df2\u88ab durable journal \u63a5\u7eb3\uff0c\u4f46\u7ed3\u679c\u4ecd\u9700\u56de\u5230\u4efb\u52a1\u4e0e\u6267\u884c\u8d26\u672c\u4e2d\u4eba\u5de5\u6838\u5bf9\u3002",
+          })
+        : null,
+      form.lockedByOutcomeUnknown
+        ? el("p", {
+            className: "muted",
+            text:
+              "\u8be5\u8868\u5355\u76ee\u524d\u4e0d\u4f1a\u751f\u6210\u65b0 mutation\uff1b\u8bf7\u5148\u6838\u5bf9 /api/v1/tasks\uff0c\u6216\u4fee\u6539 task_id / strategy_id / strategy_revision \u540e\u518d\u83b7\u53d6\u65b0 IDs\u3002",
+          })
+        : null,
+    ]);
+  }
+  return renderEmpty(
+    "\u5c1a\u672a\u63d0\u4ea4\u53d7\u4fe1 Paper \u6307\u4ee4\u3002",
+    "\u53ea\u5141\u8bb8 start_paper_grid\u3001start_paper_arbitrage\u3001stop_task \u548c cancel_task \u8fd9\u56db\u79cd lifecycle \u52a8\u4f5c\u3002",
+  );
 }
 
 function attentionBatches() {
