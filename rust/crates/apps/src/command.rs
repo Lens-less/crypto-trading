@@ -17,6 +17,10 @@ use crypto_trading_config::{
     load_price_alert_config_from_str, load_symbol_conversions_from_str,
     load_volume_maker_config_from_str, read_bounded_config,
 };
+use crypto_trading_control_plane::{
+    SubmitCommand, SubmitEnvelope, SubmitPermission, SubmitReceipt, SubmitRiskConfirmation,
+    SubmitRole, SubmitStatus,
+};
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
 };
@@ -30,8 +34,9 @@ use crypto_trading_runtime::{
     DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
     ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataError,
     MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy,
-    MarketInstrument, MarketSupervisorConfig, MarketUniverse, RuntimeError, SystemMarketDataClock,
-    current_capability_manifest,
+    MarketInstrument, MarketSupervisorConfig, MarketUniverse, ReadOnlyTaskExit,
+    ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel,
+    ReadOnlyTaskRecovery, RuntimeError, SystemMarketDataClock, current_capability_manifest,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -40,10 +45,16 @@ use crypto_trading_strategy::{
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::{Instant, timeout_at},
+};
 
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
-    MonitorMode, PriceAlertArgs, ScannerArgs, TestnetSmokeArgs, VolumeMakerArgs,
+    MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs,
+    PaperTaskArgs, PriceAlertArgs, ScannerArgs, TestnetSmokeArgs, VolumeMakerArgs,
 };
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
@@ -74,6 +85,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::VolumeMaker(args) => run_volume_maker(&args),
         Command::PriceAlert(args) => run_price_alert(&args),
         Command::Scanner(args) => run_scanner(&args),
+        Command::Paper(args) => run_paper(args).await,
     }
 }
 
@@ -124,6 +136,520 @@ fn run_capabilities(args: &CapabilitiesArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+const MIN_TRUSTED_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_TRUSTED_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_TRUSTED_ENV_VAR_BYTES: usize = 128;
+const MAX_TRUSTED_HTTP_REQUEST_BODY_BYTES: usize = 32 * 1024;
+const MAX_TRUSTED_HTTP_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+const MAX_TRUSTED_HTTP_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const TRUSTED_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaperTaskKind {
+    Grid,
+    Arbitrage,
+}
+
+impl PaperTaskKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Grid => "grid",
+            Self::Arbitrage => "arbitrage",
+        }
+    }
+
+    const fn task_kind(self) -> ReadOnlyTaskKind {
+        match self {
+            Self::Grid => ReadOnlyTaskKind::GridPaper,
+            Self::Arbitrage => ReadOnlyTaskKind::ArbitragePaper,
+        }
+    }
+
+    fn start_command(self, args: &PaperStartArgs) -> SubmitCommand {
+        match self {
+            Self::Grid => SubmitCommand::StartPaperGrid {
+                strategy_id: args.strategy_id.clone(),
+                strategy_revision: args.strategy_revision.clone(),
+            },
+            Self::Arbitrage => SubmitCommand::StartPaperArbitrage {
+                strategy_id: args.strategy_id.clone(),
+                strategy_revision: args.strategy_revision.clone(),
+            },
+        }
+    }
+}
+
+struct TrustedControlContext {
+    control_addr: std::net::SocketAddr,
+    bearer_token: String,
+}
+
+struct TrustedHttpResponse {
+    status_code: u16,
+    body: Vec<u8>,
+}
+
+async fn run_paper(command: PaperCommand) -> Result<()> {
+    match command {
+        PaperCommand::Grid(args) => run_paper_task(PaperTaskKind::Grid, args).await,
+        PaperCommand::Arbitrage(args) => run_paper_task(PaperTaskKind::Arbitrage, args).await,
+    }
+}
+
+async fn run_paper_task(kind: PaperTaskKind, args: PaperTaskArgs) -> Result<()> {
+    match args.operation {
+        PaperOperation::Start(args) => run_paper_start(kind, &args).await,
+        PaperOperation::Status(args) => run_paper_status(kind, &args).await,
+        PaperOperation::Stop(args) => {
+            run_paper_mutation(kind, "stop", SubmitCommand::StopTask, &args).await
+        }
+        PaperOperation::Cancel(args) => {
+            run_paper_mutation(kind, "cancel", SubmitCommand::CancelTask, &args).await
+        }
+    }
+}
+
+async fn run_paper_start(kind: PaperTaskKind, args: &PaperStartArgs) -> Result<()> {
+    let permission = SubmitPermission::new(
+        args.mutation.principal_id.clone(),
+        SubmitRole::PaperOperator,
+    )
+    .context("invalid paper trusted-submit principal")?;
+    let envelope = SubmitEnvelope::new(
+        args.mutation.command_id,
+        args.mutation.idempotency_key.clone(),
+        args.mutation.task_id.clone(),
+        permission,
+        SubmitRiskConfirmation::PaperOnly,
+        kind.start_command(args),
+    )
+    .context("invalid trusted submit envelope")?;
+    submit_paper_command(kind, "start", &args.mutation.control, envelope).await
+}
+
+async fn run_paper_mutation(
+    kind: PaperTaskKind,
+    operation: &str,
+    command: SubmitCommand,
+    args: &PaperMutationArgs,
+) -> Result<()> {
+    let permission = SubmitPermission::new(args.principal_id.clone(), SubmitRole::PaperOperator)
+        .context("invalid paper trusted-submit principal")?;
+    let envelope = SubmitEnvelope::new(
+        args.command_id,
+        args.idempotency_key.clone(),
+        args.task_id.clone(),
+        permission,
+        SubmitRiskConfirmation::PaperOnly,
+        command,
+    )
+    .context("invalid trusted submit envelope")?;
+    submit_paper_command(kind, operation, &args.control, envelope).await
+}
+
+async fn submit_paper_command(
+    kind: PaperTaskKind,
+    operation: &str,
+    control: &crate::cli::TrustedControlArgs,
+    envelope: SubmitEnvelope,
+) -> Result<()> {
+    let control = trusted_control_context(control.control_addr, &control.token_env_var)?;
+    let body =
+        serde_json::to_vec(&envelope).context("failed to serialize trusted submit envelope")?;
+    if body.len() > MAX_TRUSTED_HTTP_REQUEST_BODY_BYTES {
+        bail!("trusted submit envelope exceeded the bounded request body limit");
+    }
+    let response = trusted_http_json_request(
+        "POST",
+        control.control_addr,
+        "/api/v1/submit",
+        &control.bearer_token,
+        Some(&body),
+    )
+    .await?;
+
+    match response.status_code {
+        200 | 202 | 422 => {
+            let receipt: SubmitReceipt = serde_json::from_slice(&response.body)
+                .context("trusted submit response did not match SubmitReceipt")?;
+            render_submit_receipt(kind, operation, &receipt);
+            match receipt.status() {
+                SubmitStatus::Applied => Ok(()),
+                SubmitStatus::Rejected => bail!(
+                    "{} paper {} rejected by trusted submit",
+                    kind.label(),
+                    operation
+                ),
+                SubmitStatus::OutcomeUnknown => bail!(
+                    "{} paper {} returned outcome_unknown and is not confirmed applied",
+                    kind.label(),
+                    operation
+                ),
+            }
+        }
+        _ => bail!(
+            "trusted submit {} failed with HTTP {}: {}",
+            operation,
+            response.status_code,
+            bounded_http_error(&response.body)
+        ),
+    }
+}
+
+async fn run_paper_status(kind: PaperTaskKind, args: &PaperStatusArgs) -> Result<()> {
+    let control = trusted_control_context(args.control.control_addr, &args.control.token_env_var)?;
+    let response = trusted_http_json_request(
+        "GET",
+        control.control_addr,
+        "/api/v1/tasks",
+        &control.bearer_token,
+        None,
+    )
+    .await?;
+    if response.status_code != 200 {
+        bail!(
+            "trusted task status failed with HTTP {}: {}",
+            response.status_code,
+            bounded_http_error(&response.body)
+        );
+    }
+    let model: ReadOnlyTaskReadModel = serde_json::from_slice(&response.body)
+        .context("task status response did not match ReadOnlyTaskReadModel")?;
+    let task = model
+        .tasks
+        .iter()
+        .find(|task| task.task_id == args.task_id)
+        .with_context(|| format!("task {} not found in /api/v1/tasks", args.task_id))?;
+    if task.kind != kind.task_kind() {
+        bail!(
+            "task {} is kind={}, expected kind={} for paper {} status",
+            task.task_id,
+            task_kind_name(task.kind),
+            task_kind_name(kind.task_kind()),
+            kind.label()
+        );
+    }
+
+    print!(
+        "projection_status={}\njournal_head_sequence={}\ninvalid_event_count={}\ntask_id={}\nkind={}\nphase={}\nrecovery={}\nprocessed_event_count={}\nupdated_at={}\nexit={}\nfailure={}\n",
+        projection_status_name(model.projection_status),
+        model
+            .journal_head_sequence
+            .map_or_else(|| "none".to_owned(), |sequence| sequence.to_string()),
+        model.invalid_event_count,
+        task.task_id,
+        task_kind_name(task.kind),
+        task_phase_name(task.phase),
+        task_recovery_name(task.recovery),
+        task.processed_event_count,
+        task.updated_at.to_rfc3339(),
+        task_exit_name(task.exit),
+        task_failure_name(task.failure),
+    );
+    Ok(())
+}
+
+fn trusted_control_context(
+    control_addr: std::net::SocketAddr,
+    token_env_var: &str,
+) -> Result<TrustedControlContext> {
+    if !control_addr.ip().is_loopback() {
+        bail!("trusted paper control address must stay on loopback: {control_addr}");
+    }
+    validate_env_var_name(token_env_var)?;
+    let bearer_token = std::env::var(token_env_var)
+        .with_context(|| format!("trusted bearer token env var {token_env_var} is not set"))?;
+    if !(MIN_TRUSTED_BEARER_TOKEN_BYTES..=MAX_TRUSTED_BEARER_TOKEN_BYTES)
+        .contains(&bearer_token.len())
+    {
+        bail!(
+            "trusted bearer token from {token_env_var} has {} bytes; expected {}..={}",
+            bearer_token.len(),
+            MIN_TRUSTED_BEARER_TOKEN_BYTES,
+            MAX_TRUSTED_BEARER_TOKEN_BYTES
+        );
+    }
+    if bearer_token.chars().any(char::is_control) {
+        bail!("trusted bearer token from {token_env_var} must not contain control characters");
+    }
+    Ok(TrustedControlContext {
+        control_addr,
+        bearer_token,
+    })
+}
+
+fn validate_env_var_name(value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("trusted bearer token env var name must not be empty");
+    }
+    if value.len() > MAX_TRUSTED_ENV_VAR_BYTES {
+        bail!("trusted bearer token env var name exceeds {MAX_TRUSTED_ENV_VAR_BYTES} bytes");
+    }
+    if value.trim() != value {
+        bail!("trusted bearer token env var name must not have surrounding whitespace");
+    }
+    if value.chars().any(char::is_control) {
+        bail!("trusted bearer token env var name must not contain control characters");
+    }
+    if value.chars().any(|character| {
+        !(character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
+    }) {
+        bail!("trusted bearer token env var name must use only ASCII A-Z, digits, or _");
+    }
+    Ok(())
+}
+
+async fn trusted_http_json_request(
+    method: &str,
+    address: std::net::SocketAddr,
+    path: &str,
+    bearer_token: &str,
+    body: Option<&[u8]>,
+) -> Result<TrustedHttpResponse> {
+    let request = build_trusted_http_request(method, address, path, bearer_token, body)?;
+    let deadline = Instant::now() + TRUSTED_HTTP_TIMEOUT;
+    let mut stream = timeout_at(deadline, TcpStream::connect(address))
+        .await
+        .context("trusted HTTP transaction timed out during connect")?
+        .with_context(|| format!("failed to connect to trusted paper endpoint {address}"))?;
+    timeout_at(deadline, stream.write_all(&request))
+        .await
+        .context("trusted HTTP transaction timed out during write")?
+        .context("failed to write trusted HTTP request")?;
+    timeout_at(deadline, stream.shutdown())
+        .await
+        .context("trusted HTTP transaction timed out during shutdown")?
+        .context("failed to finish trusted HTTP request")?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = timeout_at(deadline, stream.read(&mut buffer))
+            .await
+            .context("trusted HTTP transaction timed out during read")?
+            .context("failed to read trusted HTTP response")?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.len()
+            > MAX_TRUSTED_HTTP_RESPONSE_HEADER_BYTES + MAX_TRUSTED_HTTP_RESPONSE_BODY_BYTES + 4
+        {
+            bail!("trusted HTTP response exceeded the bounded header/body limit");
+        }
+    }
+
+    parse_trusted_http_response(&response)
+}
+
+fn build_trusted_http_request(
+    method: &str,
+    address: std::net::SocketAddr,
+    path: &str,
+    bearer_token: &str,
+    body: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let body = body.unwrap_or_default();
+    if body.len() > MAX_TRUSTED_HTTP_REQUEST_BODY_BYTES {
+        bail!("trusted HTTP request body exceeded the bounded limit");
+    }
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {bearer_token}\r\nAccept: application/json\r\nConnection: close\r\n"
+    )
+    .into_bytes();
+    if body.is_empty() {
+        request.extend_from_slice(b"Content-Length: 0\r\n");
+    } else {
+        request.extend_from_slice(
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    }
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    Ok(request)
+}
+
+fn parse_trusted_http_response(response: &[u8]) -> Result<TrustedHttpResponse> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        bail!("trusted HTTP response headers were incomplete");
+    };
+    if header_end > MAX_TRUSTED_HTTP_RESPONSE_HEADER_BYTES {
+        bail!("trusted HTTP response headers exceeded the bounded limit");
+    }
+    let headers = std::str::from_utf8(&response[..header_end])
+        .context("trusted HTTP response headers were not valid UTF-8")?;
+    let mut lines = headers.split("\r\n");
+    let status_line = lines
+        .next()
+        .context("trusted HTTP response was missing a status line")?;
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts
+        .next()
+        .context("trusted HTTP response status line was malformed")?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        bail!("trusted HTTP response must use HTTP/1.0 or HTTP/1.1");
+    }
+    let status_code = status_parts
+        .next()
+        .context("trusted HTTP response status line was malformed")?
+        .parse::<u16>()
+        .context("trusted HTTP response status code was invalid")?;
+
+    let mut content_length = None;
+    let mut content_type = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            bail!("trusted HTTP response header line was malformed");
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                bail!("trusted HTTP response duplicated content-length");
+            }
+            let parsed = value
+                .parse::<usize>()
+                .context("trusted HTTP response content-length was invalid")?;
+            if parsed > MAX_TRUSTED_HTTP_RESPONSE_BODY_BYTES {
+                bail!("trusted HTTP response body exceeded the bounded limit");
+            }
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.is_some() {
+                bail!("trusted HTTP response duplicated content-type");
+            }
+            content_type = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            bail!("trusted HTTP response transfer-encoding is unsupported");
+        }
+    }
+    let content_length = content_length.context("trusted HTTP response omitted content-length")?;
+    let body_start = header_end + 4;
+    if response.len() != body_start + content_length {
+        bail!("trusted HTTP response body length did not match content-length");
+    }
+    if content_length > 0
+        && !content_type
+            .as_deref()
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        bail!("trusted HTTP response content type must be application/json");
+    }
+
+    Ok(TrustedHttpResponse {
+        status_code,
+        body: response[body_start..].to_vec(),
+    })
+}
+
+fn render_submit_receipt(kind: PaperTaskKind, operation: &str, receipt: &SubmitReceipt) {
+    println!(
+        "paper={}\noperation={}\ncommand_id={}\ntask_id={}\nstatus={}\njournal_projection={}\nsource={}",
+        kind.label(),
+        operation,
+        receipt.command_id(),
+        receipt.target_task_id(),
+        submit_status_name(receipt.status()),
+        receipt.journal_projection(),
+        receipt.source(),
+    );
+}
+
+fn bounded_http_error(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "empty response body".to_owned();
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(message) = value
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("error").and_then(Value::as_str))
+        {
+            return message.to_owned();
+        }
+        return bounded_text(
+            &value.to_string(),
+            MAX_TRUSTED_HTTP_RESPONSE_BODY_BYTES.min(512),
+        );
+    }
+    bounded_text(
+        &String::from_utf8_lossy(body),
+        MAX_TRUSTED_HTTP_RESPONSE_BODY_BYTES.min(512),
+    )
+}
+
+const fn submit_status_name(status: SubmitStatus) -> &'static str {
+    match status {
+        SubmitStatus::Applied => "applied",
+        SubmitStatus::Rejected => "rejected",
+        SubmitStatus::OutcomeUnknown => "outcome_unknown",
+    }
+}
+
+const fn projection_status_name(status: crypto_trading_runtime::ProjectionStatus) -> &'static str {
+    match status {
+        crypto_trading_runtime::ProjectionStatus::Complete => "complete",
+        crypto_trading_runtime::ProjectionStatus::Windowed => "windowed",
+        crypto_trading_runtime::ProjectionStatus::Degraded => "degraded",
+    }
+}
+
+const fn task_kind_name(kind: ReadOnlyTaskKind) -> &'static str {
+    match kind {
+        ReadOnlyTaskKind::ArbitrageMonitor => "arbitrage_monitor",
+        ReadOnlyTaskKind::ArbitragePaper => "arbitrage_paper",
+        ReadOnlyTaskKind::GridPaper => "grid_paper",
+    }
+}
+
+const fn task_phase_name(phase: ReadOnlyTaskPhase) -> &'static str {
+    match phase {
+        ReadOnlyTaskPhase::Registered => "registered",
+        ReadOnlyTaskPhase::Running => "running",
+        ReadOnlyTaskPhase::Stopping => "stopping",
+        ReadOnlyTaskPhase::Stopped => "stopped",
+        ReadOnlyTaskPhase::Failed => "failed",
+    }
+}
+
+const fn task_recovery_name(recovery: ReadOnlyTaskRecovery) -> &'static str {
+    match recovery {
+        ReadOnlyTaskRecovery::None => "none",
+        ReadOnlyTaskRecovery::Investigate => "investigate",
+    }
+}
+
+const fn task_exit_name(exit: Option<ReadOnlyTaskExit>) -> &'static str {
+    match exit {
+        Some(ReadOnlyTaskExit::StopRequested) => "stop_requested",
+        Some(ReadOnlyTaskExit::SourceEnded) => "source_ended",
+        Some(ReadOnlyTaskExit::ShutdownTimedOut) => "shutdown_timed_out",
+        Some(ReadOnlyTaskExit::Completed) => "completed",
+        None => "none",
+    }
+}
+
+const fn task_failure_name(failure: Option<ReadOnlyTaskFailure>) -> &'static str {
+    match failure {
+        Some(ReadOnlyTaskFailure::StartupFailed) => "startup_failed",
+        Some(ReadOnlyTaskFailure::SourceContract) => "source_contract",
+        Some(ReadOnlyTaskFailure::MonitorContract) => "monitor_contract",
+        Some(ReadOnlyTaskFailure::JournalUnavailable) => "journal_unavailable",
+        Some(ReadOnlyTaskFailure::TaskPanicked) => "task_panicked",
+        Some(ReadOnlyTaskFailure::TaskCancelled) => "task_cancelled",
+        Some(ReadOnlyTaskFailure::InvalidRequest) => "invalid_request",
+        Some(ReadOnlyTaskFailure::RecoveryRequired) => "recovery_required",
+        Some(ReadOnlyTaskFailure::AccountContract) => "account_contract",
+        Some(ReadOnlyTaskFailure::ExecutionIncomplete) => "execution_incomplete",
+        Some(ReadOnlyTaskFailure::ExecutionFailed) => "execution_failed",
+        None => "none",
+    }
 }
 
 struct BinanceSmokeSymbols {

@@ -364,6 +364,7 @@ dependencies = [
  "chrono",
  "clap",
  "crypto-trading-config",
+ "crypto-trading-control-plane",
  "crypto-trading-domain",
  "crypto-trading-exchange",
  "crypto-trading-runtime",
@@ -373,6 +374,7 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

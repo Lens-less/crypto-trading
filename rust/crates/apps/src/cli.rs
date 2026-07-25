@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 /// Rust-first command surface replacing the legacy Python launch scripts.
 #[derive(Debug, Parser)]
@@ -35,6 +36,9 @@ pub enum Command {
     /// Parse and validate existing YAML configuration files.
     #[command(name = "config-check")]
     ConfigCheck(ConfigCheckArgs),
+    /// Submit or inspect trusted paper task lifecycle commands.
+    #[command(subcommand)]
+    Paper(PaperCommand),
 }
 
 #[derive(Debug, Args)]
@@ -292,4 +296,79 @@ pub struct ConfigCheckArgs {
     /// Emit machine-readable JSON summaries.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PaperCommand {
+    /// Control one continuous paper grid task through the trusted submit seam.
+    Grid(PaperTaskArgs),
+    /// Control one continuous paper arbitrage task through the trusted submit seam.
+    Arbitrage(PaperTaskArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PaperTaskArgs {
+    #[command(subcommand)]
+    pub operation: PaperOperation,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PaperOperation {
+    /// Start one paper task with an explicit trusted-submit command identity.
+    Start(PaperStartArgs),
+    /// Read one task projection from the server-side read model.
+    Status(PaperStatusArgs),
+    /// Request a graceful stop through the trusted submit seam.
+    Stop(PaperMutationArgs),
+    /// Request durable cancellation through the trusted submit seam.
+    Cancel(PaperMutationArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TrustedControlArgs {
+    /// Loopback-only trusted submit socket in `IP:PORT` form.
+    #[arg(long, value_name = "IP:PORT")]
+    pub control_addr: SocketAddr,
+    /// Environment variable name that stores the bearer token.
+    #[arg(long, value_name = "ENV_VAR")]
+    pub token_env_var: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PaperMutationArgs {
+    #[command(flatten)]
+    pub control: TrustedControlArgs,
+    /// Principal identity that must exactly match the server's paper-operator identity.
+    #[arg(long)]
+    pub principal_id: String,
+    /// Stable UUID assigned by the caller to this trusted submit command.
+    #[arg(long)]
+    pub command_id: Uuid,
+    /// Stable idempotency key assigned by the caller.
+    #[arg(long)]
+    pub idempotency_key: String,
+    /// Stable durable task identity targeted by the command.
+    #[arg(long)]
+    pub task_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PaperStartArgs {
+    #[command(flatten)]
+    pub mutation: PaperMutationArgs,
+    /// Stable strategy identity referenced by the task owner.
+    #[arg(long)]
+    pub strategy_id: String,
+    /// Explicit strategy revision that the trusted task must run.
+    #[arg(long)]
+    pub strategy_revision: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PaperStatusArgs {
+    #[command(flatten)]
+    pub control: TrustedControlArgs,
+    /// Stable durable task identity projected by `/api/v1/tasks`.
+    #[arg(long)]
+    pub task_id: String,
 }

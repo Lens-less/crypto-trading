@@ -18,6 +18,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crypto-trading-config = { path = "../config" }
+crypto-trading-control-plane = { path = "../control-plane" }
 crypto-trading-domain = { path = "../domain" }
 crypto-trading-exchange = { path = "../exchange" }
 crypto-trading-runtime = { path = "../runtime" }
@@ -27,6 +28,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
