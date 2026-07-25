@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod submit;
+
+pub use submit::{
+    SUBMIT_SCHEMA_VERSION, SubmitCommand, SubmitEnvelope, SubmitPermission, SubmitRiskConfirmation,
+    SubmitRole, SubmitValidationError,
+};
+
 pub use crypto_trading_runtime::{
     AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
     AlertOccurrenceView, ArbitrageMonitorProjection, ArbitrageMonitorReadModel,
