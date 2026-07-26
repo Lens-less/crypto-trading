@@ -7,6 +7,7 @@
 mod alert;
 mod arbitrage;
 mod grid;
+mod grid_protection;
 mod risk;
 mod virtual_grid;
 mod volume_maker;
@@ -25,6 +26,12 @@ pub use arbitrage::{
 };
 pub use grid::{
     GridDirection, GridLevel, GridPlanConfig, GridPlanner, GridRange, GridState, GridStrategy,
+};
+pub use grid_protection::{
+    CapitalProtectionPolicy, CapitalProtectionPolicyConfig, GridDirective, GridProtectionGeometry,
+    GridProtectionMachine, GridProtectionObservation, GridProtectionPolicies, GridProtectionReason,
+    PriceLockPolicy, PriceLockPolicyConfig, ScalpingPolicy, ScalpingPolicyConfig, StopLossPolicy,
+    StopLossPolicyConfig, TakeProfitPolicy, TakeProfitPolicyConfig,
 };
 pub use risk::{AccountRiskSnapshot, RiskDecision, RiskEngine, RiskLimits, RiskRejection};
 pub use virtual_grid::{

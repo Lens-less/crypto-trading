@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
-use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
     DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError, JournalReadError,
@@ -23,7 +23,11 @@ use crypto_trading_runtime::{
     PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
     ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
-use crypto_trading_strategy::{GridFill, StrategyError, VirtualGrid, VirtualGridCross};
+use crypto_trading_strategy::{
+    GridDirective, GridFill, GridProtectionMachine, GridProtectionObservation,
+    GridProtectionReason, StrategyError, VirtualGrid, VirtualGridCross,
+};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::{
     sync::watch,
@@ -41,6 +45,9 @@ pub const GRID_PAPER_TASK_STATUS_SCHEMA_VERSION: u16 = 1;
 const TASK_RECORD_SCHEMA_VERSION: u16 = 1;
 const TASK_STRATEGY: &str = "read_only_task";
 const TASK_SYMBOL: &str = "control-plane";
+const PROTECTION_STRATEGY: &str = "grid_protection";
+const PROTECTION_RECORD_SCHEMA_VERSION: u16 = 1;
+const PROTECTION_APR_WINDOW_MINUTES: i64 = 10;
 const MAX_TASK_ID_BYTES: usize = 96;
 const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
 
@@ -63,6 +70,7 @@ pub struct GridPaperTaskConfig {
     quantity: Quantity,
     cost_model: PaperCostModel,
     supervisor: MarketSupervisorConfig,
+    protection: Option<GridProtectionMachine>,
 }
 
 impl GridPaperTaskConfig {
@@ -102,7 +110,17 @@ impl GridPaperTaskConfig {
             quantity,
             cost_model,
             supervisor,
+            protection: None,
         })
+    }
+
+    /// Attaches the pure grid-protection arbitration machine. The owner
+    /// translates its directives into durable `grid_protection` facts and
+    /// bounded paper actions.
+    #[must_use]
+    pub fn with_protection(mut self, protection: GridProtectionMachine) -> Self {
+        self.protection = Some(protection);
+        self
     }
 
     #[must_use]
@@ -485,6 +503,8 @@ async fn run_owner(
     mut last_recorded_at: DateTime<Utc>,
     mut operation_sequence: u64,
 ) -> TaskResult {
+    let mut protection = config.protection.clone();
+    let mut last_protection: Option<ProtectionSignature> = None;
     loop {
         let selected = tokio::select! {
             biased;
@@ -532,8 +552,8 @@ async fn run_owner(
                     .checked_add(1)
                     .ok_or(GridPaperTaskError::InvalidRequest)?;
                 next.sources = vec![source.status()];
-                let crosses = match grid_crosses(&config, &mut grid, event) {
-                    Ok(crosses) => crosses,
+                let observed = match observation_view(&config, &grid, &event) {
+                    Ok(observed) => observed,
                     Err(error) => {
                         return fail_owner(
                             &mut source,
@@ -546,10 +566,282 @@ async fn run_owner(
                         .await;
                     }
                 };
+                // Protection arbitration runs before crossings are consumed so
+                // a frozen or resetting grid never silently consumes levels.
+                let directive = if let Some((price, observed_at)) = observed {
+                    match protection_directive(
+                        &mut protection,
+                        &config,
+                        &grid,
+                        saga.account(),
+                        price,
+                        observed_at,
+                    )
+                    .await
+                    {
+                        Ok(directive) => directive,
+                        Err(error) => {
+                            let failure = error.failure_bucket();
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    GridDirective::Continue
+                };
+
+                let mut scalp_request = None;
+                let crosses = match (directive, observed) {
+                    (GridDirective::Continue, _) | (_, None) => {
+                        if observed.is_some() {
+                            last_protection = None;
+                        }
+                        match grid_crosses(&config, &mut grid, &event) {
+                            Ok(crosses) => crosses,
+                            Err(error) => {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::InvalidRequest,
+                                    error,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    (GridDirective::FreezeEntries { reason }, Some((price, _))) => {
+                        // Freeze admits no new entry operations but keeps the
+                        // position and the task alive.
+                        let signature = ProtectionSignature::Freeze(reason);
+                        if last_protection.as_ref() != Some(&signature) {
+                            let recorded_at = Utc::now().max(last_recorded_at);
+                            if let Err(error) = history
+                                .append(&protection_record(
+                                    &config.task_id,
+                                    grid.config().symbol.as_str(),
+                                    &directive,
+                                    price,
+                                    recorded_at,
+                                ))
+                                .await
+                            {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::JournalUnavailable,
+                                    GridPaperTaskError::Journal(error),
+                                )
+                                .await;
+                            }
+                            last_recorded_at = recorded_at;
+                            last_protection = Some(signature);
+                        }
+                        Vec::new()
+                    }
+                    (
+                        GridDirective::Scalp {
+                            side,
+                            quantity,
+                            take_profit_price,
+                            ..
+                        },
+                        Some((price, _)),
+                    ) => {
+                        let signature = ProtectionSignature::Scalp {
+                            side,
+                            quantity: quantity.as_decimal(),
+                            price: take_profit_price.as_decimal(),
+                        };
+                        if last_protection.as_ref() != Some(&signature) {
+                            let recorded_at = Utc::now().max(last_recorded_at);
+                            if let Err(error) = history
+                                .append(&protection_record(
+                                    &config.task_id,
+                                    grid.config().symbol.as_str(),
+                                    &directive,
+                                    price,
+                                    recorded_at,
+                                ))
+                                .await
+                            {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::JournalUnavailable,
+                                    GridPaperTaskError::Journal(error),
+                                )
+                                .await;
+                            }
+                            last_recorded_at = recorded_at;
+                            last_protection = Some(signature);
+                            operation_sequence = operation_sequence
+                                .checked_add(1)
+                                .ok_or(GridPaperTaskError::InvalidRequest)?;
+                            match build_protection_operation(
+                                &config,
+                                &grid,
+                                side,
+                                quantity,
+                                take_profit_price,
+                                operation_sequence,
+                            ) {
+                                Ok(request) => scalp_request = Some(request),
+                                Err(error) => {
+                                    next.operation_count = operation_sequence;
+                                    status_sender.send_replace(next);
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskFailure::InvalidRequest,
+                                        error,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        Vec::new()
+                    }
+                    (GridDirective::ResetGrid { .. }, Some((price, observed_at))) => {
+                        last_protection = None;
+                        let recorded_at = Utc::now().max(last_recorded_at);
+                        if let Err(error) = history
+                            .append(&protection_record(
+                                &config.task_id,
+                                grid.config().symbol.as_str(),
+                                &directive,
+                                price,
+                                recorded_at,
+                            ))
+                            .await
+                        {
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::JournalUnavailable,
+                                GridPaperTaskError::Journal(error),
+                            )
+                            .await;
+                        }
+                        last_recorded_at = recorded_at;
+                        // This owner keeps no resting orders, so the reset
+                        // analog of "cancel and rebuild" is a fresh virtual
+                        // grid anchored at the observed price.
+                        let mut grid_config = grid.config().clone();
+                        grid_config.initial_price = price;
+                        grid = match VirtualGrid::new(grid_config, observed_at) {
+                            Ok(grid) => grid,
+                            Err(error) => {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::InvalidRequest,
+                                    GridPaperTaskError::Strategy(error),
+                                )
+                                .await;
+                            }
+                        };
+                        Vec::new()
+                    }
+                    (GridDirective::ExitAll { .. }, Some((price, _))) => {
+                        let recorded_at = Utc::now().max(last_recorded_at);
+                        if let Err(error) = history
+                            .append(&protection_record(
+                                &config.task_id,
+                                grid.config().symbol.as_str(),
+                                &directive,
+                                price,
+                                recorded_at,
+                            ))
+                            .await
+                        {
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::JournalUnavailable,
+                                GridPaperTaskError::Journal(error),
+                            )
+                            .await;
+                        }
+                        last_recorded_at = recorded_at;
+                        return stop_owner(
+                            &mut source,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            GridPaperTaskExit::StopRequested,
+                        )
+                        .await;
+                    }
+                };
 
                 let cross_count = crosses.len();
                 let mut completed_cross_count = 0_usize;
                 let mut stop_after_operation = false;
+                if let Some(request) = scalp_request {
+                    match run_operation(
+                        &saga,
+                        Arc::clone(&executor),
+                        request,
+                        &mut stop,
+                        &mut cancel,
+                    )
+                    .await
+                    {
+                        OperationOutcome::Terminal(Ok(_), stop_requested) => {
+                            next.operation_count = operation_sequence;
+                            stop_after_operation |= stop_requested;
+                        }
+                        OperationOutcome::Terminal(Err(error), _) => {
+                            let (failure, error) = classify_saga_error(error);
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                error,
+                            )
+                            .await;
+                        }
+                        OperationOutcome::Cancelled(request) => {
+                            retain_cancelled_operation(saga.account(), &request).await;
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                GridPaperTaskError::RecoveryRequired,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 for cross in crosses {
                     if *cancel.borrow() || *stop.borrow() {
                         next.operation_count = operation_sequence;
@@ -745,8 +1037,21 @@ async fn retain_cancelled_operation(
 fn grid_crosses(
     config: &GridPaperTaskConfig,
     grid: &mut VirtualGrid,
-    event: MarketDataEvent,
+    event: &MarketDataEvent,
 ) -> Result<Vec<VirtualGridCross>, GridPaperTaskError> {
+    match observation_view(config, grid, event)? {
+        Some((price, received_at)) => grid
+            .consume_crosses_at(price, received_at)
+            .map_err(GridPaperTaskError::Strategy),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn observation_view(
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    event: &MarketDataEvent,
+) -> Result<Option<(Price, DateTime<Utc>)>, GridPaperTaskError> {
     match event {
         MarketDataEvent::Observation(observation) => {
             if observation.snapshot.exchange() != config.exchange
@@ -759,13 +1064,149 @@ fn grid_crosses(
                 .snapshot
                 .last
                 .unwrap_or_else(|| observation.snapshot.mid_price());
-            grid.consume_crosses_at(price, observation.received_at)
-                .map_err(GridPaperTaskError::Strategy)
+            Ok(Some((price, observation.received_at)))
         }
-        MarketDataEvent::SourceGap { .. } | MarketDataEvent::SourceUnavailable { .. } => {
-            Ok(Vec::new())
-        }
+        MarketDataEvent::SourceGap { .. } | MarketDataEvent::SourceUnavailable { .. } => Ok(None),
     }
+}
+
+/// Feeds one observed price plus the owner's tracked position, paper equity,
+/// and realized cycle rate into the pure protection machine.
+async fn protection_directive(
+    protection: &mut Option<GridProtectionMachine>,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    account: &PaperAccountAuthority,
+    price: Price,
+    observed_at: DateTime<Utc>,
+) -> Result<GridDirective, GridPaperTaskError> {
+    let Some(machine) = protection.as_mut() else {
+        return Ok(GridDirective::Continue);
+    };
+    let snapshot = account.snapshot().await?;
+    let current_collateral = snapshot
+        .available
+        .as_decimal()
+        .checked_add(snapshot.pending_reserved.as_decimal())
+        .and_then(|value| value.checked_add(snapshot.uncertain_reserved.as_decimal()))
+        .and_then(|value| value.checked_add(snapshot.committed_exposure.as_decimal()))
+        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    let position_quantity = Decimal::from(grid.buy_crosses())
+        .checked_sub(Decimal::from(grid.sell_crosses()))
+        .and_then(|net| net.checked_mul(config.quantity.as_decimal()))
+        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    let recent_cycles = grid.recent_cycles_at(
+        observed_at,
+        ChronoDuration::minutes(PROTECTION_APR_WINDOW_MINUTES),
+    );
+    let cycles_per_hour = Decimal::from(u64::try_from(recent_cycles).unwrap_or(u64::MAX))
+        .checked_mul(Decimal::from(6_u32))
+        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    machine
+        .observe(&GridProtectionObservation {
+            price,
+            observed_at,
+            position_quantity,
+            current_collateral,
+            cycles_per_hour,
+        })
+        .map_err(GridPaperTaskError::Strategy)
+}
+
+/// One durable `grid_protection` fact naming the directive and its reason.
+fn protection_record(
+    task_id: &str,
+    symbol: &str,
+    directive: &GridDirective,
+    price: Price,
+    recorded_at: DateTime<Utc>,
+) -> DecisionRecord {
+    let mut details = json!({
+        "schema_version": PROTECTION_RECORD_SCHEMA_VERSION,
+        "task_id": task_id,
+        "task_kind": "grid_paper",
+        "reason": directive.reason().map(GridProtectionReason::as_str),
+        "price": price.to_string(),
+    });
+    if let GridDirective::Scalp {
+        side,
+        quantity,
+        take_profit_price,
+        ..
+    } = directive
+        && let Some(map) = details.as_object_mut()
+    {
+        map.insert(
+            "side".to_owned(),
+            Value::from(match side {
+                Side::Buy => "buy",
+                Side::Sell => "sell",
+            }),
+        );
+        map.insert("quantity".to_owned(), Value::from(quantity.to_string()));
+        map.insert(
+            "take_profit_price".to_owned(),
+            Value::from(take_profit_price.to_string()),
+        );
+    }
+    DecisionRecord {
+        timestamp: recorded_at,
+        strategy: PROTECTION_STRATEGY.to_owned(),
+        symbol: symbol.to_owned(),
+        decision: directive.label().to_owned(),
+        details,
+    }
+}
+
+/// Builds the single reduce-side scalp take-profit operation.
+fn build_protection_operation(
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    side: Side,
+    quantity: Quantity,
+    price: Price,
+    operation_sequence: u64,
+) -> Result<PaperSingleLegRequest, GridPaperTaskError> {
+    let intent = OrderIntent::limit(
+        config.exchange.clone(),
+        grid.config().symbol.clone(),
+        config.market_type,
+        side,
+        quantity,
+        price,
+    );
+    let batch = ExecutionBatch::planned(vec![intent.clone()])?;
+    let reserved_notional = price
+        .as_decimal()
+        .checked_mul(quantity.as_decimal())
+        .map(Money::new)
+        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    let task_id = format!("{}/op/{operation_sequence:06}", config.task_id);
+    let idempotency_key = format!("scalp:{operation_sequence:06}");
+    let reservation = PaperReservationRequest::planned(
+        task_id,
+        idempotency_key,
+        batch.id(),
+        config.cost_model,
+        vec![PaperReservationLeg::from_intent(
+            0,
+            &intent,
+            reserved_notional,
+        )?],
+    )?;
+    PaperSingleLegRequest::new(grid.config().symbol.clone(), batch, reservation)
+        .map_err(GridPaperTaskError::Saga)
+}
+
+/// Deduplication signature so steady-state directives journal once per change.
+#[derive(Clone, Debug, PartialEq)]
+enum ProtectionSignature {
+    Freeze(GridProtectionReason),
+    Scalp {
+        side: Side,
+        quantity: Decimal,
+        price: Decimal,
+    },
 }
 
 fn build_operation(

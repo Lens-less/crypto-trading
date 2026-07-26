@@ -153,7 +153,7 @@ cargo run --locked -- testnet-soak --mode verify --help
 - 不受支持的外部连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
 - 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、正的 `max_position_value`、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
 - `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；`equity` 与 `available_balance` 也尚未参与资金或保证金校验。它不代表跨进程仓位、账户资金、挂单风险 reservation、多腿补偿或真实账户风控已经完成。
-- Grid one-shot 仍只验证网格规划与 paper 挂单语义；连续 Grid/Arbitrage owner 另行使用 journal-backed `PaperAccountAuthority` 做 pending/uncertain/committed 预留。两者都不代表真实交易所权益、保证金、持仓真相或 live 风控已经完成。
+- Grid one-shot 仍只验证网格规划与 paper 挂单语义；连续 Grid/Arbitrage owner 另行使用 journal-backed `PaperAccountAuthority` 做 pending/uncertain/committed 预留。连续 Grid owner 可按配置启用纯策略网格保护（止损 > 本金保护 > 价格锁定 > 止盈 > 剥头皮），其指令写入 `grid_protection` journal 事实并只作用于 owner 自身的虚拟持仓。以上都不代表真实交易所权益、保证金、持仓真相或 live 风控已经完成。
 - 历史 Python 实现冻结在 `../archive/python-legacy/`，不得作为当前 Rust 入口。
 
 架构、兼容面和验收门槛见 [`docs/internal/specs/RUST_REFACTOR_PLAN.md`](../docs/internal/specs/RUST_REFACTOR_PLAN.md)；审计复核、修复证据和剩余 NO-GO 项见 [`docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](../docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。

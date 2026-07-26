@@ -790,9 +790,9 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Fixed-snapshot grid planning plus a recoverable continuous paper owner that emits one durable operation per crossed level.",
+            "Fixed-snapshot grid planning plus a recoverable continuous paper owner that emits one durable operation per crossed level and translates grid-protection directives (freeze, scalp, reset, exit) into durable facts and bounded paper actions.",
             &[
-                "The continuous owner currently consumes only an explicit replay-backed profile and does not imply a real external feed or testnet/mainnet authority.",
+                "The continuous owner currently consumes only an explicit replay-backed profile and does not imply a real external feed or testnet/mainnet authority; protection directives act on the paper owner's own virtual position, not on exchange truth.",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
@@ -1048,11 +1048,13 @@ fn strategy_capabilities() -> Vec<Capability> {
             CapabilityArea::Strategy,
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic fixed-grid planning without I/O.",
+            "Deterministic fixed-grid and martingale planning plus pure grid-protection state machines (scalping, capital protection, take profit, price lock, stop loss) without I/O.",
             &[],
             &[
                 "rust/crates/strategy/src/grid.rs",
+                "rust/crates/strategy/src/grid_protection.rs",
                 "rust/crates/strategy/tests/grid_planner.rs",
+                "rust/crates/strategy/tests/grid_protection.rs",
             ],
         ),
         capability(

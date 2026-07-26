@@ -72,6 +72,123 @@ fn fixed_long_grid_derives_legacy_levels_and_martingale_quantities() {
     assert!(levels.iter().all(|level| level.side == Side::Buy));
 }
 
+// Golden vector extracted from the frozen Python engine
+// (`archive/python-legacy/core/services/grid/models/grid_config.py:557-564`):
+// long martingale quantity per level is
+// `order_amount + (grid_count - grid_index) * martingale_increment`, with
+// Grid 1 at the lower bound (`grid_config.py:307-310`) buying the most.
+#[test]
+fn martingale_long_matches_the_legacy_ten_level_quantity_ladder() {
+    let planner = GridPlanner::new(GridPlanConfig {
+        exchange: "paper".to_owned(),
+        symbol: Symbol::new("BTC").unwrap(),
+        market_type: MarketType::Perpetual,
+        direction: GridDirection::Long,
+        range: GridRange::Fixed {
+            lower: price("100"),
+            upper: price("110"),
+        },
+        interval: decimal("1"),
+        quantity: quantity("0.5"),
+        martingale_increment: Some(decimal("0.05")),
+    })
+    .unwrap();
+
+    let levels = planner.fixed_levels().unwrap();
+    let expected: Vec<(Decimal, Decimal)> = [
+        ("100", "0.95"),
+        ("101", "0.90"),
+        ("102", "0.85"),
+        ("103", "0.80"),
+        ("104", "0.75"),
+        ("105", "0.70"),
+        ("106", "0.65"),
+        ("107", "0.60"),
+        ("108", "0.55"),
+        ("109", "0.50"),
+    ]
+    .iter()
+    .map(|(price, quantity)| (decimal(price), decimal(quantity)))
+    .collect();
+
+    assert_eq!(
+        levels
+            .iter()
+            .map(|level| (level.price.as_decimal(), level.quantity.as_decimal()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(levels.iter().all(|level| level.side == Side::Buy));
+}
+
+// Golden vector extracted from the frozen Python engine
+// (`archive/python-legacy/core/services/grid/models/grid_config.py:565-569`):
+// short martingale quantity per level is
+// `order_amount + (grid_index - 1) * martingale_increment`, with Grid 1 at
+// the upper bound (`grid_config.py:311-314`) selling the least.
+#[test]
+fn martingale_short_matches_the_legacy_ten_level_quantity_ladder() {
+    let planner = GridPlanner::new(GridPlanConfig {
+        exchange: "paper".to_owned(),
+        symbol: Symbol::new("BTC").unwrap(),
+        market_type: MarketType::Perpetual,
+        direction: GridDirection::Short,
+        range: GridRange::Fixed {
+            lower: price("100"),
+            upper: price("110"),
+        },
+        interval: decimal("1"),
+        quantity: quantity("0.5"),
+        martingale_increment: Some(decimal("0.05")),
+    })
+    .unwrap();
+
+    let levels = planner.fixed_levels().unwrap();
+    let expected: Vec<(Decimal, Decimal)> = [
+        ("110", "0.50"),
+        ("109", "0.55"),
+        ("108", "0.60"),
+        ("107", "0.65"),
+        ("106", "0.70"),
+        ("105", "0.75"),
+        ("104", "0.80"),
+        ("103", "0.85"),
+        ("102", "0.90"),
+        ("101", "0.95"),
+    ]
+    .iter()
+    .map(|(price, quantity)| (decimal(price), decimal(quantity)))
+    .collect();
+
+    assert_eq!(
+        levels
+            .iter()
+            .map(|level| (level.price.as_decimal(), level.quantity.as_decimal()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(levels.iter().all(|level| level.side == Side::Sell));
+}
+
+#[test]
+fn grid_rejects_a_zero_martingale_increment() {
+    let config = GridPlanConfig {
+        exchange: "paper".to_owned(),
+        symbol: Symbol::new("BTC").unwrap(),
+        market_type: MarketType::Perpetual,
+        direction: GridDirection::Long,
+        range: GridRange::Fixed {
+            lower: price("100"),
+            upper: price("104"),
+        },
+        interval: decimal("1"),
+        quantity: quantity("1"),
+        martingale_increment: Some(Decimal::ZERO),
+    };
+
+    assert!(GridPlanner::new(config).is_err());
+}
+
 #[test]
 fn grid_rejects_a_snapshot_for_another_market_type() {
     let planner = GridPlanner::new(GridPlanConfig {

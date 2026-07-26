@@ -58,7 +58,7 @@ impl GridPlanner {
     /// # Errors
     ///
     /// Returns [`StrategyError::InvalidConfig`] for empty exchanges, invalid
-    /// ranges, non-positive intervals, or negative martingale increments.
+    /// ranges, non-positive intervals, or non-positive martingale increments.
     pub fn new(config: GridPlanConfig) -> Result<Self, StrategyError> {
         if config.exchange.trim().is_empty() {
             return Err(StrategyError::InvalidConfig(
@@ -72,10 +72,10 @@ impl GridPlanner {
         }
         if config
             .martingale_increment
-            .is_some_and(|increment| increment < Decimal::ZERO)
+            .is_some_and(|increment| increment <= Decimal::ZERO)
         {
             return Err(StrategyError::InvalidConfig(
-                "martingale increment must not be negative",
+                "martingale increment must be positive",
             ));
         }
 
@@ -346,6 +346,19 @@ impl TryFrom<&crypto_trading_config::GridConfig> for GridPlanConfig {
     type Error = StrategyError;
 
     fn try_from(config: &crypto_trading_config::GridConfig) -> Result<Self, Self::Error> {
+        // Martingale grids require a strictly positive per-level increment;
+        // the legacy engine treats a missing or zero increment as "not
+        // martingale" (`grid_config.py:352-367`), which would silently turn a
+        // declared martingale grid into a flat one.
+        if config.mode.is_martingale()
+            && config
+                .martingale_increment
+                .is_none_or(|increment| increment.as_decimal() <= Decimal::ZERO)
+        {
+            return Err(StrategyError::InvalidConfig(
+                "martingale grid requires a positive martingale_increment",
+            ));
+        }
         let direction = if config.mode.is_short() {
             GridDirection::Short
         } else {

@@ -23,8 +23,13 @@ use crypto_trading_runtime::{
     MarketInstrument, MarketUniverse, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
     RuntimeError,
 };
-use crypto_trading_strategy::{VirtualGrid, VirtualGridConfig};
+use crypto_trading_strategy::{
+    CapitalProtectionPolicyConfig, GridDirection, GridProtectionGeometry, GridProtectionMachine,
+    GridProtectionPolicies, PriceLockPolicyConfig, ScalpingPolicyConfig, StopLossPolicyConfig,
+    TakeProfitPolicyConfig, VirtualGrid, VirtualGridConfig,
+};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
 
 use crate::{
@@ -281,23 +286,21 @@ impl GridPaperProfile {
             clock,
             latest,
         });
-        GridPaperTask::start(
-            GridPaperTaskConfig::new(
-                self.task_id.clone(),
-                self.config.exchange.clone(),
-                self.config.market_type,
-                self.config.order_amount,
-                default_cost_model().map_err(GridPaperTaskError::Account)?,
-                crypto_trading_runtime::MarketSupervisorConfig::new(self.shutdown_grace)
-                    .map_err(GridPaperTaskError::Source)?,
-            )?,
-            grid,
-            source,
-            account,
-            history,
-            executor,
-        )
-        .await
+        let mut task_config = GridPaperTaskConfig::new(
+            self.task_id.clone(),
+            self.config.exchange.clone(),
+            self.config.market_type,
+            self.config.order_amount,
+            default_cost_model().map_err(GridPaperTaskError::Account)?,
+            crypto_trading_runtime::MarketSupervisorConfig::new(self.shutdown_grace)
+                .map_err(GridPaperTaskError::Source)?,
+        )?;
+        if let Some(protection) =
+            build_grid_protection(&self.config).map_err(GridPaperTaskError::Strategy)?
+        {
+            task_config = task_config.with_protection(protection);
+        }
+        GridPaperTask::start(task_config, grid, source, account, history, executor).await
     }
 }
 
@@ -764,6 +767,70 @@ fn build_virtual_grid(
         },
         initialized_at,
     )
+}
+
+/// Builds the pure grid-protection machine when the grid config enables any
+/// protection subsystem; returns `None` when every subsystem is disabled.
+fn build_grid_protection(
+    config: &GridConfig,
+) -> Result<Option<GridProtectionMachine>, crypto_trading_strategy::StrategyError> {
+    let policies = GridProtectionPolicies {
+        stop_loss: match (
+            config.stop_loss_trigger_percent,
+            config.stop_loss_escape_timeout,
+            config.stop_loss_apr_threshold,
+        ) {
+            (Some(trigger), Some(timeout), Some(apr)) => {
+                Some(StopLossPolicyConfig::new(trigger, timeout, apr)?)
+            }
+            _ => None,
+        },
+        capital_protection: config
+            .capital_protection_trigger_percent
+            .map(CapitalProtectionPolicyConfig::new)
+            .transpose()?,
+        price_lock: config.price_lock_threshold.map(PriceLockPolicyConfig::new),
+        take_profit: config
+            .take_profit_percentage
+            .map(TakeProfitPolicyConfig::new)
+            .transpose()?,
+        scalping: match (
+            config.scalping_trigger_percent,
+            config.scalping_take_profit_grids,
+        ) {
+            (Some(trigger), Some(levels)) => Some(ScalpingPolicyConfig::new(trigger, levels)?),
+            _ => None,
+        },
+    };
+    if policies == GridProtectionPolicies::default() {
+        return Ok(None);
+    }
+    let lower = config.lower_price.ok_or({
+        crypto_trading_strategy::StrategyError::InvalidConfig(
+            "grid protection requires lower_price",
+        )
+    })?;
+    let upper = config.upper_price.ok_or({
+        crypto_trading_strategy::StrategyError::InvalidConfig(
+            "grid protection requires upper_price",
+        )
+    })?;
+    let level_count = upper
+        .as_decimal()
+        .checked_sub(lower.as_decimal())
+        .and_then(|span| span.checked_div(config.grid_interval.as_decimal()))
+        .map(|count| count.floor())
+        .and_then(|count| count.to_u32())
+        .ok_or(crypto_trading_strategy::StrategyError::InvalidConfig(
+            "grid protection level count is not representable",
+        ))?;
+    let direction = if config.mode.is_short() {
+        GridDirection::Short
+    } else {
+        GridDirection::Long
+    };
+    let geometry = GridProtectionGeometry::new(direction, lower, upper, level_count)?;
+    GridProtectionMachine::new(geometry, policies).map(Some)
 }
 
 fn midpoint_price(

@@ -15,7 +15,7 @@ use crypto_trading_cli::{
     GridPaperTaskError, GridPaperTaskExit, GridPaperTaskFailure, GridPaperTaskPhase,
 };
 use crypto_trading_domain::{
-    MarketSnapshot, MarketType, Money, Order, OrderStatus, Price, Quantity, Symbol,
+    MarketSnapshot, MarketType, Money, Order, OrderStatus, Price, Quantity, Side, Symbol,
 };
 use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
@@ -24,7 +24,10 @@ use crypto_trading_runtime::{
     PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationPhase,
     ReadOnlyTaskKind, ReadOnlyTaskPhase, RuntimeError,
 };
-use crypto_trading_strategy::{VirtualGrid, VirtualGridConfig};
+use crypto_trading_strategy::{
+    GridDirection, GridProtectionGeometry, GridProtectionMachine, GridProtectionPolicies,
+    PriceLockPolicyConfig, StopLossPolicyConfig, VirtualGrid, VirtualGridConfig,
+};
 use rust_decimal::Decimal;
 use tokio::sync::Semaphore;
 
@@ -554,6 +557,205 @@ async fn stop_without_an_inflight_operation_is_durable_and_opens_no_reservation(
         task.durable_status().await.unwrap().phase,
         ReadOnlyTaskPhase::Stopped
     );
+}
+
+/// Grid-protection machine matching the test grid geometry (100 +- 5%,
+/// ten one-percent levels).
+fn protection(policies: GridProtectionPolicies) -> GridProtectionMachine {
+    GridProtectionMachine::new(
+        GridProtectionGeometry::new(GridDirection::Long, price("95"), price("105"), 10).unwrap(),
+        policies,
+    )
+    .unwrap()
+}
+
+/// Source that releases one event per semaphore permit so a multi-event test
+/// is not conflated by the supervisor's latest-event retention.
+#[derive(Debug)]
+struct SteppedSource {
+    events: VecDeque<MarketDataEvent>,
+    release: Arc<Semaphore>,
+}
+
+impl SteppedSource {
+    fn new(events: Vec<MarketDataEvent>, release: Arc<Semaphore>) -> Self {
+        Self {
+            events: events.into(),
+            release,
+        }
+    }
+}
+
+impl MarketDataEventSource for SteppedSource {
+    fn source_id(&self) -> &'static str {
+        "paper-grid"
+    }
+
+    fn next_event(&mut self) -> MarketDataEventFuture<'_> {
+        let Some(event) = self.events.pop_front() else {
+            return Box::pin(async move { Ok(None) });
+        };
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            release.acquire_owned().await.unwrap().forget();
+            Ok(Some(event))
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingExecutor {
+    intents: std::sync::Mutex<Vec<(Side, Decimal)>>,
+}
+
+impl GridPaperExecutor for RecordingExecutor {
+    fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
+        let intent = batch.intents()[0].clone();
+        self.intents
+            .lock()
+            .unwrap()
+            .push((intent.side, intent.price.unwrap().as_decimal()));
+        Box::pin(async move {
+            Ok(vec![TradingReceipt::Submitted {
+                order: Order {
+                    id: format!("paper-{}", intent.client_order_id),
+                    intent: intent.clone(),
+                    filled_quantity: intent.quantity,
+                    average_fill_price: intent.price,
+                    status: OrderStatus::Filled,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                disposition: SubmissionDisposition::Filled,
+            }])
+        })
+    }
+}
+
+#[tokio::test]
+async fn stop_loss_exit_stops_the_task_and_journals_the_exit_all_fact() {
+    let (account, history, path) = account("stop-loss-exit");
+    let executor = Arc::new(FillExecutor::default());
+    // $94 sits at/below the 100% stop-loss trigger ($95); the second
+    // observation arrives after the one-second escape timeout with zero
+    // completed cycles, so the APR gate decides to exit.
+    let stepper = Arc::new(Semaphore::new(1));
+    let source = SteppedSource::new(
+        vec![
+            observation("94", 1, base_time() + Duration::seconds(70)),
+            observation("94", 2, base_time() + Duration::seconds(80)),
+        ],
+        Arc::clone(&stepper),
+    );
+    let machine = protection(GridProtectionPolicies {
+        stop_loss: Some(StopLossPolicyConfig::new(decimal("100"), 1, decimal("50")).unwrap()),
+        ..GridProtectionPolicies::default()
+    });
+    let mut task = GridPaperTask::start(
+        config("grid:stop-loss", StdDuration::from_secs(1)).with_protection(machine),
+        grid(),
+        source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let (exit, ()) = tokio::join!(task.wait(), async {
+        // The first observation crosses the five buy levels; release the
+        // second only after they are all executed.
+        wait_until(|| executor.calls.load(Ordering::SeqCst) == 5).await;
+        stepper.add_permits(1);
+    });
+    assert_eq!(exit.unwrap(), GridPaperTaskExit::StopRequested);
+    assert_eq!(task.status().phase, GridPaperTaskPhase::Stopped);
+    assert_eq!(
+        task.durable_status().await.unwrap().phase,
+        ReadOnlyTaskPhase::Stopped
+    );
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("\"decision\":\"exit_all\""));
+    assert!(body.contains("\"reason\":\"stop_loss_apr_below_threshold\""));
+    assert!(body.contains("\"strategy\":\"grid_protection\""));
+}
+
+#[tokio::test]
+async fn price_lock_freezes_entries_without_closing_or_stopping() {
+    let (account, history, path) = account("price-lock");
+    let executor = Arc::new(FillExecutor::default());
+    // $107 escapes above the grid ($105) and reaches the $106 lock threshold;
+    // without the lock these observations would emit sell operations.
+    let source = VecSource::new(vec![
+        observation("107", 1, base_time() + Duration::seconds(70)),
+        observation("107", 2, base_time() + Duration::seconds(80)),
+    ]);
+    let machine = protection(GridProtectionPolicies {
+        price_lock: Some(PriceLockPolicyConfig::new(price("106"))),
+        ..GridProtectionPolicies::default()
+    });
+    let mut task = GridPaperTask::start(
+        config("grid:price-lock", StdDuration::from_secs(1)).with_protection(machine),
+        grid(),
+        source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(task.wait().await.unwrap(), GridPaperTaskExit::SourceEnded);
+    assert_eq!(task.status().phase, GridPaperTaskPhase::Stopped);
+    assert_eq!(task.status().processed_event_count, 2);
+    // Frozen entries: no operations, no position close, no reservation.
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.contains("\"decision\":\"freeze_entries\""));
+    assert!(body.contains("\"reason\":\"price_lock_active\""));
+    assert!(!body.contains("\"decision\":\"exit_all\""));
+    // The steady-state freeze journals once, not per observation.
+    assert_eq!(body.matches("\"decision\":\"freeze_entries\"").count(), 1);
+}
+
+#[tokio::test]
+async fn filled_level_reposts_the_reverse_side_one_interval_away() {
+    // Martingale/grid runtime semantics: a filled buy immediately re-arms the
+    // reverse sell one interval above the fill, mirroring the legacy reverse
+    // order flow (`grid_config.py:206-212`).
+    let (account, history, _) = account("reverse-repost");
+    let executor = Arc::new(RecordingExecutor::default());
+    let stepper = Arc::new(Semaphore::new(1));
+    let source = SteppedSource::new(
+        vec![
+            observation("99", 1, base_time() + Duration::seconds(70)),
+            observation("100", 2, base_time() + Duration::seconds(80)),
+        ],
+        Arc::clone(&stepper),
+    );
+    let mut task = GridPaperTask::start(
+        config("grid:reverse", StdDuration::from_secs(1)),
+        grid(),
+        source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let (exit, ()) = tokio::join!(task.wait(), async {
+        wait_until(|| executor.intents.lock().unwrap().len() == 1).await;
+        stepper.add_permits(1);
+    });
+    assert_eq!(exit.unwrap(), GridPaperTaskExit::SourceEnded);
+    assert_eq!(
+        executor.intents.lock().unwrap().clone(),
+        vec![(Side::Buy, decimal("99")), (Side::Sell, decimal("100"))]
+    );
+    let snapshot = account.snapshot().await.unwrap();
+    assert_eq!(snapshot.reservations.len(), 2);
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {

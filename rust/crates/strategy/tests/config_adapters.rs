@@ -80,6 +80,30 @@ symbol_configs:
 }
 
 #[test]
+fn martingale_mode_without_a_positive_increment_is_rejected_end_to_end() {
+    // The loader already fails closed; the pure planner conversion must also
+    // refuse a hand-mutated config so martingale semantics cannot silently
+    // degrade to a flat grid (`grid_config.py:352-367` treats a missing or
+    // zero increment as "not martingale").
+    let yaml = r"
+exchange: paper
+symbol: BTCUSDT
+market_type: perpetual
+mode: martingale_long
+grid_interval: 1
+order_amount: 1
+lower_price: 100
+upper_price: 104
+";
+    assert!(load_grid_config_from_str(yaml).is_err());
+
+    let mut config =
+        load_grid_config_from_str(&format!("{yaml}martingale_increment: 0.1\n")).unwrap();
+    config.martingale_increment = None;
+    assert!(GridPlanner::try_from(&config).is_err());
+}
+
+#[test]
 fn arbitrage_public_conversion_enforces_operator_controls_mode_and_allowlists() {
     for yaml in [
         r"

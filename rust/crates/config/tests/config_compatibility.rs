@@ -61,6 +61,175 @@ grid:
 }
 
 #[test]
+fn grid_loader_requires_a_positive_increment_for_martingale_modes() {
+    let base = r"
+grid:
+  exchange: backpack
+  symbol: BTC_USDC_PERP
+  grid_type: martingale_long
+  grid_interval: 1
+  order_amount: 0.5
+  lower_price: 100
+  upper_price: 110
+";
+
+    let missing = load_grid_config_from_str(base).unwrap_err();
+    assert!(
+        missing.to_string().contains("martingale_increment"),
+        "{missing}"
+    );
+
+    let zero =
+        load_grid_config_from_str(&format!("{base}  martingale_increment: 0\n")).unwrap_err();
+    assert!(zero.to_string().contains("martingale_increment"), "{zero}");
+
+    let config =
+        load_grid_config_from_str(&format!("{base}  martingale_increment: 0.05\n")).unwrap();
+    assert_eq!(config.mode, GridMode::MartingaleLong);
+    assert_eq!(
+        config.martingale_increment.unwrap().as_decimal(),
+        Decimal::from_str("0.05").unwrap()
+    );
+}
+
+#[test]
+fn grid_protection_fields_stay_disabled_unless_their_legacy_flag_is_set() {
+    // Values without enable flags mirror the checked-in legacy configs where a
+    // subsystem is described but switched off.
+    let yaml = r"
+grid:
+  exchange: backpack
+  symbol: BTC_USDC_PERP
+  grid_type: long
+  grid_interval: 1
+  order_amount: 0.5
+  lower_price: 100
+  upper_price: 110
+  scalping_enabled: false
+  scalping_trigger_percent: 40
+  capital_protection_enabled: false
+  capital_protection_trigger_percent: 30
+  take_profit_enabled: false
+  take_profit_percentage: 0.002
+  price_lock_enabled: false
+  price_lock_threshold: 125000.0
+  stop_loss_protection_enabled: false
+  stop_loss_trigger_percent: 95.0
+  stop_loss_escape_timeout: 600
+  stop_loss_apr_threshold: 45.0
+";
+    let config = load_grid_config_from_str(yaml).unwrap();
+    assert_eq!(config.scalping_trigger_percent, None);
+    assert_eq!(config.scalping_take_profit_grids, None);
+    assert_eq!(config.capital_protection_trigger_percent, None);
+    assert_eq!(config.take_profit_percentage, None);
+    assert_eq!(config.price_lock_threshold, None);
+    assert_eq!(config.stop_loss_trigger_percent, None);
+    assert_eq!(config.stop_loss_escape_timeout, None);
+    assert_eq!(config.stop_loss_apr_threshold, None);
+}
+
+#[test]
+fn grid_protection_fields_load_with_legacy_defaults_when_enabled() {
+    let yaml = r"
+grid:
+  exchange: backpack
+  symbol: BTC_USDC_PERP
+  grid_type: long
+  grid_interval: 1
+  order_amount: 0.5
+  lower_price: 100
+  upper_price: 110
+  scalping_enabled: true
+  scalping_trigger_percent: 40
+  capital_protection_enabled: true
+  take_profit_enabled: true
+  take_profit_percentage: 0.002
+  price_lock_enabled: true
+  price_lock_threshold: 125
+  stop_loss_protection_enabled: true
+  stop_loss_trigger_percent: 95.0
+  stop_loss_escape_timeout: 600
+  stop_loss_apr_threshold: 45.0
+";
+    let config = load_grid_config_from_str(yaml).unwrap();
+    assert_eq!(config.scalping_trigger_percent, Some(40));
+    // Take-profit distance defaults to the legacy two grids.
+    assert_eq!(config.scalping_take_profit_grids, Some(2));
+    // Capital protection trigger defaults to the legacy 50%.
+    assert_eq!(config.capital_protection_trigger_percent, Some(50));
+    assert_eq!(
+        config.take_profit_percentage,
+        Some(Decimal::from_str("0.002").unwrap())
+    );
+    assert_eq!(
+        config.price_lock_threshold.unwrap().as_decimal(),
+        Decimal::from(125)
+    );
+    assert_eq!(
+        config.stop_loss_trigger_percent,
+        Some(Decimal::from_str("95.0").unwrap())
+    );
+    assert_eq!(config.stop_loss_escape_timeout, Some(600));
+    assert_eq!(
+        config.stop_loss_apr_threshold,
+        Some(Decimal::from_str("45.0").unwrap())
+    );
+}
+
+#[test]
+fn grid_protection_validation_fails_closed_on_out_of_range_values() {
+    let base = r"
+grid:
+  exchange: backpack
+  symbol: BTC_USDC_PERP
+  grid_type: long
+  grid_interval: 1
+  order_amount: 0.5
+  lower_price: 100
+  upper_price: 110
+";
+    for (extra, needle) in [
+        (
+            "  scalping_enabled: true\n  scalping_trigger_percent: 0\n",
+            "scalping_trigger_percent",
+        ),
+        (
+            "  scalping_enabled: true\n  scalping_trigger_percent: 101\n",
+            "scalping_trigger_percent",
+        ),
+        (
+            "  scalping_enabled: true\n  scalping_take_profit_grids: 0\n",
+            "scalping_take_profit_grids",
+        ),
+        (
+            "  capital_protection_enabled: true\n  capital_protection_trigger_percent: 101\n",
+            "capital_protection_trigger_percent",
+        ),
+        (
+            "  take_profit_enabled: true\n  take_profit_percentage: 0\n",
+            "take_profit_percentage",
+        ),
+        ("  price_lock_enabled: true\n", "price_lock_threshold"),
+        (
+            "  stop_loss_protection_enabled: true\n  stop_loss_trigger_percent: 0\n",
+            "stop_loss_trigger_percent",
+        ),
+        (
+            "  stop_loss_protection_enabled: true\n  stop_loss_escape_timeout: 0\n",
+            "stop_loss_escape_timeout",
+        ),
+        (
+            "  stop_loss_protection_enabled: true\n  stop_loss_apr_threshold: -1\n",
+            "stop_loss_apr_threshold",
+        ),
+    ] {
+        let error = load_grid_config_from_str(&format!("{base}{extra}")).unwrap_err();
+        assert!(error.to_string().contains(needle), "{extra}: {error}");
+    }
+}
+
+#[test]
 fn monitor_and_arbitrage_top_level_documents_keep_their_operator_controls() {
     let monitor = load_monitor_config_from_str(
         r#"

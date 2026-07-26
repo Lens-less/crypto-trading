@@ -43,7 +43,7 @@
 | `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；对 public path loaders、public from_str loaders 和 shared raw reader 统一施加 1 MiB / YAML 读入护栏；发现不支持配置、读取错误或预算耗尽时非零退出 |
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
-| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model |
+| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓 |
 | `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
@@ -71,7 +71,7 @@ Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Va
 ## 核心特性
 
 - **精确领域类型**：价格、数量和金额使用 `rust_decimal`，关键算术使用受检操作，不以二进制浮点承担交易计算。
-- **纯策略内核**：固定网格、分段套利、价格提醒、做量和虚拟网格逻辑与 I/O 分离，便于确定性测试。
+- **纯策略内核**：固定/马丁网格、网格保护子系统（剥头皮、本金保护、止盈、价格锁定、止损，按固定优先级仲裁）、分段套利、价格提醒、做量和虚拟网格逻辑与 I/O 分离，便于确定性测试。
 - **可验证的 PaperExchange**：覆盖订单状态、盘口深度消耗、GTC/IOC/FOK 语义、spot sell inventory 与 reduce-only capacity 的进程内预留、部分成交收缩、撤单释放和 flat position 清理；但不包含 cash/margin ledger、fees/funding/slippage/queue impact、持久化 / 跨进程持仓或风险预留。
 - **失败关闭的执行边界**：未授权模式、过期行情、产品身份不匹配、深度不足、风险超限和未实现适配器都在提交前拒绝。
 - **可审计执行历史**：先写入 `execution_planned`，再写入 `execution_completed`、`execution_partial` 或 `execution_incomplete`。
@@ -411,7 +411,7 @@ Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依�
 | --- | --- |
 | `domain` | Symbol、MarketSnapshot、Order、Position、Price、Quantity、Money 等领域类型 |
 | `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
-| `strategy` | 网格、分段套利、风险、价格提醒、做量和虚拟网格算法 |
+| `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、风险、价格提醒、做量和虚拟网格算法 |
 | `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |
 | `runtime` | 执行模式、路由、批次、提交策略、部分结果对账、JSONL journal、operator read model 与 capability 清单 |
 | `control-plane` | journal 与各操作界面之间的最小权限读取/提交 seam |

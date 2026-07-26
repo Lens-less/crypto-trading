@@ -53,6 +53,22 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
         vec![CapabilityEnvironment::Offline]
     );
     assert_eq!(grid_strategy.scope.access, CapabilityAccess::Local);
+    // The pure protection subsystem (scalping, capital protection, take
+    // profit, price lock, stop loss) is part of the offline grid strategy
+    // capability and must stay backed by its module and golden tests.
+    assert!(grid_strategy.summary.contains("grid-protection"));
+    assert!(
+        grid_strategy
+            .evidence
+            .iter()
+            .any(|evidence| evidence.ends_with("strategy/src/grid_protection.rs"))
+    );
+    assert!(
+        grid_strategy
+            .evidence
+            .iter()
+            .any(|evidence| evidence.ends_with("strategy/tests/grid_protection.rs"))
+    );
 
     let grid_runtime = manifest.capability("runtime.grid").unwrap();
     assert_eq!(grid_runtime.area, CapabilityArea::Runtime);
@@ -62,6 +78,15 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
         vec![CapabilityEnvironment::Paper]
     );
     assert_eq!(grid_runtime.scope.access, CapabilityAccess::PaperTrading);
+    // The paper owner consumes protection directives; the manifest must say so
+    // and must scope them to the owner's virtual position.
+    assert!(grid_runtime.summary.contains("grid-protection directives"));
+    assert!(
+        grid_runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("virtual position"))
+    );
 
     let web = manifest.capability("control-plane.web").unwrap();
     assert_eq!(web.level, CapabilityLevel::Available);
