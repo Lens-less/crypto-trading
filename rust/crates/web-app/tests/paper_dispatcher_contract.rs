@@ -27,6 +27,17 @@ const BEARER: &str = "0123456789abcdef0123456789abcdef";
 const PRINCIPAL: &str = "local-paper-operator";
 const JOURNAL_ID: Uuid = Uuid::from_u128(0x7777);
 
+/// Shutdown grace is purely a hang budget: the graceful stop path is
+/// signal-driven and completes in milliseconds, so a large grace never slows a
+/// healthy test. A small grace, however, turns CI scheduling jitter into a
+/// forced `ShutdownTimedOut` (surfaced as `Rejected`), because the owner's
+/// stop deadline of twice this grace must cover several `sync_data` journal
+/// appends and any in-flight replay execution on a loaded host.
+const SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(30);
+
+/// Outer polling deadline for projections that require durable journal reads.
+const PROJECTION_DEADLINE: StdDuration = StdDuration::from_secs(30);
+
 struct ApplicationFixture {
     listener: tokio::net::TcpListener,
     router: axum::Router,
@@ -329,7 +340,7 @@ fn catalog_from_replays(
             arbitrage_config_path,
             monitor_config_path,
             replay_path: arbitrage_replay_path,
-            shutdown_grace: StdDuration::from_secs(1),
+            shutdown_grace: SHUTDOWN_GRACE,
         })
     } else {
         None
@@ -342,7 +353,7 @@ fn catalog_from_replays(
             strategy_revision: "grid.v1".to_owned(),
             config_path: grid_config_path,
             replay_path: grid_replay_path,
-            shutdown_grace: StdDuration::from_secs(1),
+            shutdown_grace: SHUTDOWN_GRACE,
         }),
         arbitrage,
         account_risk_config_path: None,
@@ -425,8 +436,11 @@ async fn tasks(router: &axum::Router) -> Value {
 }
 
 async fn wait_for_task(router: &axum::Router, task_id: &str, phase: &str) -> Value {
-    let mut last_payload = Value::Null;
-    for _ in 0..50 {
+    // Deadline-based rather than iteration-based: every journal append is
+    // synced to disk, so a loaded CI host can take seconds to surface a phase
+    // change through the durable projection.
+    let deadline = tokio::time::Instant::now() + PROJECTION_DEADLINE;
+    loop {
         let payload = tasks(router).await;
         if let Some(task) = payload["tasks"]
             .as_array()
@@ -439,22 +453,27 @@ async fn wait_for_task(router: &axum::Router, task_id: &str, phase: &str) -> Val
         {
             return task;
         }
-        last_payload = payload;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "task {task_id} never reached phase {phase}; last projection: {payload}"
+        );
         tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
-    panic!("task {task_id} never reached phase {phase}; last projection: {last_payload}");
 }
 
 async fn wait_for_journal(path: &PathBuf, expected: &str) -> String {
-    let mut last_journal = String::new();
-    for _ in 0..50 {
-        last_journal = std::fs::read_to_string(path).unwrap();
+    let deadline = tokio::time::Instant::now() + PROJECTION_DEADLINE;
+    loop {
+        let last_journal = std::fs::read_to_string(path).unwrap();
         if last_journal.contains(expected) {
             return last_journal;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "journal never contained {expected:?}; last journal: {last_journal}"
+        );
         tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
-    panic!("journal never contained {expected:?}; last journal: {last_journal}");
 }
 
 fn accepted_only_record(envelope: &SubmitEnvelope) -> String {

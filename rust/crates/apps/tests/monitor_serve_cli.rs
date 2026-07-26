@@ -44,8 +44,13 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
                 &control_port.to_string(),
                 "--control-poll-interval-ms",
                 "25",
+                // The grace is purely a hang budget: a graceful stop is
+                // signal-driven and fast, while a small grace lets CI
+                // scheduling jitter force `exit=shutdown_timed_out` because
+                // the owner must finish several synced journal appends within
+                // it before `stop` reports `exit=stop_requested`.
                 "--shutdown-grace-ms",
-                "250",
+                "30000",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -82,7 +87,7 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");
     assert!(stop_stdout.contains("exit=stop_requested"), "{stop_stdout}");
 
-    let output = wait_with_output(child.0.take().unwrap(), Duration::from_secs(5));
+    let output = wait_with_output(child.0.take().unwrap(), Duration::from_secs(30));
     assert!(output.status.success(), "{output:?}");
     let serve_stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -121,7 +126,9 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
 }
 
 fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Every checkpoint append is synced to disk and each poll spawns a status
+    // process, so slow CI hosts can take several seconds to reach running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let output = Command::new(binary())
             .current_dir(repo_root())

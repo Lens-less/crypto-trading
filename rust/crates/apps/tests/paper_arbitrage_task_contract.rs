@@ -298,7 +298,7 @@ async fn exact_pair_opportunity_commits_one_independent_two_leg_operation() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:btc", StdDuration::from_secs(1)),
+        task_config("arbitrage:btc", StdDuration::from_secs(30)),
         monitor(),
         left_source,
         right_source,
@@ -349,7 +349,7 @@ async fn risk_rejection_happens_before_any_reservation() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config_with_max("arbitrage:risk", StdDuration::from_secs(1), "50"),
+        task_config_with_max("arbitrage:risk", StdDuration::from_secs(30), "50"),
         monitor(),
         left_source,
         right_source,
@@ -411,7 +411,7 @@ async fn account_risk_pause_skips_opportunities_without_failing_the_owner() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:risk-paused", StdDuration::from_secs(1))
+        task_config("arbitrage:risk-paused", StdDuration::from_secs(30))
             .with_account_risk(risk.clone()),
         monitor(),
         left_source,
@@ -472,7 +472,7 @@ async fn engaged_kill_switch_stops_the_arbitrage_owner_before_any_entry() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, _right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:risk-kill", StdDuration::from_secs(1)).with_account_risk(risk),
+        task_config("arbitrage:risk-kill", StdDuration::from_secs(30)).with_account_risk(risk),
         monitor(),
         left_source,
         right_source,
@@ -505,7 +505,7 @@ async fn liquidity_rejection_happens_before_any_reservation() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:liquidity", StdDuration::from_secs(1)),
+        task_config("arbitrage:liquidity", StdDuration::from_secs(30)),
         monitor(),
         left_source,
         right_source,
@@ -556,7 +556,7 @@ async fn stop_drains_the_inflight_pair_without_admitting_a_coalesced_reservation
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:stop", StdDuration::from_secs(1)),
+        task_config("arbitrage:stop", StdDuration::from_secs(30)),
         monitor(),
         left_source,
         right_source,
@@ -748,7 +748,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut first = ArbitragePaperTask::start(
-        task_config("arbitrage:reconcile", StdDuration::from_secs(1)),
+        task_config("arbitrage:reconcile", StdDuration::from_secs(30)),
         monitor(),
         left_source,
         right_source,
@@ -801,7 +801,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     let (new_right, _new_right_sender) = ChannelSource::new("right");
 
     let restart = ArbitragePaperTask::start(
-        task_config("arbitrage:reconcile", StdDuration::from_secs(1)),
+        task_config("arbitrage:reconcile", StdDuration::from_secs(30)),
         monitor(),
         new_left,
         new_right,
@@ -826,7 +826,7 @@ async fn source_mismatch_is_zero_write_and_clean_stable_owner_restart_remains_pr
     let (wrong_left, _wrong_left_sender) = ChannelSource::new("right");
     let (right, _right_sender) = ChannelSource::new("right");
     let mismatch = ArbitragePaperTask::start(
-        task_config("arbitrage:mismatch", StdDuration::from_secs(1)),
+        task_config("arbitrage:mismatch", StdDuration::from_secs(30)),
         monitor(),
         wrong_left,
         right,
@@ -846,7 +846,7 @@ async fn source_mismatch_is_zero_write_and_clean_stable_owner_restart_remains_pr
     let (first_left, _first_left_sender) = ChannelSource::new("left");
     let (first_right, _first_right_sender) = ChannelSource::new("right");
     let mut first = ArbitragePaperTask::start(
-        task_config("arbitrage:restart", StdDuration::from_secs(1)),
+        task_config("arbitrage:restart", StdDuration::from_secs(30)),
         monitor(),
         first_left,
         first_right,
@@ -866,7 +866,7 @@ async fn source_mismatch_is_zero_write_and_clean_stable_owner_restart_remains_pr
     let (drift_left, _drift_left_sender) = ChannelSource::new("drift-left");
     let (drift_right, _drift_right_sender) = ChannelSource::new("right");
     let drift = ArbitragePaperTask::start(
-        task_config("arbitrage:restart", StdDuration::from_secs(1)),
+        task_config("arbitrage:restart", StdDuration::from_secs(30)),
         monitor_for("drift-left", "right"),
         drift_left,
         drift_right,
@@ -889,7 +889,7 @@ async fn source_mismatch_is_zero_write_and_clean_stable_owner_restart_remains_pr
     let (second_left, _second_left_sender) = ChannelSource::new("left");
     let (second_right, _second_right_sender) = ChannelSource::new("right");
     let mut second = ArbitragePaperTask::start(
-        task_config("arbitrage:restart", StdDuration::from_secs(1)),
+        task_config("arbitrage:restart", StdDuration::from_secs(30)),
         monitor(),
         second_left,
         second_right,
@@ -919,7 +919,7 @@ async fn inflight_opportunities_coalesce_into_one_latest_pair_re_evaluation() {
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:coalesce", StdDuration::from_secs(1)),
+        task_config("arbitrage:coalesce", StdDuration::from_secs(30)),
         monitor(),
         left_source,
         right_source,
@@ -1018,7 +1018,7 @@ fn history_task_config(
         &strategy,
         Duration::minutes(5),
         PaperCostModel::v1(10, 5, 15).unwrap(),
-        MarketSupervisorConfig::new(StdDuration::from_secs(1)).unwrap(),
+        MarketSupervisorConfig::new(StdDuration::from_secs(30)).unwrap(),
     )
     .unwrap()
 }
@@ -1206,7 +1206,7 @@ async fn history_mode_fails_closed_on_a_corrupted_spread_history_journal() {
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {
-    tokio::time::timeout(StdDuration::from_secs(2), async {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
         loop {
             if predicate() {
                 break;

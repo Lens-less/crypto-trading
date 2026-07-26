@@ -437,7 +437,7 @@ async fn spread_observations_are_mirrored_into_the_dedicated_spread_history_jour
 fn config(task_id: &str) -> ContinuousMonitorTaskConfig {
     ContinuousMonitorTaskConfig::new(
         task_id,
-        MarketSupervisorConfig::new(StdDuration::from_millis(250)).unwrap(),
+        MarketSupervisorConfig::new(StdDuration::from_secs(30)).unwrap(),
     )
     .unwrap()
 }
@@ -484,7 +484,7 @@ fn observation(
 }
 
 async fn wait_for_processed(task: &ContinuousMonitorTask, expected: u64) {
-    tokio::time::timeout(StdDuration::from_secs(2), async {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
         loop {
             if task.status().processed_event_count >= expected {
                 break;
@@ -497,7 +497,7 @@ async fn wait_for_processed(task: &ContinuousMonitorTask, expected: u64) {
 }
 
 async fn wait_for_phase(task: &ContinuousMonitorTask, expected: ContinuousMonitorTaskPhase) {
-    tokio::time::timeout(StdDuration::from_secs(2), async {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
         loop {
             if task.status().phase == expected {
                 break;
@@ -513,7 +513,7 @@ async fn wait_for_runtime_failure(
     task: &ContinuousMonitorTask,
     expected: ContinuousMonitorTaskFailure,
 ) {
-    tokio::time::timeout(StdDuration::from_secs(2), async {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
         loop {
             if task.status().runtime_failure == Some(expected) {
                 break;

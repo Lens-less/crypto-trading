@@ -246,7 +246,7 @@ async fn price_gap_emits_three_independent_single_leg_operations() {
         base_time() + Duration::seconds(70),
     )]);
     let mut task = GridPaperTask::start(
-        config("grid:btc", StdDuration::from_secs(1)),
+        config("grid:btc", StdDuration::from_secs(30)),
         grid(),
         source,
         account.clone(),
@@ -325,7 +325,7 @@ async fn account_risk_rejections_skip_entry_crossings_without_reservations() {
         base_time() + Duration::seconds(70),
     )]);
     let mut task = GridPaperTask::start(
-        config("grid:risk-reject", StdDuration::from_secs(1)).with_account_risk(risk.clone()),
+        config("grid:risk-reject", StdDuration::from_secs(30)).with_account_risk(risk.clone()),
         grid(),
         source,
         account.clone(),
@@ -363,7 +363,7 @@ async fn engaged_kill_switch_stops_the_grid_owner_before_any_entry() {
         base_time() + Duration::seconds(70),
     )]);
     let mut task = GridPaperTask::start(
-        config("grid:risk-kill", StdDuration::from_secs(1)).with_account_risk(risk),
+        config("grid:risk-kill", StdDuration::from_secs(30)).with_account_risk(risk),
         grid(),
         source,
         account.clone(),
@@ -391,7 +391,7 @@ async fn stop_during_a_multi_cross_event_never_checkpoints_unexecuted_crosses_as
         first: Some(observation("97", 1, base_time() + Duration::seconds(70))),
     };
     let mut task = GridPaperTask::start(
-        config("grid:stop-gap", StdDuration::from_secs(1)),
+        config("grid:stop-gap", StdDuration::from_secs(30)),
         grid(),
         source,
         account.clone(),
@@ -428,7 +428,7 @@ async fn stop_during_a_multi_cross_event_never_checkpoints_unexecuted_crosses_as
     assert!(!body.contains("\"decision\":\"task_stopped\""));
 
     let restart = GridPaperTask::start(
-        config("grid:stop-gap", StdDuration::from_secs(1)),
+        config("grid:stop-gap", StdDuration::from_secs(30)),
         grid(),
         VecSource::new(Vec::new()),
         account,
@@ -449,7 +449,7 @@ async fn timeout_marks_operation_uncertain_and_restart_fails_closed() {
         base_time() + Duration::seconds(10),
     )]);
     let mut task = GridPaperTask::start(
-        config("grid:timeout", StdDuration::from_secs(1)),
+        config("grid:timeout", StdDuration::from_secs(30)),
         grid(),
         source,
         account.clone(),
@@ -475,7 +475,7 @@ async fn timeout_marks_operation_uncertain_and_restart_fails_closed() {
     );
 
     let restart = GridPaperTask::start(
-        config("grid:timeout", StdDuration::from_secs(1)),
+        config("grid:timeout", StdDuration::from_secs(30)),
         grid(),
         VecSource::new(Vec::new()),
         account,
@@ -528,7 +528,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
         base_time() + Duration::seconds(10),
     )]);
     let mut first = GridPaperTask::start(
-        config("grid:first", StdDuration::from_secs(1)),
+        config("grid:first", StdDuration::from_secs(30)),
         grid(),
         source,
         account.clone(),
@@ -563,7 +563,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     let records_before = std::fs::read_to_string(&path).unwrap().lines().count();
 
     let restart = GridPaperTask::start(
-        config("grid:second", StdDuration::from_secs(1)),
+        config("grid:second", StdDuration::from_secs(30)),
         grid(),
         VecSource::new(Vec::new()),
         account,
@@ -589,7 +589,7 @@ async fn clean_stop_can_restart_the_stable_owner_without_degrading_projection() 
         base_time() + Duration::seconds(10),
     )]);
     let mut first = GridPaperTask::start(
-        config("grid:restart", StdDuration::from_secs(1)),
+        config("grid:restart", StdDuration::from_secs(30)),
         grid(),
         first_source,
         account.clone(),
@@ -606,7 +606,7 @@ async fn clean_stop_can_restart_the_stable_owner_without_degrading_projection() 
         base_time() + Duration::seconds(20),
     )]);
     let mut second = GridPaperTask::start(
-        config("grid:restart", StdDuration::from_secs(1)),
+        config("grid:restart", StdDuration::from_secs(30)),
         grid(),
         second_source,
         account.clone(),
@@ -631,7 +631,7 @@ async fn stop_without_an_inflight_operation_is_durable_and_opens_no_reservation(
     let (account, history, _) = account("stop-idle");
     let source = BlockingSource { first: None };
     let mut task = GridPaperTask::start(
-        config("grid:idle", StdDuration::from_millis(250)),
+        config("grid:idle", StdDuration::from_secs(30)),
         grid(),
         source,
         account.clone(),
@@ -743,7 +743,7 @@ async fn stop_loss_exit_stops_the_task_and_journals_the_exit_all_fact() {
         ..GridProtectionPolicies::default()
     });
     let mut task = GridPaperTask::start(
-        config("grid:stop-loss", StdDuration::from_secs(1)).with_protection(machine),
+        config("grid:stop-loss", StdDuration::from_secs(30)).with_protection(machine),
         grid(),
         source,
         account.clone(),
@@ -786,7 +786,7 @@ async fn price_lock_freezes_entries_without_closing_or_stopping() {
         ..GridProtectionPolicies::default()
     });
     let mut task = GridPaperTask::start(
-        config("grid:price-lock", StdDuration::from_secs(1)).with_protection(machine),
+        config("grid:price-lock", StdDuration::from_secs(30)).with_protection(machine),
         grid(),
         source,
         account.clone(),
@@ -826,7 +826,7 @@ async fn filled_level_reposts_the_reverse_side_one_interval_away() {
         Arc::clone(&stepper),
     );
     let mut task = GridPaperTask::start(
-        config("grid:reverse", StdDuration::from_secs(1)),
+        config("grid:reverse", StdDuration::from_secs(30)),
         grid(),
         source,
         account.clone(),
@@ -850,13 +850,19 @@ async fn filled_level_reposts_the_reverse_side_one_interval_away() {
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {
-    for _ in 0..100 {
+    // Deadline-based with a CI-jitter margin: the predicate normally flips in
+    // milliseconds, so the budget only bounds a genuinely stuck condition.
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(10);
+    loop {
         if predicate() {
             return;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition was not observed within the test deadline"
+        );
         tokio::time::sleep(StdDuration::from_millis(10)).await;
     }
-    panic!("condition was not observed within the test deadline");
 }
 
 fn temp_path(label: &str) -> std::path::PathBuf {

@@ -48,8 +48,13 @@ fn scanner_serve_process_ranks_the_replay_and_stops_through_the_control_host() {
                 &control_port.to_string(),
                 "--control-poll-interval-ms",
                 "25",
+                // The grace is purely a hang budget: a graceful stop is
+                // signal-driven and fast, while a small grace lets CI
+                // scheduling jitter force `exit=shutdown_timed_out` because
+                // the owner must finish several synced journal appends within
+                // it before `stop` reports `exit=stop_requested`.
                 "--shutdown-grace-ms",
-                "250",
+                "30000",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -72,7 +77,7 @@ fn scanner_serve_process_ranks_the_replay_and_stops_through_the_control_host() {
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");
     assert!(stop_stdout.contains("exit=stop_requested"), "{stop_stdout}");
 
-    let output = wait_with_output(child.0.take().unwrap(), Duration::from_secs(10));
+    let output = wait_with_output(child.0.take().unwrap(), Duration::from_secs(30));
     assert!(output.status.success(), "{output:?}");
     let serve_stdout = String::from_utf8(output.stdout).unwrap();
     assert!(

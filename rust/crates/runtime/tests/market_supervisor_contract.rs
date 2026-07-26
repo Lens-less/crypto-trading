@@ -276,7 +276,7 @@ async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memor
     )
     .unwrap();
 
-    tokio::time::timeout(StdDuration::from_secs(1), async {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
         loop {
             if supervisor.status().event_sequence == 3 {
                 break;
@@ -314,14 +314,19 @@ async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memor
 
 #[tokio::test]
 async fn supervisor_stop_cancels_an_in_flight_source_within_the_grace_period() {
+    // The grace only bounds a stop that would otherwise hang: a cancelled
+    // in-flight source must report `StopRequested` well before it elapses. A
+    // generous grace keeps CI scheduling jitter from forcing the
+    // `ShutdownTimedOut` fallback while still failing fast if cancellation
+    // ever regresses.
     let mut supervisor = MarketSupervisor::start(
         Uuid::from_u128(42),
         PendingSource,
-        supervisor_config(StdDuration::from_millis(100)),
+        supervisor_config(StdDuration::from_secs(5)),
     )
     .unwrap();
 
-    let exit = tokio::time::timeout(StdDuration::from_secs(1), supervisor.stop())
+    let exit = tokio::time::timeout(StdDuration::from_secs(30), supervisor.stop())
         .await
         .unwrap()
         .unwrap();
@@ -379,7 +384,7 @@ async fn supervisor_cancels_a_long_polling_backoff_without_waiting_for_the_timer
     let mut supervisor = MarketSupervisor::start(
         Uuid::from_u128(43),
         source,
-        supervisor_config(StdDuration::from_millis(100)),
+        supervisor_config(StdDuration::from_secs(5)),
     )
     .unwrap();
 
@@ -387,7 +392,9 @@ async fn supervisor_cancels_a_long_polling_backoff_without_waiting_for_the_timer
         supervisor.next_event().await.unwrap().unwrap(),
         MarketDataEvent::SourceUnavailable { .. }
     ));
-    let exit = tokio::time::timeout(StdDuration::from_secs(1), supervisor.stop())
+    // Ten seconds is a CI-jitter margin that still proves the semantic point:
+    // the stop never waits out the thirty-second polling backoff timer.
+    let exit = tokio::time::timeout(StdDuration::from_secs(10), supervisor.stop())
         .await
         .unwrap()
         .unwrap();

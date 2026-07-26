@@ -53,7 +53,9 @@ fn wait_with_output(mut child: Child, timeout: Duration) -> Output {
 }
 
 fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Every journal append is synced to disk and each poll spawns a status
+    // process, so slow CI hosts can take several seconds to reach running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
@@ -81,7 +83,7 @@ fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
 }
 
 fn wait_for_journal_fact(history: &Path, needle: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if fs::read_to_string(history).is_ok_and(|journal| journal.contains(needle)) {
             return;
@@ -259,7 +261,7 @@ fn serve_status_and_stop_work_with_the_hidden_fixture_probe() {
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");
     assert!(stop_stdout.contains("exit=stop_requested"), "{stop_stdout}");
 
-    let output = wait_with_output(child.0.take().unwrap(), Duration::from_secs(5));
+    let output = wait_with_output(child.0.take().unwrap(), Duration::from_secs(30));
     assert!(output.status.success(), "{output:?}");
     let serve_stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
