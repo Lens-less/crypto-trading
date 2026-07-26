@@ -292,23 +292,53 @@ fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
 fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() {
     let manifest = current_capability_manifest();
     let account = manifest.capability("risk.account-authority").unwrap();
-    assert_eq!(account.level, CapabilityLevel::Unavailable);
+    // The account-level risk authority is available, but only for the paper
+    // environment: testnet/mainnet account truth stays an explicit blocker.
+    assert_eq!(account.level, CapabilityLevel::Available);
+    assert_eq!(
+        account.scope.environments,
+        vec![CapabilityEnvironment::Paper]
+    );
+    assert_eq!(account.scope.access, CapabilityAccess::PaperTrading);
+    for summary_term in [
+        "exposure caps",
+        "daily trade caps",
+        "pause/resume",
+        "kill switch",
+    ] {
+        assert!(
+            account.summary.contains(summary_term),
+            "summary must state {summary_term}"
+        );
+    }
+    for evidence in [
+        "rust/crates/strategy/src/account_risk.rs",
+        "rust/crates/config/src/account_risk.rs",
+        "rust/crates/runtime/src/account_risk.rs",
+        "rust/crates/runtime/src/paper_account.rs",
+        "rust/crates/runtime/tests/account_risk_contract.rs",
+        "rust/crates/control-plane/src/submit.rs",
+        "rust/crates/web-app/src/paper_dispatcher.rs",
+    ] {
+        assert!(
+            account.evidence.contains(&evidence.to_owned()),
+            "missing evidence {evidence}"
+        );
+    }
     assert!(
         account
-            .evidence
-            .contains(&"rust/crates/runtime/src/paper_account.rs".to_owned())
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("paper-scoped only")
+                && blocker.contains("testnet/mainnet")),
+        "the paper-only boundary must stay an explicit blocker"
     );
     assert!(
         account
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("paper-only reservation"))
-    );
-    assert!(
-        account
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("gap is closed"))
+            .any(|blocker| blocker.contains("no disengage transition")),
+        "the latching kill switch must stay explicit"
     );
 
     let arbitrage = manifest.capability("runtime.arbitrage").unwrap();

@@ -14,6 +14,7 @@ publish = false
 chrono.workspace = true
 crypto-trading-domain = { path = "../domain" }
 crypto-trading-exchange = { path = "../exchange" }
+crypto-trading-strategy = { path = "../strategy" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,7 +23,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-crypto-trading-strategy = { path = "../strategy" }
 rust_decimal.workspace = true
 
 [lints]

@@ -1,5 +1,6 @@
 //! Backward-compatible configuration loading for the legacy YAML files.
 
+mod account_risk;
 mod arbitrage;
 mod auth;
 mod error;
@@ -10,6 +11,10 @@ mod scanner;
 mod supporting;
 mod symbol_conversion;
 
+pub use account_risk::{
+    AccountRiskConfig, MAX_ACCOUNT_RISK_CONFIG_DURATION_SECONDS, MAX_ACCOUNT_RISK_CONFIG_SYMBOLS,
+    load_account_risk_config, load_account_risk_config_from_str,
+};
 pub use arbitrage::{
     ArbitrageConfig, ArbitrageHistoryDecisionConfig, ArbitrageSymbolConfig,
     MAX_ARBITRAGE_HISTORY_MIN_SAMPLES, MAX_ARBITRAGE_HISTORY_WINDOW_SECONDS, load_arbitrage_config,

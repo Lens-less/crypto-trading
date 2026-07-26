@@ -25,6 +25,7 @@ doc = false
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crypto-trading-apps = { path = "../apps" }
 crypto-trading-control-plane = { path = "../control-plane" }

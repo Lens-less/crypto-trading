@@ -30,6 +30,7 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
+    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskError,
     DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError, JournalReadError,
     JournalSnapshot, JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION,
     MarketDataError, MarketDataEvent, MarketDataEventSource, MarketSupervisor,
@@ -42,9 +43,9 @@ use crypto_trading_runtime::{
     SpreadHistorySampleView, read_journal_chain,
 };
 use crypto_trading_strategy::{
-    AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, HistoryDecisionKind,
-    HistoryDecisionMachine, PairStrategyMachine, RiskDecision, RiskEngine, RiskLimits,
-    RiskRejection, SpreadSample, StrategyError,
+    AccountRiskSnapshot, ArbitrageDecision, ArbitrageDecisionKind, ArbitrageState,
+    ArbitrageStrategy, HistoryDecisionKind, HistoryDecisionMachine, PairStrategyMachine,
+    RiskDecision, RiskEngine, RiskLimits, RiskRejection, SpreadSample, StrategyError,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -60,6 +61,7 @@ use crate::{
         ArbitrageMonitorError, ArbitrageMonitorEvent, ArbitrageMonitorOutcome,
         ReadOnlyArbitrageMonitor,
     },
+    paper_grid_task::{account_risk_directive_record, account_risk_exit_reason},
     task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture},
 };
 
@@ -95,6 +97,9 @@ pub struct ArbitragePaperTaskConfig {
     /// Optional dedicated spread-history journal used to backfill the
     /// history machine on cold start.
     spread_history_path: Option<PathBuf>,
+    /// Optional durable account-level risk authority: opening decisions must
+    /// pass its admission and its close directives stop the owner.
+    account_risk: Option<AccountRiskAuthority>,
 }
 
 impl ArbitragePaperTaskConfig {
@@ -148,7 +153,17 @@ impl ArbitragePaperTaskConfig {
             supervisor,
             history_decision,
             spread_history_path,
+            account_risk: None,
         })
+    }
+
+    /// Attaches the durable account-level risk authority. Opening decisions
+    /// must pass its admission before any reservation is created; its close
+    /// directives stop the owner fail-closed.
+    #[must_use]
+    pub fn with_account_risk(mut self, account_risk: AccountRiskAuthority) -> Self {
+        self.account_risk = Some(account_risk);
+        self
     }
 
     #[must_use]
@@ -682,6 +697,24 @@ async fn run_owner(
                     )
                     .await;
                 }
+                // A flat strategy position closes the owner-level risk clock.
+                if let Some(risk) = config.account_risk.as_ref()
+                    && state.position_quantity.is_zero()
+                    && let Err(error) = risk
+                        .record_position_closed(&config.task_id, Utc::now())
+                        .await
+                {
+                    return fail_owner(
+                        &mut left,
+                        &mut right,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        ArbitragePaperTaskFailure::AccountContract,
+                        ArbitragePaperTaskError::AccountRisk(error),
+                    )
+                    .await;
+                }
                 if pending_opportunity && !*stop.borrow() && !*cancel.borrow() {
                     pending_opportunity = false;
                     let gate_open = match history_gate(
@@ -852,6 +885,67 @@ async fn run_owner(
                 last_recorded_at = recorded_at;
                 status_sender.send_replace(next);
 
+                // Durable account-risk close directives stop the owner
+                // fail-closed before any further opportunity is planned.
+                if let Some(risk) = config.account_risk.as_ref() {
+                    let directives = match risk.directives(monitor_event.recorded_at).await {
+                        Ok(directives) => directives,
+                        Err(error) => {
+                            abort_inflight(&mut in_flight, saga.account()).await;
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                ArbitragePaperTaskFailure::AccountContract,
+                                ArbitragePaperTaskError::AccountRisk(error),
+                            )
+                            .await;
+                        }
+                    };
+                    if let Some(reason) = account_risk_exit_reason(&directives, &config.task_id) {
+                        let directive_recorded_at = Utc::now().max(last_recorded_at);
+                        if let Err(error) = history
+                            .append(&account_risk_directive_record(
+                                &config.task_id,
+                                "arbitrage_paper",
+                                monitor.legs().0.symbol.as_str(),
+                                &reason,
+                                "",
+                                directive_recorded_at,
+                            ))
+                            .await
+                        {
+                            abort_inflight(&mut in_flight, saga.account()).await;
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                ArbitragePaperTaskFailure::JournalUnavailable,
+                                ArbitragePaperTaskError::Journal(error),
+                            )
+                            .await;
+                        }
+                        last_recorded_at = directive_recorded_at;
+                        return stop_owner(
+                            &mut left,
+                            &mut right,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            ArbitragePaperTaskExit::StopRequested,
+                            in_flight.take(),
+                            false,
+                            saga.account(),
+                            &mut state,
+                        )
+                        .await;
+                    }
+                }
+
                 if is_opportunity && in_flight.is_none() && !*stop.borrow() && !*cancel.borrow() {
                     let gate_open = match history_gate(
                         history_machine.as_ref(),
@@ -959,6 +1053,44 @@ async fn plan_latest_operation(
         .evaluate_pair(state, &pair.left, &pair.right)?;
     if decision.intents.is_empty() {
         return Ok(None);
+    }
+    // Opening exposure passes the durable account-level admission before any
+    // reservation exists; a recorded rejection skips the opportunity while
+    // reducing decisions stay exempt so risk can always be closed out.
+    if let Some(risk) = config.account_risk.as_ref()
+        && matches!(
+            decision.kind,
+            ArbitrageDecisionKind::Open | ArbitrageDecisionKind::Increase
+        )
+    {
+        let markets = [pair.left.clone(), pair.right.clone()];
+        let mut notional = Decimal::ZERO;
+        for intent in &decision.intents {
+            let market = matching_market(intent, &markets)?;
+            let execution_price = intent.price.unwrap_or_else(|| match intent.side {
+                Side::Buy => market.ask(),
+                Side::Sell => market.bid(),
+            });
+            notional = execution_price
+                .as_decimal()
+                .checked_mul(intent.quantity.as_decimal())
+                .and_then(|value| notional.checked_add(value))
+                .ok_or(ArbitragePaperTaskError::InvalidRequest)?;
+        }
+        let candidate = AccountRiskCandidate::new(
+            config.task_id.clone(),
+            decision.intents[0].symbol.as_str(),
+            Money::new(notional),
+        )
+        .map_err(ArbitragePaperTaskError::AccountRisk)?;
+        match risk
+            .admit(&candidate, pair.observed_at)
+            .await
+            .map_err(ArbitragePaperTaskError::AccountRisk)?
+        {
+            AccountRiskAdmission::Admitted { .. } => {}
+            AccountRiskAdmission::Rejected(_) => return Ok(None),
+        }
     }
     let account_snapshot = account.snapshot().await?;
     let next_sequence = operation_sequence
@@ -1871,6 +2003,7 @@ pub enum ArbitragePaperTaskError {
     JournalRead(JournalReadError),
     Projection(ReadModelError),
     Account(PaperAccountError),
+    AccountRisk(AccountRiskError),
     Source(MarketSupervisorError),
     SourceContract,
     Monitor(ArbitrageMonitorError),
@@ -1900,7 +2033,7 @@ impl ArbitragePaperTaskError {
             Self::Journal(_) | Self::JournalRead(_) | Self::Projection(_) => {
                 ArbitragePaperTaskFailure::JournalUnavailable
             }
-            Self::Account(_) => ArbitragePaperTaskFailure::AccountContract,
+            Self::Account(_) | Self::AccountRisk(_) => ArbitragePaperTaskFailure::AccountContract,
             Self::Source(_) | Self::SourceContract => ArbitragePaperTaskFailure::SourceContract,
             Self::Monitor(_) => ArbitragePaperTaskFailure::MonitorContract,
             Self::Saga(error) => classify_saga_error(error),
@@ -2009,6 +2142,7 @@ impl fmt::Display for ArbitragePaperTaskError {
             Self::JournalRead(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::Account(error) => error.fmt(formatter),
+            Self::AccountRisk(error) => error.fmt(formatter),
             Self::Source(error) => error.fmt(formatter),
             Self::SourceContract => formatter.write_str("arbitrage paper source contract failed"),
             Self::Monitor(error) => error.fmt(formatter),
@@ -2035,6 +2169,7 @@ impl Error for ArbitragePaperTaskError {
             Self::JournalRead(error) => Some(error),
             Self::Projection(error) => Some(error),
             Self::Account(error) => Some(error),
+            Self::AccountRisk(error) => Some(error),
             Self::Source(error) => Some(error),
             Self::Monitor(error) => Some(error),
             Self::Market(error) => Some(error),

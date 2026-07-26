@@ -20,10 +20,10 @@ use axum::{
     routing::get,
 };
 use crypto_trading_control_plane::{
-    ArbitrageMonitorReadModel, CapabilityManifest, ControlPlaneEventsPage, ControlPlaneSnapshot,
-    ExecutionBatchState, OperatorReadModel, PaperAccountReadModel, PriceAlertReadModel,
-    ProjectionStatus, ReadControlPlane, ReadFailureKind, ReadOnlyTaskReadModel, RecoveryDirective,
-    ReleaseStage, VirtualGridScannerReadModel,
+    AccountRiskReadModel, ArbitrageMonitorReadModel, CapabilityManifest, ControlPlaneEventsPage,
+    ControlPlaneSnapshot, ExecutionBatchState, OperatorReadModel, PaperAccountReadModel,
+    PriceAlertReadModel, ProjectionStatus, ReadControlPlane, ReadFailureKind,
+    ReadOnlyTaskReadModel, RecoveryDirective, ReleaseStage, VirtualGridScannerReadModel,
 };
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
@@ -395,9 +395,23 @@ async fn scanner(
     Ok(Json(snapshot.scanner))
 }
 
-async fn risk(State(state): State<ApiState>) -> Result<Json<PaperAccountReadModel>, ApiError> {
+/// Combined risk projection: journal-backed paper-account exposure plus the
+/// durable account-level risk state (pause, kill switch, daily counts).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskResponse {
+    pub schema_version: u16,
+    pub paper_accounts: PaperAccountReadModel,
+    pub account_risk: AccountRiskReadModel,
+}
+
+async fn risk(State(state): State<ApiState>) -> Result<Json<RiskResponse>, ApiError> {
     let snapshot = load_snapshot(state.control_plane).await?;
-    Ok(Json(snapshot.paper_accounts))
+    Ok(Json(RiskResponse {
+        schema_version: API_SCHEMA_VERSION,
+        paper_accounts: snapshot.paper_accounts,
+        account_risk: snapshot.account_risk,
+    }))
 }
 
 async fn runtime_settings(State(state): State<ApiState>) -> Json<SettingsResponse> {

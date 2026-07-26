@@ -567,6 +567,46 @@ pub enum PaperCommand {
     Grid(PaperTaskArgs),
     /// Control one continuous paper arbitrage task through the trusted submit seam.
     Arbitrage(PaperTaskArgs),
+    /// Control the shared account-level risk authority through the trusted submit seam.
+    Risk(PaperRiskArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PaperRiskArgs {
+    #[command(subcommand)]
+    pub operation: PaperRiskOperation,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PaperRiskOperation {
+    /// Durably pause new account-risk admissions with an explicit reason.
+    Pause(PaperRiskReasonArgs),
+    /// Durably resume admissions after a pause; never clears the kill switch.
+    Resume(PaperMutationArgs),
+    /// Durably engage the latching account kill switch.
+    KillSwitch(PaperRiskKillSwitchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PaperRiskReasonArgs {
+    #[command(flatten)]
+    pub mutation: PaperMutationArgs,
+    /// Bounded operator-facing reason recorded as a durable fact.
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PaperRiskKillSwitchArgs {
+    #[command(flatten)]
+    pub mutation: PaperMutationArgs,
+    /// Bounded operator-facing reason recorded as a durable fact.
+    #[arg(long)]
+    pub reason: String,
+    /// Exact acknowledgement phrase; any other value fails closed before any
+    /// request is sent.
+    #[arg(long, value_name = "PHRASE")]
+    pub acknowledge: String,
 }
 
 #[derive(Debug, Args)]

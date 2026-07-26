@@ -25,7 +25,7 @@ fn scanner_projection_shares_the_frozen_control_plane_snapshot() {
         snapshot.schema_version,
         CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION
     );
-    assert_eq!(CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION, 6);
+    assert_eq!(CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION, 7);
     assert_eq!(
         snapshot.scanner.schema_version,
         VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION

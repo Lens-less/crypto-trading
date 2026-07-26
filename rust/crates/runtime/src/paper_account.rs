@@ -47,7 +47,7 @@ const PAPER_ACCOUNT_COMMITTED: &str = "paper_account_committed";
 const PAPER_ACCOUNT_RELEASED: &str = "paper_account_released";
 const PAPER_ACCOUNT_RECONCILE_FAILED: &str = "paper_account_reconcile_failed";
 
-type AuthorityLock = AsyncMutex<()>;
+pub(crate) type AuthorityLock = AsyncMutex<()>;
 static AUTHORITY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<AuthorityLock>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1969,7 +1969,7 @@ fn require_writable(snapshot: &PaperAccountSnapshot) -> Result<(), PaperAccountE
     Ok(())
 }
 
-fn shared_authority_lock(path: &Path) -> Arc<AuthorityLock> {
+pub(crate) fn shared_authority_lock(path: &Path) -> Arc<AuthorityLock> {
     let registry = AUTHORITY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
@@ -1983,7 +1983,7 @@ fn shared_authority_lock(path: &Path) -> Arc<AuthorityLock> {
     lock
 }
 
-fn bounded_identity(value: &str, field: &'static str) -> Result<String, &'static str> {
+pub(crate) fn bounded_identity(value: &str, field: &'static str) -> Result<String, &'static str> {
     let normalized = value.trim();
     if normalized.is_empty()
         || normalized.len() > MAX_LABEL_BYTES

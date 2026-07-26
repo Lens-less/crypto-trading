@@ -482,6 +482,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "clap",
  "crypto-trading-apps",
  "crypto-trading-control-plane",

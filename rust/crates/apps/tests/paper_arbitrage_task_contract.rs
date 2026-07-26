@@ -24,13 +24,14 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
-    ExecutionBatch, JsonlHistory, MarketDataBook, MarketDataEvent, MarketDataEventFuture,
-    MarketDataEventSource, MarketDataObservation, MarketFreshnessPolicy, MarketInstrument,
-    MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
-    PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationPhase,
-    ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskRecovery,
-    SpreadHistoryRecord, SpreadHistoryWriter,
+    AccountRiskAuthority, ExecutionBatch, JsonlHistory, MarketDataBook, MarketDataEvent,
+    MarketDataEventFuture, MarketDataEventSource, MarketDataObservation, MarketFreshnessPolicy,
+    MarketInstrument, MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority,
+    PaperAccountConfig, PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof,
+    PaperReservationPhase, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
+    ReadOnlyTaskRecovery, SpreadHistoryRecord, SpreadHistoryWriter,
 };
+use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
 use rust_decimal::Decimal;
 use tokio::sync::{Semaphore, mpsc};
 
@@ -383,6 +384,119 @@ async fn risk_rejection_happens_before_any_reservation() {
             .unwrap()
             .contains("\"decision\":\"paper_account_reserved\"")
     );
+}
+
+fn account_risk_authority(
+    account: &PaperAccountAuthority,
+    history: &JsonlHistory,
+    limits: AccountRiskLimits,
+) -> AccountRiskAuthority {
+    AccountRiskAuthority::new(
+        account.journal_id(),
+        history.clone(),
+        "paper",
+        AccountRiskPolicy::new(limits).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn account_risk_pause_skips_opportunities_without_failing_the_owner() {
+    let (account, history, path) = account("account-risk-paused");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    risk.pause("exchange maintenance", base_time())
+        .await
+        .unwrap();
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-paused", StdDuration::from_secs(1))
+            .with_account_risk(risk.clone()),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    // The paused authority records a durable rejection; the opportunity is
+    // skipped without any reservation and the owner keeps running.
+    wait_until(|| {
+        std::fs::read_to_string(&path)
+            .map(|body| body.contains("\"decision\":\"account_risk_rejected\""))
+            .unwrap_or(false)
+    })
+    .await;
+    drop(left_sender);
+    drop(right_sender);
+    assert_eq!(
+        task.wait().await.unwrap(),
+        ArbitragePaperTaskExit::SourceEnded
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let state = risk.state().await.unwrap();
+    assert_eq!(state.rejected_count, 1);
+    assert_eq!(state.last_rejection.as_deref(), Some("paused"));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_rejected\""));
+    assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
+}
+
+#[tokio::test]
+async fn engaged_kill_switch_stops_the_arbitrage_owner_before_any_entry() {
+    let (account, history, path) = account("account-risk-kill");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    risk.engage_kill_switch("operator drill", base_time())
+        .await
+        .unwrap();
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, _right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-kill", StdDuration::from_secs(1)).with_account_risk(risk),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task.wait().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_directive_exit\""));
+    assert!(body.contains("kill_switch:operator drill"));
 }
 
 #[tokio::test]

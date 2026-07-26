@@ -11,22 +11,24 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use crypto_trading_config::{
-    ArbitrageConfig, GridConfig, GridMode, MonitorConfig, load_arbitrage_config_from_str,
-    load_grid_config_from_str, load_monitor_config_from_str, read_bounded_config,
+    ArbitrageConfig, GridConfig, GridMode, MonitorConfig, load_account_risk_config,
+    load_arbitrage_config_from_str, load_grid_config_from_str, load_monitor_config_from_str,
+    read_bounded_config,
 };
 use crypto_trading_domain::{MarketSnapshot, MarketType, Money, OrderIntent, Price, Symbol};
 use crypto_trading_exchange::PaperExchange;
 use crypto_trading_runtime::{
-    ExchangeRouter, ExecutionBatch, ExecutionClock, ExecutionMode, ExecutionPolicy, IntentExecutor,
-    JsonlHistory, MarketDataBook, MarketDataClock, MarketDataError, MarketDataEvent,
-    MarketDataEventFuture, MarketDataEventSource, MarketDataObservation, MarketFreshnessPolicy,
-    MarketInstrument, MarketUniverse, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
-    RuntimeError,
+    AccountRiskAuthority, ExchangeRouter, ExecutionBatch, ExecutionClock, ExecutionMode,
+    ExecutionPolicy, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataClock,
+    MarketDataError, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
+    MarketDataObservation, MarketFreshnessPolicy, MarketInstrument, MarketUniverse,
+    PaperAccountAuthority, PaperAccountConfig, PaperCostModel, RuntimeError,
 };
 use crypto_trading_strategy::{
-    CapitalProtectionPolicyConfig, GridDirection, GridProtectionGeometry, GridProtectionMachine,
-    GridProtectionPolicies, PriceLockPolicyConfig, ScalpingPolicyConfig, StopLossPolicyConfig,
-    TakeProfitPolicyConfig, VirtualGrid, VirtualGridConfig,
+    AccountRiskLimits, AccountRiskPolicy, CapitalProtectionPolicyConfig, GridDirection,
+    GridProtectionGeometry, GridProtectionMachine, GridProtectionPolicies, PriceLockPolicyConfig,
+    ScalpingPolicyConfig, StopLossPolicyConfig, TakeProfitPolicyConfig, VirtualGrid,
+    VirtualGridConfig,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -46,11 +48,18 @@ const DEFAULT_GRID_INITIAL_AVAILABLE: i64 = 10_000;
 const DEFAULT_ARBITRAGE_INITIAL_AVAILABLE: i64 = 100_000;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 const DEFAULT_GRID_MAX_MARKET_AGE_SECONDS: i64 = 30;
+/// One shared account-risk scope for every configured paper owner: the
+/// authority is deliberately global, mirroring the legacy controller.
+const ACCOUNT_RISK_SCOPE: &str = "paper";
 
 #[derive(Clone, Debug)]
 pub struct PaperProfileCatalogInput {
     pub grid: Option<GridPaperProfileInput>,
     pub arbitrage: Option<ArbitragePaperProfileInput>,
+    /// Optional account-level risk limits shared by every paper owner; when
+    /// absent, every limit stays disabled but durable pause/kill-switch facts
+    /// still gate admissions.
+    pub account_risk_config_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +87,7 @@ pub struct ArbitragePaperProfileInput {
 pub struct PaperProfileCatalog {
     grid: Option<GridPaperProfile>,
     arbitrage: Option<ArbitragePaperProfile>,
+    account_risk_policy: AccountRiskPolicy,
 }
 
 #[derive(Debug)]
@@ -103,9 +113,11 @@ impl PaperProfileCatalog {
     /// Returns an error when a profile is incomplete, internally inconsistent,
     /// or references a config/replay file that cannot be loaded safely.
     pub fn new(input: PaperProfileCatalogInput) -> Result<Self> {
+        let account_risk_policy = load_account_risk_policy(input.account_risk_config_path)?;
         let catalog = Self {
             grid: input.grid.map(load_grid_profile).transpose()?,
             arbitrage: input.arbitrage.map(load_arbitrage_profile).transpose()?,
+            account_risk_policy,
         };
         if matches!(
             (&catalog.grid, &catalog.arbitrage),
@@ -119,6 +131,18 @@ impl PaperProfileCatalog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.grid.is_none() && self.arbitrage.is_none()
+    }
+
+    /// Returns the validated shared account-risk policy for trusted hosts.
+    #[must_use]
+    pub const fn account_risk_policy(&self) -> &AccountRiskPolicy {
+        &self.account_risk_policy
+    }
+
+    /// Stable scope identity for the shared paper account-risk authority.
+    #[must_use]
+    pub const fn account_risk_scope() -> &'static str {
+        ACCOUNT_RISK_SCOPE
     }
 
     #[must_use]
@@ -160,7 +184,7 @@ impl PaperProfileCatalog {
                     return Err(PaperProfileError::StrategyMismatch);
                 }
                 profile
-                    .start(journal_id, history_path)
+                    .start(journal_id, history_path, self.account_risk_policy.clone())
                     .await
                     .map(StartedPaperTask::Grid)
                     .map_err(PaperProfileError::GridStart)
@@ -182,7 +206,7 @@ impl PaperProfileCatalog {
                     return Err(PaperProfileError::StrategyMismatch);
                 }
                 profile
-                    .start(journal_id, history_path)
+                    .start(journal_id, history_path, self.account_risk_policy.clone())
                     .await
                     .map(StartedPaperTask::Arbitrage)
                     .map_err(PaperProfileError::ArbitrageStart)
@@ -205,6 +229,7 @@ impl PaperProfileError {
                     | GridPaperTaskError::RecoveryRequired
                     | GridPaperTaskError::ShutdownTimedOut
                     | GridPaperTaskError::Account(_)
+                    | GridPaperTaskError::AccountRisk(_)
                     | GridPaperTaskError::Source(_)
                     | GridPaperTaskError::Strategy(_)
                     | GridPaperTaskError::Runtime(_)
@@ -222,6 +247,7 @@ impl PaperProfileError {
                     | ArbitragePaperTaskError::RecoveryRequired
                     | ArbitragePaperTaskError::ShutdownTimedOut
                     | ArbitragePaperTaskError::Account(_)
+                    | ArbitragePaperTaskError::AccountRisk(_)
                     | ArbitragePaperTaskError::Source(_)
                     | ArbitragePaperTaskError::SourceContract
                     | ArbitragePaperTaskError::Monitor(_)
@@ -251,6 +277,7 @@ impl GridPaperProfile {
         &self,
         journal_id: Uuid,
         history_path: &Path,
+        account_risk_policy: AccountRiskPolicy,
     ) -> Result<GridPaperTask, GridPaperTaskError> {
         let first_snapshot =
             first_observation(&self.replay_events).ok_or(GridPaperTaskError::InvalidConfig)?;
@@ -300,6 +327,14 @@ impl GridPaperProfile {
         {
             task_config = task_config.with_protection(protection);
         }
+        let account_risk = AccountRiskAuthority::new(
+            journal_id,
+            history.clone(),
+            ACCOUNT_RISK_SCOPE,
+            account_risk_policy,
+        )
+        .map_err(GridPaperTaskError::AccountRisk)?;
+        task_config = task_config.with_account_risk(account_risk);
         GridPaperTask::start(task_config, grid, source, account, history, executor).await
     }
 }
@@ -323,6 +358,7 @@ impl ArbitragePaperProfile {
         &self,
         journal_id: Uuid,
         history_path: &Path,
+        account_risk_policy: AccountRiskPolicy,
     ) -> Result<ArbitragePaperTask, ArbitragePaperTaskError> {
         let first_snapshot =
             first_observation(&self.replay_events).ok_or(ArbitragePaperTaskError::InvalidConfig)?;
@@ -377,6 +413,13 @@ impl ArbitragePaperProfile {
             clock,
             latest,
         });
+        let account_risk = AccountRiskAuthority::new(
+            journal_id,
+            history.clone(),
+            ACCOUNT_RISK_SCOPE,
+            account_risk_policy,
+        )
+        .map_err(ArbitragePaperTaskError::AccountRisk)?;
         ArbitragePaperTask::start(
             ArbitragePaperTaskConfig::new(
                 self.task_id.clone(),
@@ -387,7 +430,8 @@ impl ArbitragePaperProfile {
                 default_cost_model().map_err(ArbitragePaperTaskError::Account)?,
                 crypto_trading_runtime::MarketSupervisorConfig::new(self.shutdown_grace)
                     .map_err(ArbitragePaperTaskError::Source)?,
-            )?,
+            )?
+            .with_account_risk(account_risk),
             monitor,
             left_source,
             right_source,
@@ -609,6 +653,21 @@ impl ArbitragePaperExecutor for ArbitrageReplayExecutor {
             router.register(right_exchange, right);
             router.execute_batch(batch).await
         })
+    }
+}
+
+fn load_account_risk_policy(path: Option<PathBuf>) -> Result<AccountRiskPolicy> {
+    match path {
+        Some(path) => {
+            let config = load_account_risk_config(&path).with_context(|| {
+                format!("failed to load account risk config {}", path.display())
+            })?;
+            AccountRiskPolicy::try_from(&config).with_context(|| {
+                format!("failed to validate account risk config {}", path.display())
+            })
+        }
+        None => AccountRiskPolicy::new(AccountRiskLimits::default())
+            .context("failed to construct the default account risk policy"),
     }
 }
 

@@ -19,14 +19,15 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
-    ExecutionBatch, JsonlHistory, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
-    MarketDataObservation, MarketSupervisorConfig, PaperAccountAuthority, PaperAccountConfig,
-    PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationPhase,
-    ReadOnlyTaskKind, ReadOnlyTaskPhase, RuntimeError,
+    AccountRiskAuthority, ExecutionBatch, JsonlHistory, MarketDataEvent, MarketDataEventFuture,
+    MarketDataEventSource, MarketDataObservation, MarketSupervisorConfig, PaperAccountAuthority,
+    PaperAccountConfig, PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof,
+    PaperReservationPhase, ReadOnlyTaskKind, ReadOnlyTaskPhase, RuntimeError,
 };
 use crypto_trading_strategy::{
-    GridDirection, GridProtectionGeometry, GridProtectionMachine, GridProtectionPolicies,
-    PriceLockPolicyConfig, StopLossPolicyConfig, VirtualGrid, VirtualGridConfig,
+    AccountRiskLimits, AccountRiskPolicy, GridDirection, GridProtectionGeometry,
+    GridProtectionMachine, GridProtectionPolicies, PriceLockPolicyConfig, StopLossPolicyConfig,
+    VirtualGrid, VirtualGridConfig,
 };
 use rust_decimal::Decimal;
 use tokio::sync::Semaphore;
@@ -290,6 +291,96 @@ async fn price_gap_emits_three_independent_single_leg_operations() {
     assert_eq!(durable.phase, ReadOnlyTaskPhase::Stopped);
     assert_eq!(durable.sources.len(), 1);
     assert_eq!(task.status().operation_count, 3);
+}
+
+fn account_risk(
+    account: &PaperAccountAuthority,
+    history: &JsonlHistory,
+    limits: AccountRiskLimits,
+) -> AccountRiskAuthority {
+    AccountRiskAuthority::new(
+        account.journal_id(),
+        history.clone(),
+        "paper",
+        AccountRiskPolicy::new(limits).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn account_risk_rejections_skip_entry_crossings_without_reservations() {
+    let (account, history, path) = account("account-risk-rejects");
+    let risk = account_risk(
+        &account,
+        &history,
+        AccountRiskLimits {
+            disabled_symbols: std::collections::BTreeSet::from(["BTC-USDT".to_owned()]),
+            ..AccountRiskLimits::default()
+        },
+    );
+    let executor = Arc::new(FillExecutor::default());
+    let source = VecSource::new(vec![observation(
+        "97",
+        1,
+        base_time() + Duration::seconds(70),
+    )]);
+    let mut task = GridPaperTask::start(
+        config("grid:risk-reject", StdDuration::from_secs(1)).with_account_risk(risk.clone()),
+        grid(),
+        source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Every entry crossing is refused before any reservation exists; the
+    // owner stays alive and completes when the source ends.
+    assert_eq!(task.wait().await.unwrap(), GridPaperTaskExit::SourceEnded);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(task.status().operation_count, 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let state = risk.state().await.unwrap();
+    assert_eq!(state.rejected_count, 3);
+    assert_eq!(state.last_rejection.as_deref(), Some("symbol_disabled"));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_rejected\""));
+    assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
+}
+
+#[tokio::test]
+async fn engaged_kill_switch_stops_the_grid_owner_before_any_entry() {
+    let (account, history, path) = account("account-risk-kill");
+    let risk = account_risk(&account, &history, AccountRiskLimits::default());
+    risk.engage_kill_switch("operator drill", base_time())
+        .await
+        .unwrap();
+    let executor = Arc::new(FillExecutor::default());
+    let source = VecSource::new(vec![observation(
+        "97",
+        1,
+        base_time() + Duration::seconds(70),
+    )]);
+    let mut task = GridPaperTask::start(
+        config("grid:risk-kill", StdDuration::from_secs(1)).with_account_risk(risk),
+        grid(),
+        source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    // The close-all directive is consumed like a protection exit: one durable
+    // fact, a clean stop, and no execution.
+    assert_eq!(task.wait().await.unwrap(), GridPaperTaskExit::StopRequested);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_directive_exit\""));
+    assert!(body.contains("kill_switch:operator drill"));
 }
 
 #[tokio::test]

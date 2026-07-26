@@ -109,6 +109,12 @@ pub struct PaperWriteArgs {
     /// Optional shutdown grace override for the configured paper arbitrage owner.
     #[arg(long, value_name = "MILLISECONDS")]
     pub paper_arbitrage_shutdown_grace_ms: Option<u64>,
+
+    /// Optional bounded YAML account-level risk limits shared by every
+    /// configured paper owner; absent limits stay disabled while durable
+    /// pause/kill-switch facts still gate admissions.
+    #[arg(long, value_name = "PATH")]
+    pub paper_account_risk_config: Option<PathBuf>,
 }
 
 struct WriteModeConfig {
@@ -364,6 +370,7 @@ fn write_mode_config(cli: &Cli) -> Result<Option<WriteModeConfig>> {
     let catalog = PaperProfileCatalog::new(PaperProfileCatalogInput {
         grid: grid_profile_input(&cli.paper_write)?,
         arbitrage: arbitrage_profile_input(&cli.paper_write)?,
+        account_risk_config_path: cli.paper_write.paper_account_risk_config.clone(),
     })
     .context("failed to construct the replay-backed paper profile catalog")?;
     if catalog.is_empty() {

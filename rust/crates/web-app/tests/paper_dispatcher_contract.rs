@@ -345,6 +345,7 @@ fn catalog_from_replays(
             shutdown_grace: StdDuration::from_secs(1),
         }),
         arbitrage,
+        account_risk_config_path: None,
     })
     .unwrap()
 }
@@ -507,6 +508,69 @@ async fn exact_profile_match_and_unknown_tasks_fail_closed() {
     )
     .await;
     assert_eq!(stop_unknown["status"], "rejected");
+
+    drop(fixture.listener);
+}
+
+#[tokio::test]
+async fn account_risk_pause_resume_and_kill_switch_are_durable_trusted_commands() {
+    let fixture = application("account-risk", catalog("account-risk", false), None).await;
+
+    let paused = submit(
+        &fixture.router,
+        &mutation(
+            Uuid::new_v4(),
+            "risk-pause-1",
+            "paper-account-risk",
+            SubmitCommand::PauseAccountRisk {
+                reason: "exchange maintenance".to_owned(),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(paused["status"], "applied");
+
+    let resumed = submit(
+        &fixture.router,
+        &mutation(
+            Uuid::new_v4(),
+            "risk-resume-1",
+            "paper-account-risk",
+            SubmitCommand::ResumeAccountRisk,
+        ),
+    )
+    .await;
+    assert_eq!(resumed["status"], "applied");
+
+    let kill = SubmitEnvelope::new(
+        Uuid::new_v4(),
+        "risk-kill-1",
+        "paper-account-risk",
+        SubmitPermission::new(PRINCIPAL, SubmitRole::PaperOperator).unwrap(),
+        SubmitRiskConfirmation::AccountKillSwitchArmed,
+        SubmitCommand::EngageAccountKillSwitch {
+            reason: "operator drill".to_owned(),
+        },
+    )
+    .unwrap();
+    let engaged = submit(&fixture.router, &kill).await;
+    assert_eq!(engaged["status"], "applied");
+
+    // The durable projection reflects the resumed pause and the latching
+    // kill switch through the read-only risk endpoint.
+    let response = fixture
+        .router
+        .clone()
+        .oneshot(request("GET", "/api/v1/risk", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let risk = response_json(response).await;
+    let scope = &risk["account_risk"]["scopes"][0];
+    assert_eq!(scope["scope_id"], "paper");
+    assert_eq!(scope["paused"], false);
+    assert_eq!(scope["kill_switch_engaged"], true);
+    assert_eq!(scope["kill_switch_reason"], "operator drill");
 
     drop(fixture.listener);
 }

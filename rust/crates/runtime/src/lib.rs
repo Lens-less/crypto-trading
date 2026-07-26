@@ -1,5 +1,6 @@
 //! Supervised runtime and process-local synchronized decision history.
 
+mod account_risk;
 mod alert_read_model;
 mod capability;
 mod execution;
@@ -18,6 +19,12 @@ mod spread_history;
 mod spread_history_read_model;
 mod task_read_model;
 
+pub use account_risk::{
+    ACCOUNT_RISK_SCHEMA_VERSION, AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate,
+    AccountRiskDirective, AccountRiskError, AccountRiskOpenPositionView,
+    AccountRiskProjectionError, AccountRiskReadModel, AccountRiskStateView,
+    MAX_ACCOUNT_RISK_SCOPE_POSITIONS, MAX_ACCOUNT_RISK_SCOPES,
+};
 pub use alert_read_model::{
     AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
     AlertOccurrenceView, MAX_ALERT_READ_MODEL_OCCURRENCES, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,

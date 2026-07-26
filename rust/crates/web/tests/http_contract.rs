@@ -396,14 +396,19 @@ async fn risk_endpoint_exposes_paper_reservations_and_account_exposure_read_only
     assert_eq!(response.status(), StatusCode::OK);
     assert_security_headers(&response);
     let risk = response_json(response).await;
-    assert_eq!(risk["projection_status"], "complete");
-    assert_eq!(risk["accounts"][0]["account_id"], "paper-main");
-    assert_eq!(risk["accounts"][0]["available"], "899.70");
-    assert_eq!(risk["accounts"][0]["pending_reserved"], "100.30");
+    assert_eq!(risk["schema_version"], 1);
+    let accounts = &risk["paper_accounts"];
+    assert_eq!(accounts["projection_status"], "complete");
+    assert_eq!(accounts["accounts"][0]["account_id"], "paper-main");
+    assert_eq!(accounts["accounts"][0]["available"], "899.70");
+    assert_eq!(accounts["accounts"][0]["pending_reserved"], "100.30");
     assert_eq!(
-        risk["accounts"][0]["reservations"][0]["reservation_id"],
+        accounts["accounts"][0]["reservations"][0]["reservation_id"],
         reservation_id.to_string()
     );
+    // Without account-risk facts the projection is present and empty.
+    assert_eq!(risk["account_risk"]["projection_status"], "complete");
+    assert_eq!(risk["account_risk"]["scopes"], json!([]));
 
     let write = app
         .oneshot(
@@ -416,6 +421,78 @@ async fn risk_endpoint_exposes_paper_reservations_and_account_exposure_read_only
         .await
         .unwrap();
     assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn risk_endpoint_projects_durable_account_risk_state() {
+    let journal_id = fixed_uuid(1);
+    let bytes = jsonl(&[
+        json!({
+            "timestamp": "2026-07-25T00:01:00Z",
+            "strategy": "account_risk",
+            "symbol": "paper",
+            "decision": "account_risk_admitted",
+            "details": {
+                "kind": "admitted",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "task_id": "paper-grid-btc",
+                "symbol": "BTC-USDT",
+                "notional": "100",
+                "utc_date": "2026-07-25",
+                "recorded_at": "2026-07-25T00:01:00Z",
+                "warnings": ["low_balance"]
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:02:00Z",
+            "strategy": "account_risk",
+            "symbol": "paper",
+            "decision": "account_risk_paused",
+            "details": {
+                "kind": "paused",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "reason": "exchange maintenance",
+                "recorded_at": "2026-07-25T00:02:00Z"
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:03:00Z",
+            "strategy": "account_risk",
+            "symbol": "paper",
+            "decision": "account_risk_kill_switch_engaged",
+            "details": {
+                "kind": "kill_switch_engaged",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "reason": "operator drill",
+                "recorded_at": "2026-07-25T00:03:00Z"
+            }
+        }),
+    ]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.oneshot(get("/api/v1/risk")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let risk = response_json(response).await;
+    // The durable account-level risk state is projected alongside exposure:
+    // pause and kill-switch facts, UTC-day counts, and open position clocks.
+    let account_risk = &risk["account_risk"];
+    assert_eq!(account_risk["projection_status"], "complete");
+    let scope = &account_risk["scopes"][0];
+    assert_eq!(scope["scope_id"], "paper");
+    assert_eq!(scope["paused"], true);
+    assert_eq!(scope["pause_reason"], "exchange maintenance");
+    assert_eq!(scope["kill_switch_engaged"], true);
+    assert_eq!(scope["kill_switch_reason"], "operator drill");
+    assert_eq!(scope["trade_date_utc"], "2026-07-25");
+    assert_eq!(scope["daily_trade_count"], 1);
+    assert_eq!(scope["admitted_count"], 1);
+    assert_eq!(scope["open_positions"][0]["task_id"], "paper-grid-btc");
 }
 
 #[tokio::test]

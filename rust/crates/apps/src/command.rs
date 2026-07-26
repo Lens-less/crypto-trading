@@ -227,11 +227,65 @@ struct TrustedHttpResponse {
     body: Vec<u8>,
 }
 
+/// Exact operator acknowledgement required to engage the latching account
+/// kill switch through the CLI. Any other phrase fails closed locally.
+pub const ACCOUNT_KILL_SWITCH_ACKNOWLEDGEMENT: &str =
+    "I ACKNOWLEDGE THE LATCHING ACCOUNT KILL SWITCH";
+
 async fn run_paper(command: PaperCommand) -> Result<()> {
     match command {
         PaperCommand::Grid(args) => run_paper_task(PaperTaskKind::Grid, args).await,
         PaperCommand::Arbitrage(args) => run_paper_task(PaperTaskKind::Arbitrage, args).await,
+        PaperCommand::Risk(args) => run_paper_risk(args).await,
     }
+}
+
+async fn run_paper_risk(args: crate::cli::PaperRiskArgs) -> Result<()> {
+    use crate::cli::PaperRiskOperation;
+    let (operation, command, confirmation, mutation) = match args.operation {
+        PaperRiskOperation::Pause(args) => (
+            "risk-pause",
+            SubmitCommand::PauseAccountRisk {
+                reason: args.reason,
+            },
+            SubmitRiskConfirmation::PaperOnly,
+            args.mutation,
+        ),
+        PaperRiskOperation::Resume(mutation) => (
+            "risk-resume",
+            SubmitCommand::ResumeAccountRisk,
+            SubmitRiskConfirmation::PaperOnly,
+            mutation,
+        ),
+        PaperRiskOperation::KillSwitch(args) => {
+            if args.acknowledge != ACCOUNT_KILL_SWITCH_ACKNOWLEDGEMENT {
+                bail!(
+                    "account kill switch requires the exact acknowledgement phrase: {ACCOUNT_KILL_SWITCH_ACKNOWLEDGEMENT:?}"
+                );
+            }
+            (
+                "risk-kill-switch",
+                SubmitCommand::EngageAccountKillSwitch {
+                    reason: args.reason,
+                },
+                SubmitRiskConfirmation::AccountKillSwitchArmed,
+                args.mutation,
+            )
+        }
+    };
+    let permission =
+        SubmitPermission::new(mutation.principal_id.clone(), SubmitRole::PaperOperator)
+            .context("invalid paper trusted-submit principal")?;
+    let envelope = SubmitEnvelope::new(
+        mutation.command_id,
+        mutation.idempotency_key.clone(),
+        mutation.task_id.clone(),
+        permission,
+        confirmation,
+        command,
+    )
+    .context("invalid trusted submit envelope")?;
+    submit_paper_envelope("risk", operation, &mutation.control, envelope).await
 }
 
 async fn run_paper_task(kind: PaperTaskKind, args: PaperTaskArgs) -> Result<()> {
@@ -291,6 +345,15 @@ async fn submit_paper_command(
     control: &crate::cli::TrustedControlArgs,
     envelope: SubmitEnvelope,
 ) -> Result<()> {
+    submit_paper_envelope(kind.label(), operation, control, envelope).await
+}
+
+async fn submit_paper_envelope(
+    label: &'static str,
+    operation: &str,
+    control: &crate::cli::TrustedControlArgs,
+    envelope: SubmitEnvelope,
+) -> Result<()> {
     let control = trusted_control_context(control.control_addr, &control.token_env_var)?;
     let body =
         serde_json::to_vec(&envelope).context("failed to serialize trusted submit envelope")?;
@@ -310,18 +373,14 @@ async fn submit_paper_command(
         200 | 202 | 422 => {
             let receipt: SubmitReceipt = serde_json::from_slice(&response.body)
                 .context("trusted submit response did not match SubmitReceipt")?;
-            render_submit_receipt(kind, operation, &receipt);
+            render_submit_receipt(label, operation, &receipt);
             match receipt.status() {
                 SubmitStatus::Applied => Ok(()),
-                SubmitStatus::Rejected => bail!(
-                    "{} paper {} rejected by trusted submit",
-                    kind.label(),
-                    operation
-                ),
+                SubmitStatus::Rejected => {
+                    bail!("{label} paper {operation} rejected by trusted submit")
+                }
                 SubmitStatus::OutcomeUnknown => bail!(
-                    "{} paper {} returned outcome_unknown and is not confirmed applied",
-                    kind.label(),
-                    operation
+                    "{label} paper {operation} returned outcome_unknown and is not confirmed applied"
                 ),
             }
         }
@@ -584,10 +643,10 @@ fn parse_trusted_http_response(response: &[u8]) -> Result<TrustedHttpResponse> {
     })
 }
 
-fn render_submit_receipt(kind: PaperTaskKind, operation: &str, receipt: &SubmitReceipt) {
+fn render_submit_receipt(label: &'static str, operation: &str, receipt: &SubmitReceipt) {
     println!(
         "paper={}\noperation={}\ncommand_id={}\ntask_id={}\nstatus={}\njournal_projection={}\nsource={}",
-        kind.label(),
+        label,
         operation,
         receipt.command_id(),
         receipt.target_task_id(),

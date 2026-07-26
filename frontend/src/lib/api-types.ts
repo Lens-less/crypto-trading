@@ -689,6 +689,87 @@ export const paperAccountReadModelSchema = z.looseObject({
   ),
 });
 
+/** 一条 open position 时钟(runtime::AccountRiskOpenPositionView)。 */
+export interface AccountRiskOpenPositionView {
+  task_id: string;
+  symbol: string;
+  opened_at: string;
+}
+
+/**
+ * 每个 scope 的持久账户风控状态(runtime::AccountRiskStateView)。
+ * kill_switch_engaged 是闩锁事实:一旦为 true,读侧永不呈现「可解除」。
+ */
+export interface AccountRiskStateView {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  scope_id: string;
+  paused: boolean;
+  pause_reason: string | null;
+  kill_switch_engaged: boolean;
+  kill_switch_reason: string | null;
+  /** daily_trade_count 所属的 UTC 交易日(YYYY-MM-DD)。 */
+  trade_date_utc: string | null;
+  daily_trade_count: number;
+  open_positions: AccountRiskOpenPositionView[];
+  admitted_count: number;
+  rejected_count: number;
+  last_rejection: string | null;
+  last_recorded_at: string | null;
+}
+
+export interface AccountRiskReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  projection_status: ProjectionStatus;
+  invalid_event_count: number;
+  scopes: AccountRiskStateView[];
+}
+
+export const accountRiskReadModelSchema = z.looseObject({
+  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+  journal_id: z.string(),
+  projection_status: z.enum(["complete", "windowed", "degraded"]),
+  invalid_event_count: z.number(),
+  scopes: z.array(
+    z.looseObject({
+      scope_id: z.string(),
+      paused: z.boolean(),
+      pause_reason: z.string().nullable(),
+      kill_switch_engaged: z.boolean(),
+      kill_switch_reason: z.string().nullable(),
+      trade_date_utc: z.string().nullable(),
+      daily_trade_count: z.number(),
+      open_positions: z.array(
+        z.looseObject({
+          task_id: z.string(),
+          symbol: z.string(),
+          opened_at: z.string(),
+        }),
+      ),
+      admitted_count: z.number(),
+      rejected_count: z.number(),
+      last_rejection: z.string().nullable(),
+      last_recorded_at: z.string().nullable(),
+    }),
+  ),
+});
+
+/**
+ * GET /api/v1/risk 组合响应(web::RiskResponse):journal-backed paper
+ * 账户敞口 + 持久账户级风控状态(pause / kill switch / UTC 日计数)。
+ */
+export interface RiskResponse {
+  schema_version: typeof API_SCHEMA_VERSION;
+  paper_accounts: PaperAccountReadModel;
+  account_risk: AccountRiskReadModel;
+}
+
+export const riskResponseSchema = z.looseObject({
+  schema_version: z.literal(API_SCHEMA_VERSION),
+  paper_accounts: paperAccountReadModelSchema,
+  account_risk: accountRiskReadModelSchema,
+});
+
 /* ----------------------------------------------------- GET /api/v1/settings */
 
 export const SETTINGS_SCHEMA_VERSION = 1;

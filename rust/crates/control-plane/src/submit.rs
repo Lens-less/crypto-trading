@@ -203,6 +203,10 @@ pub enum SubmitRole {
 pub enum SubmitRiskConfirmation {
     PaperOnly,
     ReconciliationEvidenceVerified,
+    /// Dedicated stronger confirmation for the latching account kill switch:
+    /// the caller explicitly acknowledges that every later admission is
+    /// refused and open paper positions must be closed.
+    AccountKillSwitchArmed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +228,13 @@ pub enum SubmitCommand {
     RecordReconcileFailure {
         proof: PaperReconciliationProof,
     },
+    PauseAccountRisk {
+        reason: String,
+    },
+    ResumeAccountRisk,
+    EngageAccountKillSwitch {
+        reason: String,
+    },
 }
 
 impl SubmitCommand {
@@ -240,9 +251,12 @@ impl SubmitCommand {
                 validate_identity(strategy_id, "strategy id")?;
                 validate_identity(strategy_revision, "strategy revision")
             }
-            Self::StopTask | Self::CancelTask => Ok(()),
+            Self::StopTask | Self::CancelTask | Self::ResumeAccountRisk => Ok(()),
             Self::ReconcileRelease { proof } | Self::RecordReconcileFailure { proof } => {
                 validate_reconciliation_proof(proof)
+            }
+            Self::PauseAccountRisk { reason } | Self::EngageAccountKillSwitch { reason } => {
+                validate_identity(reason, "risk reason")
             }
         }
     }
@@ -252,7 +266,10 @@ impl SubmitCommand {
             Self::StartPaperArbitrage { .. }
             | Self::StartPaperGrid { .. }
             | Self::StopTask
-            | Self::CancelTask => SubmitRole::PaperOperator,
+            | Self::CancelTask
+            | Self::PauseAccountRisk { .. }
+            | Self::ResumeAccountRisk
+            | Self::EngageAccountKillSwitch { .. } => SubmitRole::PaperOperator,
             Self::ReconcileRelease { .. } | Self::RecordReconcileFailure { .. } => {
                 SubmitRole::Reconciler
             }
@@ -264,10 +281,13 @@ impl SubmitCommand {
             Self::StartPaperArbitrage { .. }
             | Self::StartPaperGrid { .. }
             | Self::StopTask
-            | Self::CancelTask => SubmitRiskConfirmation::PaperOnly,
+            | Self::CancelTask
+            | Self::PauseAccountRisk { .. }
+            | Self::ResumeAccountRisk => SubmitRiskConfirmation::PaperOnly,
             Self::ReconcileRelease { .. } | Self::RecordReconcileFailure { .. } => {
                 SubmitRiskConfirmation::ReconciliationEvidenceVerified
             }
+            Self::EngageAccountKillSwitch { .. } => SubmitRiskConfirmation::AccountKillSwitchArmed,
         }
     }
 }

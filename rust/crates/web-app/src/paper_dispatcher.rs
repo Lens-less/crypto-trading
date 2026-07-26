@@ -1,5 +1,6 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
 
+use chrono::Utc;
 use crypto_trading_cli::{
     ArbitragePaperTaskError, GridPaperTaskError, PaperProfileCatalog, PaperProfileError,
     StartedPaperTask,
@@ -7,6 +8,7 @@ use crypto_trading_cli::{
 use crypto_trading_control_plane::{
     SubmitCommand, SubmitDispatchFuture, SubmitDispatchOutcome, SubmitDispatcher, SubmitEnvelope,
 };
+use crypto_trading_runtime::{AccountRiskAuthority, AccountRiskError, JsonlHistory};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -16,17 +18,27 @@ pub struct TrustedPaperSubmitDispatcher {
     history_path: Arc<PathBuf>,
     catalog: Arc<PaperProfileCatalog>,
     registry: Arc<PaperTaskRegistry>,
+    account_risk: Option<Arc<AccountRiskAuthority>>,
 }
 
 impl TrustedPaperSubmitDispatcher {
     #[must_use]
     pub fn new(journal_id: Uuid, history_path: PathBuf, catalog: PaperProfileCatalog) -> Self {
         let registry = PaperTaskRegistry::new(catalog.task_ids());
+        let account_risk = AccountRiskAuthority::new(
+            journal_id,
+            JsonlHistory::new(&history_path),
+            PaperProfileCatalog::account_risk_scope(),
+            catalog.account_risk_policy().clone(),
+        )
+        .ok()
+        .map(Arc::new);
         Self {
             journal_id,
             history_path: Arc::new(history_path),
             catalog: Arc::new(catalog),
             registry: Arc::new(registry),
+            account_risk,
         }
     }
 
@@ -45,8 +57,50 @@ impl TrustedPaperSubmitDispatcher {
                     .control(envelope.target_task_id(), TaskControl::Cancel)
                     .await
             }
+            SubmitCommand::PauseAccountRisk { reason } => {
+                let reason = reason.clone();
+                self.dispatch_account_risk(move |authority| async move {
+                    authority.pause(&reason, Utc::now()).await.map(|_| ())
+                })
+                .await
+            }
+            SubmitCommand::ResumeAccountRisk => {
+                self.dispatch_account_risk(|authority| async move {
+                    authority.resume(Utc::now()).await.map(|_| ())
+                })
+                .await
+            }
+            SubmitCommand::EngageAccountKillSwitch { reason } => {
+                let reason = reason.clone();
+                self.dispatch_account_risk(move |authority| async move {
+                    authority
+                        .engage_kill_switch(&reason, Utc::now())
+                        .await
+                        .map(|_| ())
+                })
+                .await
+            }
             SubmitCommand::ReconcileRelease { .. }
             | SubmitCommand::RecordReconcileFailure { .. } => SubmitDispatchOutcome::Rejected,
+        }
+    }
+
+    async fn dispatch_account_risk<F, Fut>(&self, action: F) -> SubmitDispatchOutcome
+    where
+        F: FnOnce(Arc<AccountRiskAuthority>) -> Fut,
+        Fut: Future<Output = Result<(), AccountRiskError>>,
+    {
+        let Some(authority) = self.account_risk.clone() else {
+            return SubmitDispatchOutcome::Rejected;
+        };
+        match action(authority).await {
+            Ok(()) => SubmitDispatchOutcome::Applied,
+            Err(
+                AccountRiskError::InvalidConfig(_)
+                | AccountRiskError::InvalidRequest(_)
+                | AccountRiskError::DegradedState,
+            ) => SubmitDispatchOutcome::Rejected,
+            Err(_) => SubmitDispatchOutcome::OutcomeUnknown,
         }
     }
 
@@ -284,6 +338,7 @@ fn map_grid_control_error(error: &GridPaperTaskError) -> SubmitDispatchOutcome {
         | GridPaperTaskError::RecoveryRequired
         | GridPaperTaskError::ShutdownTimedOut
         | GridPaperTaskError::Account(_)
+        | GridPaperTaskError::AccountRisk(_)
         | GridPaperTaskError::Source(_)
         | GridPaperTaskError::Strategy(_)
         | GridPaperTaskError::Runtime(_)
@@ -308,6 +363,7 @@ fn map_arbitrage_control_error(error: &ArbitragePaperTaskError) -> SubmitDispatc
         | ArbitragePaperTaskError::RecoveryRequired
         | ArbitragePaperTaskError::ShutdownTimedOut
         | ArbitragePaperTaskError::Account(_)
+        | ArbitragePaperTaskError::AccountRisk(_)
         | ArbitragePaperTaskError::Source(_)
         | ArbitragePaperTaskError::SourceContract
         | ArbitragePaperTaskError::Monitor(_)

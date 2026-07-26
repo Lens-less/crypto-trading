@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use crypto_trading_runtime::{
-    CapabilityError, CursorError, JournalPage, JournalPageBoundary, JournalReadError,
-    JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope,
+    AccountRiskProjectionError, CapabilityError, CursorError, JournalPage, JournalPageBoundary,
+    JournalReadError, JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope,
     PaperAccountProjectionError, ReadModelError, current_capability_manifest,
 };
 use serde::{Deserialize, Serialize};
@@ -30,12 +30,13 @@ pub use submit::{
 };
 
 pub use crypto_trading_runtime::{
-    AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
-    AlertOccurrenceView, ArbitrageMonitorProjection, ArbitrageMonitorReadModel,
-    ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState, MonitorContinuityState,
-    MonitorFreshnessState, MonitorLegView, MonitorProjectionState, OperatorReadModel,
-    PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PaperAccountReadModel,
-    PaperAccountSnapshot, PriceAlertReadModel, ProjectionStatus,
+    ACCOUNT_RISK_SCHEMA_VERSION, AccountRiskOpenPositionView, AccountRiskReadModel,
+    AccountRiskStateView, AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView,
+    AlertOccurrenceKind, AlertOccurrenceView, ArbitrageMonitorProjection,
+    ArbitrageMonitorReadModel, ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState,
+    MonitorContinuityState, MonitorFreshnessState, MonitorLegView, MonitorProjectionState,
+    OperatorReadModel, PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
+    PaperAccountReadModel, PaperAccountSnapshot, PriceAlertReadModel, ProjectionStatus,
     READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit, ReadOnlyTaskFailure,
     ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
     ReadOnlyTaskSourceExit, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
@@ -45,7 +46,7 @@ pub use crypto_trading_runtime::{
     VirtualGridScannerReadModel,
 };
 
-pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
 
 /// Stable transport-independent classification for safe public error mapping.
@@ -108,6 +109,7 @@ impl ReadControlPlane {
         let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)?;
         let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)?;
         let paper_accounts = PaperAccountReadModel::from_legacy_snapshot(&journal)?;
+        let account_risk = AccountRiskReadModel::from_legacy_snapshot(&journal)?;
         Ok(ControlPlaneSnapshot {
             schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
             capabilities: self.capabilities.clone(),
@@ -117,6 +119,7 @@ impl ReadControlPlane {
             tasks,
             scanner,
             paper_accounts,
+            account_risk,
         })
     }
 
@@ -186,6 +189,8 @@ impl ReadControlPlane {
             .map_err(ControlPlaneReadError::Projection)?;
         let paper_accounts = PaperAccountReadModel::from_legacy_snapshot(&journal)
             .map_err(ControlPlaneReadError::PaperAccountProjection)?;
+        let account_risk = AccountRiskReadModel::from_legacy_snapshot(&journal)
+            .map_err(ControlPlaneReadError::AccountRiskProjection)?;
         Ok(ControlPlaneRead {
             snapshot: ControlPlaneSnapshot {
                 schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
@@ -196,6 +201,7 @@ impl ReadControlPlane {
                 tasks,
                 scanner,
                 paper_accounts,
+                account_risk,
             },
             events: control_plane_events_page(&page),
         })
@@ -235,6 +241,7 @@ pub struct ControlPlaneSnapshot {
     pub tasks: ReadOnlyTaskReadModel,
     pub scanner: VirtualGridScannerReadModel,
     pub paper_accounts: PaperAccountReadModel,
+    pub account_risk: AccountRiskReadModel,
 }
 
 /// Payload-free notification that tells an adapter which snapshot fact changed.
@@ -298,6 +305,8 @@ pub enum ControlPlaneSnapshotError {
     Projection(#[from] ReadModelError),
     #[error(transparent)]
     PaperAccountProjection(#[from] PaperAccountProjectionError),
+    #[error(transparent)]
+    AccountRiskProjection(#[from] AccountRiskProjectionError),
 }
 
 impl ControlPlaneSnapshotError {
@@ -306,18 +315,26 @@ impl ControlPlaneSnapshotError {
         match self {
             Self::Journal(source)
             | Self::Projection(ReadModelError::Journal(source))
-            | Self::PaperAccountProjection(PaperAccountProjectionError::Journal(source)) => {
+            | Self::PaperAccountProjection(PaperAccountProjectionError::Journal(source))
+            | Self::AccountRiskProjection(AccountRiskProjectionError::Journal(source)) => {
                 journal_failure_kind(source)
             }
             Self::Projection(
                 ReadModelError::BatchLimitExceeded { .. }
                 | ReadModelError::TaskLimitExceeded { .. },
+            )
+            | Self::AccountRiskProjection(
+                AccountRiskProjectionError::ScopeLimitExceeded { .. }
+                | AccountRiskProjectionError::OpenPositionLimitExceeded { .. },
             ) => ReadFailureKind::ResourceLimit,
             Self::Projection(ReadModelError::NonAdvancingPage)
             | Self::PaperAccountProjection(
                 PaperAccountProjectionError::NonAdvancingPage
                 | PaperAccountProjectionError::ArithmeticOverflow,
-            ) => ReadFailureKind::InvalidJournal,
+            )
+            | Self::AccountRiskProjection(AccountRiskProjectionError::NonAdvancingPage) => {
+                ReadFailureKind::InvalidJournal
+            }
         }
     }
 }
@@ -350,6 +367,8 @@ pub enum ControlPlaneReadError {
     Projection(ReadModelError),
     #[error(transparent)]
     PaperAccountProjection(PaperAccountProjectionError),
+    #[error(transparent)]
+    AccountRiskProjection(AccountRiskProjectionError),
 }
 
 impl ControlPlaneReadError {
@@ -359,18 +378,26 @@ impl ControlPlaneReadError {
             Self::Cursor(source) => cursor_failure_kind(source),
             Self::Journal(source)
             | Self::Projection(ReadModelError::Journal(source))
-            | Self::PaperAccountProjection(PaperAccountProjectionError::Journal(source)) => {
+            | Self::PaperAccountProjection(PaperAccountProjectionError::Journal(source))
+            | Self::AccountRiskProjection(AccountRiskProjectionError::Journal(source)) => {
                 journal_failure_kind(source)
             }
             Self::Projection(
                 ReadModelError::BatchLimitExceeded { .. }
                 | ReadModelError::TaskLimitExceeded { .. },
+            )
+            | Self::AccountRiskProjection(
+                AccountRiskProjectionError::ScopeLimitExceeded { .. }
+                | AccountRiskProjectionError::OpenPositionLimitExceeded { .. },
             ) => ReadFailureKind::ResourceLimit,
             Self::Projection(ReadModelError::NonAdvancingPage)
             | Self::PaperAccountProjection(
                 PaperAccountProjectionError::NonAdvancingPage
                 | PaperAccountProjectionError::ArithmeticOverflow,
-            ) => ReadFailureKind::InvalidJournal,
+            )
+            | Self::AccountRiskProjection(AccountRiskProjectionError::NonAdvancingPage) => {
+                ReadFailureKind::InvalidJournal
+            }
         }
     }
 }

@@ -14,14 +14,15 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
-    DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError, JournalReadError,
-    JournalSnapshot, JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION,
-    MarketDataEvent, MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig,
-    MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
-    MarketSupervisorStatus, PaperAccountAuthority, PaperAccountError, PaperCostModel,
-    PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
-    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskDirective,
+    AccountRiskError, DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError,
+    JournalReadError, JournalSnapshot, JournalSnapshotSource, JsonlHistory,
+    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent, MarketDataEventSource,
+    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
+    MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus, PaperAccountAuthority,
+    PaperAccountError, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
+    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
+    ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     GridDirective, GridFill, GridProtectionMachine, GridProtectionObservation,
@@ -71,6 +72,7 @@ pub struct GridPaperTaskConfig {
     cost_model: PaperCostModel,
     supervisor: MarketSupervisorConfig,
     protection: Option<GridProtectionMachine>,
+    account_risk: Option<AccountRiskAuthority>,
 }
 
 impl GridPaperTaskConfig {
@@ -111,6 +113,7 @@ impl GridPaperTaskConfig {
             cost_model,
             supervisor,
             protection: None,
+            account_risk: None,
         })
     }
 
@@ -120,6 +123,15 @@ impl GridPaperTaskConfig {
     #[must_use]
     pub fn with_protection(mut self, protection: GridProtectionMachine) -> Self {
         self.protection = Some(protection);
+        self
+    }
+
+    /// Attaches the durable account-level risk authority. Entry-side
+    /// operations must pass its admission before any reservation is created;
+    /// its close directives are consumed like grid-protection exits.
+    #[must_use]
+    pub fn with_account_risk(mut self, account_risk: AccountRiskAuthority) -> Self {
+        self.account_risk = Some(account_risk);
         self
     }
 
@@ -566,6 +578,48 @@ async fn run_owner(
                         .await;
                     }
                 };
+                // Durable account-risk close directives run first: a kill
+                // switch, a critically low balance, or an expired position
+                // clock stops the owner exactly like a protection exit.
+                if let Some(risk) = config.account_risk.as_ref()
+                    && let Some((price, observed_at)) = observed
+                {
+                    match account_risk_exit(
+                        risk,
+                        &config,
+                        &grid,
+                        &history,
+                        price,
+                        observed_at,
+                        &mut last_recorded_at,
+                    )
+                    .await
+                    {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return stop_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskExit::StopRequested,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            let failure = error.failure_bucket();
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 // Protection arbitration runs before crossings are consumed so
                 // a frozen or resetting grid never silently consumes levels.
                 let directive = if let Some((price, observed_at)) = observed {
@@ -856,6 +910,35 @@ async fn run_owner(
                         )
                         .await;
                     }
+                    // Entry-side crossings pass the account-level admission
+                    // before any reservation exists; a durable rejection
+                    // skips the crossing and keeps the owner alive.
+                    if let Some(risk) = config.account_risk.as_ref()
+                        && matches!(cross.side, GridFill::Buy)
+                    {
+                        let observed_at = observed.map_or_else(Utc::now, |(_, at)| at);
+                        match admit_grid_entry(risk, &config, &grid, &cross, observed_at).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                completed_cross_count += 1;
+                                continue;
+                            }
+                            Err(error) => {
+                                let failure = error.failure_bucket();
+                                next.operation_count = operation_sequence;
+                                status_sender.send_replace(next);
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     operation_sequence = operation_sequence
                         .checked_add(1)
                         .ok_or(GridPaperTaskError::InvalidRequest)?;
@@ -920,6 +1003,30 @@ async fn run_owner(
                         GridPaperTaskError::RecoveryRequired,
                     )
                     .await;
+                }
+
+                // A flat virtual position closes the owner-level risk clock.
+                if let Some(risk) = config.account_risk.as_ref()
+                    && cross_count > 0
+                    && grid.buy_crosses() == grid.sell_crosses()
+                {
+                    let closed_at = observed.map_or_else(Utc::now, |(_, at)| at);
+                    if let Err(error) = risk
+                        .record_position_closed(&config.task_id, closed_at)
+                        .await
+                    {
+                        next.operation_count = operation_sequence;
+                        status_sender.send_replace(next);
+                        return fail_owner(
+                            &mut source,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            GridPaperTaskFailure::AccountContract,
+                            GridPaperTaskError::AccountRisk(error),
+                        )
+                        .await;
+                    }
                 }
 
                 let recorded_at = Utc::now().max(last_recorded_at);
@@ -1068,6 +1175,110 @@ fn observation_view(
         }
         MarketDataEvent::SourceGap { .. } | MarketDataEvent::SourceUnavailable { .. } => Ok(None),
     }
+}
+
+/// Evaluates durable account-risk close directives at the observed instant.
+/// A demanded closure journals one bounded `account_risk` directive fact and
+/// reports `true`, so the owner stops exactly like a protection exit.
+#[allow(clippy::too_many_arguments)]
+async fn account_risk_exit(
+    risk: &AccountRiskAuthority,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    history: &JsonlHistory,
+    price: Price,
+    observed_at: DateTime<Utc>,
+    last_recorded_at: &mut DateTime<Utc>,
+) -> Result<bool, GridPaperTaskError> {
+    let directives = risk
+        .directives(observed_at)
+        .await
+        .map_err(GridPaperTaskError::AccountRisk)?;
+    let Some(reason) = account_risk_exit_reason(&directives, &config.task_id) else {
+        return Ok(false);
+    };
+    let recorded_at = Utc::now().max(*last_recorded_at);
+    history
+        .append(&account_risk_directive_record(
+            &config.task_id,
+            "grid_paper",
+            grid.config().symbol.as_str(),
+            &reason,
+            &price.to_string(),
+            recorded_at,
+        ))
+        .await
+        .map_err(GridPaperTaskError::Journal)?;
+    *last_recorded_at = recorded_at;
+    Ok(true)
+}
+
+/// Admits one entry-side crossing through the account-level risk authority.
+async fn admit_grid_entry(
+    risk: &AccountRiskAuthority,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    cross: &VirtualGridCross,
+    observed_at: DateTime<Utc>,
+) -> Result<bool, GridPaperTaskError> {
+    let notional = cross
+        .trigger_price
+        .as_decimal()
+        .checked_mul(config.quantity.as_decimal())
+        .map(Money::new)
+        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    let candidate = AccountRiskCandidate::new(
+        config.task_id.clone(),
+        grid.config().symbol.as_str(),
+        notional,
+    )
+    .map_err(GridPaperTaskError::AccountRisk)?;
+    match risk
+        .admit(&candidate, observed_at)
+        .await
+        .map_err(GridPaperTaskError::AccountRisk)?
+    {
+        AccountRiskAdmission::Admitted { .. } => Ok(true),
+        AccountRiskAdmission::Rejected(_) => Ok(false),
+    }
+}
+
+/// One bounded durable fact naming the consumed account-risk directive.
+pub(crate) fn account_risk_directive_record(
+    task_id: &str,
+    task_kind: &'static str,
+    symbol: &str,
+    reason: &str,
+    price: &str,
+    recorded_at: DateTime<Utc>,
+) -> DecisionRecord {
+    DecisionRecord {
+        timestamp: recorded_at,
+        strategy: "account_risk".to_owned(),
+        symbol: symbol.to_owned(),
+        decision: "account_risk_directive_exit".to_owned(),
+        details: json!({
+            "schema_version": 1,
+            "task_id": task_id,
+            "task_kind": task_kind,
+            "reason": reason,
+            "price": price,
+        }),
+    }
+}
+
+/// Extracts the first close demand that applies to this owner.
+pub(crate) fn account_risk_exit_reason(
+    directives: &[AccountRiskDirective],
+    task_id: &str,
+) -> Option<String> {
+    directives.iter().find_map(|directive| match directive {
+        AccountRiskDirective::CloseAllPositions { reason } => Some(reason.clone()),
+        AccountRiskDirective::ClosePosition {
+            task_id: target, ..
+        } if target == task_id => Some("position_duration_exceeded".to_owned()),
+        AccountRiskDirective::ClosePosition { .. } => None,
+    })
 }
 
 /// Feeds one observed price plus the owner's tracked position, paper equity,
@@ -1572,6 +1783,7 @@ pub enum GridPaperTaskError {
     JournalRead(JournalReadError),
     Projection(ReadModelError),
     Account(PaperAccountError),
+    AccountRisk(AccountRiskError),
     Source(MarketSupervisorError),
     Strategy(StrategyError),
     Runtime(RuntimeError),
@@ -1593,7 +1805,7 @@ impl GridPaperTaskError {
             Self::Journal(_) | Self::JournalRead(_) | Self::Projection(_) => {
                 GridPaperTaskFailure::JournalUnavailable
             }
-            Self::Account(_) => GridPaperTaskFailure::AccountContract,
+            Self::Account(_) | Self::AccountRisk(_) => GridPaperTaskFailure::AccountContract,
             Self::Source(_) => GridPaperTaskFailure::SourceContract,
             Self::Strategy(_) | Self::Runtime(_) => GridPaperTaskFailure::InvalidRequest,
             Self::Saga(error) => classify_saga_error_ref(error),
@@ -1658,6 +1870,7 @@ impl fmt::Display for GridPaperTaskError {
             Self::JournalRead(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::Account(error) => error.fmt(formatter),
+            Self::AccountRisk(error) => error.fmt(formatter),
             Self::Source(error) => error.fmt(formatter),
             Self::Strategy(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
@@ -1678,6 +1891,7 @@ impl Error for GridPaperTaskError {
             Self::JournalRead(error) => Some(error),
             Self::Projection(error) => Some(error),
             Self::Account(error) => Some(error),
+            Self::AccountRisk(error) => Some(error),
             Self::Source(error) => Some(error),
             Self::Strategy(error) => Some(error),
             Self::Runtime(error) => Some(error),

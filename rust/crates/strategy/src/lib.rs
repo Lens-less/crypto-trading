@@ -4,6 +4,7 @@
 //! configuration, explicit state, and market snapshots into deterministic
 //! decisions that the runtime may execute or record.
 
+mod account_risk;
 mod alert;
 mod arbitrage;
 mod arbitrage_history;
@@ -16,6 +17,12 @@ mod volume_maker;
 use crypto_trading_domain::{MarketSnapshot, OrderIntent};
 use thiserror::Error;
 
+pub use account_risk::{
+    AccountRiskDecision, AccountRiskInput, AccountRiskLimits, AccountRiskOpenPosition,
+    AccountRiskPolicy, AccountRiskRejection, AccountRiskTimeout, AccountRiskWarning,
+    MAX_ACCOUNT_RISK_OPEN_POSITIONS, MAX_ACCOUNT_RISK_POSITION_DURATION_SECONDS,
+    MAX_ACCOUNT_RISK_SYMBOLS,
+};
 pub use alert::{
     AlertConfig, AlertKind, AlertState, AlertStrategy, PriceAlert, PricePoint,
     VolatilityAlertConfig,

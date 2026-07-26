@@ -121,6 +121,82 @@ fn unknown_fields_and_unbounded_identifiers_are_rejected() {
 }
 
 #[test]
+fn account_risk_pause_and_resume_use_the_paper_operator_confirmation() {
+    let pause = paper_operator(SubmitCommand::PauseAccountRisk {
+        reason: "exchange maintenance".to_owned(),
+    });
+    let encoded = serde_json::to_string(&pause).unwrap();
+    let decoded: SubmitEnvelope = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, pause);
+
+    let resume = paper_operator(SubmitCommand::ResumeAccountRisk);
+    resume.validate().unwrap();
+
+    // A blank pause reason fails closed.
+    assert!(
+        SubmitEnvelope::new(
+            Uuid::from_u128(9),
+            "risk-0002",
+            "paper-account-risk",
+            SubmitPermission::new("operator-a", SubmitRole::PaperOperator).unwrap(),
+            SubmitRiskConfirmation::PaperOnly,
+            SubmitCommand::PauseAccountRisk {
+                reason: " ".to_owned()
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn kill_switch_requires_its_dedicated_stronger_confirmation() {
+    let operator = || SubmitPermission::new("operator-a", SubmitRole::PaperOperator).unwrap();
+    let command = || SubmitCommand::EngageAccountKillSwitch {
+        reason: "operator drill".to_owned(),
+    };
+
+    // The ordinary paper-only confirmation must never arm the kill switch.
+    assert!(
+        SubmitEnvelope::new(
+            Uuid::from_u128(11),
+            "risk-0003",
+            "paper-account-risk",
+            operator(),
+            SubmitRiskConfirmation::PaperOnly,
+            command(),
+        )
+        .is_err()
+    );
+    // Nor can the kill-switch confirmation authorize any other command.
+    assert!(
+        SubmitEnvelope::new(
+            Uuid::from_u128(12),
+            "risk-0004",
+            "paper-account-risk",
+            operator(),
+            SubmitRiskConfirmation::AccountKillSwitchArmed,
+            SubmitCommand::StopTask,
+        )
+        .is_err()
+    );
+
+    let armed = SubmitEnvelope::new(
+        Uuid::from_u128(13),
+        "risk-0005",
+        "paper-account-risk",
+        operator(),
+        SubmitRiskConfirmation::AccountKillSwitchArmed,
+        command(),
+    )
+    .unwrap();
+    let encoded = serde_json::to_value(&armed).unwrap();
+    assert_eq!(encoded["risk_confirmation"], "account_kill_switch_armed");
+    assert_eq!(encoded["command"]["kind"], "engage_account_kill_switch");
+    let decoded: SubmitEnvelope = serde_json::from_value(encoded).unwrap();
+    decoded.validate().unwrap();
+}
+
+#[test]
 fn nil_command_ids_and_blank_strategy_fields_fail_closed() {
     assert!(
         SubmitEnvelope::new(
