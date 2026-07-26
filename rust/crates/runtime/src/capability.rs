@@ -691,11 +691,14 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
             CapabilityArea::History,
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Paper], CapabilityAccess::Local),
-            "Bounded planned, completed, partial, and incomplete execution JSONL records with a cross-process single-writer lease.",
-            &[],
+            "Bounded planned, completed, partial, and incomplete execution JSONL records with a cross-process single-writer lease and sealed-segment rotation.",
+            &[
+                "Rotation seals full journal files into read-only segments with no compaction by design, preserving the replayable fact chain; once the bounded segment or chain-byte budget is reached, appends still fail closed.",
+            ],
             &[
                 "rust/crates/runtime/src/history.rs",
                 "rust/crates/runtime/tests/history_writer_lock_contract.rs",
+                "rust/crates/runtime/tests/history_rotation_contract.rs",
                 "rust/crates/runtime/tests/execution_contract.rs",
             ],
         ),
@@ -884,7 +887,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             "Bounded multi-symbol price-alert evaluation with durable samples, cooldowns, acknowledgements, a stable read model, isolated local delivery adapters, and a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts.",
             &[
                 "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the price-alert task host, and restart recovery projects prior facts without automatically resuming external sources.",
-                "The JSONL alert journal has no rotation or compaction; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
+                "The JSONL alert journal rotates through bounded sealed segments with no compaction by design; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
             ],
             &[
                 "rust/crates/apps/src/alert/mod.rs",
@@ -897,6 +900,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/runtime/src/task_read_model.rs",
                 "rust/crates/runtime/tests/alert_read_model_contract.rs",
                 "rust/crates/runtime/tests/task_read_model_contract.rs",
+                "rust/crates/runtime/tests/history_rotation_contract.rs",
                 "rust/crates/control-plane/tests/alert_projection_contract.rs",
                 "rust/crates/web/tests/http_contract.rs",
             ],
@@ -930,7 +934,7 @@ fn scanner_capability() -> Capability {
         &[
             "The CLI service bootstrap is replay-backed only: no real-time market discovery or external continuous market source is wired into the scanner task host, and no continuous supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
             "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
-            "The JSONL journal now enforces a cross-process single-writer lease, but it still has no rotation or compaction.",
+            "The JSONL journal enforces a cross-process single-writer lease and rotates through bounded sealed segments with no compaction by design; a full segment chain still fails closed.",
         ],
         &[
             "rust/crates/apps/src/scanner.rs",
@@ -942,6 +946,7 @@ fn scanner_capability() -> Capability {
             "rust/crates/runtime/src/scanner_read_model.rs",
             "rust/crates/runtime/src/task_read_model.rs",
             "rust/crates/runtime/tests/scanner_read_model_contract.rs",
+            "rust/crates/runtime/tests/history_rotation_contract.rs",
             "rust/crates/control-plane/tests/scanner_projection_contract.rs",
             "rust/crates/web/tests/http_contract.rs",
             "rust/crates/web/tests/ui_contract.rs",

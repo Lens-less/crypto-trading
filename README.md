@@ -437,7 +437,7 @@ Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依�
 | `execution_partial` | 提交过程报错且已有部分结果，同时保存有界对账摘要 |
 | `execution_incomplete` | 提交返回，但结果数量或状态不足以判定完整成功 |
 
-历史写入在构造时固定相对路径；单条、单批和单文件上限仍然存在，单文件达到 `64 MiB` 后失败关闭，目前不自动轮转。同一 journal 路径通过 sibling lock file 获取跨进程 OS writer lease，竞争者立即失败关闭；它仍不提供 journal 自动轮转或通用 transactional saga。取消、进程死亡或抢占中断都可能留下 planned-only 状态，重试前必须先 reconcile。
+历史写入在构造时固定相对路径；单条、单批和单文件上限仍然存在。追加即将超过 `64 MiB` 单文件上限时，活跃文件会先被密封为只读段 `<path>.<seq>`（seq 从 1 递增，密封后永不改写），再开新活跃文件续写；读侧按段序拼接重放，与未轮转时逐字节等价。段链有界：最多 63 个密封段、全链共 4 GiB，超限后追加仍失败关闭；设计上不做 compaction，以保留可重放验证的事实链。同一 journal 路径通过 sibling lock file 获取跨进程 OS writer lease（租约覆盖整条段链，密封动作只在持有租约时发生），竞争者立即失败关闭；它仍不提供通用 transactional saga。取消、进程死亡或抢占中断都可能留下 planned-only 状态，重试前必须先 reconcile。
 
 ## 项目结构
 

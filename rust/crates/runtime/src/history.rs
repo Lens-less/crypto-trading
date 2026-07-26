@@ -17,6 +17,19 @@ use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
 pub const MAX_HISTORY_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_HISTORY_BATCH_BYTES: usize = 8_388_608;
 pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1_024 * 1_024;
+/// Maximum number of sealed, read-only segments in one journal chain.
+///
+/// Together with the active file this bounds a chain at 64 files. Sealed
+/// segments are never compacted or rewritten, so this is also the bound on how
+/// often rotation can postpone the fail-closed append limit.
+pub const MAX_HISTORY_SEALED_SEGMENTS: u64 = 63;
+/// Total byte budget for one journal chain (sealed segments plus the active
+/// file): 64 files of at most 64 MiB each, i.e. 4 GiB of replayable facts.
+///
+/// The budget is the arithmetic closure of the per-file and segment-count
+/// limits; it is still enforced independently so metadata anomalies or future
+/// constant drift fail closed instead of silently unbounding the chain.
+pub const MAX_HISTORY_CHAIN_BYTES: u64 = (MAX_HISTORY_SEALED_SEGMENTS + 1) * MAX_HISTORY_FILE_BYTES;
 
 type PathLock = AsyncMutex<()>;
 type CrossProcessLeaseState = StdMutex<Option<Arc<CrossProcessHistoryLease>>>;
@@ -158,6 +171,125 @@ impl CrossProcessLeaseFailure {
     }
 }
 
+/// One sealed, read-only member of a journal chain, described by metadata only.
+#[derive(Clone, Debug)]
+pub(crate) struct SealedSegment {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+}
+
+/// Why a sealed-segment chain could not be trusted.
+///
+/// Chain inspection rebuilds state from on-disk facts; any layout that the
+/// writer could not itself have produced is ambiguous and must fail closed.
+#[derive(Debug)]
+pub(crate) enum SealedChainError {
+    Inspect { path: PathBuf, source: io::Error },
+    NotAFile { path: PathBuf },
+    Bytes { path: PathBuf, bytes: u64 },
+    Gap { missing: PathBuf, found: PathBuf },
+    TooManySegments { segments: u64 },
+}
+
+impl SealedChainError {
+    fn into_history_error(self) -> HistoryError {
+        match self {
+            Self::Inspect { path, source } => HistoryError::SegmentInspect { path, source },
+            Self::NotAFile { path } => HistoryError::SealedSegmentNotAFile { path },
+            Self::Bytes { path, bytes } => HistoryError::SealedSegmentBytes {
+                path,
+                bytes,
+                limit: MAX_HISTORY_FILE_BYTES,
+            },
+            Self::Gap { missing, found } => HistoryError::SealedSegmentGap { missing, found },
+            Self::TooManySegments { segments } => HistoryError::TooManySegments {
+                segments,
+                limit: MAX_HISTORY_SEALED_SEGMENTS,
+            },
+        }
+    }
+}
+
+/// Maps an active journal path onto the sealed segment for `sequence`.
+pub(crate) fn sealed_segment_path(active_path: &Path, sequence: u64) -> PathBuf {
+    let file_name = active_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.jsonl");
+    active_path.with_file_name(format!("{file_name}.{sequence}"))
+}
+
+/// Enumerates the sealed chain `<path>.1 ..= <path>.N` from filesystem facts.
+///
+/// A contiguous run starting at `1` is the only layout the writer produces, so
+/// gaps, empty or oversized segments, non-files, and chains beyond the segment
+/// budget all fail closed rather than being repaired or skipped.
+pub(crate) fn inspect_sealed_segments(
+    active_path: &Path,
+) -> Result<Vec<SealedSegment>, SealedChainError> {
+    let mut segments = Vec::new();
+    for sequence in 1..=MAX_HISTORY_SEALED_SEGMENTS {
+        let path = sealed_segment_path(active_path, sequence);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(SealedChainError::NotAFile { path });
+                }
+                if metadata.len() == 0 || metadata.len() > MAX_HISTORY_FILE_BYTES {
+                    return Err(SealedChainError::Bytes {
+                        path,
+                        bytes: metadata.len(),
+                    });
+                }
+                segments.push(SealedSegment {
+                    path,
+                    bytes: metadata.len(),
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                for later in
+                    sequence.saturating_add(1)..=MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1)
+                {
+                    let found = sealed_segment_path(active_path, later);
+                    if found.exists() {
+                        return Err(SealedChainError::Gap {
+                            missing: path,
+                            found,
+                        });
+                    }
+                }
+                return Ok(segments);
+            }
+            Err(source) => return Err(SealedChainError::Inspect { path, source }),
+        }
+    }
+    let overflow = sealed_segment_path(active_path, MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1));
+    if overflow.exists() {
+        return Err(SealedChainError::TooManySegments {
+            segments: MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1),
+        });
+    }
+    Ok(segments)
+}
+
+const fn ensure_chain_budget(
+    sealed_bytes: u64,
+    active_bytes: u64,
+    batch_bytes: u64,
+) -> Result<(), HistoryError> {
+    let chain_bytes = sealed_bytes
+        .saturating_add(active_bytes)
+        .saturating_add(batch_bytes);
+    if chain_bytes > MAX_HISTORY_CHAIN_BYTES {
+        return Err(HistoryError::ChainTooLarge {
+            chain_bytes,
+            batch_bytes,
+            limit: MAX_HISTORY_CHAIN_BYTES,
+        });
+    }
+    Ok(())
+}
+
 struct PathLockRegistry {
     locks: HashMap<PathBuf, Weak<PathLock>>,
     next_cleanup_size: usize,
@@ -202,7 +334,16 @@ pub struct DecisionRecord {
 /// canonical path share one in-process lock, including lexical aliases and
 /// aliases through an existing parent directory. Cross-process writers share a
 /// dedicated sibling lock file and fail closed immediately when another
-/// process already owns that lease.
+/// process already owns that lease. The lease is held for the whole chain:
+/// sealed segments `<path>.1 ..= <path>.N` plus the active file.
+///
+/// When an append would push the active file past [`MAX_HISTORY_FILE_BYTES`],
+/// the active file is first sealed by renaming it to the next segment in the
+/// chain and a fresh active file continues the journal. Sealed segments are
+/// read-only facts: they are never rewritten, truncated, or compacted, so the
+/// append-only replay invariant extends across the whole chain. Rotation only
+/// postpones the fail-closed limit; once [`MAX_HISTORY_SEALED_SEGMENTS`] or
+/// [`MAX_HISTORY_CHAIN_BYTES`] would be exceeded, appends are rejected again.
 ///
 /// Locks are keyed by normalized paths rather than filesystem object identity.
 /// Existing hard links and paths retargeted after construction can therefore
@@ -261,9 +402,19 @@ impl JsonlHistory {
     /// write failure can still leave a partial tail that recovery code must
     /// detect and quarantine.
     ///
+    /// If the batch would push the active file past [`MAX_HISTORY_FILE_BYTES`],
+    /// the active file is sealed as the next read-only chain segment before the
+    /// batch is written to a fresh active file. A crash between sealing and
+    /// recreating the active file leaves a contiguous sealed chain without an
+    /// active file; that state is unambiguous, and the next append rebuilds the
+    /// active file from it. Any other chain inconsistency (segment gaps, empty
+    /// or oversized segments, chains past the segment or byte budget) fails
+    /// closed without writing.
+    ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] on validation or I/O failure.
+    /// Returns [`HistoryError`] on validation, chain-integrity, chain-budget,
+    /// or I/O failure.
     pub async fn append_batch(&self, records: &[DecisionRecord]) -> Result<(), HistoryError> {
         if records.is_empty() {
             return Ok(());
@@ -339,26 +490,82 @@ impl JsonlHistory {
         }
         let _lease = self.active_cross_process_lease()?;
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .map_err(HistoryError::Open)?;
-        let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
         let batch_bytes = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-        let next_file_bytes = existing_bytes.saturating_add(batch_bytes);
-        if next_file_bytes > MAX_HISTORY_FILE_BYTES {
+        let mut file = self.open_active_within_chain_budget(batch_bytes).await?;
+        file.write_all(&batch).await.map_err(HistoryError::Write)?;
+        file.flush().await.map_err(HistoryError::Flush)?;
+        file.sync_data().await.map_err(HistoryError::Sync)
+    }
+
+    /// Opens the active file with room for `batch_bytes`, sealing it as the
+    /// next read-only chain segment first when the batch would cross
+    /// [`MAX_HISTORY_FILE_BYTES`].
+    ///
+    /// Must be called with the in-process path lock held and the cross-process
+    /// writer lease claimed; sealing is only legal under that lease.
+    async fn open_active_within_chain_budget(
+        &self,
+        batch_bytes: u64,
+    ) -> Result<tokio::fs::File, HistoryError> {
+        let sealed =
+            inspect_sealed_segments(&self.path).map_err(SealedChainError::into_history_error)?;
+        let sealed_bytes = sealed
+            .iter()
+            .fold(0u64, |total, segment| total.saturating_add(segment.bytes));
+
+        let file = self.open_active().await?;
+        let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
+        if existing_bytes > MAX_HISTORY_FILE_BYTES || batch_bytes > MAX_HISTORY_FILE_BYTES {
+            // An oversized active file was not produced by this writer; sealing
+            // it would launder the violation into the read-only chain.
             return Err(HistoryError::FileTooLarge {
                 existing_bytes,
                 batch_bytes,
                 limit: MAX_HISTORY_FILE_BYTES,
             });
         }
-        file.write_all(&batch).await.map_err(HistoryError::Write)?;
-        file.flush().await.map_err(HistoryError::Flush)?;
-        file.sync_data().await.map_err(HistoryError::Sync)
+        ensure_chain_budget(sealed_bytes, existing_bytes, batch_bytes)?;
+        if existing_bytes.saturating_add(batch_bytes) <= MAX_HISTORY_FILE_BYTES {
+            return Ok(file);
+        }
+
+        // Rotation is reached only with a non-empty active file, so sealed
+        // segments are never empty.
+        let segments = u64::try_from(sealed.len()).unwrap_or(u64::MAX);
+        if segments >= MAX_HISTORY_SEALED_SEGMENTS {
+            return Err(HistoryError::TooManySegments {
+                segments,
+                limit: MAX_HISTORY_SEALED_SEGMENTS,
+            });
+        }
+        let sealed_path = sealed_segment_path(&self.path, segments.saturating_add(1));
+        drop(file);
+        tokio::fs::rename(&self.path, &sealed_path)
+            .await
+            .map_err(|source| HistoryError::Seal {
+                path: sealed_path,
+                source,
+            })?;
+        let file = self.open_active().await?;
+        let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
+        if existing_bytes.saturating_add(batch_bytes) > MAX_HISTORY_FILE_BYTES {
+            return Err(HistoryError::FileTooLarge {
+                existing_bytes,
+                batch_bytes,
+                limit: MAX_HISTORY_FILE_BYTES,
+            });
+        }
+        Ok(file)
+    }
+
+    async fn open_active(&self) -> Result<tokio::fs::File, HistoryError> {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .map_err(HistoryError::Open)
     }
 
     fn active_cross_process_lease(&self) -> Result<Arc<CrossProcessHistoryLease>, HistoryError> {
@@ -589,6 +796,40 @@ pub enum HistoryError {
         batch_bytes: u64,
         limit: u64,
     },
+    #[error(
+        "history journal chain would hold {chain_bytes} bytes including this {batch_bytes}-byte batch; maximum is {limit}"
+    )]
+    ChainTooLarge {
+        chain_bytes: u64,
+        batch_bytes: u64,
+        limit: u64,
+    },
+    #[error("history journal chain already holds {segments} sealed segments; maximum is {limit}")]
+    TooManySegments { segments: u64, limit: u64 },
+    #[error("history journal chain is missing sealed segment {missing} while {found} exists")]
+    SealedSegmentGap { missing: PathBuf, found: PathBuf },
+    #[error(
+        "sealed history segment {path} has {bytes} bytes; sealed segments must hold 1..={limit} bytes"
+    )]
+    SealedSegmentBytes {
+        path: PathBuf,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("sealed history segment {path} is not a regular file")]
+    SealedSegmentNotAFile { path: PathBuf },
+    #[error("failed to inspect sealed history segment {path}: {source}")]
+    SegmentInspect {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to seal history segment {path}: {source}")]
+    Seal {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to reserve {bytes} bytes for {resource}")]
     Allocation {
         resource: &'static str,
@@ -730,11 +971,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_allows_exact_file_limit_then_rejects_without_writing() {
+    async fn history_allows_exact_file_limit_then_seals_a_segment_and_continues() {
         let path = std::env::temp_dir().join(format!("history-file-limit-{}", Uuid::new_v4()));
         let history = JsonlHistory::new(&path);
         let record = DecisionRecord {
-            timestamp: Utc::now(),
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             strategy: "limit-test".to_owned(),
             symbol: "BTC".to_owned(),
             decision: "hold".to_owned(),
@@ -750,21 +991,35 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             MAX_HISTORY_FILE_BYTES
         );
+        let sealed = sealed_segment_path(history.path(), 1);
+        assert!(!sealed.exists());
 
-        let error = history.append(&record).await.unwrap_err();
-        assert!(matches!(
-            error,
-            HistoryError::FileTooLarge {
-                existing_bytes: MAX_HISTORY_FILE_BYTES,
-                limit: MAX_HISTORY_FILE_BYTES,
-                ..
-            }
-        ));
+        history.append(&record).await.unwrap();
         assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
+            std::fs::metadata(&sealed).unwrap().len(),
             MAX_HISTORY_FILE_BYTES
         );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), record_bytes);
+
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(sealed).unwrap();
+    }
+
+    #[test]
+    fn chain_budget_rejects_totals_beyond_the_chain_limit() {
+        assert!(ensure_chain_budget(MAX_HISTORY_CHAIN_BYTES - 10, 4, 6).is_ok());
+        assert!(matches!(
+            ensure_chain_budget(MAX_HISTORY_CHAIN_BYTES - 10, 5, 6),
+            Err(HistoryError::ChainTooLarge {
+                batch_bytes: 6,
+                limit: MAX_HISTORY_CHAIN_BYTES,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ensure_chain_budget(u64::MAX, 1, 1),
+            Err(HistoryError::ChainTooLarge { .. })
+        ));
     }
 
     #[tokio::test]

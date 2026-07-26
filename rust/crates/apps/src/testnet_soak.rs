@@ -4,19 +4,12 @@
 //! errors, response bodies, credentials, and other free-form text never enter
 //! the decision journal.
 
-use std::{
-    fmt,
-    fs::File,
-    future::Future,
-    io::{self, Read},
-    path::Path,
-    pin::Pin,
-    time::Duration,
-};
+use std::{fmt, future::Future, io, path::Path, pin::Pin, time::Duration};
 
 use chrono::{DateTime, Utc};
 use crypto_trading_runtime::{
-    DecisionRecord, HistoryError, JsonlHistory, MAX_HISTORY_RECORD_BYTES, MAX_JOURNAL_SOURCE_BYTES,
+    DecisionRecord, HistoryError, JournalReadError, JsonlHistory, MAX_HISTORY_RECORD_BYTES,
+    read_journal_chain,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -1023,36 +1016,37 @@ fn read_records(
     path: &Path,
     missing_is_empty: bool,
 ) -> Result<Vec<DecisionRecord>, TestnetSoakEvidenceError> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if missing_is_empty && error.kind() == io::ErrorKind::NotFound => {
-            return Ok(Vec::new());
+    let bytes = match read_journal_chain(path) {
+        Ok(bytes) => bytes,
+        Err(JournalReadError::Open(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return if missing_is_empty {
+                Ok(Vec::new())
+            } else {
+                Err(TestnetSoakEvidenceError::SourceMissing)
+            };
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(TestnetSoakEvidenceError::SourceMissing);
+        Err(JournalReadError::NotAFile | JournalReadError::SealedSegmentNotAFile { .. }) => {
+            return Err(TestnetSoakEvidenceError::NotAFile);
+        }
+        Err(
+            JournalReadError::SourceTooLarge { .. }
+            | JournalReadError::ChainTooLarge { .. }
+            | JournalReadError::TooManySegments { .. }
+            | JournalReadError::SealedSegmentBytes { .. },
+        ) => {
+            return Err(TestnetSoakEvidenceError::SourceTooLarge);
+        }
+        Err(JournalReadError::Allocation { .. }) => {
+            return Err(TestnetSoakEvidenceError::Allocation);
+        }
+        Err(JournalReadError::SourceChanged { .. }) => {
+            return Err(TestnetSoakEvidenceError::SourceChanged);
+        }
+        Err(JournalReadError::SealedSegmentPartialTail { .. }) => {
+            return Err(TestnetSoakEvidenceError::PartialRecord);
         }
         Err(_) => return Err(TestnetSoakEvidenceError::Io),
     };
-    let metadata = file.metadata().map_err(|_| TestnetSoakEvidenceError::Io)?;
-    if !metadata.is_file() {
-        return Err(TestnetSoakEvidenceError::NotAFile);
-    }
-    if metadata.len() > MAX_JOURNAL_SOURCE_BYTES {
-        return Err(TestnetSoakEvidenceError::SourceTooLarge);
-    }
-    let expected =
-        usize::try_from(metadata.len()).map_err(|_| TestnetSoakEvidenceError::SourceTooLarge)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(expected)
-        .map_err(|_| TestnetSoakEvidenceError::Allocation)?;
-    file.by_ref()
-        .take(metadata.len())
-        .read_to_end(&mut bytes)
-        .map_err(|_| TestnetSoakEvidenceError::Io)?;
-    if bytes.len() != expected {
-        return Err(TestnetSoakEvidenceError::SourceChanged);
-    }
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         return Err(TestnetSoakEvidenceError::PartialRecord);
     }

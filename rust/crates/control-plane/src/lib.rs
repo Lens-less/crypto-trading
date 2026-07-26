@@ -390,17 +390,24 @@ const fn journal_failure_kind(error: &JournalReadError) -> ReadFailureKind {
     match error {
         JournalReadError::Cursor(source) => cursor_failure_kind(source),
         JournalReadError::SourceTooLarge { .. }
+        | JournalReadError::ChainTooLarge { .. }
+        | JournalReadError::TooManySegments { .. }
         | JournalReadError::Allocation { .. }
         | JournalReadError::RecordTooLarge { .. } => ReadFailureKind::ResourceLimit,
         JournalReadError::NotAFile
         | JournalReadError::Open(_)
         | JournalReadError::Metadata(_)
         | JournalReadError::Read(_)
-        | JournalReadError::SourceChanged { .. } => ReadFailureKind::SourceUnavailable,
+        | JournalReadError::SourceChanged { .. }
+        | JournalReadError::SealedSegmentInspect { .. } => ReadFailureKind::SourceUnavailable,
         JournalReadError::NilJournalId
         | JournalReadError::EmptyRecord { .. }
         | JournalReadError::MalformedRecord { .. }
         | JournalReadError::SequenceOverflow
+        | JournalReadError::SealedSegmentGap { .. }
+        | JournalReadError::SealedSegmentBytes { .. }
+        | JournalReadError::SealedSegmentNotAFile { .. }
+        | JournalReadError::SealedSegmentPartialTail { .. }
         | JournalReadError::EventContract { .. } => ReadFailureKind::InvalidJournal,
     }
 }

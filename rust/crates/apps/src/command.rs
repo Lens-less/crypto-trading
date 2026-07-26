@@ -3,7 +3,6 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     fmt,
-    io::Read,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,13 +33,13 @@ use crypto_trading_exchange::{
 };
 use crypto_trading_runtime::{
     DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
-    ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MAX_HISTORY_RECORD_BYTES,
-    MAX_JOURNAL_SOURCE_BYTES, MarketDataBook, MarketDataError, MarketDataEvent,
+    ExecutionPolicy, HistoryError, IntentExecutor, JournalReadError, JsonlHistory,
+    MAX_HISTORY_RECORD_BYTES, MarketDataBook, MarketDataError, MarketDataEvent,
     MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy, MarketInstrument,
     MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
     ReadOnlyTaskExit, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
     ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError, SystemMarketDataClock,
-    current_capability_manifest,
+    current_capability_manifest, read_journal_chain,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -1683,40 +1682,12 @@ fn project_testnet_soak_status(
 }
 
 fn read_bounded_testnet_soak_records(history_path: &Path) -> Result<Vec<DecisionRecord>> {
-    let mut file = std::fs::File::open(history_path)
-        .with_context(|| format!("failed to open {}", history_path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to inspect {}", history_path.display()))?;
-    if !metadata.is_file() {
-        bail!(
-            "testnet soak status failed: history source {} is not a file",
+    let bytes = read_journal_chain(history_path).with_context(|| {
+        format!(
+            "testnet soak status failed to read history chain {}",
             history_path.display()
-        );
-    }
-    if metadata.len() > MAX_JOURNAL_SOURCE_BYTES {
-        bail!(
-            "testnet soak status failed: history source {} exceeds {} bytes",
-            history_path.display(),
-            MAX_JOURNAL_SOURCE_BYTES
-        );
-    }
-    let expected = usize::try_from(metadata.len())
-        .context("testnet soak status history is too large for this process")?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(expected)
-        .context("testnet soak status could not reserve history buffer")?;
-    std::io::Read::by_ref(&mut file)
-        .take(metadata.len())
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {}", history_path.display()))?;
-    if bytes.len() != expected {
-        bail!(
-            "testnet soak status failed: history source {} changed while reading",
-            history_path.display()
-        );
-    }
+        )
+    })?;
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         bail!(
             "testnet soak status failed: history source {} has a partial trailing record",
@@ -2364,20 +2335,25 @@ fn project_task_status(
     task_id: &str,
     scope: TaskProjectionScope,
 ) -> Result<ProjectedTaskStatus> {
-    if !history_path.exists() {
-        bail!(
-            "{} status failed: history file {} does not exist",
-            scope.label,
-            history_path.display()
-        );
-    }
+    let bytes = match read_journal_chain(history_path) {
+        Ok(bytes) => bytes,
+        Err(JournalReadError::Open(source)) if source.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "{} status failed: history file {} does not exist",
+                scope.label,
+                history_path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", history_path.display()));
+        }
+    };
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("failed to read {}", history_path.display()))?;
 
     let mut projected = None;
-    for (index, line) in std::fs::read_to_string(history_path)
-        .with_context(|| format!("failed to read {}", history_path.display()))?
-        .lines()
-        .enumerate()
-    {
+    for (index, line) in text.lines().enumerate() {
         let record: Value = serde_json::from_str(line).with_context(|| {
             format!(
                 "failed to parse {} task record {} from {}",

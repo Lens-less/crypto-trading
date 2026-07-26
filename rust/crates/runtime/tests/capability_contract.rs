@@ -310,6 +310,41 @@ fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() 
 }
 
 #[test]
+fn journal_rotation_is_reflected_without_advertising_compaction() {
+    let manifest = current_capability_manifest();
+    let rotation_evidence = "rust/crates/runtime/tests/history_rotation_contract.rs".to_owned();
+
+    let history = manifest.capability("history.execution-jsonl").unwrap();
+    assert!(history.summary.contains("sealed-segment rotation"));
+    assert!(history.evidence.contains(&rotation_evidence));
+    assert!(
+        history
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("no compaction by design"))
+    );
+
+    for id in ["runtime.price-alert", "runtime.scanner"] {
+        let capability = manifest.capability(id).unwrap();
+        assert!(
+            !capability
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("no rotation")),
+            "{id} must not claim the journal lacks rotation once sealed segments ship"
+        );
+        assert!(
+            capability
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("no compaction by design")),
+            "{id} must keep the no-compaction design decision explicit"
+        );
+        assert!(capability.evidence.contains(&rotation_evidence));
+    }
+}
+
+#[test]
 fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
     let manifest = current_capability_manifest();
     let scanner = manifest.capability("runtime.scanner").unwrap();

@@ -33,7 +33,8 @@ pub use execution::{
     RuntimeError,
 };
 pub use history::{
-    DecisionRecord, HistoryError, JsonlHistory, MAX_HISTORY_BATCH_BYTES, MAX_HISTORY_RECORD_BYTES,
+    DecisionRecord, HistoryError, JsonlHistory, MAX_HISTORY_BATCH_BYTES, MAX_HISTORY_CHAIN_BYTES,
+    MAX_HISTORY_FILE_BYTES, MAX_HISTORY_RECORD_BYTES, MAX_HISTORY_SEALED_SEGMENTS,
 };
 pub use journal::{
     AggregateRef, CursorError, EventContractError, JOURNAL_CURSOR_SCHEMA_VERSION, JournalCursor,
@@ -43,8 +44,8 @@ pub use journal::{
 pub use journal_reader::{
     FileJournalSnapshotSource, JournalPage, JournalPageBoundary, JournalReadError, JournalSnapshot,
     JournalSnapshotSource, LegacyJsonlJournalReader, MAX_CURSOR_ANCHOR_SCAN_BYTES,
-    MAX_JOURNAL_PAGE_BYTES, MAX_JOURNAL_PAGE_EVENTS, MAX_JOURNAL_SOURCE_BYTES,
-    MemoryJournalSnapshotSource,
+    MAX_JOURNAL_CHAIN_SOURCE_BYTES, MAX_JOURNAL_PAGE_BYTES, MAX_JOURNAL_PAGE_EVENTS,
+    MAX_JOURNAL_SOURCE_BYTES, MemoryJournalSnapshotSource, read_journal_chain,
 };
 pub use market_data::{
     DeterministicMarketDataAdapter, MARKET_DATA_VIEW_SCHEMA_VERSION, MAX_MARKET_DATA_EVENTS,

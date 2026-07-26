@@ -10,13 +10,19 @@ use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::history::{MAX_HISTORY_FILE_BYTES, stable_history_path_for_read};
+use crate::history::{
+    MAX_HISTORY_CHAIN_BYTES, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_SEALED_SEGMENTS, SealedChainError,
+    inspect_sealed_segments, stable_history_path_for_read,
+};
 use crate::{
     AggregateRef, CursorError, EventContractError, JournalCursor, MAX_HISTORY_RECORD_BYTES,
     OperationEventEnvelope,
 };
 
+/// Maximum size of one chain file (a sealed segment or the active file).
 pub const MAX_JOURNAL_SOURCE_BYTES: u64 = MAX_HISTORY_FILE_BYTES;
+/// Maximum total size of one journal chain captured into a snapshot.
+pub const MAX_JOURNAL_CHAIN_SOURCE_BYTES: u64 = MAX_HISTORY_CHAIN_BYTES;
 pub const MAX_JOURNAL_PAGE_EVENTS: usize = 256;
 pub const MAX_JOURNAL_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
 pub const MAX_CURSOR_ANCHOR_SCAN_BYTES: usize =
@@ -50,7 +56,7 @@ impl JournalSnapshot {
     /// # Errors
     ///
     /// Returns [`JournalReadError`] when the ID is nil or the bytes exceed the
-    /// global journal source budget.
+    /// journal chain budget [`MAX_JOURNAL_CHAIN_SOURCE_BYTES`].
     pub fn new(journal_id: Uuid, bytes: Vec<u8>) -> Result<Self, JournalReadError> {
         validate_journal_id(journal_id)?;
         validate_source_len(bytes.len())?;
@@ -115,11 +121,14 @@ impl JournalSnapshotSource for MemoryJournalSnapshotSource {
     }
 }
 
-/// File adapter that freezes the file length before reading.
+/// File adapter that captures a whole journal chain as one frozen snapshot.
 ///
-/// Appends completed after the initial metadata read are deliberately excluded
-/// from the returned snapshot. The caller supplies a durable generation ID; it
-/// must change when a journal is intentionally replaced or rotated.
+/// Sealed segments `<path>.1 ..= <path>.N` are read in sequence order before
+/// the active file, whose length is frozen before reading; appends completed
+/// after that metadata read are deliberately excluded. Byte offsets, event
+/// sequences, and cursor anchors are continuous across segment boundaries, so
+/// rotation is invisible to snapshot consumers. The caller supplies a durable
+/// generation ID; it must change when a journal is intentionally replaced.
 #[derive(Clone, Debug)]
 pub struct FileJournalSnapshotSource {
     journal_id: Uuid,
@@ -148,39 +157,146 @@ impl FileJournalSnapshotSource {
 
 impl JournalSnapshotSource for FileJournalSnapshotSource {
     fn snapshot(&self) -> Result<JournalSnapshot, JournalReadError> {
-        let file = File::open(&self.path).map_err(JournalReadError::Open)?;
-        let metadata = file.metadata().map_err(JournalReadError::Metadata)?;
-        if !metadata.is_file() {
-            return Err(JournalReadError::NotAFile);
-        }
-        if metadata.len() > MAX_JOURNAL_SOURCE_BYTES {
-            return Err(JournalReadError::SourceTooLarge {
-                bytes: metadata.len(),
-                limit: MAX_JOURNAL_SOURCE_BYTES,
-            });
-        }
+        JournalSnapshot::new(self.journal_id, read_chain_bytes(&self.path)?)
+    }
+}
 
-        let expected_bytes =
-            usize::try_from(metadata.len()).map_err(|_| JournalReadError::SourceTooLarge {
-                bytes: metadata.len(),
-                limit: MAX_JOURNAL_SOURCE_BYTES,
-            })?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(expected_bytes)
-            .map_err(|_| JournalReadError::Allocation {
-                bytes: expected_bytes,
-            })?;
-        file.take(metadata.len())
-            .read_to_end(&mut bytes)
-            .map_err(JournalReadError::Read)?;
-        if bytes.len() != expected_bytes {
-            return Err(JournalReadError::SourceChanged {
-                expected_bytes,
-                actual_bytes: bytes.len(),
+/// Reads one journal's sealed segments and active file as a single ordered,
+/// bounded byte stream.
+///
+/// Sealed segments `<path>.1 ..= <path>.N` are concatenated in sequence order
+/// before the active file, so replaying the stream is byte-for-byte identical
+/// to replaying a journal that was never rotated. A missing active file behind
+/// at least one sealed segment is the well-defined crash point between sealing
+/// and recreating the active file and reads as an empty tail. Every other
+/// inconsistency — segment gaps, empty, oversized, or unterminated sealed
+/// segments, or a chain past the segment or byte budget — fails closed.
+///
+/// # Errors
+///
+/// Returns [`JournalReadError`] for I/O or allocation failures and for any
+/// chain-integrity violation described above.
+pub fn read_journal_chain(path: impl AsRef<Path>) -> Result<Vec<u8>, JournalReadError> {
+    read_chain_bytes(&stable_history_path_for_read(path.as_ref()))
+}
+
+fn read_chain_bytes(path: &Path) -> Result<Vec<u8>, JournalReadError> {
+    let sealed = inspect_sealed_segments(path)?;
+    let mut bytes = Vec::new();
+    let mut chain_bytes = 0u64;
+    for segment in &sealed {
+        chain_bytes = chain_bytes.saturating_add(segment.bytes);
+        validate_chain_budget(chain_bytes)?;
+        append_sealed_segment(&segment.path, segment.bytes, &mut bytes)?;
+        if !bytes.ends_with(b"\n") {
+            return Err(JournalReadError::SealedSegmentPartialTail {
+                path: segment.path.clone(),
             });
         }
-        JournalSnapshot::new(self.journal_id, bytes)
+    }
+
+    match File::open(path) {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(JournalReadError::Metadata)?;
+            if !metadata.is_file() {
+                return Err(JournalReadError::NotAFile);
+            }
+            if metadata.len() > MAX_JOURNAL_SOURCE_BYTES {
+                return Err(JournalReadError::SourceTooLarge {
+                    bytes: metadata.len(),
+                    limit: MAX_JOURNAL_SOURCE_BYTES,
+                });
+            }
+            chain_bytes = chain_bytes.saturating_add(metadata.len());
+            validate_chain_budget(chain_bytes)?;
+            append_frozen_prefix(file, metadata.len(), &mut bytes)?;
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && !sealed.is_empty() => {
+            // Crash point between sealing and recreating the active file: the
+            // sealed chain is the complete durable record; the tail is empty.
+        }
+        Err(source) => return Err(JournalReadError::Open(source)),
+    }
+    Ok(bytes)
+}
+
+fn append_sealed_segment(
+    path: &Path,
+    expected: u64,
+    sink: &mut Vec<u8>,
+) -> Result<(), JournalReadError> {
+    let file = File::open(path).map_err(JournalReadError::Open)?;
+    let metadata = file.metadata().map_err(JournalReadError::Metadata)?;
+    if !metadata.is_file() {
+        return Err(JournalReadError::SealedSegmentNotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() != expected {
+        return Err(JournalReadError::SourceChanged {
+            expected_bytes: usize::try_from(expected).unwrap_or(usize::MAX),
+            actual_bytes: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        });
+    }
+    append_frozen_prefix(file, expected, sink)
+}
+
+fn append_frozen_prefix(
+    file: File,
+    expected: u64,
+    sink: &mut Vec<u8>,
+) -> Result<(), JournalReadError> {
+    let expected_bytes =
+        usize::try_from(expected).map_err(|_| JournalReadError::SourceTooLarge {
+            bytes: expected,
+            limit: MAX_JOURNAL_SOURCE_BYTES,
+        })?;
+    sink.try_reserve_exact(expected_bytes)
+        .map_err(|_| JournalReadError::Allocation {
+            bytes: expected_bytes,
+        })?;
+    let before = sink.len();
+    file.take(expected)
+        .read_to_end(sink)
+        .map_err(JournalReadError::Read)?;
+    let actual_bytes = sink.len().saturating_sub(before);
+    if actual_bytes != expected_bytes {
+        return Err(JournalReadError::SourceChanged {
+            expected_bytes,
+            actual_bytes,
+        });
+    }
+    Ok(())
+}
+
+const fn validate_chain_budget(bytes: u64) -> Result<(), JournalReadError> {
+    if bytes > MAX_JOURNAL_CHAIN_SOURCE_BYTES {
+        return Err(JournalReadError::ChainTooLarge {
+            bytes,
+            limit: MAX_JOURNAL_CHAIN_SOURCE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+impl From<SealedChainError> for JournalReadError {
+    fn from(error: SealedChainError) -> Self {
+        match error {
+            SealedChainError::Inspect { path, source } => {
+                Self::SealedSegmentInspect { path, source }
+            }
+            SealedChainError::NotAFile { path } => Self::SealedSegmentNotAFile { path },
+            SealedChainError::Bytes { path, bytes } => Self::SealedSegmentBytes {
+                path,
+                bytes,
+                limit: MAX_JOURNAL_SOURCE_BYTES,
+            },
+            SealedChainError::Gap { missing, found } => Self::SealedSegmentGap { missing, found },
+            SealedChainError::TooManySegments { segments } => Self::TooManySegments {
+                segments,
+                limit: MAX_HISTORY_SEALED_SEGMENTS,
+            },
+        }
     }
 }
 
@@ -531,14 +647,7 @@ fn validate_journal_id(journal_id: Uuid) -> Result<(), JournalReadError> {
 }
 
 fn validate_source_len(bytes: usize) -> Result<(), JournalReadError> {
-    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-    if bytes > MAX_JOURNAL_SOURCE_BYTES {
-        return Err(JournalReadError::SourceTooLarge {
-            bytes,
-            limit: MAX_JOURNAL_SOURCE_BYTES,
-        });
-    }
-    Ok(())
+    validate_chain_budget(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
 fn to_u64(value: usize) -> u64 {
@@ -567,6 +676,30 @@ pub enum JournalReadError {
     SourceChanged {
         expected_bytes: usize,
         actual_bytes: usize,
+    },
+    #[error("journal chain has {bytes} bytes; maximum is {limit}")]
+    ChainTooLarge { bytes: u64, limit: u64 },
+    #[error("journal chain has {segments} sealed segments; maximum is {limit}")]
+    TooManySegments { segments: u64, limit: u64 },
+    #[error("journal chain is missing sealed segment {missing} while {found} exists")]
+    SealedSegmentGap { missing: PathBuf, found: PathBuf },
+    #[error(
+        "sealed journal segment {path} has {bytes} bytes; sealed segments must hold 1..={limit} bytes"
+    )]
+    SealedSegmentBytes {
+        path: PathBuf,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("sealed journal segment {path} is not a regular file")]
+    SealedSegmentNotAFile { path: PathBuf },
+    #[error("sealed journal segment {path} does not end with a complete record")]
+    SealedSegmentPartialTail { path: PathBuf },
+    #[error("failed to inspect sealed journal segment {path}: {source}")]
+    SealedSegmentInspect {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error("journal record at offset {offset} has {bytes} bytes; maximum is {limit}")]
     RecordTooLarge {
