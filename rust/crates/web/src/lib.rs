@@ -19,3 +19,4 @@ pub use api::{
 pub use app::{app_router, app_router_with_settings};
 pub use crypto_trading_control_plane::ReadControlPlane;
 pub use server::{DEFAULT_WEB_PORT, WebServerConfig, WebServerConfigError, serve_with_shutdown};
+pub use ui::{embedded_ui_assets, ui_assets_embedded};

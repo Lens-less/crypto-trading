@@ -15,3 +15,8 @@ rust/temp-*
 **/.env.*
 **/*secret*
 **/*credential*
+
+# The frontend bundle is built inside the ui-builder stage from sources, so
+# host-local installs and stale bundles must not leak into the image.
+frontend/node_modules
+frontend/dist

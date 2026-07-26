@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "HTTP API and embedded no-build operator control plane for the trading runtime."
+description = "HTTP API and compile-time embedded operator control plane UI for the trading runtime."
 # The workspace ships as an application, not as crates.io libraries.
 # Publishing is refused explicitly so it cannot happen by accident.
 publish = false
@@ -14,6 +14,7 @@ publish = false
 axum.workspace = true
 crypto-trading-control-plane = { path = "../control-plane" }
 futures-util.workspace = true
+include_dir.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }

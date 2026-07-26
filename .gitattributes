@@ -10,3 +10,8 @@ rust/config/** -whitespace
 # records are checksummed, so a CRLF checkout on Windows would change the
 # bytes the tests assert on.
 rust/fixtures/** text eol=lf
+
+# Frontend sources build into a bundle that is embedded byte-for-byte into
+# the Rust binary, and pnpm verifies pnpm-lock.yaml against content hashes,
+# so a CRLF checkout on Windows would change build output and lockfile bytes.
+frontend/** text=auto eol=lf
