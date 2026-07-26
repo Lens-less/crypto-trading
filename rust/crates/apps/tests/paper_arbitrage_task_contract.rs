@@ -441,8 +441,7 @@ async fn account_risk_pause_skips_opportunities_without_failing_the_owner() {
     // skipped without any reservation and the owner keeps running.
     wait_until(|| {
         std::fs::read_to_string(&path)
-            .map(|body| body.contains("\"decision\":\"account_risk_rejected\""))
-            .unwrap_or(false)
+            .is_ok_and(|body| body.contains("\"decision\":\"account_risk_rejected\""))
     })
     .await;
     drop(left_sender);
