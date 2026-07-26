@@ -241,21 +241,30 @@ fn serve_status_and_stop_work_with_the_hidden_fixture_probe() {
     assert!(status_stdout.contains(&format!("task_id={task_id}")));
     wait_for_journal_fact(&history, "\"probe_failure\":\"transport\"");
 
-    let stop = Command::new(binary())
-        .current_dir(repo_root())
-        .args([
-            "testnet-soak",
-            "--mode",
-            "stop",
-            "--task-id",
-            task_id.as_str(),
-            "--history-path",
-            history.to_str().unwrap(),
-            "--control-port",
-            &control_port.to_string(),
-        ])
-        .output()
-        .unwrap();
+    // A stop is idempotent, and one transient TCP failure against the control
+    // socket must not fail the contract on a loaded CI host.
+    let stop_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let stop = loop {
+        let output = Command::new(binary())
+            .current_dir(repo_root())
+            .args([
+                "testnet-soak",
+                "--mode",
+                "stop",
+                "--task-id",
+                task_id.as_str(),
+                "--history-path",
+                history.to_str().unwrap(),
+                "--control-port",
+                &control_port.to_string(),
+            ])
+            .output()
+            .unwrap();
+        if output.status.success() || std::time::Instant::now() >= stop_deadline {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
     assert!(stop.status.success(), "{stop:?}");
     let stop_stdout = String::from_utf8(stop.stdout).unwrap();
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");

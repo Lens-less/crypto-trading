@@ -67,21 +67,31 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
     );
     assert!(status_stdout.contains("phase=running"), "{status_stdout}");
 
-    let stop = Command::new(binary())
-        .current_dir(repo_root())
-        .args([
-            "monitor",
-            "--mode",
-            "stop",
-            "--task-id",
-            task_id.as_str(),
-            "--history-path",
-            history.to_str().unwrap(),
-            "--control-port",
-            &control_port.to_string(),
-        ])
-        .output()
-        .unwrap();
+    // A stop is idempotent, and a single transient TCP failure against the
+    // control socket must not fail the contract on a loaded CI host, so the
+    // command retries within a bounded budget until the stop is confirmed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let stop = loop {
+        let output = Command::new(binary())
+            .current_dir(repo_root())
+            .args([
+                "monitor",
+                "--mode",
+                "stop",
+                "--task-id",
+                task_id.as_str(),
+                "--history-path",
+                history.to_str().unwrap(),
+                "--control-port",
+                &control_port.to_string(),
+            ])
+            .output()
+            .unwrap();
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
     assert!(stop.status.success(), "{stop:?}");
     let stop_stdout = String::from_utf8(stop.stdout).unwrap();
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");

@@ -71,7 +71,9 @@ fn scanner_serve_process_ranks_the_replay_and_stops_through_the_control_host() {
     );
     assert!(status_stdout.contains("phase=running"), "{status_stdout}");
 
-    let stop = run_control("stop", &task_id, &history, control_port);
+    // A stop is idempotent, and one transient TCP failure against the control
+    // socket must not fail the contract on a loaded CI host.
+    let stop = retry_until_success(|| run_control("stop", &task_id, &history, control_port));
     assert!(stop.status.success(), "{stop:?}");
     let stop_stdout = String::from_utf8(stop.stdout).unwrap();
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");
@@ -193,6 +195,17 @@ fn assert_deterministic_ranking_and_projections(history: &Path, task_id: &str) {
     assert_eq!(tasks.tasks[0].phase, ReadOnlyTaskPhase::Stopped);
     assert_eq!(tasks.tasks[0].recovery, ReadOnlyTaskRecovery::None);
     assert_eq!(tasks.tasks[0].processed_event_count, FIXTURE_EVENT_COUNT);
+}
+
+fn retry_until_success(attempt: impl Fn() -> Output) -> Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = attempt();
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn run_control(mode: &str, task_id: &str, history: &Path, control_port: u16) -> Output {

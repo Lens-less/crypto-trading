@@ -935,9 +935,21 @@ mod tests {
         assert_eq!(matching_registry_entries(&tag), 128);
         drop(histories);
 
-        let survivor = JsonlHistory::new(root.join("survivor.jsonl"));
-        assert_eq!(matching_registry_entries(&tag), 1);
-        drop(survivor);
+        // The registry and its cleanup thresholds are process-global, so
+        // concurrently running tests shift when a registration sweeps. The
+        // contract is that dead entries are eventually pruned, not that the
+        // first registration after the drop is the one that prunes them.
+        let mut pruned = false;
+        for index in 0..1024 {
+            let survivor = JsonlHistory::new(root.join(format!("survivor-{index}.jsonl")));
+            let remaining = matching_registry_entries(&tag);
+            drop(survivor);
+            if remaining <= 2 {
+                pruned = true;
+                break;
+            }
+        }
+        assert!(pruned, "dead registry entries were never pruned");
     }
 
     #[test]

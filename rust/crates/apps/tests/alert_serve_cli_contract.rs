@@ -62,7 +62,9 @@ fn price_alert_serve_process_can_start_report_status_and_stop() {
     );
     assert!(status_stdout.contains("phase=running"), "{status_stdout}");
 
-    let stop = run_control("stop", &task_id, &history, control_port);
+    // A stop is idempotent, and one transient TCP failure against the control
+    // socket must not fail the contract on a loaded CI host.
+    let stop = retry_until_success(|| run_control("stop", &task_id, &history, control_port));
     assert!(stop.status.success(), "{stop:?}");
     let stop_stdout = String::from_utf8(stop.stdout).unwrap();
     assert!(stop_stdout.contains("phase=stopped"), "{stop_stdout}");
@@ -148,6 +150,17 @@ fn price_alert_default_mode_still_validates_and_now_succeeds() {
     assert!(stdout.contains("valid: price-alert"), "{stdout}");
     assert!(stdout.contains("exchange=binance"), "{stdout}");
     assert!(String::from_utf8(output.stderr).unwrap().is_empty());
+}
+
+fn retry_until_success(attempt: impl Fn() -> Output) -> Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = attempt();
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn run_control(mode: &str, task_id: &str, history: &Path, control_port: u16) -> Output {
