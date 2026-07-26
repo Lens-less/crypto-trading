@@ -407,6 +407,9 @@ pub struct MonitorArgs {
     /// Append read-only monitor outcomes to this JSONL journal.
     #[arg(long, default_value = "var/history/arbitrage-monitor.jsonl")]
     pub history_path: PathBuf,
+    /// Append serve-mode spread observations to this dedicated JSONL journal.
+    #[arg(long, default_value = "var/history/spread-history.jsonl")]
+    pub spread_history_path: PathBuf,
     #[arg(long)]
     pub debug: bool,
     #[arg(long)]

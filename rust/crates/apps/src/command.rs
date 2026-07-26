@@ -38,8 +38,8 @@ use crypto_trading_runtime::{
     MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy, MarketInstrument,
     MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
     ReadOnlyTaskExit, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError, SystemMarketDataClock,
-    current_capability_manifest, read_journal_chain,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError, SpreadHistoryWriter,
+    SystemMarketDataClock, current_capability_manifest, read_journal_chain,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -2099,12 +2099,13 @@ async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
         &monitor.exchanges[1],
         &symbol,
     )?;
-    let mut task = ContinuousMonitorTask::start(
+    let mut task = ContinuousMonitorTask::start_with_spread_history(
         ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?,
         read_monitor,
         left_source,
         right_source,
         JsonlHistory::new(&args.history_path),
+        Some(SpreadHistoryWriter::new(&args.spread_history_path)),
     )
     .await
     .context("failed to start continuous monitor task")?;
@@ -2114,10 +2115,11 @@ async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
         .with_context(|| format!("failed to bind monitor control socket on {address}"))?;
 
     println!(
-        "continuous monitor task started: task_id={} control={} history={}",
+        "continuous monitor task started: task_id={} control={} history={} spread_history={}",
         task_id,
         address,
-        args.history_path.display()
+        args.history_path.display(),
+        args.spread_history_path.display()
     );
 
     let outcome = serve_host(

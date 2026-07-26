@@ -18,8 +18,8 @@
 | `testnet-soak` | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
 | `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
 | `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
-| `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model |
-| `monitor` | 是 | 否 | 是（只读 replay） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
+| `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`） |
+| `monitor` | 是 | 否 | 是（只读 replay） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 相同地失败关闭）；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
 | `price-alert` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert owner，状态可降级到 journal 投影 |
 | `scanner` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验 fail-closed scanner schema 后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 owner，评级排名与生命周期事实写入 journal，状态可降级到 journal 投影 |

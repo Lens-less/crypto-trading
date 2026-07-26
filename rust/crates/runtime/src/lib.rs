@@ -14,6 +14,8 @@ mod monitor_read_model;
 mod paper_account;
 mod read_model;
 mod scanner_read_model;
+mod spread_history;
+mod spread_history_read_model;
 mod task_read_model;
 
 pub use alert_read_model::{
@@ -85,6 +87,15 @@ pub use scanner_read_model::{
     MAX_VIRTUAL_GRID_SCANNER_ROWS, ScannerInstrumentView, ScannerPriorityView,
     ScannerRatingGradeView, VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION, VirtualGridScanRowView,
     VirtualGridScanView, VirtualGridScannerReadModel,
+};
+pub use spread_history::{
+    DEFAULT_SPREAD_HISTORY_FILE, MAX_SPREAD_HISTORY_BATCH_RECORDS,
+    SPREAD_HISTORY_RECORD_SCHEMA_VERSION, SPREAD_HISTORY_RECORD_V1_DECISION,
+    SPREAD_HISTORY_STRATEGY, SpreadHistoryError, SpreadHistoryRecord, SpreadHistoryWriter,
+};
+pub use spread_history_read_model::{
+    MAX_SPREAD_HISTORY_READ_MODEL_SAMPLES, SPREAD_HISTORY_READ_MODEL_SCHEMA_VERSION,
+    SpreadHistoryReadModel, SpreadHistorySampleView,
 };
 pub use task_read_model::{
     MAX_READ_ONLY_TASKS, READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit,

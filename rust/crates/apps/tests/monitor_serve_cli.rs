@@ -21,6 +21,7 @@ fn repo_root() -> PathBuf {
 fn monitor_serve_process_can_start_report_status_and_stop() {
     let task_id = format!("monitor-serve-smoke-{}", std::process::id());
     let history = temp_path("monitor-serve-history", "jsonl");
+    let spread_history = temp_path("monitor-serve-spread-history", "jsonl");
     let control_port = free_port();
     let mut child = ChildGuard(Some(
         Command::new(binary())
@@ -37,6 +38,8 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
                 task_id.as_str(),
                 "--history-path",
                 history.to_str().unwrap(),
+                "--spread-history-path",
+                spread_history.to_str().unwrap(),
                 "--control-port",
                 &control_port.to_string(),
                 "--control-poll-interval-ms",
@@ -102,7 +105,19 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
         assert!(journal.contains(decision), "{journal}");
     }
 
+    // The replay fixture is stale against the serve-mode system clock, so
+    // every outcome is a waiting fact: the dedicated spread-history journal
+    // must stay empty rather than recording spreads it never observed.
+    // (In-process spread persistence is covered by
+    // continuous_monitor_task_contract.rs.)
+    let spread_journal = std::fs::read_to_string(&spread_history).unwrap_or_default();
+    assert!(
+        !spread_journal.contains("\"decision\":\"spread_history_record_v1\""),
+        "{spread_journal}"
+    );
+
     std::fs::remove_file(history).unwrap();
+    let _ = std::fs::remove_file(spread_history);
 }
 
 fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {

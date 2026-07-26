@@ -8,6 +8,12 @@ use crate::{
     input::{parse_yaml, read_config_file},
 };
 
+/// Maximum history window accepted by the history decision mode (24 hours,
+/// mirroring the Python history calculator's dynamic window ceiling).
+pub const MAX_ARBITRAGE_HISTORY_WINDOW_SECONDS: u64 = 86_400;
+/// Maximum minimum-sample requirement; matches the strategy sample ring.
+pub const MAX_ARBITRAGE_HISTORY_MIN_SAMPLES: u32 = 4_096;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArbitrageConfig {
     pub mode: String,
@@ -22,6 +28,66 @@ pub struct ArbitrageConfig {
     pub first_close_ratio: Decimal,
     pub max_position_value: Option<Decimal>,
     pub symbol_configs: BTreeMap<Symbol, ArbitrageSymbolConfig>,
+    /// Optional history ("natural spread") decision mode. Absent means the
+    /// mode is disabled; presence still requires `enabled: true` inside.
+    pub history_decision: Option<ArbitrageHistoryDecisionConfig>,
+}
+
+/// Operator controls for the history-based ("natural spread") decision mode.
+///
+/// The mode continuously compares the current spread against the median of
+/// recently persisted spread samples and only judges an opportunity when the
+/// deviation exceeds the configured threshold. Funding-rate terms participate
+/// only when the data source publishes funding rates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArbitrageHistoryDecisionConfig {
+    pub enabled: bool,
+    /// Look-back window in seconds, `1..=86_400`.
+    pub window_seconds: u64,
+    /// Minimum same-direction samples inside the window before any judgement.
+    pub min_samples: u32,
+    /// Required deviation from the natural spread, in basis points.
+    pub deviation_threshold_bps: Decimal,
+    /// Annualized funding-rate cost ceiling in percent per year.
+    pub funding_rate_annual_threshold_pct: Decimal,
+    /// Optional spread-history journal used to backfill samples on cold start.
+    pub spread_history_path: Option<String>,
+}
+
+impl ArbitrageHistoryDecisionConfig {
+    fn validate(&self) -> ConfigResult<()> {
+        if self.window_seconds == 0 || self.window_seconds > MAX_ARBITRAGE_HISTORY_WINDOW_SECONDS {
+            return Err(ConfigError::Validation(format!(
+                "history_decision.window_seconds must be in 1..={MAX_ARBITRAGE_HISTORY_WINDOW_SECONDS}"
+            )));
+        }
+        if self.min_samples == 0 || self.min_samples > MAX_ARBITRAGE_HISTORY_MIN_SAMPLES {
+            return Err(ConfigError::Validation(format!(
+                "history_decision.min_samples must be in 1..={MAX_ARBITRAGE_HISTORY_MIN_SAMPLES}"
+            )));
+        }
+        if self.deviation_threshold_bps <= Decimal::ZERO {
+            return Err(ConfigError::Validation(
+                "history_decision.deviation_threshold_bps must be positive".to_owned(),
+            ));
+        }
+        if self.funding_rate_annual_threshold_pct < Decimal::ZERO {
+            return Err(ConfigError::Validation(
+                "history_decision.funding_rate_annual_threshold_pct must not be negative"
+                    .to_owned(),
+            ));
+        }
+        if self
+            .spread_history_path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "history_decision.spread_history_path must not be blank".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +254,9 @@ impl ArbitrageConfig {
                 "arbitrage max_position_value must be positive".to_owned(),
             ));
         }
+        if let Some(history) = &self.history_decision {
+            history.validate()?;
+        }
         Ok(())
     }
 }
@@ -296,6 +365,7 @@ pub fn load_arbitrage_config_from_str(yaml: &str) -> ConfigResult<ArbitrageConfi
     )?;
 
     let symbol_configs = symbol_configs_at(&document)?;
+    let history_decision = history_decision_at(&document)?;
 
     Ok(ArbitrageConfig {
         mode,
@@ -310,7 +380,46 @@ pub fn load_arbitrage_config_from_str(yaml: &str) -> ConfigResult<ArbitrageConfi
         first_close_ratio,
         max_position_value,
         symbol_configs,
+        history_decision,
     })
+}
+
+fn history_decision_at(
+    document: &serde_yaml::Value,
+) -> ConfigResult<Option<ArbitrageHistoryDecisionConfig>> {
+    let Some(value) = value_at(document, &["history_decision"]) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if !value.is_mapping() {
+        return Err(ConfigError::Validation(
+            "history_decision must be a mapping".to_owned(),
+        ));
+    }
+    let enabled = bool_at(value, &["enabled"])?.unwrap_or(false);
+    let window_seconds = u64_at(value, &["window_seconds"])?.unwrap_or(3_600);
+    // Python default min_data_points=10 (history_calculator.py:75).
+    let min_samples = u32_at(value, &["min_samples"])?.unwrap_or(10);
+    let deviation_threshold_bps = decimal_at_any(value, &[&["deviation_threshold_bps"]])?
+        .unwrap_or_else(|| Decimal::from(10u8));
+    // Python default funding_rate_annual_threshold=10.0 %/year
+    // (config/arbitrage_config.py:65).
+    let funding_rate_annual_threshold_pct =
+        decimal_at_any(value, &[&["funding_rate_annual_threshold_pct"]])?
+            .unwrap_or_else(|| Decimal::from(10u8));
+    let spread_history_path = string_at(value, &["spread_history_path"]).map(ToOwned::to_owned);
+    let config = ArbitrageHistoryDecisionConfig {
+        enabled,
+        window_seconds,
+        min_samples,
+        deviation_threshold_bps,
+        funding_rate_annual_threshold_pct,
+        spread_history_path,
+    };
+    config.validate()?;
+    Ok(Some(config))
 }
 
 fn value_at<'a>(document: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a serde_yaml::Value> {
@@ -334,6 +443,18 @@ fn bool_at(document: &serde_yaml::Value, path: &[&str]) -> ConfigResult<Option<b
         .as_bool()
         .map(Some)
         .ok_or_else(|| ConfigError::Validation(format!("{} must be a boolean", path.join("."))))
+}
+
+fn u64_at(document: &serde_yaml::Value, path: &[&str]) -> ConfigResult<Option<u64>> {
+    let Some(value) = value_at(document, path) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_u64().map(Some).ok_or_else(|| {
+        ConfigError::Validation(format!("{} must be an unsigned integer", path.join(".")))
+    })
 }
 
 fn u32_at(document: &serde_yaml::Value, path: &[&str]) -> ConfigResult<Option<u32>> {

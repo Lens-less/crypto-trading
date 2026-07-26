@@ -11,7 +11,9 @@ mod supporting;
 mod symbol_conversion;
 
 pub use arbitrage::{
-    ArbitrageConfig, ArbitrageSymbolConfig, load_arbitrage_config, load_arbitrage_config_from_str,
+    ArbitrageConfig, ArbitrageHistoryDecisionConfig, ArbitrageSymbolConfig,
+    MAX_ARBITRAGE_HISTORY_MIN_SAMPLES, MAX_ARBITRAGE_HISTORY_WINDOW_SECONDS, load_arbitrage_config,
+    load_arbitrage_config_from_str,
 };
 pub use auth::{
     EnvProvider, ExchangeAuth, ProcessEnvironment, Secret, load_exchange_auth,

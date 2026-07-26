@@ -12,8 +12,9 @@ use std::{
     fmt,
     future::Future,
     io::ErrorKind,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -37,11 +38,13 @@ use crypto_trading_runtime::{
     PaperAccountError, PaperAccountSnapshot, PaperCostModel, PaperReconciliationOutcome,
     PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
     ReadModelError, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel,
-    ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError, SpreadHistoryReadModel,
+    SpreadHistorySampleView, read_journal_chain,
 };
 use crypto_trading_strategy::{
-    AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, PairStrategyMachine,
-    RiskDecision, RiskEngine, RiskLimits, RiskRejection, StrategyError,
+    AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, HistoryDecisionKind,
+    HistoryDecisionMachine, PairStrategyMachine, RiskDecision, RiskEngine, RiskLimits,
+    RiskRejection, SpreadSample, StrategyError,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -49,10 +52,14 @@ use tokio::{
     sync::watch,
     task::{JoinError, JoinHandle},
 };
+use uuid::Uuid;
 
 use crate::{
     DurablePaperArbitrageSaga, PaperArbitrageRequest, PaperArbitrageRun, PaperArbitrageSagaError,
-    monitor::{ArbitrageMonitorError, ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor},
+    monitor::{
+        ArbitrageMonitorError, ArbitrageMonitorEvent, ArbitrageMonitorOutcome,
+        ReadOnlyArbitrageMonitor,
+    },
     task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture},
 };
 
@@ -82,6 +89,12 @@ pub struct ArbitragePaperTaskConfig {
     risk: RiskEngine,
     cost_model: PaperCostModel,
     supervisor: MarketSupervisorConfig,
+    /// Optional history ("natural spread") gate: when present, opportunities
+    /// only become operations after the machine judges `Open`.
+    history_decision: Option<HistoryDecisionMachine>,
+    /// Optional dedicated spread-history journal used to backfill the
+    /// history machine on cold start.
+    spread_history_path: Option<PathBuf>,
 }
 
 impl ArbitragePaperTaskConfig {
@@ -117,12 +130,24 @@ impl ArbitragePaperTaskConfig {
             max_snapshot_age,
         })
         .map_err(ArbitragePaperTaskError::Strategy)?;
+        let (history_decision, spread_history_path) = match &arbitrage.history_decision {
+            Some(history) if history.enabled => (
+                Some(
+                    HistoryDecisionMachine::try_from(history)
+                        .map_err(ArbitragePaperTaskError::Strategy)?,
+                ),
+                history.spread_history_path.as_ref().map(PathBuf::from),
+            ),
+            _ => (None, None),
+        };
         Ok(Self {
             task_id: task_id.to_owned(),
             strategy,
             risk,
             cost_model,
             supervisor,
+            history_decision,
+            spread_history_path,
         })
     }
 
@@ -221,7 +246,7 @@ impl ArbitragePaperTask {
     /// strategy, or journal failure.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn start<L, R>(
-        config: ArbitragePaperTaskConfig,
+        mut config: ArbitragePaperTaskConfig,
         monitor: ReadOnlyArbitrageMonitor,
         left_source: L,
         right_source: R,
@@ -247,6 +272,12 @@ impl ArbitragePaperTask {
         let source_ids = [left_source_id, right_source_id];
         let operation_sequence =
             recovery_preflight(&config.task_id, &source_ids, &account, &history).await?;
+
+        if let Some(path) = config.spread_history_path.clone()
+            && let Some(machine) = config.history_decision.as_mut()
+        {
+            backfill_history_machine(machine, &path).await?;
+        }
 
         let registered_at = Utc::now();
         history
@@ -570,6 +601,8 @@ async fn run_owner(
     let mut state = ArbitrageState::default();
     let mut in_flight: Option<InFlightOperation> = None;
     let mut pending_opportunity = false;
+    let mut history_machine = config.history_decision.clone();
+    let mut latest_history_sample: Option<SpreadSample> = None;
 
     loop {
         let selected = if let Some(operation) = in_flight.as_mut() {
@@ -651,6 +684,27 @@ async fn run_owner(
                 }
                 if pending_opportunity && !*stop.borrow() && !*cancel.borrow() {
                     pending_opportunity = false;
+                    let gate_open = match history_gate(
+                        history_machine.as_ref(),
+                        latest_history_sample.as_ref(),
+                    ) {
+                        Ok(open) => open,
+                        Err(error) => {
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                ArbitragePaperTaskFailure::InvalidRequest,
+                                ArbitragePaperTaskError::Strategy(error),
+                            )
+                            .await;
+                        }
+                    };
+                    if !gate_open {
+                        continue;
+                    }
                     match plan_latest_operation(
                         &config,
                         &monitor,
@@ -706,6 +760,42 @@ async fn run_owner(
                     monitor_event.outcome,
                     ArbitrageMonitorOutcome::Opportunity { .. }
                 );
+                if history_machine.is_some() {
+                    match history_sample_of(&monitor_event) {
+                        Ok(Some(sample)) => {
+                            if let Some(machine) = history_machine.as_mut()
+                                && let Err(error) = machine.observe(sample.clone())
+                            {
+                                abort_inflight(&mut in_flight, saga.account()).await;
+                                return fail_owner(
+                                    &mut left,
+                                    &mut right,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    ArbitragePaperTaskFailure::InvalidRequest,
+                                    ArbitragePaperTaskError::Strategy(error),
+                                )
+                                .await;
+                            }
+                            latest_history_sample = Some(sample);
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            abort_inflight(&mut in_flight, saga.account()).await;
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                ArbitragePaperTaskFailure::MonitorContract,
+                                ArbitragePaperTaskError::InvalidRequest,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 let mut next = status_sender.borrow().clone();
                 next.processed_event_count =
                     if let Some(value) = next.processed_event_count.checked_add(1) {
@@ -763,6 +853,27 @@ async fn run_owner(
                 status_sender.send_replace(next);
 
                 if is_opportunity && in_flight.is_none() && !*stop.borrow() && !*cancel.borrow() {
+                    let gate_open = match history_gate(
+                        history_machine.as_ref(),
+                        latest_history_sample.as_ref(),
+                    ) {
+                        Ok(open) => open,
+                        Err(error) => {
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                ArbitragePaperTaskFailure::InvalidRequest,
+                                ArbitragePaperTaskError::Strategy(error),
+                            )
+                            .await;
+                        }
+                    };
+                    if !gate_open {
+                        continue;
+                    }
                     match plan_latest_operation(
                         &config,
                         &monitor,
@@ -863,6 +974,134 @@ async fn plan_latest_operation(
     )?;
     *operation_sequence = next_sequence;
     Ok(Some(PlannedOperation { request, decision }))
+}
+
+/// Applies the optional history ("natural spread") gate: without the mode
+/// every opportunity passes; with the mode an opportunity becomes an
+/// operation only after the machine judges `Open`. `InsufficientHistory`
+/// and `Hold` both refuse to trade (fail closed, no order).
+fn history_gate(
+    machine: Option<&HistoryDecisionMachine>,
+    latest: Option<&SpreadSample>,
+) -> Result<bool, StrategyError> {
+    match (machine, latest) {
+        (None, _) => Ok(true),
+        (Some(_), None) => Ok(false),
+        (Some(machine), Some(sample)) => Ok(matches!(
+            machine.evaluate(sample)?.kind,
+            HistoryDecisionKind::Open
+        )),
+    }
+}
+
+/// Projects one spread-bearing monitor outcome into a strategy spread sample.
+/// Waiting and rejected outcomes carry no spread and yield `Ok(None)`.
+/// Funding fields stay `None`: no wired market-data source publishes funding
+/// rates yet, so history decisions run funding-degraded.
+fn history_sample_of(event: &ArbitrageMonitorEvent) -> Result<Option<SpreadSample>, ()> {
+    let (buy_exchange, sell_exchange, buy_price, sell_price, spread_percent) = match &event.outcome
+    {
+        ArbitrageMonitorOutcome::NoOpportunity {
+            buy_exchange,
+            sell_exchange,
+            buy_price,
+            sell_price,
+            spread_percent,
+            ..
+        }
+        | ArbitrageMonitorOutcome::Opportunity {
+            buy_exchange,
+            sell_exchange,
+            buy_price,
+            sell_price,
+            spread_percent,
+            ..
+        } => (
+            buy_exchange,
+            sell_exchange,
+            *buy_price,
+            *sell_price,
+            *spread_percent,
+        ),
+        ArbitrageMonitorOutcome::Waiting { .. }
+        | ArbitrageMonitorOutcome::AnalysisRejected { .. } => {
+            return Ok(None);
+        }
+    };
+    let spread_bps = spread_percent.checked_mul(Decimal::ONE_HUNDRED).ok_or(())?;
+    Ok(Some(SpreadSample {
+        timestamp: event.recorded_at,
+        buy_exchange: buy_exchange.clone(),
+        sell_exchange: sell_exchange.clone(),
+        buy_price: buy_price.as_decimal(),
+        sell_price: sell_price.as_decimal(),
+        spread_bps,
+        funding_rate_buy: None,
+        funding_rate_sell: None,
+    }))
+}
+
+/// Cold-start backfill: replays the bounded recent window of the dedicated
+/// spread-history chain into the history machine. A missing journal is an
+/// empty history; a degraded or corrupted projection fails closed.
+async fn backfill_history_machine(
+    machine: &mut HistoryDecisionMachine,
+    path: &Path,
+) -> Result<(), ArbitragePaperTaskError> {
+    let chain_path = path.to_owned();
+    let bytes = tokio::task::spawn_blocking(move || match read_journal_chain(&chain_path) {
+        Ok(bytes) => Ok(bytes),
+        Err(JournalReadError::Open(source)) if source.kind() == ErrorKind::NotFound => {
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+    })
+    .await
+    .map_err(|_| ArbitragePaperTaskError::SnapshotTaskFailed)?
+    .map_err(ArbitragePaperTaskError::JournalRead)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let snapshot = JournalSnapshot::new(Uuid::new_v4(), bytes)?;
+    let model = SpreadHistoryReadModel::from_legacy_snapshot(&snapshot)?;
+    if model.projection_status != ProjectionStatus::Complete {
+        // Corrupted or partially readable spread history must not silently
+        // seed the machine.
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    let Some(newest) = model.samples.last().map(|sample| sample.timestamp) else {
+        return Ok(());
+    };
+    let mut window: Vec<&SpreadHistorySampleView> =
+        model.recent_window(newest, machine.config().window);
+    window.sort_by_key(|sample| sample.timestamp);
+    for view in window {
+        machine
+            .observe(history_sample_from_view(view)?)
+            .map_err(ArbitragePaperTaskError::Strategy)?;
+    }
+    Ok(())
+}
+
+fn history_sample_from_view(
+    view: &SpreadHistorySampleView,
+) -> Result<SpreadSample, ArbitragePaperTaskError> {
+    fn parse(text: &str) -> Result<Decimal, ArbitragePaperTaskError> {
+        Decimal::from_str(text).map_err(|_| ArbitragePaperTaskError::RecoveryRequired)
+    }
+    fn parse_optional(text: Option<&str>) -> Result<Option<Decimal>, ArbitragePaperTaskError> {
+        text.map(parse).transpose()
+    }
+    Ok(SpreadSample {
+        timestamp: view.timestamp,
+        buy_exchange: view.exchange_buy.clone(),
+        sell_exchange: view.exchange_sell.clone(),
+        buy_price: parse(&view.price_buy)?,
+        sell_price: parse(&view.price_sell)?,
+        spread_bps: parse(&view.spread_bps)?,
+        funding_rate_buy: parse_optional(view.funding_rate_buy.as_deref())?,
+        funding_rate_sell: parse_optional(view.funding_rate_sell.as_deref())?,
+    })
 }
 
 fn build_operation(

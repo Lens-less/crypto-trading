@@ -16,7 +16,9 @@ use crypto_trading_cli::{
     ArbitragePaperTaskFailure, ArbitragePaperTaskPhase,
     monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock},
 };
-use crypto_trading_config::{ArbitrageConfig, ArbitrageSymbolConfig};
+use crypto_trading_config::{
+    ArbitrageConfig, ArbitrageHistoryDecisionConfig, ArbitrageSymbolConfig,
+};
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, Order, OrderStatus, Price, Quantity, Symbol,
 };
@@ -27,6 +29,7 @@ use crypto_trading_runtime::{
     MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
     PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationPhase,
     ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskRecovery,
+    SpreadHistoryRecord, SpreadHistoryWriter,
 };
 use rust_decimal::Decimal;
 use tokio::sync::{Semaphore, mpsc};
@@ -100,6 +103,7 @@ fn strategy_config() -> ArbitrageConfig {
         first_close_ratio: decimal("0.5"),
         max_position_value: Some(decimal("10000")),
         symbol_configs,
+        history_decision: None,
     }
 }
 
@@ -879,6 +883,212 @@ async fn inflight_opportunities_coalesce_into_one_latest_pair_re_evaluation() {
             "arbitrage:coalesce/op/000002",
         ]
     );
+}
+
+fn history_task_config(
+    task_id: &str,
+    min_samples: u32,
+    spread_history_path: Option<&std::path::Path>,
+) -> ArbitragePaperTaskConfig {
+    let mut strategy = strategy_config();
+    strategy.history_decision = Some(ArbitrageHistoryDecisionConfig {
+        enabled: true,
+        window_seconds: 3_600,
+        min_samples,
+        deviation_threshold_bps: decimal("1"),
+        funding_rate_annual_threshold_pct: decimal("10"),
+        spread_history_path: spread_history_path.map(|path| path.to_string_lossy().into_owned()),
+    });
+    ArbitragePaperTaskConfig::new(
+        task_id,
+        &strategy,
+        Duration::minutes(5),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        MarketSupervisorConfig::new(StdDuration::from_secs(1)).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn history_mode_holds_orders_on_insufficient_history_then_opens_after_enough_samples() {
+    let (account, history, _) = account("history-mode");
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        history_task_config("arbitrage:history", 3, None),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    // Two spread observations (150 bps, 160 bps): fewer than min_samples=3
+    // same-direction samples, so InsufficientHistory blocks any order.
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| task.status().processed_event_count >= 2).await;
+    right_sender
+        .send(observation(
+            "right",
+            "101.6",
+            "102",
+            2,
+            base_time() + Duration::seconds(2),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| task.status().processed_event_count >= 3).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        executor.calls.load(Ordering::SeqCst),
+        0,
+        "insufficient history must not place any order"
+    );
+
+    // Third observation: window now holds three samples with median 160 bps;
+    // the 400 bps spread deviates by 240 bps >= 1 bps, so the gate opens.
+    right_sender
+        .send(observation(
+            "right",
+            "104",
+            "104.5",
+            3,
+            base_time() + Duration::seconds(3),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+
+    assert_eq!(
+        task.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    let snapshot = account.snapshot().await.unwrap();
+    assert_eq!(snapshot.reservations.len(), 1);
+    assert_eq!(
+        snapshot.reservations[0].task_id,
+        "arbitrage:history/op/000001"
+    );
+    assert_eq!(
+        snapshot.reservations[0].phase,
+        PaperReservationPhase::Committed
+    );
+}
+
+#[tokio::test]
+async fn history_mode_backfills_the_sample_buffer_from_the_spread_history_journal() {
+    let spread_history_path = temp_path("history-backfill-spread");
+    let writer = SpreadHistoryWriter::new(&spread_history_path);
+    // Three persisted same-direction samples inside the window: the machine
+    // starts warm and the first live opportunity may open immediately.
+    writer
+        .append_batch(
+            &[(-180i64, "150"), (-120, "155"), (-60, "160")]
+                .into_iter()
+                .map(|(offset, spread_bps)| SpreadHistoryRecord {
+                    timestamp: base_time() + Duration::seconds(offset),
+                    symbol: "BTC-USDT".to_owned(),
+                    exchange_buy: "left".to_owned(),
+                    exchange_sell: "right".to_owned(),
+                    price_buy: "100".to_owned(),
+                    price_sell: "101.5".to_owned(),
+                    spread_bps: spread_bps.to_owned(),
+                    funding_rate_buy: None,
+                    funding_rate_sell: None,
+                    funding_rate_diff: None,
+                    funding_rate_diff_annual_pct: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+
+    let (account, history, _) = account("history-backfill");
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        history_task_config("arbitrage:backfill", 3, Some(&spread_history_path)),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    // One live opportunity at 400 bps against the backfilled natural spread
+    // of 155 bps is enough: no warm-up phase is required after a restart.
+    right_sender
+        .send(observation(
+            "right",
+            "104",
+            "104.5",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+
+    assert_eq!(
+        task.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    let snapshot = account.snapshot().await.unwrap();
+    assert_eq!(snapshot.reservations.len(), 1);
+    std::fs::remove_file(spread_history_path).unwrap();
+}
+
+#[tokio::test]
+async fn history_mode_fails_closed_on_a_corrupted_spread_history_journal() {
+    let spread_history_path = temp_path("history-corrupt-spread");
+    std::fs::write(&spread_history_path, b"this-is-not-json\n").unwrap();
+
+    let (account, history, path) = account("history-corrupt");
+    let (left_source, _left_sender) = ChannelSource::new("left");
+    let (right_source, _right_sender) = ChannelSource::new("right");
+    let error = ArbitragePaperTask::start(
+        history_task_config("arbitrage:corrupt", 3, Some(&spread_history_path)),
+        monitor(),
+        left_source,
+        right_source,
+        account,
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, ArbitragePaperTaskError::Projection(_)));
+    assert!(
+        !path.exists(),
+        "a corrupted spread history must fail before task registration"
+    );
+    std::fs::remove_file(spread_history_path).unwrap();
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {

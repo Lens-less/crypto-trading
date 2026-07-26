@@ -442,6 +442,145 @@ symbol_configs:
 }
 
 #[test]
+fn arbitrage_history_decision_defaults_to_absent_and_parses_explicit_controls() {
+    let absent = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+system_mode:
+  monitor_only: true
+",
+    )
+    .unwrap();
+    assert_eq!(absent.history_decision, None);
+
+    let config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+system_mode:
+  monitor_only: true
+history_decision:
+  enabled: true
+  window_seconds: 7200
+  min_samples: 12
+  deviation_threshold_bps: 15
+  funding_rate_annual_threshold_pct: 20
+  spread_history_path: var/history/spread-history.jsonl
+",
+    )
+    .unwrap();
+    let history = config.history_decision.unwrap();
+    assert!(history.enabled);
+    assert_eq!(history.window_seconds, 7_200);
+    assert_eq!(history.min_samples, 12);
+    assert_eq!(history.deviation_threshold_bps.to_string(), "15");
+    assert_eq!(history.funding_rate_annual_threshold_pct.to_string(), "20");
+    assert_eq!(
+        history.spread_history_path.as_deref(),
+        Some("var/history/spread-history.jsonl")
+    );
+
+    // A bare mapping stays disabled and takes the Python-derived defaults
+    // (min_data_points=10, funding annual threshold 10 %/year).
+    let defaults = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+system_mode:
+  monitor_only: true
+history_decision:
+  window_seconds: 600
+",
+    )
+    .unwrap()
+    .history_decision
+    .unwrap();
+    assert!(!defaults.enabled);
+    assert_eq!(defaults.min_samples, 10);
+    assert_eq!(defaults.deviation_threshold_bps.to_string(), "10");
+    assert_eq!(defaults.funding_rate_annual_threshold_pct.to_string(), "10");
+    assert_eq!(defaults.spread_history_path, None);
+}
+
+#[test]
+fn arbitrage_history_decision_bounds_are_fail_closed() {
+    for (yaml, expected) in [
+        (
+            r"
+mode: segmented
+history_decision:
+  window_seconds: 0
+",
+            "window_seconds must be in 1..=86400",
+        ),
+        (
+            r"
+mode: segmented
+history_decision:
+  window_seconds: 86401
+",
+            "window_seconds must be in 1..=86400",
+        ),
+        (
+            r"
+mode: segmented
+history_decision:
+  min_samples: 0
+",
+            "min_samples must be in 1..=4096",
+        ),
+        (
+            r"
+mode: segmented
+history_decision:
+  min_samples: 4097
+",
+            "min_samples must be in 1..=4096",
+        ),
+        (
+            r"
+mode: segmented
+history_decision:
+  deviation_threshold_bps: 0
+",
+            "deviation_threshold_bps must be positive",
+        ),
+        (
+            r"
+mode: segmented
+history_decision:
+  funding_rate_annual_threshold_pct: -1
+",
+            "funding_rate_annual_threshold_pct must not be negative",
+        ),
+        (
+            r#"
+mode: segmented
+history_decision:
+  spread_history_path: "   "
+"#,
+            "spread_history_path must not be blank",
+        ),
+        (
+            r"
+mode: segmented
+history_decision: 7
+",
+            "history_decision must be a mapping",
+        ),
+        (
+            r#"
+mode: segmented
+history_decision:
+  window_seconds: "soon"
+"#,
+            "window_seconds must be an unsigned integer",
+        ),
+    ] {
+        let error = load_arbitrage_config_from_str(yaml).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}: {yaml}");
+    }
+}
+
+#[test]
 fn arbitrage_execution_controls_are_explicit_and_fail_closed() {
     for (yaml, expected) in [
         (

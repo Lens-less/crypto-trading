@@ -506,7 +506,7 @@ fn instrument_details(instrument: &MarketInstrument) -> Value {
     })
 }
 
-fn monitor_symbol(left: &MarketInstrument, right: &MarketInstrument) -> String {
+pub(crate) fn monitor_symbol(left: &MarketInstrument, right: &MarketInstrument) -> String {
     if left.symbol == right.symbol {
         left.symbol.to_string()
     } else {

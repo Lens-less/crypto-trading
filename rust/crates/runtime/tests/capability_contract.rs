@@ -335,6 +335,55 @@ fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() 
 }
 
 #[test]
+fn arbitrage_history_decision_facts_stay_paper_scoped_and_funding_degraded() {
+    let manifest = current_capability_manifest();
+
+    let strategy = manifest.capability("strategy.arbitrage").unwrap();
+    assert_eq!(strategy.level, CapabilityLevel::Available);
+    assert!(strategy.summary.contains("history-mode"));
+    for evidence in [
+        "rust/crates/strategy/src/arbitrage_history.rs",
+        "rust/crates/strategy/tests/arbitrage_history.rs",
+    ] {
+        assert!(strategy.evidence.contains(&evidence.to_owned()));
+    }
+    assert!(
+        strategy
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("funding_degraded")),
+        "the missing funding data source must stay an explicit blocker"
+    );
+
+    let arbitrage = manifest.capability("runtime.arbitrage").unwrap();
+    assert!(arbitrage.summary.contains("history-decision"));
+    assert!(arbitrage.summary.contains("spread-history journal"));
+    for evidence in [
+        "rust/crates/runtime/src/spread_history.rs",
+        "rust/crates/runtime/src/spread_history_read_model.rs",
+        "rust/crates/runtime/tests/spread_history_contract.rs",
+    ] {
+        assert!(arbitrage.evidence.contains(&evidence.to_owned()));
+    }
+    assert!(
+        arbitrage
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("second venue")
+                && blocker.contains("funding_degraded")),
+        "waiting for a second venue's public funding data must stay explicit"
+    );
+
+    let monitor = manifest.capability("runtime.monitor").unwrap();
+    assert!(monitor.summary.contains("spread-history journal"));
+    assert!(
+        monitor
+            .evidence
+            .contains(&"rust/crates/runtime/src/spread_history.rs".to_owned())
+    );
+}
+
+#[test]
 fn journal_rotation_is_reflected_without_advertising_compaction() {
     let manifest = current_capability_manifest();
     let rotation_evidence = "rust/crates/runtime/tests/history_rotation_contract.rs".to_owned();

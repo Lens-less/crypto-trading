@@ -739,9 +739,10 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Two-leg segmented paper execution through both the one-shot CLI and a recoverable exact-pair owner reached through the trusted CLI/Web submit path.",
+            "Two-leg segmented paper execution through both the one-shot CLI and a recoverable exact-pair owner reached through the trusted CLI/Web submit path, plus an optional history-decision (natural-spread) gate backfilled from the durable spread-history journal.",
             &[
                 "The continuous owner currently consumes only an explicit replay-backed profile; nonterminal restart remains deliberately fail-closed and no testnet/mainnet order authority is implied.",
+                "The history-decision mode is paper/replay only and evaluates without funding-rate input: spread-history records carry no funding fields while we wait for a second venue's public market data to provide funding rates, so funding-aware judgements stay degraded (funding_degraded).",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
@@ -754,6 +755,9 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 "rust/crates/web-app/src/paper_dispatcher.rs",
                 "rust/crates/web-app/tests/paper_dispatcher_contract.rs",
                 "rust/crates/runtime/tests/arbitrage_paper_slice.rs",
+                "rust/crates/runtime/src/spread_history.rs",
+                "rust/crates/runtime/src/spread_history_read_model.rs",
+                "rust/crates/runtime/tests/spread_history_contract.rs",
             ],
         ),
         capability(
@@ -859,7 +863,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             CapabilityArea::Runtime,
             CapabilityLevel::ReadOnly,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, bounded stop, and a Web-visible task projection.",
+            "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, spread observations mirrored into the dedicated spread-history journal, bounded stop, and a Web-visible task projection.",
             &[
                 "The CLI service bootstrap is replay-backed, only Binance has a real public adapter, and restart recovery projects prior facts without automatically resuming external sources.",
             ],
@@ -867,6 +871,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/apps/src/command.rs",
                 "rust/crates/apps/src/monitor.rs",
                 "rust/crates/apps/src/continuous_monitor.rs",
+                "rust/crates/runtime/src/spread_history.rs",
                 "rust/crates/apps/tests/monitor_contract.rs",
                 "rust/crates/apps/tests/monitor_replay_cli.rs",
                 "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
@@ -1036,11 +1041,15 @@ fn strategy_capabilities() -> Vec<Capability> {
             CapabilityArea::Strategy,
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic segmented arbitrage decisions without I/O.",
-            &[],
+            "Deterministic segmented and history-mode (natural-spread median) arbitrage decisions without I/O.",
+            &[
+                "History-mode funding terms stay degraded (funding_degraded=true): no wired market-data source publishes funding rates while we wait for a second venue's public feed to provide them.",
+            ],
             &[
                 "rust/crates/strategy/src/arbitrage.rs",
+                "rust/crates/strategy/src/arbitrage_history.rs",
                 "rust/crates/strategy/tests/segmented_arbitrage.rs",
+                "rust/crates/strategy/tests/arbitrage_history.rs",
             ],
         ),
         capability(

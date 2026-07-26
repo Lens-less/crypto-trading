@@ -6,6 +6,7 @@
 
 mod alert;
 mod arbitrage;
+mod arbitrage_history;
 mod grid;
 mod grid_protection;
 mod risk;
@@ -23,6 +24,11 @@ pub use arbitrage::{
     ArbitrageDecision, ArbitrageDecisionKind, ArbitrageDirection, ArbitrageState,
     ArbitrageStrategy, PairStrategyMachine, SegmentedArbitrageConfig, SpreadCalculator,
     SpreadQuote,
+};
+pub use arbitrage_history::{
+    FUNDING_INTERVALS_PER_YEAR, HistoryArbitrageConfig, HistoryDecision, HistoryDecisionKind,
+    HistoryDecisionMachine, MAX_HISTORY_WINDOW_SECONDS, MAX_SPREAD_SAMPLES,
+    NaturalSpreadCalculator, SpreadSample,
 };
 pub use grid::{
     GridDirection, GridLevel, GridPlanConfig, GridPlanner, GridRange, GridState, GridStrategy,

@@ -11,8 +11,9 @@ use crypto_trading_runtime::{
     DecisionRecord, HistoryError, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION,
     MarketDataEvent, MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig,
     MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
-    MarketSupervisorStatus,
+    MarketSupervisorStatus, SpreadHistoryError, SpreadHistoryRecord, SpreadHistoryWriter,
 };
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::{
     sync::watch,
@@ -20,7 +21,10 @@ use tokio::{
     time::Instant,
 };
 
-use crate::monitor::{ArbitrageMonitorError, ReadOnlyArbitrageMonitor};
+use crate::monitor::{
+    ArbitrageMonitorError, ArbitrageMonitorEvent, ArbitrageMonitorOutcome,
+    ReadOnlyArbitrageMonitor, monitor_symbol,
+};
 use crate::task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture};
 
 /// Stable schema version for the process-local task status surface.
@@ -166,6 +170,30 @@ impl ContinuousMonitorTask {
         L: MarketDataEventSource,
         R: MarketDataEventSource,
     {
+        Self::start_with_spread_history(config, monitor, left_source, right_source, history, None)
+            .await
+    }
+
+    /// Like [`Self::start`], but additionally persists one spread-history
+    /// record into the dedicated spread-history journal for every spread
+    /// observation. A spread-history write failure is treated exactly like a
+    /// monitor journal write failure: the owner fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::start`].
+    pub async fn start_with_spread_history<L, R>(
+        config: ContinuousMonitorTaskConfig,
+        monitor: ReadOnlyArbitrageMonitor,
+        left_source: L,
+        right_source: R,
+        history: JsonlHistory,
+        spread_history: Option<SpreadHistoryWriter>,
+    ) -> Result<Self, ContinuousMonitorTaskError>
+    where
+        L: MarketDataEventSource,
+        R: MarketDataEventSource,
+    {
         let (left_leg, right_leg) = monitor.legs();
         let left_source_id = left_source.source_id().to_owned();
         let right_source_id = right_source.source_id().to_owned();
@@ -242,6 +270,7 @@ impl ContinuousMonitorTask {
                 left,
                 right,
                 task_history,
+                spread_history,
                 task_status_sender,
                 stop_receiver,
                 running_at,
@@ -410,11 +439,13 @@ impl Drop for ContinuousMonitorTask {
 
 type TaskResult = Result<ContinuousMonitorTaskExit, ContinuousMonitorTaskError>;
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_owner(
     mut monitor: ReadOnlyArbitrageMonitor,
     mut left: MarketSupervisor,
     mut right: MarketSupervisor,
     history: JsonlHistory,
+    spread_history: Option<SpreadHistoryWriter>,
     status_sender: watch::Sender<ContinuousMonitorTaskStatus>,
     mut stop: watch::Receiver<bool>,
     mut last_recorded_at: DateTime<Utc>,
@@ -474,6 +505,18 @@ async fn run_owner(
                 next.sources = source_statuses(&left, &right);
                 next.last_recorded_at = Some(recorded_at);
                 next.runtime_failure = None;
+                let Ok(spread_record) = spread_history_record(&monitor_event) else {
+                    return fail_owner(
+                        &mut left,
+                        &mut right,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        ContinuousMonitorTaskFailure::MonitorContract,
+                        ContinuousMonitorTaskError::MonitorContract,
+                    )
+                    .await;
+                };
                 let records = [
                     monitor_event.to_record(),
                     status_record(&next, "task_checkpointed", recorded_at),
@@ -485,6 +528,18 @@ async fn run_owner(
                         ContinuousMonitorTaskFailure::JournalUnavailable,
                     );
                     return Err(ContinuousMonitorTaskError::Journal(error));
+                }
+                if let (Some(writer), Some(record)) = (&spread_history, &spread_record)
+                    && let Err(error) = writer.append(record).await
+                {
+                    // A spread-history write failure shares the monitor
+                    // journal's fail-closed semantics: no degraded recording.
+                    let _ = tokio::join!(left.stop(), right.stop());
+                    publish_runtime_failure(
+                        &status_sender,
+                        ContinuousMonitorTaskFailure::JournalUnavailable,
+                    );
+                    return Err(ContinuousMonitorTaskError::SpreadHistory(error));
                 }
                 last_recorded_at = recorded_at;
                 status_sender.send_replace(next);
@@ -667,6 +722,56 @@ const fn aggregate_stop_exit(
     } else {
         requested
     }
+}
+
+/// Projects one spread-bearing monitor outcome into the versioned
+/// spread-history record. Waiting and rejected outcomes carry no spread and
+/// yield `Ok(None)`. Funding-rate fields stay `None` because no wired
+/// market-data source publishes funding rates yet.
+fn spread_history_record(event: &ArbitrageMonitorEvent) -> Result<Option<SpreadHistoryRecord>, ()> {
+    let (buy_exchange, sell_exchange, buy_price, sell_price, spread_percent) = match &event.outcome
+    {
+        ArbitrageMonitorOutcome::NoOpportunity {
+            buy_exchange,
+            sell_exchange,
+            buy_price,
+            sell_price,
+            spread_percent,
+            ..
+        }
+        | ArbitrageMonitorOutcome::Opportunity {
+            buy_exchange,
+            sell_exchange,
+            buy_price,
+            sell_price,
+            spread_percent,
+            ..
+        } => (
+            buy_exchange,
+            sell_exchange,
+            *buy_price,
+            *sell_price,
+            *spread_percent,
+        ),
+        ArbitrageMonitorOutcome::Waiting { .. }
+        | ArbitrageMonitorOutcome::AnalysisRejected { .. } => {
+            return Ok(None);
+        }
+    };
+    let spread_bps = spread_percent.checked_mul(Decimal::ONE_HUNDRED).ok_or(())?;
+    Ok(Some(SpreadHistoryRecord {
+        timestamp: event.recorded_at,
+        symbol: monitor_symbol(&event.left, &event.right),
+        exchange_buy: buy_exchange.clone(),
+        exchange_sell: sell_exchange.clone(),
+        price_buy: buy_price.as_decimal().to_string(),
+        price_sell: sell_price.as_decimal().to_string(),
+        spread_bps: spread_bps.to_string(),
+        funding_rate_buy: None,
+        funding_rate_sell: None,
+        funding_rate_diff: None,
+        funding_rate_diff_annual_pct: None,
+    }))
 }
 
 fn publish_runtime_failure(
@@ -854,6 +959,7 @@ pub enum ContinuousMonitorTaskError {
     InvalidConfig,
     InvalidSourceBinding,
     Journal(HistoryError),
+    SpreadHistory(SpreadHistoryError),
     SourceContract,
     MonitorContract,
     TaskPanicked,
@@ -867,7 +973,9 @@ impl ContinuousMonitorTaskError {
             Self::InvalidConfig | Self::InvalidSourceBinding => {
                 ContinuousMonitorTaskFailure::StartupFailed
             }
-            Self::Journal(_) => ContinuousMonitorTaskFailure::JournalUnavailable,
+            Self::Journal(_) | Self::SpreadHistory(_) => {
+                ContinuousMonitorTaskFailure::JournalUnavailable
+            }
             Self::SourceContract => ContinuousMonitorTaskFailure::SourceContract,
             Self::MonitorContract => ContinuousMonitorTaskFailure::MonitorContract,
             Self::TaskPanicked => ContinuousMonitorTaskFailure::TaskPanicked,
@@ -886,6 +994,12 @@ impl fmt::Display for ContinuousMonitorTaskError {
             }
             Self::Journal(source) => {
                 write!(formatter, "continuous monitor journal failed: {source}")
+            }
+            Self::SpreadHistory(source) => {
+                write!(
+                    formatter,
+                    "continuous monitor spread-history journal failed: {source}"
+                )
             }
             Self::SourceContract => {
                 formatter.write_str("continuous monitor source contract failed")
@@ -911,6 +1025,7 @@ impl std::error::Error for ContinuousMonitorTaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Journal(source) => Some(source),
+            Self::SpreadHistory(source) => Some(source),
             Self::InvalidConfig
             | Self::InvalidSourceBinding
             | Self::SourceContract

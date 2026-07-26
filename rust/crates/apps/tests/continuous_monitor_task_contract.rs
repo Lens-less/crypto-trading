@@ -28,7 +28,7 @@ use crypto_trading_runtime::{
     MarketDataEventSource, MarketDataObservation, MarketDataSourceFailure, MarketFreshnessPolicy,
     MarketInstrument, MarketPollingPolicy, MarketSupervisorConfig, MarketSupervisorHealth,
     MarketUniverse, ProjectionStatus, ReadOnlyTaskFailure, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, SpreadHistoryReadModel, SpreadHistoryWriter,
 };
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
@@ -366,6 +366,72 @@ async fn credential_free_binance_polling_composes_with_a_second_source_and_the_s
 
     server.join().unwrap();
     remove_file(&path);
+}
+
+#[tokio::test]
+async fn spread_observations_are_mirrored_into_the_dedicated_spread_history_journal() {
+    let path = temp_path("continuous-monitor-spread-history");
+    let spread_path = temp_path("continuous-monitor-spread-history-spread");
+    let base = timestamp(0);
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ContinuousMonitorTask::start_with_spread_history(
+        config("arb-spread-history"),
+        monitor(base),
+        left_source,
+        right_source,
+        JsonlHistory::new(&path),
+        Some(SpreadHistoryWriter::new(&spread_path)),
+    )
+    .await
+    .unwrap();
+
+    // First event: only one leg is fresh, so the outcome is waiting and no
+    // spread record may be persisted.
+    left_sender
+        .send(Ok(Some(observation("left", "99", "100", 1, base))))
+        .await
+        .unwrap();
+    wait_for_processed(&task, 1).await;
+    assert!(
+        !spread_path.exists(),
+        "waiting outcomes must not append spread history"
+    );
+
+    // Second event completes the pair: 102 bid vs 100 ask is a 2% spread,
+    // recorded as 200 bps.
+    right_sender
+        .send(Ok(Some(observation(
+            "right",
+            "102",
+            "103",
+            1,
+            base + Duration::seconds(1),
+        ))))
+        .await
+        .unwrap();
+    wait_for_processed(&task, 2).await;
+    task.stop().await.unwrap();
+
+    let spread_snapshot = crypto_trading_runtime::JournalSnapshot::new(
+        "00000000-0000-0000-0000-000000000901".parse().unwrap(),
+        crypto_trading_runtime::read_journal_chain(&spread_path).unwrap(),
+    )
+    .unwrap();
+    let model = SpreadHistoryReadModel::from_legacy_snapshot(&spread_snapshot).unwrap();
+    assert_eq!(model.projection_status, ProjectionStatus::Complete);
+    assert_eq!(model.samples.len(), 1);
+    let sample = &model.samples[0];
+    assert_eq!(sample.symbol, "BTC-USDT");
+    assert_eq!(sample.exchange_buy, "left");
+    assert_eq!(sample.exchange_sell, "right");
+    assert_eq!(sample.price_buy, "100");
+    assert_eq!(sample.price_sell, "102");
+    assert_eq!(sample.spread_bps, "200.00");
+    assert_eq!(sample.funding_rate_buy, None, "no source publishes funding");
+
+    remove_file(&path);
+    remove_file(&spread_path);
 }
 
 fn config(task_id: &str) -> ContinuousMonitorTaskConfig {

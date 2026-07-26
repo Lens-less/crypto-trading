@@ -43,8 +43,8 @@
 | `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；对 public path loaders、public from_str loaders 和 shared raw reader 统一施加 1 MiB / YAML 读入护栏；发现不支持配置、读取错误或预算耗尽时非零退出 |
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
-| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓 |
-| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
+| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓；Arbitrage owner 可选历史决策模式（`history_decision`）：用 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级并标注 `funding_degraded` |
+| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
 | `scanner` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
@@ -427,6 +427,7 @@ Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依�
 
 - Grid：`rust/var/history/grid-paper.jsonl`
 - Arbitrage：`rust/var/history/arbitrage-paper.jsonl`
+- Spread history（monitor serve 的价差观测样本，供套利历史决策模式回填）：`rust/var/history/spread-history.jsonl`
 
 关键事件：
 
