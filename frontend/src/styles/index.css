@@ -1,0 +1,33 @@
+@import "tailwindcss";
+@import "./tokens.css";
+
+/*
+ * Tailwind v4 CSS-first 配置。
+ * @theme inline 将 HSL 分量变量映射为 Tailwind 颜色 token,
+ * 深/浅切换只改 tokens.css 里的变量,工具类自动跟随。
+ */
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-border: hsl(var(--border));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-up: hsl(var(--up));
+  --color-down: hsl(var(--down));
+
+  --color-safe-danger: hsl(var(--safe-danger));
+  --color-safe-warning: hsl(var(--safe-warning));
+  --color-safe-ok: hsl(var(--safe-ok));
+  --color-safe-neutral: hsl(var(--safe-neutral));
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono:
+    "IBM Plex Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}

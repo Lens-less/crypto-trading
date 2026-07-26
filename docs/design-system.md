@@ -1,228 +1,157 @@
-# Crypto Trading Control Plane Design System
+# Crypto Trading 控制面设计系统
 
-> Status: selected and active
-> Selection: A — 金融精确
-> User adjustment: use B's developer-native typography and C's audit-ledger palette
-> Dials: visual variance 4/10, motion 3/10, information density 8/10
+> 状态:2026-07-26 起生效,取代此前的方向 A(「金融精确 / Carbon 日光审计」方案)
+> 决策:React 18 + Tailwind CSS v4(CSS-first)+ tickflow 深色金融面板风
+> 实现载体:顶层 `frontend/`(Vite + TypeScript strict),token 落地在
+> `frontend/src/styles/tokens.css`,本文档是视觉与语义的单一事实来源
 
-This file is the visual single source of truth for the project Web control plane. Change the
-design here before changing individual pages.
+本文件描述 Web 控制面的视觉基线与语义规则。先改这里,再改页面。旧版方向 A 的
+浅色审计视觉不再适用;其中与视觉无关的安全语义、响应式与可访问性规则被保留并
+收敛到本文档对应章节。
 
-## 1. Visual Theme & Atmosphere
+## 1. 主题与氛围
 
-The product is a **financial precision ledger** for one operator. Its memorable shape is a
-fixed risk spine beside a cross-lane execution ribbon: authority, freshness, adapter health,
-and unrecovered batches are visible before charts or decoration.
+产品是单操作员的**深色金融操作面板**:固定的左侧权限脊柱(risk spine)在前,
+图表与装饰在后。界面必须精确、安静、可审计,不做营销仪表盘,不做终端 cosplay。
 
-The interface combines:
+- 深色为默认主题(`:root`),浅色通过根元素 `.light` 类整体覆盖。
+- 首帧主题由独立静态文件 `/theme-init.js` 决定(生产 CSP 为 `script-src 'self'`,
+  禁止内联脚本),读取顺序:`localStorage["ct-theme"]` → `prefers-color-scheme` → 深色。
+- 数据是 journal 的持久化投影,不是实时行情;界面所有措辞与徽标都不得暗示
+  「实时」「新鲜」。
 
-- A's asymmetric operating-desk structure and risk-first hierarchy.
-- B's developer-native mono rhythm for identifiers, cursors, times, prices, and keyboard hints.
-- C's daylight audit palette, rectangular geometry, ruled tables, and print-like evidence.
+## 2. Token 表(HSL 分量变量)
 
-It must feel exact, calm, and inspectable. It must not resemble a marketing dashboard,
-terminal cosplay, or a wall of rounded cards.
+所有颜色以 HSL 分量存放(如 `222 47% 7%`),使用处写 `hsl(var(--token))`;
+Tailwind v4 通过 `@theme inline` 把变量映射为 `bg-background`、`text-safe-warning`
+等工具类。深浅切换只改变量,不改组件。
 
-Functional contract:
+### 基础
 
-- In 3 seconds the operator can identify paper/live mode, live authority, journal projection,
-  data freshness, adapter health, and unrecovered execution state.
-- The operator can locate a batch, inspect its plan/outcome/recovery facts, and copy a stable
-  cursor without constructing trading authority.
-- `Unavailable`, `stale`, `degraded`, `windowed`, `partial`, `empty`, and `error` are first-class
-  product states, not implementation footnotes.
-- CLI, HTTP, and Web must display the same capability and execution truth.
-- A monitor result is a durable historical projection. It must show its recorded time and market
-  generation, and must never imply that the current external feed is connected or fresh.
-- The operation-event SSE badge describes notification-channel connectivity only. It uses
-  “connected / notification-only”, never “real-time” or “fresh”, and cannot upgrade monitor age.
+| Token | 深色(默认) | 浅色(`.light`) | 角色 |
+| --- | --- | --- | --- |
+| `--background` | `222 47% 7%` | `220 25% 97%` | 页面画布 |
+| `--foreground` | `214 30% 90%` | `222 40% 12%` | 主文字 |
+| `--card` | `222 44% 10%` | `0 0% 100%` | 卡片/脊柱表面 |
+| `--card-foreground` | `214 30% 90%` | `222 40% 12%` | 卡片文字 |
+| `--muted` | `222 30% 15%` | `220 20% 92%` | 次级表面、hover |
+| `--muted-foreground` | `217 14% 62%` | `220 12% 40%` | 次级文字(仍需可读对比) |
+| `--border` | `221 28% 18%` | `220 18% 84%` | 边线与表格规则线 |
+| `--primary` | `217 91% 60%` | `221 83% 45%` | 唯一交互强调色与焦点 |
+| `--primary-foreground` | `222 47% 7%` | `0 0% 100%` | 强调色上的文字 |
 
-## 2. Color Palette & Roles
+### 方向语义(加密惯例)
 
-The core palette follows IBM Carbon's white-to-gray audit hierarchy with one engineering blue.
+只用于价格与 PnL 的方向,别无他用:
 
-| Token | Value | Role |
-| --- | --- | --- |
-| `--canvas` | `#ffffff` | Main page and table surface |
-| `--layer-01` | `#f4f4f4` | Navigation groups, filters, alternate rows |
-| `--layer-02` | `#e0e0e0` | Selected structural regions and skeletons |
-| `--ink` | `#161616` | Primary text, dark risk spine |
-| `--ink-secondary` | `#525252` | Secondary copy |
-| `--ink-muted` | `#6f6f6f` | Metadata that still meets readable contrast |
-| `--border` | `#c6c6c6` | Hairlines and table rules |
-| `--blue` | `#0f62fe` | Sole interactive accent and focus |
-| `--blue-hover` | `#0043ce` | Link/interactive hover |
-| `--blue-active` | `#002d9c` | Pressed interaction |
-| `--blue-tint` | `#edf5ff` | Selected row and informational surface |
-| `--danger` | `#da1e28` | Failed, unsafe, or blocked |
-| `--warning` | `#8e6a00` | Stale, degraded, or recovery required |
-| `--success` | `#198038` | Complete, fresh, or reconciled |
+| Token | 深色 | 浅色 | 角色 |
+| --- | --- | --- | --- |
+| `--up` | `145 65% 46%` | `146 70% 30%` | 上涨 / 正 PnL(绿) |
+| `--down` | `358 72% 58%` | `358 68% 44%` | 下跌 / 负 PnL(红) |
 
-Rules:
+### 安全语义(与方向严格分离)
 
-- Blue is for interaction or information, never decoration.
-- Red is never used for ordinary negative P&L; it means action is blocked or evidence is unsafe.
-- Status always has text plus color. Color alone never carries meaning.
-- No gradients, purple glow, pure black, translucent text, or low-contrast gray body copy.
+用于系统与操作安全状态,永不用于价格方向:
 
-## 3. Typography Rules
+| Token | 深色 | 浅色 | 角色 |
+| --- | --- | --- | --- |
+| `--safe-danger` | `341 84% 60%` | `341 78% 42%` | 失败、降级、证据不安全 |
+| `--safe-warning` | `40 92% 55%` | `36 90% 34%` | 窗口化、需令牌、需恢复 |
+| `--safe-ok` | `172 60% 42%` | `172 70% 27%` | 完整、就绪、已对账 |
+| `--safe-neutral` | `217 12% 58%` | `220 10% 44%` | 暂不可用、待接入、未知 |
 
-Chinese UI copy uses the native CJK stack:
+### 方向与安全的分离规则
+
+- 方向色恒伴随 `+`/`−` 符号(或明确的涨/跌文字),色弱用户不依赖红绿也能读方向。
+- 安全色必须文字+颜色同时出现;颜色永不单独承载安全含义。
+- `--down`(方向红)不表达「危险」;`--safe-danger` 不表达「下跌」。两组色相刻意
+  错开(方向红 358°,安全红 341°;方向绿 145°,安全绿 172°),混用即为缺陷。
+- 负 PnL 用方向红是正常呈现;「操作被阻断/证据不安全」才用安全红。
+
+## 3. 字体与数字规范
+
+中文 UI 文案使用系统 CJK 栈(不引入远程字体、无阻塞字体依赖):
 
 ```css
 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
 "Microsoft YaHei", "Noto Sans SC", sans-serif
 ```
 
-Latin identifiers and numeric data use a developer-native mono stack inspired by Warp:
+标识符与数字数据(id、游标、序列号、价格、时间戳、计数)使用等宽栈:
 
 ```css
-"IBM Plex Mono", "JetBrains Mono", "Cascadia Code", "SFMono-Regular",
-Consolas, monospace
+"IBM Plex Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace
 ```
 
-The font plan intentionally ships no remote Chinese font and no blocking font dependency.
+规则:
 
-| Role | Size | Weight | Line height | Treatment |
-| --- | --- | --- | --- | --- |
-| Page title | `clamp(28px, 3vw, 42px)` | 400 | 1.19 | Chinese system sans, at most 2 lines |
-| Section title | 20px | 600 | 1.4 | System sans |
-| Body | 14px | 400 | 1.7 | System sans, `text-wrap: pretty` |
-| Navigation | 14px | 500 | 1.5 | System sans |
-| Compact label | 12px | 500 | 1.33 | 0.32px tracking; no forced English-only uppercase |
-| Data / code | 13–14px | 400 | 1.5 | Mono, tabular numbers |
-| Hero status | `clamp(24px, 2.6vw, 38px)` | 400 | 1.16 | Mono Latin/numbers, system CJK |
+- 所有数据数字必须 `font-variant-numeric: tabular-nums`(工具类 `.numeric`
+  或 Tailwind `tabular-nums`),表格数字右对齐,刷新时列不抖动。
+- `html` 设 `scrollbar-gutter: stable`,滚动条出现/消失不得引起横向跳动。
+- 权限脊柱第一区的 `PAPER` / `LIVE CLOSED` 用等宽大写字形。
+- 不用斜体,正文最小字号 12px,中文不加负字距。
 
-Never use italic, weight 700, negative tracking on Chinese, or type smaller than 12px.
+## 4. 不可协商安全语义
 
-## 4. Component Styling
+以下条目是产品契约,任何页面、任何重构不得削弱:
 
-### Navigation and risk spine
+- 权限脊柱第一区 3 秒可辨 PAPER/LIVE CLOSED。权限态只从
+  `/api/v1/capabilities` 推导,加载中与读取失败也要显式呈现为状态。
+- 状态=文字+颜色。颜色永不单独承载含义,纯色点不是状态。
+- monitor 数据必须显示 recorded_at 与 market generation、永不暗示外部行情新鲜。
+  monitor 结果是持久化历史投影,系统级行情新鲜度在真正受监督之前保持
+  `not_available`。
+- SSE 徽标只说"已连接/仅通知"禁"实时"。它只描述通知通道连通性,不能升级
+  monitor 数据的年龄。
+- bearer token 与游标只存内存(storage 白名单仅 ct-theme)。它们不进
+  localStorage/sessionStorage/cookie、不进 URL、不进浏览器历史与深链。
+- unavailable/stale/degraded/windowed/partial/empty/error 为一等状态,有专属
+  文案与安全色,不藏在 tooltip 后面,不伪装成加载中或健康。
+- 错误脱敏:可见文案只用稳定错误码与后端给定信息,永不显示原始异常文本、
+  堆栈、文件路径、payload 或密钥。
+- 浏览器永不构造 live 权限:前端只读展示后端声明的能力,不合成、不放大、
+  不默认任何交易权限。
+- 尊重 prefers-reduced-motion:开启时移除位移动画,只保留即时的状态与颜色变化。
 
-- Desktop uses a 248px fixed left spine with `#161616` background.
-- The first region is authority, not branding: `PAPER`, `LIVE CLOSED`, bind/access mode.
-- Active navigation is a 2px blue left rule plus a Gray 80 background shift.
-- Rows are 48px high and remain real links so URL state is shareable.
+## 5. 布局与组件
 
-### Buttons and links
+- 左侧固定权限脊柱:第一区为权限态(`PAPER` 大字 / `LIVE CLOSED`),其下为
+  9 条路由导航(总览、扫描、预警、执行、集成、策略、风险、回放、设置),
+  底部为主题切换。导航是真实链接,URL 状态可分享。
+- 内容区以卡片(`--card` + `--border`)分组;数据表格数字右对齐、表头滚动时
+  可见,长标识符在单元格内换行或截断并提供完整值,不撑宽页面。
+- 空态说明缺的是什么、查过哪个事实来源;「待接入」是一等状态而不是空数据。
+- 加载骨架与最终行几何一致,只用表面色阶,不做闪光动画。
 
-- Buttons are rectangular with 0px radius, minimum 40px height, and 16px horizontal padding.
-- Primary: `#0f62fe`; hover `#0353e9`; active `#002d9c`.
-- Secondary: `#393939`; ghost actions use blue text on transparent background.
-- Focus follows Carbon: 2px blue inset plus a 1px white separation ring.
-- Pointer press feedback may use `transform: scale(0.98)` for 120ms; keyboard activation does not animate.
+## 6. 响应式(承自旧版,仍然适用)
 
-### Tiles and panels
+- `>= 1056px`:固定左侧权限脊柱 + 完整工作区,可选右侧详情。
+- `672–1055px`:紧凑脊柱,文字标签保持可见;内容先折叠,证据后折叠。
+- `< 672px`:顶部权限条 + 单列内容,16px 边距;执行详情移到所选行下方。
+- 表格等宽内容放入自身 `overflow-x: auto` 容器;页面本身永不横向滚动。
+- 界面在 320 CSS px 宽与 200% 浏览器缩放下保持可用。
 
-- Default grouping uses whitespace, alternating layers, and 1px rules.
-- Tiles use 0px radius and no shadow. `#f4f4f4` may distinguish a raised information layer.
-- Only a real overlay/drawer may use `0 2px 6px rgba(0, 0, 0, 0.30)`.
-- Status tags are the sole rounded exception: 24px pill radius, 4px 8px padding.
+## 7. 可访问性(承自旧版,仍然适用)
 
-### Tables and execution ribbon
+- 所有交互目标至少 40px,主导航行 48px。
+- 键盘可达:可见焦点环(`--primary`)、跳转导航、复制按钮均可用键盘触发。
+- 状态与方向信息不依赖颜色单独传达(见第 2、4 章)。
+- 排序表头暴露 `aria-sort`;导航使用语义化 `nav` 与当前项标注。
+- 动效只动 `transform` 与 `opacity`,时长 100–240ms;高频键盘操作不动画;
+  `prefers-reduced-motion` 见第 4 章。
 
-- Numeric columns are right-aligned with tabular mono numerals.
-- Headers remain visible while scrolling and expose `aria-sort` where sorting exists.
-- Selected rows use `#edf5ff` plus a 2px blue leading rule.
-- The execution ribbon is a full-width ruled band, not a card. It shows batch id, phase,
-  latest sequence, recovery state, and cursor before any expanded detail.
-- Long identifiers truncate visually but expose the full value through an accessible title/copy action.
-
-### States
-
-- Loading skeletons match final row geometry and use Gray 10/20 only.
-- Empty states state what is absent and what fact source was checked.
-- Errors include one safe next step and never display raw adapter/journal text.
-- Stale and degraded states remain usable but pin a visible warning band above the affected region.
-- `Unavailable` is neutral and explicit; it must never be styled as healthy or as a user setup task.
-- Monitor freshness and continuity labels describe the persisted observation only. System-level
-  market freshness remains `not_available` until a live read-only source is actually supervised.
-- A degraded monitor projection may retain its last valid fact internally for recovery, but the Web
-  must withhold that outcome and pin a danger band until the complete journal projects safely again.
-
-## 5. Layout Principles
-
-- Base unit: 8px; micro-adjustments may use 2px or 4px.
-- Desktop content uses an asymmetric 12-column grid beside the 248px risk spine.
-- Max content width is 1584px with 32px gutters; mobile gutters are 16px.
-- Major vertical transitions use 48px; dense related controls use 8px or 16px.
-- Overview begins with one dominant cross-lane system ribbon, then a 2fr/1fr evidence layout.
-- Executions prioritizes the full-width ledger and a right-side detail drawer.
-- Integrations uses a capability matrix, not equal marketing cards.
-- The selected section uses a semantic path; filters and batch id use the URL query string.
-- Opaque journal cursors and bearer tokens stay in the current page's memory and never enter
-  browser history, persistent storage, or copied deep links.
-
-## 6. Depth & Elevation
-
-Depth is communicated by information authority and surface value:
-
-1. Canvas: white.
-2. Structural layer: Gray 10.
-3. Selected/temporary layer: Gray 20 or Blue 10.
-4. True overlay: one restrained shadow plus a scrim.
-
-Cards and tables do not cast shadows. Borders and background shifts carry hierarchy.
-
-## 7. Do's and Don'ts
+## 8. Do / Don't
 
 Do:
 
-- Put real operating truth before release gates or missing features.
-- Keep mode, authority, freshness, adapter state, and recovery state continuously visible.
-- Use mono type for cursors, sequences, ids, timestamps, prices, and counts.
-- Preserve exact capability names and safe recovery directives from the read model.
-- Provide keyboard focus, skip navigation, copy affordances, and visible URL state.
+- 把真实运行事实(权限、投影状态、恢复状态)放在一切装饰之前。
+- 用等宽 tabular 数字呈现游标、序列、id、时间戳、价格、计数。
+- 保持 CLI、HTTP、Web 展示同一份能力与执行事实。
 
 Don't:
 
-- Construct or imply live authority in the browser.
-- Turn unavailable capabilities into a blocker wall or a setup checklist.
-- Use rounded dashboard cards, decorative charts, glass, gradients, glow, or fake market data.
-- Treat toast messages as durable evidence.
-- Hide stale/degraded/windowed status behind a tooltip.
-- Use raw secrets, payloads, filesystem paths, or source errors in visible copy.
-
-## 8. Responsive Behavior
-
-Breakpoints follow the Carbon grid:
-
-- `>= 1056px`: fixed 248px risk spine, full 12-column workspace, optional detail drawer.
-- `672–1055px`: 176px compact spine with visible text labels; content collapses before evidence
-  becomes unreadable.
-- `< 672px`: top authority strip, single-column content, 16px margins.
-- Tables become horizontally contained data regions with a visible scroll affordance; the page itself
-  never scrolls horizontally.
-- Long symbols, exchange pairs, cursors, and decimal evidence wrap inside their own grid cell instead
-  of widening the page or being removed from the trust line.
-- Execution details move below the selected row on mobile.
-- All interactive targets are at least 40px; primary navigation rows are 48px.
-- The UI must remain usable at 320 CSS px and at 200% browser zoom.
-
-## 9. Motion Philosophy
-
-Motion is restrained at 3/10 and exists only to explain state:
-
-- Color/focus/press feedback: 100–160ms.
-- Pointer-opened drawer or confirmation: 180–240ms, ease-out.
-- SSE updates do not animate row position; a 160ms blue leading-rule fade marks newly observed facts.
-- Keyboard-triggered navigation and high-frequency commands never animate.
-- Only `transform` and `opacity` may move.
-- `prefers-reduced-motion` removes translation and leaves immediate state/color changes.
-
-Signature craft actions:
-
-1. A low-opacity ruled-grid atmosphere outside reading surfaces (maximum 3%).
-2. Blue `::selection`.
-3. Carbon-style blue/white focus ring.
-4. One signature interaction: the execution ribbon and detail drawer share the same blue leading rule.
-5. Flat white → Gray 10 → Gray 20 depth, with shadow reserved for the drawer.
-6. A narrow blue custom scrollbar for data regions.
-7. Hairline audit rules and mono cursor stamps.
-
-DNA provenance:
-
-- From **IBM Carbon**: `#0f62fe` as the sole accent, white/Gray 10/Gray 20 layer sequence,
-  0px primary geometry, 48px navigation rhythm, and the 2px blue + 1px white focus treatment.
-- From **Warp**: mono-forward identifiers and telemetry, weight 400 dominance, quiet compact labels,
-  and restrained interactions that do not animate high-frequency keyboard work.
+- 在浏览器里构造或暗示 live 权限。
+- 用「实时」「新鲜」描述任何 journal 投影或 SSE 通道。
+- 把不可用能力渲染成阻断墙或安装向导。
+- 用玻璃拟态、渐变发光、假行情数据或纯装饰图表。
+- 把 toast 当作持久证据。

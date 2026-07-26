@@ -1,0 +1,87 @@
+/*
+ * 设计 token(单一事实来源,与 docs/design-system.md 同步)。
+ * 所有颜色以 HSL 分量存放(如 "222 47% 7%"),使用处写 hsl(var(--token))。
+ * 默认深色(tickflow 深色金融面板风),.light 类整体覆盖为浅色。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 基础表面与文字 */
+  --background: 222 47% 7%;
+  --foreground: 214 30% 90%;
+  --card: 222 44% 10%;
+  --card-foreground: 214 30% 90%;
+  --muted: 222 30% 15%;
+  --muted-foreground: 217 14% 62%;
+  --border: 221 28% 18%;
+  --primary: 217 91% 60%;
+  --primary-foreground: 222 47% 7%;
+
+  /* 方向语义(加密惯例):只用于价格与 PnL 方向,恒伴随 +/− 符号 */
+  --up: 145 65% 46%;
+  --down: 358 72% 58%;
+
+  /* 安全语义:与方向语义严格分离,必须文字+颜色同时出现 */
+  --safe-danger: 341 84% 60%;
+  --safe-warning: 40 92% 55%;
+  --safe-ok: 172 60% 42%;
+  --safe-neutral: 217 12% 58%;
+
+  /* 字体栈 */
+  --font-stack-sans:
+    -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-stack-mono:
+    "IBM Plex Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+
+.light {
+  color-scheme: light;
+
+  --background: 220 25% 97%;
+  --foreground: 222 40% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 40% 12%;
+  --muted: 220 20% 92%;
+  --muted-foreground: 220 12% 40%;
+  --border: 220 18% 84%;
+  --primary: 221 83% 45%;
+  --primary-foreground: 0 0% 100%;
+
+  --up: 146 70% 30%;
+  --down: 358 68% 44%;
+
+  --safe-danger: 341 78% 42%;
+  --safe-warning: 36 90% 34%;
+  --safe-ok: 172 70% 27%;
+  --safe-neutral: 220 10% 44%;
+}
+
+html {
+  /* 数据面板滚动条出现/消失不得引起横向布局跳动 */
+  scrollbar-gutter: stable;
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-stack-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 等宽 tabular 数字工具类:游标、序列号、价格、时间戳一律使用 */
+.numeric {
+  font-family: var(--font-stack-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
