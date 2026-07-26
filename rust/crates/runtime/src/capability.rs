@@ -425,11 +425,15 @@ fn hyperliquid_adapter() -> AdapterSupport {
         id: "hyperliquid".to_owned(),
         name: "Hyperliquid".to_owned(),
         public_data: adapter_facet(
-            AdapterSupportLevel::Unavailable,
-            &["No Rust market-data adapter emits Hyperliquid domain snapshots."],
+            AdapterSupportLevel::Implemented,
             &[
-                "rust/crates/exchange/src/hyperliquid_testnet.rs",
-                "docs/internal/research/upstream-repository-alignment.md",
+                "Snapshots come from credential-free HTTP polling of the public info endpoint (perpetual impact prices plus an hourly funding-rate side feed), not a realtime stream; freshness is bounded by the poll cadence.",
+            ],
+            &[
+                "rust/crates/exchange/src/hyperliquid_public.rs",
+                "rust/crates/exchange/tests/hyperliquid_public_contract.rs",
+                "rust/crates/runtime/src/market_polling.rs",
+                "rust/crates/runtime/tests/hyperliquid_polling_contract.rs",
             ],
         ),
         testnet_protocol: adapter_facet(
@@ -627,6 +631,7 @@ fn foundation_capabilities() -> Vec<Capability> {
 fn exchange_capabilities(adapters: &[AdapterSupport]) -> Vec<Capability> {
     let binance_public = adapter_cell(adapters, "binance", AdapterFacet::PublicData);
     let binance_testnet = adapter_cell(adapters, "binance", AdapterFacet::TestnetProtocol);
+    let hyperliquid_public = adapter_cell(adapters, "hyperliquid", AdapterFacet::PublicData);
     let hyperliquid_testnet = adapter_cell(adapters, "hyperliquid", AdapterFacet::TestnetProtocol);
     let paper_reconcile = adapter_cell(adapters, "paper", AdapterFacet::Reconcile);
     let external_live = adapter_cell(adapters, "binance", AdapterFacet::Live);
@@ -650,6 +655,16 @@ fn exchange_capabilities(adapters: &[AdapterSupport]) -> Vec<Capability> {
             ),
             "Executable Binance Spot and USD-M testnet trading and reconcile adapter with deterministic smoke coverage.",
             binance_testnet,
+        ),
+        adapter_capability(
+            "exchange.hyperliquid-public",
+            CapabilityLevel::ReadOnly,
+            scope(
+                &[CapabilityEnvironment::Mainnet],
+                CapabilityAccess::MarketData,
+            ),
+            "One-shot Hyperliquid perpetual asset-context snapshots with an hourly funding-rate side channel.",
+            hyperliquid_public,
         ),
         adapter_capability(
             "exchange.hyperliquid-testnet-protocol",
@@ -747,7 +762,7 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
             "Two-leg segmented paper execution through both the one-shot CLI and a recoverable exact-pair owner reached through the trusted CLI/Web submit path, plus an optional history-decision (natural-spread) gate backfilled from the durable spread-history journal.",
             &[
                 "The continuous owner currently consumes only an explicit replay-backed profile; nonterminal restart remains deliberately fail-closed and no testnet/mainnet order authority is implied.",
-                "The history-decision mode is paper/replay only and evaluates without funding-rate input: spread-history records carry no funding fields while we wait for a second venue's public market data to provide funding rates, so funding-aware judgements stay degraded (funding_degraded).",
+                "The history-decision mode is paper/replay only: a second venue (Hyperliquid public polling) now provides an hourly funding-rate input channel, but recorded spread-history facts still carry no funding samples, so funding-aware judgements stay degraded (funding_degraded).",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
@@ -833,36 +848,41 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
     ]
 }
 
+fn market_data_capability() -> Capability {
+    capability(
+        "runtime.market-data",
+        CapabilityArea::Runtime,
+        CapabilityLevel::ReadOnly,
+        scope(
+            &[
+                CapabilityEnvironment::Offline,
+                CapabilityEnvironment::Paper,
+                CapabilityEnvironment::Mainnet,
+            ],
+            CapabilityAccess::MarketData,
+        ),
+        "Bounded exact-universe market book with freshness, continuity, deterministic replay, subscription gaps, credential-free Binance Spot polling, and credential-free Hyperliquid perpetual polling with an hourly funding-rate side feed.",
+        &[
+            "Both real venues are credential-free HTTP polling rather than realtime streams, and the executable live bootstrap is limited to the explicit opt-in binance+hyperliquid monitor pair; the funding side feed is observation-only and drives no decision yet.",
+        ],
+        &[
+            "rust/crates/runtime/src/market_data.rs",
+            "rust/crates/runtime/src/market_polling.rs",
+            "rust/crates/runtime/src/market_supervisor.rs",
+            "rust/crates/runtime/tests/market_data_contract.rs",
+            "rust/crates/runtime/tests/market_supervisor_contract.rs",
+            "rust/crates/runtime/tests/hyperliquid_polling_contract.rs",
+            "rust/crates/apps/src/continuous_monitor.rs",
+            "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
+            "rust/crates/runtime/src/task_read_model.rs",
+            "rust/crates/runtime/tests/task_read_model_contract.rs",
+        ],
+    )
+}
+
 fn runtime_validation_capabilities() -> Vec<Capability> {
     vec![
-        capability(
-            "runtime.market-data",
-            CapabilityArea::Runtime,
-            CapabilityLevel::ReadOnly,
-            scope(
-                &[
-                    CapabilityEnvironment::Offline,
-                    CapabilityEnvironment::Paper,
-                    CapabilityEnvironment::Mainnet,
-                ],
-                CapabilityAccess::MarketData,
-            ),
-            "Bounded exact-universe market book with freshness, continuity, deterministic replay, subscription gaps, and credential-free Binance Spot polling.",
-            &[
-                "Only Binance Spot public polling is implemented; the exact-pair composer accepts two source adapters, but no second real venue or executable bootstrap is available.",
-            ],
-            &[
-                "rust/crates/runtime/src/market_data.rs",
-                "rust/crates/runtime/src/market_polling.rs",
-                "rust/crates/runtime/src/market_supervisor.rs",
-                "rust/crates/runtime/tests/market_data_contract.rs",
-                "rust/crates/runtime/tests/market_supervisor_contract.rs",
-                "rust/crates/apps/src/continuous_monitor.rs",
-                "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
-                "rust/crates/runtime/src/task_read_model.rs",
-                "rust/crates/runtime/tests/task_read_model_contract.rs",
-            ],
-        ),
+        market_data_capability(),
         capability(
             "runtime.monitor",
             CapabilityArea::Runtime,
@@ -870,7 +890,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, spread observations mirrored into the dedicated spread-history journal, bounded stop, and a Web-visible task projection.",
             &[
-                "The CLI service bootstrap is replay-backed, only Binance has a real public adapter, and restart recovery projects prior facts without automatically resuming external sources.",
+                "The CLI service bootstrap defaults to replay; the explicit --live opt-in polls only the credential-free binance+hyperliquid pair, and restart recovery projects prior facts without automatically resuming external sources.",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
@@ -922,13 +942,25 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
         capability(
             "runtime.volume-maker",
             CapabilityArea::Runtime,
-            CapabilityLevel::ValidateOnly,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Volume-maker configuration and emergency-stop validation.",
-            &["Continuous paper or live volume-maker execution is not implemented."],
+            CapabilityLevel::Available,
+            scope(
+                &[CapabilityEnvironment::Paper],
+                CapabilityAccess::PaperTrading,
+            ),
+            "Validated volume-maker configuration plus a recoverable replay-backed paper owner: virtual maker quotes and imbalance market cycles become independent single-leg reservations with reduce-only closes, account-risk admission, durable hourly statistics facts, and a CLI validate/serve/status/stop task host.",
+            &[
+                "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the volume-maker task host, and no testnet/mainnet order authority is implied.",
+                "The owner keeps no resting orders: limit-mode quotes are virtual and execute only when a later observation crosses them, so legacy post-only resting semantics are simulated, not reproduced; each serve run plans a fresh paper account generation and restart on a foreign generation fails closed.",
+            ],
             &[
                 "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_volume_maker_task.rs",
+                "rust/crates/apps/tests/paper_volume_maker_task_contract.rs",
                 "rust/crates/strategy/src/volume_maker.rs",
+                "rust/crates/strategy/tests/volume_maker.rs",
+                "rust/crates/config/src/supporting.rs",
+                "rust/crates/runtime/src/task_read_model.rs",
+                "rust/crates/runtime/tests/task_read_model_contract.rs",
             ],
         ),
     ]
@@ -1048,7 +1080,7 @@ fn strategy_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Deterministic segmented and history-mode (natural-spread median) arbitrage decisions without I/O.",
             &[
-                "History-mode funding terms stay degraded (funding_degraded=true): no wired market-data source publishes funding rates while we wait for a second venue's public feed to provide them.",
+                "History-mode funding terms stay degraded (funding_degraded=true): the Hyperliquid public feed now exposes an hourly funding-rate channel, but no recorded spread sample carries funding input yet, so evaluations remain replay/paper scoped.",
             ],
             &[
                 "rust/crates/strategy/src/arbitrage.rs",
@@ -1287,6 +1319,12 @@ fn validate_adapter_capability_alignment(
             "binance",
             AdapterFacet::TestnetProtocol,
             CapabilityLevel::Available,
+        ),
+        (
+            "exchange.hyperliquid-public",
+            "hyperliquid",
+            AdapterFacet::PublicData,
+            CapabilityLevel::ReadOnly,
         ),
         (
             "exchange.hyperliquid-testnet-protocol",

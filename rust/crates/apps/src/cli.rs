@@ -392,6 +392,10 @@ pub struct ArbitrageMarketArgs {
     pub right_ask_quantity: Option<Decimal>,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "operator CLI flags are independent toggles, not an encoded state machine"
+)]
 #[derive(Debug, Args)]
 pub struct MonitorArgs {
     #[arg(long, default_value_t = MonitorMode::Replay, value_enum)]
@@ -401,6 +405,19 @@ pub struct MonitorArgs {
     /// Finite JSONL replay of validated top-of-book snapshots.
     #[arg(long, value_name = "PATH")]
     pub replay: Option<PathBuf>,
+    /// Poll the real credential-free public endpoints (Binance Spot +
+    /// Hyperliquid perpetuals) instead of a --replay fixture. Read-only.
+    #[arg(long, conflicts_with = "replay")]
+    pub live: bool,
+    /// Loopback Binance base-URL override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub binance_base_url: Option<String>,
+    /// Loopback Hyperliquid base-URL override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub hyperliquid_base_url: Option<String>,
+    /// Live polling interval in milliseconds.
+    #[arg(long, hide = true, default_value_t = 1_000)]
+    pub poll_interval_ms: u64,
     /// Service task identity for long-running monitor operations.
     #[arg(long)]
     pub task_id: Option<String>,
@@ -440,10 +457,39 @@ pub enum MonitorMode {
 
 #[derive(Debug, Args)]
 pub struct VolumeMakerArgs {
+    #[arg(long, default_value_t = VolumeMakerRunMode::Validate, value_enum)]
+    pub mode: VolumeMakerRunMode,
     #[arg(default_value = "config/volume_maker/backpack_btc_volume_maker.yaml")]
     pub config: PathBuf,
+    /// Finite JSONL replay of validated top-of-book snapshots.
+    #[arg(long, value_name = "PATH")]
+    pub replay: Option<PathBuf>,
+    /// Service task identity for long-running volume-maker operations.
+    #[arg(long)]
+    pub task_id: Option<String>,
+    /// Append paper volume-maker facts to this JSONL journal.
+    #[arg(long, default_value = "var/history/volume-maker.jsonl")]
+    pub history_path: PathBuf,
     #[arg(long)]
     pub debug: bool,
+    /// Local loopback control port override used by volume-maker serve/status/stop.
+    #[arg(long, hide = true)]
+    pub control_port: Option<u16>,
+    /// Serve-loop status polling interval used for bounded local tests.
+    #[arg(long, hide = true, default_value_t = 100)]
+    pub control_poll_interval_ms: u64,
+    /// Supervisor shutdown grace override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub shutdown_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, ValueEnum)]
+pub enum VolumeMakerRunMode {
+    #[default]
+    Validate,
+    Serve,
+    Status,
+    Stop,
 }
 
 #[derive(Debug, Args)]

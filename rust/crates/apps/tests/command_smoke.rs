@@ -141,11 +141,14 @@ fn config_check_returns_nonzero_for_a_missing_file() {
 
 #[test]
 fn unfinished_commands_fail_closed_instead_of_reporting_success() {
-    // `price-alert` and `scanner` are no longer in this list: their default
-    // validate modes now succeed, and alert_serve_cli_contract.rs plus
-    // scanner_cli_contract.rs cover their serve/status/stop task hosts and the
-    // fail-closed no-replay paths.
-    let cases = [vec!["monitor"], vec!["volume-maker"], vec!["arbitrage"]];
+    // `price-alert`, `scanner`, and `volume-maker` are no longer in this
+    // list: their default validate modes now succeed on a clean config, and
+    // alert_serve_cli_contract.rs, scanner_cli_contract.rs, plus
+    // paper_volume_maker_task_contract.rs cover their serve/status/stop task
+    // hosts and the fail-closed no-replay paths. The checked-in volume-maker
+    // config still fails closed on its own `emergency_stop: true`, which
+    // volume_maker_cli_enforces_emergency_stop below pins explicitly.
+    let cases = [vec!["monitor"], vec!["arbitrage"]];
 
     for args in cases {
         let output = Command::new(binary())

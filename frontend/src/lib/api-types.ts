@@ -340,7 +340,8 @@ export type ReadOnlyTaskKind =
   | "arbitrage_paper"
   | "grid_paper"
   | "price_alert"
-  | "scanner";
+  | "scanner"
+  | "volume_maker";
 
 export type ReadOnlyTaskPhase =
   | "registered"

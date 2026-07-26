@@ -25,7 +25,7 @@ Status meanings:
 | Binance | implemented | implemented | implemented | implemented | unavailable |
 | EdgeX | config-only | unavailable | config-only | unavailable | unavailable |
 | GRVT | config-only | unavailable | config-only | unavailable | unavailable |
-| Hyperliquid | unavailable | protocol-only | protocol-only | request-only | unavailable |
+| Hyperliquid | implemented | protocol-only | protocol-only | request-only | unavailable |
 | Lighter | config-only | unavailable | config-only | unavailable | unavailable |
 | OKX | unavailable | unavailable | unavailable | unavailable | unavailable |
 | PaperExchange | not-applicable | not-applicable | not-applicable | implemented | not-applicable |
@@ -34,7 +34,10 @@ Status meanings:
 <!-- adapter-matrix:end -->
 
 `implemented` is not synonymous with production-ready. Binance public data is
-read-only and one-shot. Its Testnet lifecycle owner has deterministic
+read-only and one-shot. Hyperliquid public data is read-only credential-free
+polling of the perpetual asset contexts (impact prices plus an hourly
+funding-rate side channel), not a realtime stream, and grants no order or
+account authority. Binance's Testnet lifecycle owner has deterministic
 submit-query-cancel/query-first recovery coverage, and its report-first account
 gate compares signed balances, open orders, and positions to one exact
 committed Paper reservation. Real credentialed Spot/USD-M reconciliation,

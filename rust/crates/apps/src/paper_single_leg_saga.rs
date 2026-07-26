@@ -102,6 +102,7 @@ impl PaperSingleLegRequest {
 pub struct DurablePaperSingleLegSaga {
     account: PaperAccountAuthority,
     history: JsonlHistory,
+    strategy_label: &'static str,
 }
 
 impl DurablePaperSingleLegSaga {
@@ -120,7 +121,19 @@ impl DurablePaperSingleLegSaga {
                 "paper account and single-leg saga must share one journal",
             ));
         }
-        Ok(Self { account, history })
+        Ok(Self {
+            account,
+            history,
+            strategy_label: "grid",
+        })
+    }
+
+    /// Overrides the durable `strategy` label written on every execution fact,
+    /// so non-grid single-leg owners do not masquerade as grid operations.
+    #[must_use]
+    pub const fn with_strategy_label(mut self, strategy_label: &'static str) -> Self {
+        self.strategy_label = strategy_label;
+        self
     }
 
     #[must_use]
@@ -162,6 +175,7 @@ impl DurablePaperSingleLegSaga {
 
         append_planned(
             &self.history,
+            self.strategy_label,
             &request,
             &reservation,
             self.account.config().account_id(),
@@ -187,6 +201,7 @@ impl DurablePaperSingleLegSaga {
             {
                 append_outcome(
                     &self.history,
+                    self.strategy_label,
                     request.symbol(),
                     "execution_completed",
                     outcome_details(request.batch(), &receipts),
@@ -207,6 +222,7 @@ impl DurablePaperSingleLegSaga {
             {
                 append_outcome(
                     &self.history,
+                    self.strategy_label,
                     request.symbol(),
                     "execution_incomplete",
                     outcome_details(request.batch(), &receipts),
@@ -220,6 +236,7 @@ impl DurablePaperSingleLegSaga {
             Ok(receipts) => {
                 append_outcome(
                     &self.history,
+                    self.strategy_label,
                     request.symbol(),
                     "execution_incomplete",
                     outcome_details(request.batch(), &receipts),
@@ -233,6 +250,7 @@ impl DurablePaperSingleLegSaga {
             Err(error) => {
                 append_outcome(
                     &self.history,
+                    self.strategy_label,
                     request.symbol(),
                     "execution_failed",
                     json!({
@@ -271,6 +289,7 @@ fn classify_existing(
 
 async fn append_planned(
     history: &JsonlHistory,
+    strategy_label: &'static str,
     request: &PaperSingleLegRequest,
     reservation: &PaperReservationView,
     account_id: &str,
@@ -279,7 +298,7 @@ async fn append_planned(
     history
         .append(&DecisionRecord {
             timestamp: Utc::now(),
-            strategy: "grid".to_owned(),
+            strategy: strategy_label.to_owned(),
             symbol: request.symbol.to_string(),
             decision: "execution_planned".to_owned(),
             details: json!({
@@ -304,6 +323,7 @@ async fn append_planned(
 
 async fn append_outcome(
     history: &JsonlHistory,
+    strategy_label: &'static str,
     symbol: &Symbol,
     decision: &'static str,
     details: Value,
@@ -311,7 +331,7 @@ async fn append_outcome(
     history
         .append(&DecisionRecord {
             timestamp: Utc::now(),
-            strategy: "grid".to_owned(),
+            strategy: strategy_label.to_owned(),
             symbol: symbol.to_string(),
             decision: decision.to_owned(),
             details,

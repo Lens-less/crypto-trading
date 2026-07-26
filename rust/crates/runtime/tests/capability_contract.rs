@@ -162,6 +162,30 @@ fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
             .any(|blocker| blocker.contains("not yet registered in the durable task lifecycle"))
     );
 
+    let continuous = manifest.capability("runtime.continuous").unwrap();
+    assert_eq!(continuous.level, CapabilityLevel::Available);
+    assert_eq!(continuous.scope.access, CapabilityAccess::PaperTrading);
+    assert_eq!(
+        continuous.scope.environments,
+        vec![CapabilityEnvironment::Paper]
+    );
+    assert!(
+        continuous
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("External continuous trading sources"))
+    );
+    assert!(
+        continuous
+            .evidence
+            .contains(&"rust/crates/runtime/src/task_read_model.rs".to_owned())
+    );
+}
+
+#[test]
+fn market_data_reflects_two_polling_venues_without_realtime_claims() {
+    let manifest = current_capability_manifest();
+
     let market_data = manifest.capability("runtime.market-data").unwrap();
     assert_eq!(market_data.level, CapabilityLevel::ReadOnly);
     assert_eq!(market_data.scope.access, CapabilityAccess::MarketData);
@@ -180,33 +204,26 @@ fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
     );
     assert!(
         market_data
+            .summary
+            .contains("Hyperliquid perpetual polling"),
+        "the second real venue must be visible in the market-data summary"
+    );
+    assert!(
+        market_data
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("no second real venue or executable bootstrap"))
+            .any(|blocker| blocker.contains("credential-free HTTP polling rather than realtime")),
+        "the polling (non-realtime) limitation must stay an explicit blocker"
+    );
+    assert!(
+        market_data
+            .evidence
+            .contains(&"rust/crates/runtime/tests/hyperliquid_polling_contract.rs".to_owned())
     );
     assert!(
         market_data
             .evidence
             .contains(&"rust/crates/apps/src/continuous_monitor.rs".to_owned())
-    );
-
-    let continuous = manifest.capability("runtime.continuous").unwrap();
-    assert_eq!(continuous.level, CapabilityLevel::Available);
-    assert_eq!(continuous.scope.access, CapabilityAccess::PaperTrading);
-    assert_eq!(
-        continuous.scope.environments,
-        vec![CapabilityEnvironment::Paper]
-    );
-    assert!(
-        continuous
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("External continuous trading sources"))
-    );
-    assert!(
-        continuous
-            .evidence
-            .contains(&"rust/crates/runtime/src/task_read_model.rs".to_owned())
     );
 }
 
@@ -497,6 +514,71 @@ fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
 }
 
 #[test]
+fn volume_maker_paper_owner_is_available_without_external_or_resting_authority() {
+    let manifest = current_capability_manifest();
+
+    let strategy = manifest.capability("strategy.volume-maker").unwrap();
+    assert_eq!(strategy.level, CapabilityLevel::Available);
+    assert_eq!(
+        strategy.scope.environments,
+        vec![CapabilityEnvironment::Offline]
+    );
+
+    let runtime = manifest.capability("runtime.volume-maker").unwrap();
+    assert_eq!(runtime.level, CapabilityLevel::Available);
+    assert_eq!(
+        runtime.scope.environments,
+        vec![CapabilityEnvironment::Paper]
+    );
+    assert_eq!(runtime.scope.access, CapabilityAccess::PaperTrading);
+    for summary_term in [
+        "replay-backed paper owner",
+        "single-leg reservations",
+        "account-risk admission",
+        "hourly statistics facts",
+        "validate/serve/status/stop",
+    ] {
+        assert!(
+            runtime.summary.contains(summary_term),
+            "summary must state {summary_term}"
+        );
+    }
+    for evidence in [
+        "rust/crates/apps/src/paper_volume_maker_task.rs",
+        "rust/crates/apps/tests/paper_volume_maker_task_contract.rs",
+        "rust/crates/strategy/src/volume_maker.rs",
+        "rust/crates/runtime/src/task_read_model.rs",
+    ] {
+        assert!(
+            runtime.evidence.contains(&evidence.to_owned()),
+            "missing evidence {evidence}"
+        );
+    }
+    assert!(
+        runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("replay-backed only")
+                && blocker.contains("no testnet/mainnet order authority")),
+        "the replay-only and no-external-authority boundary must stay explicit"
+    );
+    assert!(
+        runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("no resting orders")),
+        "the virtual-quote simulation boundary must stay explicit"
+    );
+    assert!(
+        !runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not implemented")),
+        "the unfinished-runtime blocker must be gone once the paper owner ships"
+    );
+}
+
+#[test]
 fn mainnet_market_data_does_not_grant_live_trading_authority() {
     let manifest = current_capability_manifest();
     let public_data = manifest.capability("exchange.binance-public").unwrap();
@@ -570,20 +652,6 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         CapabilityLevel::Available
     );
 
-    let hyperliquid = manifest.adapter("hyperliquid").unwrap();
-    assert_eq!(
-        hyperliquid.public_data.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        hyperliquid.testnet_protocol.level,
-        AdapterSupportLevel::ProtocolOnly
-    );
-    assert_eq!(
-        hyperliquid.reconcile.level,
-        AdapterSupportLevel::RequestOnly
-    );
-
     let backpack = manifest.adapter("backpack").unwrap();
     assert_eq!(backpack.public_data.level, AdapterSupportLevel::ConfigOnly);
     assert_eq!(
@@ -613,6 +681,48 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
             adapter.id
         );
     }
+}
+
+#[test]
+fn hyperliquid_public_data_is_implemented_polling_without_extra_authority() {
+    let manifest = current_capability_manifest();
+
+    let hyperliquid = manifest.adapter("hyperliquid").unwrap();
+    assert_eq!(
+        hyperliquid.public_data.level,
+        AdapterSupportLevel::Implemented
+    );
+    assert!(
+        hyperliquid
+            .public_data
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not a realtime stream")),
+        "implemented public data must still state its polling cadence limitation"
+    );
+    assert_eq!(
+        manifest
+            .capability("exchange.hyperliquid-public")
+            .unwrap()
+            .evidence,
+        hyperliquid.public_data.evidence
+    );
+    assert_eq!(
+        manifest
+            .capability("exchange.hyperliquid-public")
+            .unwrap()
+            .level,
+        CapabilityLevel::ReadOnly
+    );
+    assert_eq!(
+        hyperliquid.testnet_protocol.level,
+        AdapterSupportLevel::ProtocolOnly
+    );
+    assert_eq!(
+        hyperliquid.reconcile.level,
+        AdapterSupportLevel::RequestOnly
+    );
+    assert_eq!(hyperliquid.live.level, AdapterSupportLevel::Unavailable);
 }
 
 #[test]

@@ -12,6 +12,7 @@ pub mod paper_arbitrage_task;
 pub mod paper_grid_task;
 pub mod paper_profile;
 pub mod paper_single_leg_saga;
+pub mod paper_volume_maker_task;
 pub mod scanner;
 pub mod task_host;
 pub mod testnet_lifecycle;
@@ -41,6 +42,12 @@ pub use paper_profile::{
 };
 pub use paper_single_leg_saga::{
     DurablePaperSingleLegSaga, PaperSingleLegRequest, PaperSingleLegRun, PaperSingleLegSagaError,
+};
+pub use paper_volume_maker_task::{
+    VOLUME_MAKER_PAPER_TASK_STATUS_SCHEMA_VERSION, VOLUME_MAKER_STATISTICS_SCHEMA_VERSION,
+    VolumeMakerPaperExecutionFuture, VolumeMakerPaperExecutor, VolumeMakerPaperTask,
+    VolumeMakerPaperTaskConfig, VolumeMakerPaperTaskError, VolumeMakerPaperTaskExit,
+    VolumeMakerPaperTaskFailure, VolumeMakerPaperTaskPhase, VolumeMakerPaperTaskStatus,
 };
 pub use testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TESTNET_LIFECYCLE_SCHEMA_VERSION, TestnetLifecycleConfig,

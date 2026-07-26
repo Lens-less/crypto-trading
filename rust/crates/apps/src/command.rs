@@ -26,20 +26,23 @@ use crypto_trading_domain::{
     TimeInForce,
 };
 use crypto_trading_exchange::{
-    BinanceHmacSha256Signer, BinanceProduct, BinanceRequestSigner, BinanceTestnetEndpoints,
-    BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError, ExchangeHandle, ExchangeSymbol,
-    ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules, PaperExchange, ReconcileScope,
-    RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition, TradingReceipt,
+    BinanceHmacSha256Signer, BinanceProduct, BinancePublicExchange, BinanceRequestSigner,
+    BinanceTestnetEndpoints, BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError,
+    ExchangeHandle, ExchangeSymbol, ExchangeSymbolCatalog, HyperliquidPublicEndpoint,
+    HyperliquidPublicExchange, InstrumentRuleCatalog, InstrumentRules, PaperExchange,
+    ReconcileScope, RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition,
+    TradingReceipt, hyperliquid_usdt_symbol_catalog,
 };
 use crypto_trading_runtime::{
-    DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode,
-    ExecutionPolicy, HistoryError, IntentExecutor, JournalReadError, JsonlHistory,
-    MAX_HISTORY_RECORD_BYTES, MarketDataBook, MarketDataError, MarketDataEvent,
-    MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy, MarketInstrument,
-    MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
-    ReadOnlyTaskExit, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError, SpreadHistoryWriter,
-    SystemMarketDataClock, current_capability_manifest, read_journal_chain,
+    BinancePollingRoute, BinancePublicPollingSource, DecisionRecord,
+    DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode, ExecutionPolicy,
+    HistoryError, HyperliquidPollingRoute, HyperliquidPublicPollingSource, IntentExecutor,
+    JournalReadError, JsonlHistory, MAX_HISTORY_RECORD_BYTES, MarketDataBook, MarketDataError,
+    MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy,
+    MarketInstrument, MarketPollingPolicy, MarketSupervisorConfig, MarketUniverse,
+    PaperAccountAuthority, PaperAccountConfig, ReadOnlyTaskExit, ReadOnlyTaskFailure,
+    ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError,
+    SpreadHistoryWriter, SystemMarketDataClock, current_capability_manifest, read_journal_chain,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -100,6 +103,17 @@ use crate::testnet_soak::{
     TestnetSoakTaskExit, TestnetSoakTaskFailure, TestnetSoakTaskStatus,
     verify_testnet_soak_evidence,
 };
+// Volume-maker task-host imports are grouped here so the four-mode CLI wiring
+// stays one coherent seam.
+use crate::cli::VolumeMakerRunMode;
+use crate::paper_volume_maker_task::{
+    VolumeMakerPaperExecutionFuture, VolumeMakerPaperExecutor, VolumeMakerPaperTask,
+    VolumeMakerPaperTaskConfig, VolumeMakerPaperTaskExit, VolumeMakerPaperTaskStatus,
+};
+use crypto_trading_config::VolumeMakerConfig;
+use crypto_trading_runtime::{AccountRiskAuthority, PaperCostModel};
+use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
+use rust_decimal::prelude::ToPrimitive;
 
 /// Runs one parsed CLI command.
 ///
@@ -118,7 +132,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Grid(args) => run_grid(args).await,
         Command::Arbitrage(args) => run_arbitrage(&args).await,
         Command::Monitor(args) => run_monitor(&args).await,
-        Command::VolumeMaker(args) => run_volume_maker(&args),
+        Command::VolumeMaker(args) => run_volume_maker(&args).await,
         Command::PriceAlert(args) => run_price_alert(&args).await,
         Command::Scanner(args) => run_scanner(&args).await,
         Command::Paper(args) => run_paper(args).await,
@@ -702,6 +716,7 @@ const fn task_kind_name(kind: ReadOnlyTaskKind) -> &'static str {
         ReadOnlyTaskKind::GridPaper => "grid_paper",
         ReadOnlyTaskKind::PriceAlert => "price_alert",
         ReadOnlyTaskKind::Scanner => "scanner",
+        ReadOnlyTaskKind::VolumeMaker => "volume_maker",
     }
 }
 
@@ -2129,18 +2144,40 @@ async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
     let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
     let monitor = load_monitor_config_from_str(&body)
         .with_context(|| format!("failed to load monitor config {}", args.config.display()))?;
-    let replay_path = args.replay.as_ref().context(
-        "monitor serve currently requires --replay until external continuous source adapters are wired into this task host",
-    )?;
     let task_id = args
         .task_id
         .as_deref()
         .context("monitor serve mode requires --task-id")?;
     validate_monitor_pair(&monitor)?;
     let symbol = selected_monitor_symbol(args, &monitor)?;
+    if args.live {
+        let (read_monitor, left_source, right_source) =
+            build_live_monitor_pair(args, &monitor, &symbol)?;
+        return serve_monitor_task(args, task_id, read_monitor, left_source, right_source).await;
+    }
+    let replay_path = args.replay.as_ref().context(
+        "monitor serve requires --replay unless --live opts into the credential-free binance+hyperliquid polling pair",
+    )?;
     let market_type = serve_market_type(&symbol);
     let left = MarketInstrument::new(&monitor.exchanges[0], symbol.clone(), market_type)?;
     let right = MarketInstrument::new(&monitor.exchanges[1], symbol.clone(), market_type)?;
+    let read_monitor = build_exact_pair_monitor(&monitor, left, right)?;
+    let (left_source, right_source) = build_serve_replay_sources(
+        replay_path,
+        &monitor.exchanges[0],
+        &monitor.exchanges[1],
+        &symbol,
+    )?;
+    serve_monitor_task(args, task_id, read_monitor, left_source, right_source).await
+}
+
+/// Builds the exact-pair composer (bounded book plus read-only monitor) shared
+/// by the replay-backed and live-polling serve bootstraps.
+fn build_exact_pair_monitor(
+    monitor: &MonitorConfig,
+    left: MarketInstrument,
+    right: MarketInstrument,
+) -> Result<ReadOnlyArbitrageMonitor> {
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()])?;
     let max_age_seconds = i64::try_from(monitor.data_timeout_seconds)
         .context("monitor data timeout exceeds the runtime duration")?;
@@ -2151,13 +2188,100 @@ async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
         MarketFreshnessPolicy::new(max_age, Duration::seconds(1))?,
         Arc::new(SystemMarketDataClock),
     );
-    let read_monitor = ReadOnlyArbitrageMonitor::new(book, left, right, monitor.min_spread_pct)?;
-    let (left_source, right_source) = build_serve_replay_sources(
-        replay_path,
-        &monitor.exchanges[0],
-        &monitor.exchanges[1],
-        &symbol,
+    Ok(ReadOnlyArbitrageMonitor::new(
+        book,
+        left,
+        right,
+        monitor.min_spread_pct,
+    )?)
+}
+
+/// Builds the explicit live pair: a Binance Spot polling leg and a Hyperliquid
+/// perpetual polling leg, both credential-free and read-only.
+///
+/// The Hyperliquid leg's funding-rate side feed is not consumed here yet: the
+/// spread-history journal keeps recording funding fields as absent, so
+/// history-mode decisions stay explicitly funding-degraded.
+fn build_live_monitor_pair(
+    args: &MonitorArgs,
+    monitor: &MonitorConfig,
+    symbol: &Symbol,
+) -> Result<(
+    ReadOnlyArbitrageMonitor,
+    BinancePublicPollingSource,
+    HyperliquidPublicPollingSource,
+)> {
+    if monitor.exchanges.len() != 2
+        || monitor.exchanges[0] != "binance"
+        || monitor.exchanges[1] != "hyperliquid"
+    {
+        bail!(
+            "monitor --live currently supports exactly the configured exchange pair [binance, hyperliquid] in that order"
+        );
+    }
+    let Some(coin) = symbol
+        .as_str()
+        .strip_suffix("USDT")
+        .filter(|coin| !coin.is_empty())
+    else {
+        bail!("monitor --live requires a USDT-quoted symbol such as BTCUSDT; got {symbol}");
+    };
+    let catalog = hyperliquid_usdt_symbol_catalog(&[coin])?;
+    let wire_coin = catalog
+        .to_wire("hyperliquid", symbol, MarketType::Perpetual)?
+        .to_owned();
+    let left = MarketInstrument::new("binance", symbol.clone(), MarketType::Spot)?;
+    let right = MarketInstrument::new("hyperliquid", symbol.clone(), MarketType::Perpetual)?;
+    let read_monitor = build_exact_pair_monitor(monitor, left.clone(), right.clone())?;
+    let poll_interval = StdDuration::from_millis(args.poll_interval_ms.max(1));
+    let policy = MarketPollingPolicy::new(
+        poll_interval,
+        poll_interval,
+        poll_interval.max(StdDuration::from_secs(60)),
     )?;
+    let binance = match args.binance_base_url.as_deref() {
+        Some(base_url) => BinancePublicExchange::with_base_url(base_url)?,
+        None => BinancePublicExchange::new()?,
+    };
+    let hyperliquid_endpoint = match args.hyperliquid_base_url.as_deref() {
+        Some(base_url) => HyperliquidPublicEndpoint::loopback(base_url)?,
+        None => HyperliquidPublicEndpoint::official(),
+    };
+    let hyperliquid = HyperliquidPublicExchange::with_endpoint(&hyperliquid_endpoint)?;
+    let left_source = BinancePublicPollingSource::new(
+        binance,
+        vec![BinancePollingRoute::new(
+            left,
+            Symbol::new(symbol.as_str())?,
+        )?],
+        policy,
+        Arc::new(SystemMarketDataClock),
+    )?;
+    let right_source = HyperliquidPublicPollingSource::new(
+        hyperliquid,
+        vec![HyperliquidPollingRoute::new(
+            right,
+            Symbol::new(wire_coin)?,
+        )?],
+        policy,
+        Arc::new(SystemMarketDataClock),
+    )?;
+    Ok((read_monitor, left_source, right_source))
+}
+
+/// Starts one continuous monitor owner over the given exact sources and hosts
+/// its loopback control endpoint until it stops or terminates.
+async fn serve_monitor_task<L, R>(
+    args: &MonitorArgs,
+    task_id: &str,
+    read_monitor: ReadOnlyArbitrageMonitor,
+    left_source: L,
+    right_source: R,
+) -> Result<()>
+where
+    L: MarketDataEventSource,
+    R: MarketDataEventSource,
+{
     let mut task = ContinuousMonitorTask::start_with_spread_history(
         ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?,
         read_monitor,
@@ -2541,7 +2665,34 @@ fn format_task_status(status: &TaskStatusRender<'_>) -> String {
     )
 }
 
-fn run_volume_maker(args: &VolumeMakerArgs) -> Result<()> {
+/// Fixed cost model and account bounds for the CLI paper volume-maker host.
+const VOLUME_MAKER_INITIAL_AVAILABLE: i64 = 10_000;
+const VOLUME_MAKER_COST_FEE_BPS: u32 = 10;
+const VOLUME_MAKER_COST_FUNDING_BUFFER_BPS: u32 = 5;
+const VOLUME_MAKER_COST_SLIPPAGE_BPS: u32 = 15;
+const VOLUME_MAKER_EVENT_CAPACITY: usize = 256;
+const VOLUME_MAKER_MAX_MARKET_AGE_SECONDS: i64 = 30;
+/// One shared account-risk scope mirroring the paper profile owners.
+const VOLUME_MAKER_ACCOUNT_RISK_SCOPE: &str = "paper";
+
+const VOLUME_MAKER_TASK_PROJECTION: TaskProjectionScope = TaskProjectionScope {
+    task_kind: "volume_maker",
+    label: "volume-maker",
+};
+
+async fn run_volume_maker(args: &VolumeMakerArgs) -> Result<()> {
+    match args.mode {
+        VolumeMakerRunMode::Validate => {
+            run_volume_maker_validate(args)?;
+            Ok(())
+        }
+        VolumeMakerRunMode::Serve => run_volume_maker_serve(args).await,
+        VolumeMakerRunMode::Status => run_volume_maker_status(args).await,
+        VolumeMakerRunMode::Stop => run_volume_maker_stop(args).await,
+    }
+}
+
+fn run_volume_maker_validate(args: &VolumeMakerArgs) -> Result<VolumeMakerConfig> {
     let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
     let config = load_volume_maker_config_from_str(&body).with_context(|| {
         format!(
@@ -2554,12 +2705,351 @@ fn run_volume_maker(args: &VolumeMakerArgs) -> Result<()> {
         .context("volume-maker execution controls rejected the configuration")?;
     VolumeMakerStrategy::try_from(&config)
         .context("volume-maker strategy rejected the configuration")?;
-    bail!(
-        "volume-maker runtime is unavailable (validated {}/{} from {})",
+    println!(
+        "valid: volume-maker {} exchange={} symbol={} mode={} market={:?}",
+        args.config.display(),
         config.exchange,
         config.symbol,
-        args.config.display()
+        config.order_mode.trim().to_ascii_lowercase(),
+        config.market_type
+    );
+    Ok(config)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_volume_maker_serve(args: &VolumeMakerArgs) -> Result<()> {
+    let config = run_volume_maker_validate(args)?;
+    let strategy = VolumeMakerStrategy::try_from(&config)
+        .map_err(anyhow::Error::new)
+        .context("volume-maker strategy rejected the configuration")?;
+    let replay_path = args.replay.as_ref().context(
+        "volume-maker serve currently requires --replay until external continuous market sources are wired into this task host",
+    )?;
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("volume-maker serve mode requires --task-id")?;
+    let history = JsonlHistory::new(&args.history_path);
+
+    let instrument =
+        MarketInstrument::new(&config.exchange, config.symbol.clone(), config.market_type)?;
+    let events = build_exact_universe_replay_source(
+        replay_path,
+        &config.exchange,
+        std::slice::from_ref(&instrument),
+        "volume-maker",
+    )?
+    .events;
+    let start = match events.front() {
+        Some(MarketDataEvent::Observation(observation)) => observation.received_at,
+        Some(
+            MarketDataEvent::SourceGap { observed_at, .. }
+            | MarketDataEvent::SourceUnavailable { observed_at, .. },
+        ) => *observed_at,
+        None => bail!("volume-maker replay has no events inside the configured universe"),
+    };
+    let clock = Arc::new(ReplayMarketDataClock::new(start));
+    let exchange_clock = Arc::clone(&clock);
+    let paper_exchange = Arc::new(
+        PaperExchange::with_clock(
+            config.exchange.clone(),
+            NonZeroUsize::new(VOLUME_MAKER_EVENT_CAPACITY)
+                .context("volume-maker paper event capacity must be non-zero")?,
+            move || crypto_trading_runtime::MarketDataClock::now(exchange_clock.as_ref()),
+        )
+        .map_err(anyhow::Error::new)
+        .context("failed to build the volume-maker paper exchange")?,
+    );
+    let latest: Arc<std::sync::Mutex<Option<MarketSnapshot>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let source = VolumeMakerReplaySource {
+        source_id: config.exchange.clone(),
+        events,
+        clock: Arc::clone(&clock),
+        latest: Arc::clone(&latest),
+        exchange: Arc::clone(&paper_exchange),
+    };
+    let executor = Arc::new(VolumeMakerReplayExecutor {
+        exchange: paper_exchange,
+        exchange_name: config.exchange.clone(),
+        clock,
+        latest,
+    });
+
+    let account = PaperAccountAuthority::planned(
+        history.clone(),
+        PaperAccountConfig::new(
+            format!("paper-volume-maker:{task_id}"),
+            Money::new(Decimal::from(VOLUME_MAKER_INITIAL_AVAILABLE)),
+        )
+        .map_err(anyhow::Error::new)?,
     )
+    .map_err(anyhow::Error::new)
+    .context("failed to plan the volume-maker paper account")?;
+    let account_risk = AccountRiskAuthority::new(
+        account.journal_id(),
+        history.clone(),
+        VOLUME_MAKER_ACCOUNT_RISK_SCOPE,
+        AccountRiskPolicy::new(AccountRiskLimits::default()).map_err(anyhow::Error::new)?,
+    )
+    .map_err(anyhow::Error::new)
+    .context("failed to build the volume-maker account-risk authority")?;
+
+    let mut task_config = VolumeMakerPaperTaskConfig::new(
+        task_id,
+        strategy,
+        PaperCostModel::v1(
+            VOLUME_MAKER_COST_FEE_BPS,
+            VOLUME_MAKER_COST_FUNDING_BUFFER_BPS,
+            VOLUME_MAKER_COST_SLIPPAGE_BPS,
+        )
+        .map_err(anyhow::Error::new)?,
+        supervisor_config(args.shutdown_grace_ms)?,
+    )
+    .map_err(anyhow::Error::new)
+    .context("invalid volume-maker task configuration")?
+    .with_account_risk(account_risk)
+    .with_cycle_interval(volume_maker_cycle_interval(&config)?);
+    if let Some(max_cycles) = config.max_cycles {
+        task_config = task_config.with_max_cycles(max_cycles);
+    }
+    if let Some(target_volume) = config.target_volume {
+        task_config = task_config.with_target_volume(target_volume);
+    }
+
+    let mut task = VolumeMakerPaperTask::start(task_config, source, account, history, executor)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to start continuous volume-maker task")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind volume-maker control socket on {address}"))?;
+
+    println!(
+        "continuous volume-maker task started: task_id={} control={} history={}",
+        task_id,
+        address,
+        args.history_path.display()
+    );
+
+    let outcome = serve_host(
+        &mut task,
+        listener,
+        StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
+        render_live_volume_maker_status,
+        render_live_volume_maker_stop,
+    )
+    .await
+    .map_err(|error| anyhow::Error::new(error).context("volume-maker control host failed"))?;
+
+    match outcome {
+        TaskHostServeOutcome::StopRequested(exit) => {
+            println!("continuous volume-maker task stopped: task_id={task_id} exit={exit}");
+        }
+        TaskHostServeOutcome::Terminal(status) => {
+            println!(
+                "continuous volume-maker task terminated: task_id={} phase={} processed_event_count={} completed_cycles={}",
+                status.task_id,
+                status.phase,
+                status.processed_event_count,
+                status.completed_cycle_count
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_volume_maker_status(args: &VolumeMakerArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("volume-maker status mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
+        print!("{response}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        render_projected_task_status(&project_task_status(
+            &args.history_path,
+            task_id,
+            VOLUME_MAKER_TASK_PROJECTION,
+        )?)
+    );
+    Ok(())
+}
+
+async fn run_volume_maker_stop(args: &VolumeMakerArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("volume-maker stop mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
+        print!("{response}");
+        return Ok(());
+    }
+    let projected = project_task_status(&args.history_path, task_id, VOLUME_MAKER_TASK_PROJECTION)?;
+    if projected.phase == "stopped" || projected.phase == "failed" {
+        print!("{}", render_projected_task_status(&projected));
+        return Ok(());
+    }
+    bail!(
+        "volume-maker task control endpoint is unavailable at {address}; the task is not confirmed stopped"
+    );
+}
+
+/// Converts the validated legacy `cycle_interval` seconds into event-time
+/// pacing for the paper owner.
+fn volume_maker_cycle_interval(config: &VolumeMakerConfig) -> Result<StdDuration> {
+    let milliseconds = config
+        .interval_seconds
+        .checked_mul(Decimal::ONE_THOUSAND)
+        .and_then(|value| value.to_u64())
+        .context("volume-maker cycle interval is out of range")?;
+    Ok(StdDuration::from_millis(milliseconds))
+}
+
+/// Finite replay source that mirrors every observation into the paper
+/// exchange book before the owner consumes it.
+struct VolumeMakerReplaySource {
+    source_id: String,
+    events: VecDeque<MarketDataEvent>,
+    clock: Arc<ReplayMarketDataClock>,
+    latest: Arc<std::sync::Mutex<Option<MarketSnapshot>>>,
+    exchange: Arc<PaperExchange>,
+}
+
+impl fmt::Debug for VolumeMakerReplaySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VolumeMakerReplaySource")
+            .field("source_id", &self.source_id)
+            .field("remaining_events", &self.events.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MarketDataEventSource for VolumeMakerReplaySource {
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn next_event(&mut self) -> MarketDataEventFuture<'_> {
+        let Some(event) = self.events.pop_front() else {
+            return Box::pin(async move { Ok(None) });
+        };
+        let clock = Arc::clone(&self.clock);
+        let latest = Arc::clone(&self.latest);
+        let exchange = Arc::clone(&self.exchange);
+        let source_id = self.source_id.clone();
+        Box::pin(async move {
+            match &event {
+                MarketDataEvent::Observation(observation) => {
+                    clock.advance(observation.received_at);
+                    *latest
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(observation.snapshot.clone());
+                    exchange
+                        .publish_snapshot(observation.snapshot.clone())
+                        .await
+                        .map_err(|_| MarketDataError::SourceEventTimeRollback {
+                            exchange: source_id.clone(),
+                        })?;
+                }
+                MarketDataEvent::SourceGap { observed_at, .. }
+                | MarketDataEvent::SourceUnavailable { observed_at, .. } => {
+                    clock.advance(*observed_at);
+                }
+            }
+            Ok(Some(event))
+        })
+    }
+}
+
+/// Paper-exchange execution seam for the replay-backed volume-maker host.
+struct VolumeMakerReplayExecutor {
+    exchange: Arc<PaperExchange>,
+    exchange_name: String,
+    clock: Arc<ReplayMarketDataClock>,
+    latest: Arc<std::sync::Mutex<Option<MarketSnapshot>>>,
+}
+
+impl VolumeMakerPaperExecutor for VolumeMakerReplayExecutor {
+    fn execute(&self, batch: ExecutionBatch) -> VolumeMakerPaperExecutionFuture {
+        let exchange = Arc::clone(&self.exchange);
+        let exchange_name = self.exchange_name.clone();
+        let clock = Arc::clone(&self.clock);
+        let latest = Arc::clone(&self.latest);
+        Box::pin(async move {
+            let Some(intent) = batch.intents().first().cloned() else {
+                return Err(RuntimeError::InvalidExecutionPolicy(
+                    "volume-maker batch must contain exactly one intent",
+                ));
+            };
+            if intent.exchange != exchange_name {
+                return Err(RuntimeError::UnknownExchange(exchange_name));
+            }
+            let snapshot = latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| RuntimeError::MissingMarketData {
+                    exchange: intent.exchange.clone(),
+                    symbol: intent.symbol.clone(),
+                    market_type: intent.market_type,
+                })?;
+            let policy = ExecutionPolicy::new(
+                true,
+                false,
+                crypto_trading_runtime::ExecutionClock::now(clock.as_ref()),
+                Duration::seconds(VOLUME_MAKER_MAX_MARKET_AGE_SECONDS),
+                vec![snapshot],
+            )?
+            .with_clock(clock);
+            let executor = IntentExecutor::new(exchange, ExecutionMode::Paper, policy);
+            executor.execute_batch(batch).await
+        })
+    }
+}
+
+fn render_live_volume_maker_status(status: &VolumeMakerPaperTaskStatus) -> String {
+    format_task_status(&TaskStatusRender {
+        task_id: &status.task_id,
+        phase: Cow::Owned(status.phase.to_string()),
+        recovery: Cow::Borrowed("none"),
+        failure: Cow::Owned(
+            status
+                .failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+        processed_event_count: status.processed_event_count,
+        updated_at: Cow::Owned(
+            status
+                .last_recorded_at
+                .map_or_else(|| "none".to_owned(), |recorded_at| recorded_at.to_rfc3339()),
+        ),
+        exit: Cow::Owned(
+            status
+                .exit
+                .map_or("none".to_owned(), |exit| exit.to_string()),
+        ),
+        runtime_failure: Cow::Owned(
+            status
+                .runtime_failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+    })
+}
+
+fn render_live_volume_maker_stop(
+    status: &VolumeMakerPaperTaskStatus,
+    _exit: VolumeMakerPaperTaskExit,
+) -> String {
+    render_live_volume_maker_status(status)
 }
 
 /// Bounded staleness horizon for replay-backed price-alert readiness checks.

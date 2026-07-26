@@ -7,6 +7,7 @@ use crate::ExchangeError;
 const BINANCE_SPOT_TESTNET_HOST: &str = "testnet.binance.vision";
 const BINANCE_USDM_TESTNET_HOST: &str = "demo-fapi.binance.com";
 const HYPERLIQUID_TESTNET_HOST: &str = "api.hyperliquid-testnet.xyz";
+const HYPERLIQUID_MAINNET_HOST: &str = "api.hyperliquid.xyz";
 
 /// Binance product families with distinct REST hosts and route namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +116,64 @@ impl HyperliquidTestnetEndpoint {
     pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
         Ok(Self {
             base: loopback_root(base, "Hyperliquid offline endpoint")?,
+        })
+    }
+
+    /// Resolves a fixed API path without allowing origin escape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for unsafe paths.
+    pub fn rest_url(&self, path: &str) -> Result<Url, ExchangeError> {
+        fixed_api_url(&self.base, path)
+    }
+}
+
+/// Public, credential-free Hyperliquid market-data endpoint selection.
+///
+/// This whitelist admits only the official mainnet info origin or an explicit
+/// literal-loopback origin for deterministic offline contract tests. It never
+/// selects the authenticated `/exchange` surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperliquidPublicEndpoint {
+    base: Url,
+}
+
+impl HyperliquidPublicEndpoint {
+    /// Returns the official Hyperliquid mainnet public-info endpoint.
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("https://api.hyperliquid.xyz") {
+            Ok(endpoint) => endpoint,
+            Err(_) => unreachable!("hard-coded Hyperliquid mainnet endpoint must be valid"),
+        }
+    }
+
+    /// Validates a URL against the exact official Hyperliquid mainnet host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for any non-official or
+    /// structurally unsafe endpoint.
+    pub fn try_official(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: official_root(
+                base,
+                HYPERLIQUID_MAINNET_HOST,
+                "Hyperliquid public endpoint",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline endpoint on a literal loopback address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for hostnames, non-loopback
+    /// addresses, credentials, query strings, fragments, or non-root paths.
+    pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: loopback_root(base, "Hyperliquid public offline endpoint")?,
         })
     }
 

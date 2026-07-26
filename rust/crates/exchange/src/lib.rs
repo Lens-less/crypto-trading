@@ -6,6 +6,7 @@ mod binance_testnet_exchange;
 mod bounded;
 mod endpoint;
 mod error;
+mod hyperliquid_public;
 mod hyperliquid_testnet;
 mod instrument;
 mod model;
@@ -22,8 +23,14 @@ pub use binance_testnet::{
 };
 pub use binance_testnet_exchange::{BinanceTestnetAccountSnapshot, BinanceTestnetExchange};
 pub use bounded::BoundedExchangeHandle;
-pub use endpoint::{BinanceProduct, BinanceTestnetEndpoints, HyperliquidTestnetEndpoint};
+pub use endpoint::{
+    BinanceProduct, BinanceTestnetEndpoints, HyperliquidPublicEndpoint, HyperliquidTestnetEndpoint,
+};
 pub use error::{ExchangeError, ExchangeOperation, RemoteFailureMetadata, RemoteRetryAfter};
+pub use hyperliquid_public::{
+    HyperliquidFundingRate, HyperliquidPublicExchange, HyperliquidPublicObservation,
+    MAX_HYPERLIQUID_PUBLIC_CATALOG_COINS, hyperliquid_usdt_symbol_catalog,
+};
 pub use hyperliquid_testnet::{
     HyperliquidAction, HyperliquidAsset, HyperliquidAssetCatalog, HyperliquidRequestSigner,
     HyperliquidSignature, HyperliquidTestnetProtocol,

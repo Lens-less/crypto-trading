@@ -46,8 +46,8 @@
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
 | `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓；Arbitrage owner 可选历史决策模式（`history_decision`）：用 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级并标注 `funding_degraded`；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（journal-backed：单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
 | `paper risk` | 可通过 `--paper-account-risk-config` 加载可选限额（缺省全部禁用） | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝、owner 消费 close 指令后停止 |
-| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；真实外部双源和自动恢复仍未开放 |
-| `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
+| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay / `--live` 轮询） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；`--live` 可显式选用真实免凭证公开轮询双源（仅限 binance+hyperliquid 精确对：Binance 现货 bookTicker + Hyperliquid 永续 asset contexts，后者附每小时资金费率只读侧通道，轮询非实时）；自动恢复仍未开放 |
+| `volume-maker` | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve/status/stop` 运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式吃盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源仍未开放 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
 | `scanner` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
 
@@ -547,7 +547,7 @@ CI 还会：
 
 ### 为什么配置校验成功，但命令仍然报 `runtime is unavailable`？
 
-配置解析与运行能力是两道独立门禁。`volume-maker` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor`、`price-alert` 和 `scanner` 是例外：它们的 `serve/status/stop` 模式可以运行，但只接受精确 replay 数据源（monitor 为双源，price-alert 和 scanner 为单源），不接受真实外部源；`price-alert` 与 `scanner` 的默认 `--mode validate` 校验成功后正常返回。
+配置解析与运行能力是两道独立门禁。无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor`、`volume-maker`、`price-alert` 和 `scanner` 是例外：它们的 `serve/status/stop` 模式可以运行，但只接受精确 replay 数据源（monitor 为双源，其余为单源），不接受真实外部源；`volume-maker`、`price-alert` 与 `scanner` 的默认 `--mode validate` 校验成功后正常返回（`volume-maker` 在配置 `emergency_stop: true` 时仍失败关闭）。
 
 ### 为什么 `--live` 仍然无法下单？
 

@@ -100,6 +100,7 @@ const TOKEN_LABELS = new Map<string, string>([
   ["grid_paper", "Paper 网格"],
   ["price_alert", "价格预警"],
   ["scanner", "扫描器"],
+  ["volume_maker", "Paper 刷量"],
   // 能力等级
   ["available", "可用"],
   ["read-only", "只读"],

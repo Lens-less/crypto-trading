@@ -64,7 +64,10 @@ pub use market_data::{
     MarketInstrumentView, MarketUniverse, ObservedMarketPair, SubscriptionMarketDataAdapter,
     SystemMarketDataClock,
 };
-pub use market_polling::{BinancePollingRoute, BinancePublicPollingSource, MarketPollingPolicy};
+pub use market_polling::{
+    BinancePollingRoute, BinancePublicPollingSource, FundingRateFeed, FundingRateObservation,
+    HyperliquidPollingRoute, HyperliquidPublicPollingSource, MarketPollingPolicy,
+};
 pub use market_supervisor::{
     MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEventFuture, MarketDataEventSource,
     MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,

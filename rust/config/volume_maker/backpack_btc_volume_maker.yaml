@@ -1,6 +1,6 @@
 # ==============================================================================
 # 刷量交易配置文件 - Backpack BTC永续合约
-# LEGACY-PARSEABLE ONLY：当前 Rust volume-maker runtime 失败关闭，以下实时/adapter 说明未接入。
+# LEGACY-PARSEABLE：Rust volume-maker 支持 validate/serve/status/stop（serve 为 replay-backed Paper owner）；以下实时/adapter 说明仍未接入，且本文件 emergency_stop: true 会失败关闭。
 # ==============================================================================
 # 
 # 🎯 功能说明：通过自动化交易快速刷交易量
