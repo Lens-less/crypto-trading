@@ -760,3 +760,53 @@ fn jsonl(records: &[Value]) -> Vec<u8> {
 fn fixed_uuid(value: u8) -> Uuid {
     Uuid::from_bytes([value; 16])
 }
+
+#[tokio::test]
+async fn readiness_probe_stays_unauthenticated_but_reads_no_operational_data() {
+    // A corrupt journal fails every projection. The readiness probe must still
+    // answer, which proves it is served from the static capability manifest
+    // rather than from a journal projection an unauthenticated caller could
+    // force the process to run on every request.
+    let app = fixture_app(
+        b"not a journal\n".to_vec(),
+        WebAccessPolicy::loopback_open(),
+    );
+
+    let health = app.clone().oneshot(get("/api/v1/health")).await.unwrap();
+
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_security_headers(&health);
+    let body = response_json(health).await;
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["live_trading_enabled"], false);
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        3,
+        "the probe reports schema, status, and authority only: {body}"
+    );
+
+    // The authenticated projections over the same journal do fail, confirming
+    // the probe is not simply reading a healthy snapshot.
+    let system = app.oneshot(get("/api/v1/system")).await.unwrap();
+    assert_eq!(system.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn readiness_probe_is_rate_limited_even_without_a_token() {
+    let app = fixture_app(Vec::new(), WebAccessPolicy::loopback_open());
+
+    let mut limited = None;
+    for _ in 0..=crypto_trading_web::WEB_REQUEST_LIMIT_PER_MINUTE {
+        let response = app.clone().oneshot(get("/api/v1/health")).await.unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(response);
+            break;
+        }
+    }
+
+    let limited = limited.expect("the unauthenticated probe must not be an unbounded route");
+    assert!(
+        limited.headers().contains_key(RETRY_AFTER),
+        "backpressure tells the caller when to return"
+    );
+}

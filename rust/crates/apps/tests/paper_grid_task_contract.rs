@@ -21,8 +21,8 @@ use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     ExecutionBatch, JsonlHistory, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
     MarketDataObservation, MarketSupervisorConfig, PaperAccountAuthority, PaperAccountConfig,
-    PaperCostModel, PaperReconciliationDigestAlgorithm, PaperReconciliationProof,
-    PaperReservationPhase, ReadOnlyTaskKind, ReadOnlyTaskPhase, RuntimeError,
+    PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationPhase,
+    ReadOnlyTaskKind, ReadOnlyTaskPhase, RuntimeError,
 };
 use crypto_trading_strategy::{VirtualGrid, VirtualGridConfig};
 use rust_decimal::Decimal;
@@ -448,14 +448,19 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     let reservation = account.snapshot().await.unwrap().reservations[0].clone();
     account
         .record_reconciliation_failure(
-            PaperReconciliationProof::new(
-                "paper-grid",
-                reservation.reservation_id,
-                reservation.batch_id,
-                "binance-testnet/account-snapshot-1",
-                1,
-                PaperReconciliationDigestAlgorithm::Fnv1a64,
-                "0011223344556677",
+            PaperReconciliationProof::from_evidence(
+                PaperReconciliationEvidence::mismatch(
+                    "contract-fixture",
+                    "0011223344556677",
+                    "paper-grid",
+                    reservation.reservation_id,
+                    reservation.batch_id,
+                    "binance-testnet/account-snapshot-1",
+                    1,
+                    Money::new(decimal("10000")),
+                    "fixture_mismatch",
+                )
+                .unwrap(),
             )
             .unwrap(),
         )

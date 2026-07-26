@@ -177,7 +177,54 @@ fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
 #[test]
 fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
     let manifest = current_capability_manifest();
+    let lifecycle = manifest.capability("runtime.testnet-lifecycle").unwrap();
+    let reconciliation = manifest
+        .capability("runtime.testnet-reconciliation")
+        .unwrap();
     let soak = manifest.capability("runtime.testnet-soak").unwrap();
+
+    assert_eq!(lifecycle.level, CapabilityLevel::Available);
+    assert_eq!(
+        lifecycle.scope.environments,
+        vec![CapabilityEnvironment::Testnet]
+    );
+    assert_eq!(lifecycle.scope.access, CapabilityAccess::TestnetTrading);
+    assert!(lifecycle.summary.contains("query-first recovery"));
+    assert!(
+        lifecycle
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("controlled partial-fill"))
+    );
+    assert!(
+        lifecycle
+            .evidence
+            .contains(&"rust/crates/apps/src/testnet_lifecycle.rs".to_owned())
+    );
+
+    assert_eq!(reconciliation.level, CapabilityLevel::Available);
+    assert_eq!(
+        reconciliation.scope.environments,
+        vec![CapabilityEnvironment::Testnet]
+    );
+    assert_eq!(
+        reconciliation.scope.access,
+        CapabilityAccess::TestnetTrading
+    );
+    assert!(reconciliation.summary.contains("balances"));
+    assert!(reconciliation.summary.contains("open orders"));
+    assert!(reconciliation.summary.contains("positions"));
+    assert!(
+        reconciliation
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("credentialed Spot and USD-M"))
+    );
+    assert!(
+        reconciliation
+            .evidence
+            .contains(&"rust/crates/apps/src/testnet_reconciliation.rs".to_owned())
+    );
 
     assert_eq!(soak.level, CapabilityLevel::ReadOnly);
     assert_eq!(

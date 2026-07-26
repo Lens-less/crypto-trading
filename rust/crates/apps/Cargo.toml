@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Command-line entry point for configuration checking, paper execution, and Binance testnet operations."
+# The workspace ships as an application, not as crates.io libraries.
+# Publishing is refused explicitly so it cannot happen by accident.
+publish = false
 
 [lib]
 name = "crypto_trading_cli"

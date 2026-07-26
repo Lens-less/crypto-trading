@@ -374,12 +374,17 @@ fn binance_adapter() -> AdapterSupport {
         "rust/crates/exchange/tests/binance_testnet_exchange_contract.rs",
         "rust/crates/apps/src/command.rs",
         "rust/crates/apps/tests/command_smoke.rs",
+        "rust/crates/apps/src/testnet_lifecycle.rs",
+        "rust/crates/apps/tests/testnet_lifecycle_cli_contract.rs",
+        "rust/crates/apps/src/testnet_reconciliation.rs",
+        "rust/crates/apps/tests/testnet_reconciliation_contract.rs",
+        "rust/crates/apps/tests/testnet_reconciliation_cli_contract.rs",
         "rust/crates/apps/src/testnet_soak.rs",
         "rust/crates/apps/tests/testnet_soak_contract.rs",
         "rust/crates/apps/tests/testnet_soak_cli_contract.rs",
     ];
     let credentialed_evidence_blocker = [
-        "The executable adapter and read-only soak harness have deterministic coverage, but credentialed Binance Testnet lifecycle evidence and a completed 24-hour soak are not checked in.",
+        "The executable adapter, durable order-lifecycle owner, signed account reconciliation gate, and read-only soak harness have deterministic coverage, but credentialed Binance Testnet lifecycle/reconciliation evidence and a completed 24-hour soak are not checked in.",
     ];
     AdapterSupport {
         id: "binance".to_owned(),
@@ -424,7 +429,7 @@ fn hyperliquid_adapter() -> AdapterSupport {
             &["No Rust market-data adapter emits Hyperliquid domain snapshots."],
             &[
                 "rust/crates/exchange/src/hyperliquid_testnet.rs",
-                "docs/research/upstream-repository-alignment.md",
+                "docs/internal/research/upstream-repository-alignment.md",
             ],
         ),
         testnet_protocol: adapter_facet(
@@ -496,7 +501,7 @@ fn config_only_adapter(id: &str, name: &str, config_path: &str) -> AdapterSuppor
     ];
     let unavailable_evidence = [
         config_path,
-        "docs/research/upstream-repository-alignment.md",
+        "docs/internal/research/upstream-repository-alignment.md",
     ];
     AdapterSupport {
         id: id.to_owned(),
@@ -527,8 +532,8 @@ fn config_only_adapter(id: &str, name: &str, config_path: &str) -> AdapterSuppor
 
 fn legacy_only_adapter(id: &str, name: &str) -> AdapterSupport {
     let evidence = [
-        "docs/research/upstream-repository-alignment.md",
-        "docs/plans/2026-07-24-project-alignment-web-goal-plan.md",
+        "docs/internal/research/upstream-repository-alignment.md",
+        "docs/internal/plans/2026-07-24-project-alignment-web-goal-plan.md",
     ];
     let unavailable = || {
         adapter_facet(
@@ -601,7 +606,7 @@ fn foundation_capabilities() -> Vec<Capability> {
                 "Write authority is limited to configured replay-backed Grid/Arbitrage paper owners; reconciliation, direct order submission, testnet mutation, and mainnet authority are not exposed.",
             ],
             &[
-                "DESIGN.md",
+                "docs/design-system.md",
                 "rust/crates/control-plane/src/lib.rs",
                 "rust/crates/control-plane/src/submit.rs",
                 "rust/crates/control-plane/tests/read_contract.rs",
@@ -613,7 +618,7 @@ fn foundation_capabilities() -> Vec<Capability> {
                 "rust/crates/web/src/server.rs",
                 "rust/crates/web/tests/http_contract.rs",
                 "rust/crates/web/tests/ui_contract.rs",
-                "docs/plans/2026-07-24-project-alignment-web-goal-plan.md",
+                "docs/internal/plans/2026-07-24-project-alignment-web-goal-plan.md",
             ],
         ),
     ]
@@ -715,7 +720,7 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 "rust/crates/runtime/src/paper_account.rs",
                 "rust/crates/runtime/tests/paper_account_contract.rs",
                 "rust/crates/runtime/tests/paper_account_read_model_contract.rs",
-                "rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md",
+                "docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md",
             ],
         ),
     ]
@@ -893,6 +898,8 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             ],
         ),
         scanner_capability(),
+        testnet_lifecycle_capability(),
+        testnet_reconciliation_capability(),
         testnet_soak_capability(),
         capability(
             "runtime.volume-maker",
@@ -931,6 +938,59 @@ fn scanner_capability() -> Capability {
             "rust/crates/control-plane/tests/scanner_projection_contract.rs",
             "rust/crates/web/tests/http_contract.rs",
             "rust/crates/web/tests/ui_contract.rs",
+        ],
+    )
+}
+
+fn testnet_lifecycle_capability() -> Capability {
+    capability(
+        "runtime.testnet-lifecycle",
+        CapabilityArea::Runtime,
+        CapabilityLevel::Available,
+        scope(
+            &[CapabilityEnvironment::Testnet],
+            CapabilityAccess::TestnetTrading,
+        ),
+        "Explicitly acknowledged durable Binance Testnet submit-query-cancel owner with UUID query-first recovery and bounded polling.",
+        &[
+            "A credentialed Spot open-order, controlled partial-fill, and kill-and-restart lifecycle remain external release evidence and have not been produced in this workspace.",
+            "Mainnet order authority remains unavailable.",
+        ],
+        &[
+            "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/src/testnet_lifecycle.rs",
+            "rust/crates/apps/tests/testnet_lifecycle_cli_contract.rs",
+            "rust/crates/exchange/src/binance_testnet_exchange.rs",
+            "rust/crates/exchange/tests/binance_testnet_exchange_contract.rs",
+        ],
+    )
+}
+
+fn testnet_reconciliation_capability() -> Capability {
+    capability(
+        "runtime.testnet-reconciliation",
+        CapabilityArea::Runtime,
+        CapabilityLevel::Available,
+        scope(
+            &[CapabilityEnvironment::Testnet],
+            CapabilityAccess::TestnetTrading,
+        ),
+        "Report-first clean-account gate comparing stable double-sampled Binance Testnet balances, open orders, and positions to one exact committed Paper reservation.",
+        &[
+            "A credentialed Spot and USD-M account comparison and applied Paper transition remain external release evidence and have not been produced in this workspace.",
+            "The comparator intentionally supports one configured Binance product/instrument and settlement asset per run; mixed-exchange reservations fail closed.",
+            "Mainnet account and order authority remain unavailable.",
+        ],
+        &[
+            "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/src/testnet_reconciliation.rs",
+            "rust/crates/apps/tests/testnet_reconciliation_contract.rs",
+            "rust/crates/apps/tests/testnet_reconciliation_cli_contract.rs",
+            "rust/crates/exchange/src/binance_testnet.rs",
+            "rust/crates/exchange/src/binance_testnet_exchange.rs",
+            "rust/crates/exchange/tests/binance_testnet_protocol.rs",
+            "rust/crates/exchange/tests/binance_testnet_exchange_contract.rs",
+            "rust/crates/runtime/src/paper_account.rs",
         ],
     )
 }
@@ -1022,16 +1082,28 @@ fn strategy_capabilities() -> Vec<Capability> {
     ]
 }
 
+/// Reported for an adapter the matrix does not list.
+///
+/// Claiming no capability is the fail-closed answer: an absent row must never
+/// be read as permission to do something.
+static UNLISTED_ADAPTER_FACET: AdapterFacetSupport = AdapterFacetSupport {
+    level: AdapterSupportLevel::Unavailable,
+    blockers: Vec::new(),
+    evidence: Vec::new(),
+};
+
 fn adapter_cell<'a>(
     adapters: &'a [AdapterSupport],
     id: &str,
     facet: AdapterFacet,
 ) -> &'a AdapterFacetSupport {
+    // A linear scan over the ten-row static matrix costs nothing and, unlike a
+    // binary search, does not turn a mis-ordered literal into a startup panic
+    // for every consumer of the infallible manifest constructor.
     adapters
-        .binary_search_by_key(&id, |adapter| adapter.id.as_str())
-        .ok()
-        .map(|index| adapters[index].facet(facet))
-        .expect("the static adapter matrix must contain every derived capability row")
+        .iter()
+        .find(|adapter| adapter.id == id)
+        .map_or(&UNLISTED_ADAPTER_FACET, |adapter| adapter.facet(facet))
 }
 
 fn adapter_capability(

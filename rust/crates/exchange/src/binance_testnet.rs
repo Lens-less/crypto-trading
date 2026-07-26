@@ -22,6 +22,8 @@ const MAX_API_KEY_BYTES: usize = 1_024;
 const MAX_SECRET_BYTES: usize = 2_048;
 const MAX_SIGNATURE_BYTES: usize = 2_048;
 const MAX_SERVER_ORDER_REF_BYTES: usize = 128;
+const MAX_ACCOUNT_BALANCES: usize = 4_096;
+const MAX_ASSET_BYTES: usize = 32;
 
 /// Credential-backed signing seam for Binance authenticated requests.
 ///
@@ -96,6 +98,15 @@ pub struct BinanceServerOrderRef {
     pub order_id: u64,
 }
 
+/// One asset balance from a signed Binance Testnet account snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceTestnetBalance {
+    pub asset: String,
+    pub wallet_balance: Decimal,
+    pub available_balance: Decimal,
+    pub locked_balance: Option<Decimal>,
+}
+
 /// Deterministic Binance Spot and USDⓈ-M testnet request protocol.
 pub struct BinanceTestnetProtocol {
     endpoints: BinanceTestnetEndpoints,
@@ -127,6 +138,9 @@ struct BookTickerWire {
     ask_qty: String,
 }
 
+/// Code Binance USD-M reports in the body of a successful cancel-all.
+const USDM_CANCEL_ALL_SUCCESS_CODE: i64 = 200;
+
 #[derive(Debug, Deserialize)]
 struct BinanceErrorWire {
     code: i64,
@@ -145,6 +159,11 @@ struct BinanceOrderWire {
     symbol: String,
     order_id: u64,
     client_order_id: String,
+    /// Cancel responses report the cancelled order's identity here and reuse
+    /// `clientOrderId` for the cancel request itself, so this field is the
+    /// authoritative identity whenever Binance sends it.
+    #[serde(default)]
+    orig_client_order_id: Option<String>,
     #[serde(default)]
     transact_time: Option<i64>,
     #[serde(default)]
@@ -182,6 +201,26 @@ struct BinancePositionWire {
     mark_price: String,
     #[serde(default)]
     update_time: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceSpotAccountWire {
+    balances: Vec<BinanceSpotBalanceWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceSpotBalanceWire {
+    asset: String,
+    free: String,
+    locked: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceUsdMBalanceWire {
+    asset: String,
+    balance: String,
+    available_balance: String,
 }
 
 enum ParsedBinanceOrder {
@@ -453,6 +492,48 @@ impl BinanceTestnetProtocol {
         )
     }
 
+    /// Builds an authoritative single-order query keyed by the client order
+    /// identifier that was made durable before submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a nil client order ID, a missing exact symbol
+    /// mapping, or signing failure.
+    pub fn build_query_order_request(
+        &self,
+        symbol: &crypto_trading_domain::Symbol,
+        market_type: MarketType,
+        client_order_id: uuid::Uuid,
+        timestamp_ms: u64,
+    ) -> Result<RemoteHttpRequest, ExchangeError> {
+        if client_order_id.is_nil() {
+            return Err(ExchangeError::invalid(
+                "Binance client order id must not be nil",
+            ));
+        }
+        let product = product_for_market(market_type);
+        let wire_symbol = self.symbols.to_wire(EXCHANGE, symbol, market_type)?;
+        validate_binance_wire_symbol(wire_symbol)?;
+        let path = match product {
+            BinanceProduct::Spot => "/api/v3/order",
+            BinanceProduct::UsdM => "/fapi/v1/order",
+        };
+        self.signed_request(
+            RemoteHttpMethod::Get,
+            product,
+            path,
+            &[
+                ("symbol", wire_symbol.to_owned()),
+                (
+                    "origClientOrderId",
+                    client_order_id.hyphenated().to_string(),
+                ),
+                ("recvWindow", self.recv_window_ms.to_string()),
+                ("timestamp", timestamp_ms.to_string()),
+            ],
+        )
+    }
+
     /// Builds an authoritative open-orders query for one Binance product.
     ///
     /// # Errors
@@ -508,6 +589,30 @@ impl BinanceTestnetProtocol {
             "/fapi/v2/positionRisk",
             &parameters,
         )
+    }
+
+    /// Builds an authoritative account-balance request for one Binance
+    /// Testnet product.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixed product route cannot be signed.
+    pub fn build_account_balances_request(
+        &self,
+        product: BinanceProduct,
+        timestamp_ms: u64,
+    ) -> Result<RemoteHttpRequest, ExchangeError> {
+        let mut parameters = Vec::new();
+        if product == BinanceProduct::Spot {
+            parameters.push(("omitZeroBalances", "true".to_owned()));
+        }
+        parameters.push(("recvWindow", self.recv_window_ms.to_string()));
+        parameters.push(("timestamp", timestamp_ms.to_string()));
+        let path = match product {
+            BinanceProduct::Spot => "/api/v3/account",
+            BinanceProduct::UsdM => "/fapi/v3/balance",
+        };
+        self.signed_request(RemoteHttpMethod::Get, product, path, &parameters)
     }
 
     /// Builds an unsigned one-shot top-of-book query for either Binance
@@ -669,6 +774,35 @@ impl BinanceTestnetProtocol {
         Ok((orders, foreign_orders))
     }
 
+    /// Confirms a USD-M cancel-all acknowledgement.
+    ///
+    /// USD-M answers `DELETE /fapi/v1/allOpenOrders` with HTTP 200 and reports
+    /// the real outcome in the body, so treating the status code as success
+    /// would report a refused cancellation as a completed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] when the body is malformed or
+    /// carries any code other than the documented success code.
+    pub fn parse_usdm_cancel_all_response(payload: &[u8]) -> Result<(), ExchangeError> {
+        let acknowledgement: BinanceErrorWire = serde_json::from_slice(payload).map_err(|_| {
+            ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance USD-M cancel-all response is not a recognised acknowledgement",
+            )
+        })?;
+        if acknowledgement.code == USDM_CANCEL_ALL_SUCCESS_CODE {
+            return Ok(());
+        }
+        Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance USD-M cancel-all reported code {}",
+                acknowledgement.code
+            ),
+        ))
+    }
+
     /// Parses a USD-M position-risk snapshot into typed positions.
     ///
     /// # Errors
@@ -693,6 +827,93 @@ impl BinanceTestnetProtocol {
             positions.push(position);
         }
         Ok(positions)
+    }
+
+    /// Parses one product-specific signed account balance response.
+    ///
+    /// Spot exposes free and locked balances from `/api/v3/account`; USD-M
+    /// exposes wallet and available balances from `/fapi/v3/balance`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed, duplicate, or
+    /// unsafe asset balances, and [`ExchangeError::ResourceLimit`] for an
+    /// account response outside the supported bound.
+    pub fn parse_account_balances_response(
+        &self,
+        product: BinanceProduct,
+        payload: &[u8],
+    ) -> Result<Vec<BinanceTestnetBalance>, ExchangeError> {
+        let mut balances = match product {
+            BinanceProduct::Spot => {
+                let wire: BinanceSpotAccountWire =
+                    serde_json::from_slice(payload).map_err(|error| {
+                        ExchangeError::invalid_response(EXCHANGE, error.to_string())
+                    })?;
+                bounded_account_balance_count(wire.balances.len())?;
+                wire.balances
+                    .into_iter()
+                    .map(|balance| {
+                        validate_binance_asset(&balance.asset)?;
+                        let available_balance =
+                            parse_balance_decimal("Spot free balance", &balance.free, false)?;
+                        let locked_balance =
+                            parse_balance_decimal("Spot locked balance", &balance.locked, false)?;
+                        let wallet_balance = available_balance
+                            .checked_add(locked_balance)
+                            .ok_or_else(|| {
+                                ExchangeError::invalid_response(
+                                    EXCHANGE,
+                                    "Binance Spot balance overflowed",
+                                )
+                            })?;
+                        Ok(BinanceTestnetBalance {
+                            asset: balance.asset,
+                            wallet_balance,
+                            available_balance,
+                            locked_balance: Some(locked_balance),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ExchangeError>>()?
+            }
+            BinanceProduct::UsdM => {
+                let wire: Vec<BinanceUsdMBalanceWire> =
+                    serde_json::from_slice(payload).map_err(|error| {
+                        ExchangeError::invalid_response(EXCHANGE, error.to_string())
+                    })?;
+                bounded_account_balance_count(wire.len())?;
+                wire.into_iter()
+                    .map(|balance| {
+                        validate_binance_asset(&balance.asset)?;
+                        Ok(BinanceTestnetBalance {
+                            asset: balance.asset,
+                            wallet_balance: parse_balance_decimal(
+                                "USD-M wallet balance",
+                                &balance.balance,
+                                true,
+                            )?,
+                            available_balance: parse_balance_decimal(
+                                "USD-M available balance",
+                                &balance.available_balance,
+                                true,
+                            )?,
+                            locked_balance: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ExchangeError>>()?
+            }
+        };
+        balances.sort_by(|left, right| left.asset.cmp(&right.asset));
+        if balances
+            .windows(2)
+            .any(|pair| pair[0].asset == pair[1].asset)
+        {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance account balance response contains duplicate assets",
+            ));
+        }
+        Ok(balances)
     }
 
     /// Parses a stable server-order reference emitted by this protocol.
@@ -940,6 +1161,51 @@ fn validate_binance_wire_symbol(symbol: &str) -> Result<(), ExchangeError> {
     Ok(())
 }
 
+fn validate_binance_asset(asset: &str) -> Result<(), ExchangeError> {
+    if asset.is_empty()
+        || asset.len() > MAX_ASSET_BYTES
+        || !asset
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance asset must contain 1..={MAX_ASSET_BYTES} uppercase ASCII letters or digits"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_account_balance_count(count: usize) -> Result<(), ExchangeError> {
+    if count > MAX_ACCOUNT_BALANCES {
+        return Err(ExchangeError::resource_limit(
+            "Binance account balances",
+            MAX_ACCOUNT_BALANCES,
+            count,
+        ));
+    }
+    Ok(())
+}
+
+fn parse_balance_decimal(
+    label: &str,
+    value: &str,
+    allow_negative: bool,
+) -> Result<Decimal, ExchangeError> {
+    let balance = value.parse::<Decimal>().map_err(|_| {
+        ExchangeError::invalid_response(EXCHANGE, format!("{label} is not a decimal"))
+    })?;
+    if !allow_negative && balance.is_sign_negative() {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!("{label} must not be negative"),
+        ));
+    }
+    Ok(balance)
+}
+
 fn validate_secret_text(label: &str, value: &str, max_bytes: usize) -> Result<(), ExchangeError> {
     if value.is_empty()
         || value.len() > max_bytes
@@ -1161,7 +1427,15 @@ impl BinanceTestnetProtocol {
         let updated_at =
             parse_optional_millis(wire.update_time.or(wire.transact_time), received_at)?;
         let order_id = server_order_id(product, &wire.symbol, wire.order_id);
-        match uuid::Uuid::parse_str(&wire.client_order_id) {
+        // A cancel response carries the cancelled order's identity in
+        // `origClientOrderId` and the cancel request's own generated id in
+        // `clientOrderId`. Correlating on the latter would misread every
+        // cancelled order as foreign.
+        let reported_client_order_id = wire
+            .orig_client_order_id
+            .filter(|candidate| !candidate.trim().is_empty())
+            .unwrap_or(wire.client_order_id);
+        match uuid::Uuid::parse_str(&reported_client_order_id) {
             Ok(client_order_id) if !client_order_id.is_nil() => {
                 Ok(ParsedBinanceOrder::Owned(Order {
                     id: order_id,
@@ -1186,8 +1460,8 @@ impl BinanceTestnetProtocol {
             }
             _ if allow_foreign => Ok(ParsedBinanceOrder::Foreign(ForeignOrder {
                 id: order_id,
-                client_order_id: (!wire.client_order_id.trim().is_empty())
-                    .then_some(wire.client_order_id),
+                client_order_id: (!reported_client_order_id.trim().is_empty())
+                    .then_some(reported_client_order_id),
                 exchange: EXCHANGE.to_owned(),
                 symbol,
                 market_type,
@@ -1215,16 +1489,16 @@ impl BinanceTestnetProtocol {
         wire: &BinancePositionWire,
         received_at: DateTime<Utc>,
     ) -> Result<Option<Position>, ExchangeError> {
-        let symbol = self
-            .symbols
-            .to_standard(EXCHANGE, &wire.symbol, MarketType::Perpetual)?
-            .clone();
         let signed_quantity = wire.position_amt.parse::<Decimal>().map_err(|_| {
             ExchangeError::invalid_response(EXCHANGE, "invalid Binance position size")
         })?;
         if signed_quantity.is_zero() {
             return Ok(None);
         }
+        let symbol = self
+            .symbols
+            .to_standard(EXCHANGE, &wire.symbol, MarketType::Perpetual)?
+            .clone();
         let side = match wire.position_side.as_str() {
             "LONG" => PositionSide::Long,
             "SHORT" => PositionSide::Short,

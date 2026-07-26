@@ -13,7 +13,7 @@ pub use api::{
     CredentialConfiguration, CredentialSettings, ExecutionsResponse, NotificationEvidence,
     PaperProfileKind, PaperProfileSettings, RequestLimitSettings, RuntimeLogSink,
     SETTINGS_SCHEMA_VERSION, SettingsResponse, SystemResponse, WEB_REQUEST_LIMIT_PER_MINUTE,
-    WebAccessPolicy, WebAccessPolicyError, WebRequestRateLimiter, api_router,
+    WebAccessPolicy, WebAccessPolicyError, WebRequestRateLimiter, add_security_headers, api_router,
     api_router_with_settings,
 };
 pub use app::{app_router, app_router_with_settings};

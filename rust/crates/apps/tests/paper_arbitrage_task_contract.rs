@@ -25,9 +25,8 @@ use crypto_trading_runtime::{
     ExecutionBatch, JsonlHistory, MarketDataBook, MarketDataEvent, MarketDataEventFuture,
     MarketDataEventSource, MarketDataObservation, MarketFreshnessPolicy, MarketInstrument,
     MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
-    PaperCostModel, PaperReconciliationDigestAlgorithm, PaperReconciliationProof,
-    PaperReservationPhase, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
-    ReadOnlyTaskRecovery,
+    PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationPhase,
+    ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskRecovery,
 };
 use rust_decimal::Decimal;
 use tokio::sync::{Semaphore, mpsc};
@@ -661,14 +660,19 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     let reservation = account.snapshot().await.unwrap().reservations[0].clone();
     account
         .record_reconciliation_failure(
-            PaperReconciliationProof::new(
-                "paper-arbitrage",
-                reservation.reservation_id,
-                reservation.batch_id,
-                "binance-testnet/account-snapshot-1",
-                1,
-                PaperReconciliationDigestAlgorithm::Fnv1a64,
-                "0011223344556677",
+            PaperReconciliationProof::from_evidence(
+                PaperReconciliationEvidence::mismatch(
+                    "contract-fixture",
+                    "0011223344556677",
+                    "paper-arbitrage",
+                    reservation.reservation_id,
+                    reservation.batch_id,
+                    "binance-testnet/account-snapshot-1",
+                    1,
+                    Money::new(decimal("100000")),
+                    "fixture_mismatch",
+                )
+                .unwrap(),
             )
             .unwrap(),
         )

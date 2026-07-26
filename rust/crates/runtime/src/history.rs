@@ -452,7 +452,12 @@ fn absolute_key(path: &Path) -> PathBuf {
     }
 }
 
-fn normalized_lock_key(path: &Path) -> PathBuf {
+/// Maps a journal path onto the key every lock guarding it must agree on.
+///
+/// Two spellings of one path — case differences on Windows, or a relative
+/// versus absolute form — must resolve to the same key, or separate locks
+/// would each believe they hold exclusive access to the same journal.
+pub(crate) fn normalized_lock_key(path: &Path) -> PathBuf {
     normalize_key_case(path)
 }
 

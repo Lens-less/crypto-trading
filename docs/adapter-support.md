@@ -34,6 +34,11 @@ Status meanings:
 <!-- adapter-matrix:end -->
 
 `implemented` is not synonymous with production-ready. Binance public data is
-read-only and one-shot; PaperExchange is process-local. Every external venue
-still reports `live: unavailable`, and the manifest validation rejects any
-live claim while `live_trading_enabled` is false.
+read-only and one-shot. Its Testnet lifecycle owner has deterministic
+submit-query-cancel/query-first recovery coverage, and its report-first account
+gate compares signed balances, open orders, and positions to one exact
+committed Paper reservation. Real credentialed Spot/USD-M reconciliation,
+open-order, partial-fill, restart, and 24-hour soak evidence remain external
+release gates. PaperExchange is process-local. Every external venue still
+reports `live: unavailable`, and the manifest validation rejects any live claim
+while `live_trading_enabled` is false.

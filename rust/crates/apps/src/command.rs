@@ -24,6 +24,7 @@ use crypto_trading_control_plane::{
 };
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
+    TimeInForce,
 };
 use crypto_trading_exchange::{
     BinanceHmacSha256Signer, BinanceProduct, BinanceRequestSigner, BinanceTestnetEndpoints,
@@ -36,9 +37,10 @@ use crypto_trading_runtime::{
     ExecutionPolicy, HistoryError, IntentExecutor, JsonlHistory, MAX_HISTORY_RECORD_BYTES,
     MAX_JOURNAL_SOURCE_BYTES, MarketDataBook, MarketDataError, MarketDataEvent,
     MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy, MarketInstrument,
-    MarketSupervisorConfig, MarketUniverse, ReadOnlyTaskExit, ReadOnlyTaskFailure,
-    ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError,
-    SystemMarketDataClock, current_capability_manifest,
+    MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority, PaperAccountConfig,
+    ReadOnlyTaskExit, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError, SystemMarketDataClock,
+    current_capability_manifest,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
@@ -56,8 +58,9 @@ use tokio::{
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
     MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs,
-    PaperTaskArgs, PriceAlertArgs, ScannerArgs, TestnetSmokeArgs, TestnetSoakArgs, TestnetSoakMode,
-    VolumeMakerArgs,
+    PaperTaskArgs, PriceAlertArgs, ScannerArgs, TestnetLifecycleArgs, TestnetLifecycleExpected,
+    TestnetLifecycleMarket, TestnetLifecycleSide, TestnetLifecycleTimeInForce,
+    TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs, TestnetSoakMode, VolumeMakerArgs,
 };
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
@@ -69,6 +72,14 @@ use crate::monitor::{
 };
 use crate::task_host::{
     TaskHostControlCommand, TaskHostServeOutcome, control_addr, query_control, serve_host,
+};
+use crate::testnet_lifecycle::{
+    TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TestnetLifecycleConfig, TestnetLifecycleObservation,
+    run_testnet_lifecycle,
+};
+use crate::testnet_reconciliation::{
+    TESTNET_RECONCILIATION_APPLY_ACKNOWLEDGEMENT, TestnetReconciliationConfig,
+    TestnetReconciliationPlan, TestnetReconciliationReport, product_label,
 };
 use crate::testnet_soak::{
     MAX_TESTNET_SOAK_EVIDENCE_RECORDS, TESTNET_SOAK_SCHEMA_VERSION,
@@ -88,6 +99,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Capabilities(args) => run_capabilities(&args),
         Command::TestnetSmoke(args) => run_testnet_smoke(&args).await,
+        Command::TestnetLifecycle(args) => run_testnet_lifecycle_command(&args).await,
+        Command::TestnetReconcile(args) => run_testnet_reconciliation_command(&args).await,
         Command::TestnetSoak(args) => run_testnet_soak(&args).await,
         Command::ConfigCheck(args) => check_configs(&args),
         Command::Grid(args) => run_grid(args).await,
@@ -713,6 +726,285 @@ async fn run_testnet_smoke(args: &TestnetSmokeArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_testnet_lifecycle_command(args: &TestnetLifecycleArgs) -> Result<()> {
+    if args.acknowledge_testnet_lifecycle != TESTNET_LIFECYCLE_ACKNOWLEDGEMENT {
+        bail!(
+            "testnet-lifecycle requires --acknowledge-testnet-lifecycle \"{TESTNET_LIFECYCLE_ACKNOWLEDGEMENT}\""
+        );
+    }
+    if args.timeout_ms == 0 {
+        bail!("testnet-lifecycle requires --timeout-ms > 0");
+    }
+    if args.reduce_only && args.market == TestnetLifecycleMarket::Spot {
+        bail!("testnet-lifecycle --reduce-only is only valid with --market usdm");
+    }
+
+    let symbols = BinanceSmokeSymbols {
+        spot: Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?,
+        perpetual: Symbol::new(args.perpetual_symbol.clone())
+            .context("invalid --perpetual-symbol")?,
+        wire_symbol: args.wire_symbol.clone(),
+    };
+    let (symbol, market_type) = match args.market {
+        TestnetLifecycleMarket::Spot => (symbols.spot.clone(), MarketType::Spot),
+        TestnetLifecycleMarket::Usdm => (symbols.perpetual.clone(), MarketType::Perpetual),
+    };
+    let side = match args.side {
+        TestnetLifecycleSide::Buy => Side::Buy,
+        TestnetLifecycleSide::Sell => Side::Sell,
+    };
+    let time_in_force = match args.time_in_force {
+        TestnetLifecycleTimeInForce::Gtc => TimeInForce::Gtc,
+        TestnetLifecycleTimeInForce::PostOnly => TimeInForce::PostOnly,
+    };
+    let expected_observation = match args.expected_observation {
+        TestnetLifecycleExpected::Open => TestnetLifecycleObservation::Open,
+        TestnetLifecycleExpected::PartiallyFilled => TestnetLifecycleObservation::PartiallyFilled,
+    };
+    let quantity = Quantity::new(args.quantity).context("invalid --quantity")?;
+    let price = Price::new(args.price).context("invalid --price")?;
+    let mut intent = OrderIntent::limit("binance", symbol, market_type, side, quantity, price);
+    intent.client_order_id = args.client_order_id;
+    intent.time_in_force = time_in_force;
+    intent.reduce_only = args.reduce_only;
+    let config = TestnetLifecycleConfig::new(
+        args.campaign_id.clone(),
+        intent.clone(),
+        expected_observation,
+        StdDuration::from_millis(args.poll_interval_ms),
+        args.maximum_queries,
+    )?;
+
+    let (api_key, api_secret) = load_binance_testnet_credentials()?;
+    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+    let protocol = build_binance_testnet_protocol(signer, &symbols)?;
+    let preflight_timestamp = u64::try_from(Utc::now().timestamp_millis())
+        .context("current timestamp is outside the Binance millisecond range")?;
+    protocol
+        .build_order_request(&intent, Some(price), preflight_timestamp)
+        .context("testnet lifecycle order failed local protocol validation")?;
+    let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
+        StdDuration::from_millis(args.timeout_ms),
+    )?);
+    let exchange = BinanceTestnetExchange::new(protocol, transport);
+    let history = JsonlHistory::new(&args.history_path);
+    let report = run_testnet_lifecycle(&config, &exchange, &history).await?;
+
+    let expected = lifecycle_observation_label(report.expected_observation);
+    let final_status = lifecycle_order_status_label(report.final_status);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "exchange": "binance",
+                "authority": "testnet",
+                "mainnet_enabled": false,
+                "campaign_id": report.campaign_id,
+                "client_order_id": report.client_order_id,
+                "server_order_id": report.server_order_id,
+                "expected_observation": expected,
+                "final_status": final_status,
+                "query_count": report.query_count,
+                "recovered": report.recovered,
+                "evidence_path": args.history_path,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "exchange=binance\nauthority=testnet\nmainnet_enabled=false\ncampaign_id={}\nclient_order_id={}\nserver_order_id={}\nexpected_observation={expected}\nfinal_status={final_status}\nquery_count={}\nrecovered={}\nevidence_path={}",
+        report.campaign_id,
+        report.client_order_id,
+        report.server_order_id,
+        report.query_count,
+        report.recovered,
+        args.history_path.display(),
+    );
+    Ok(())
+}
+
+const fn lifecycle_observation_label(observation: TestnetLifecycleObservation) -> &'static str {
+    match observation {
+        TestnetLifecycleObservation::Open => "open",
+        TestnetLifecycleObservation::PartiallyFilled => "partially_filled",
+    }
+}
+
+const fn lifecycle_order_status_label(status: crypto_trading_domain::OrderStatus) -> &'static str {
+    match status {
+        crypto_trading_domain::OrderStatus::Pending => "pending",
+        crypto_trading_domain::OrderStatus::Open => "open",
+        crypto_trading_domain::OrderStatus::PartiallyFilled => "partially_filled",
+        crypto_trading_domain::OrderStatus::Filled => "filled",
+        crypto_trading_domain::OrderStatus::Cancelled => "cancelled",
+        crypto_trading_domain::OrderStatus::Rejected => "rejected",
+    }
+}
+
+async fn run_testnet_reconciliation_command(args: &TestnetReconciliationArgs) -> Result<()> {
+    if let Some(acknowledgement) = args.apply_reconciliation.as_deref()
+        && acknowledgement != TESTNET_RECONCILIATION_APPLY_ACKNOWLEDGEMENT
+    {
+        bail!(
+            "testnet-reconcile --apply-reconciliation requires \"{TESTNET_RECONCILIATION_APPLY_ACKNOWLEDGEMENT}\""
+        );
+    }
+    if args.timeout_ms == 0 {
+        bail!("testnet-reconcile requires --timeout-ms > 0");
+    }
+
+    let symbols = BinanceSmokeSymbols {
+        spot: Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?,
+        perpetual: Symbol::new(args.perpetual_symbol.clone())
+            .context("invalid --perpetual-symbol")?,
+        wire_symbol: args.wire_symbol.clone(),
+    };
+    let (product, symbol) = match args.market {
+        TestnetLifecycleMarket::Spot => (BinanceProduct::Spot, symbols.spot.clone()),
+        TestnetLifecycleMarket::Usdm => (BinanceProduct::UsdM, symbols.perpetual.clone()),
+    };
+    let reconciliation_config = TestnetReconciliationConfig::new(
+        product,
+        args.settlement_asset.clone(),
+        symbol,
+        args.reservation_id,
+    )?;
+    let account_config =
+        PaperAccountConfig::new(args.account_id.clone(), Money::new(args.initial_available))
+            .context("invalid Paper account reconciliation configuration")?;
+    let history = JsonlHistory::new(&args.history_path);
+    let authority = PaperAccountAuthority::new(args.journal_id, history, account_config)
+        .context("failed to open the Paper account reconciliation authority")?;
+    let account = authority
+        .snapshot()
+        .await
+        .context("failed to load the Paper account reconciliation snapshot")?;
+    let plan = TestnetReconciliationPlan::new(reconciliation_config, account)?;
+
+    let (api_key, api_secret) = load_binance_testnet_credentials()?;
+    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+    let protocol = build_binance_testnet_protocol(signer, &symbols)?;
+    let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
+        StdDuration::from_millis(args.timeout_ms),
+    )?);
+    let exchange = BinanceTestnetExchange::new(protocol, transport);
+    let remote = exchange
+        .account_snapshot(product)
+        .await
+        .context("failed to sample complete Binance Testnet account truth")?;
+    let report = plan.compare(&remote, Utc::now())?;
+    let applied_outcome =
+        apply_testnet_reconciliation(&authority, &report, args.apply_reconciliation.is_some())
+            .await?;
+    print_testnet_reconciliation(args, &report, applied_outcome)?;
+    let mismatch_codes = report
+        .mismatches
+        .iter()
+        .map(|mismatch| mismatch.code())
+        .collect::<Vec<_>>();
+    if !report.matches() {
+        bail!(
+            "Binance Testnet account truth did not match the Paper release gate: {}",
+            mismatch_codes.join(",")
+        );
+    }
+    Ok(())
+}
+
+async fn apply_testnet_reconciliation(
+    authority: &PaperAccountAuthority,
+    report: &TestnetReconciliationReport,
+    apply: bool,
+) -> Result<Option<&'static str>> {
+    if !apply {
+        return Ok(None);
+    }
+    if report.matches() {
+        authority
+            .reconcile_release(report.proof.clone())
+            .await
+            .context("failed to apply the verified Paper reconciliation release")?;
+        return Ok(Some("released"));
+    }
+    authority
+        .record_reconciliation_failure(report.proof.clone())
+        .await
+        .context("failed to record the Paper reconciliation failure")?;
+    Ok(Some("failure_recorded"))
+}
+
+fn print_testnet_reconciliation(
+    args: &TestnetReconciliationArgs,
+    report: &TestnetReconciliationReport,
+    applied_outcome: Option<&str>,
+) -> Result<()> {
+    let mismatch_codes = report
+        .mismatches
+        .iter()
+        .map(|mismatch| mismatch.code())
+        .collect::<Vec<_>>();
+    let expected_available = report.expected_available.normalize().to_string();
+    let observed_wallet = report
+        .observed_wallet
+        .map(|value| value.normalize().to_string());
+    let observed_available = report
+        .observed_available
+        .map(|value| value.normalize().to_string());
+    let observed_locked = report
+        .observed_locked
+        .map(|value| value.normalize().to_string());
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": report.schema_version,
+                "exchange": "binance",
+                "authority": "testnet",
+                "mainnet_enabled": false,
+                "scope": "clean_account_release_gate",
+                "product": product_label(report.product),
+                "settlement_asset": &report.settlement_asset,
+                "account_id": &report.account_id,
+                "reservation_id": report.reservation_id,
+                "batch_id": report.batch_id,
+                "matches": report.matches(),
+                "expected_available": &expected_available,
+                "observed_wallet": &observed_wallet,
+                "observed_available": &observed_available,
+                "observed_locked": &observed_locked,
+                "owned_order_count": report.owned_order_count,
+                "foreign_order_count": report.foreign_order_count,
+                "position_count": report.position_count,
+                "observed_at": report.observed_at,
+                "captured_at": report.captured_at,
+                "mismatches": &mismatch_codes,
+                "proof": &report.proof,
+                "mutation_requested": args.apply_reconciliation.is_some(),
+                "applied_outcome": applied_outcome,
+                "evidence_path": &args.history_path,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "exchange=binance\nauthority=testnet\nmainnet_enabled=false\nscope=clean_account_release_gate\nproduct={}\nsettlement_asset={}\naccount_id={}\nreservation_id={}\nmatches={}\nexpected_available={expected_available}\nobserved_available={}\nowned_order_count={}\nforeign_order_count={}\nposition_count={}\nmismatches={}\napplied_outcome={}\nevidence_path={}",
+        product_label(report.product),
+        report.settlement_asset,
+        report.account_id,
+        report.reservation_id,
+        report.matches(),
+        observed_available.as_deref().unwrap_or("missing"),
+        report.owned_order_count,
+        report.foreign_order_count,
+        report.position_count,
+        mismatch_codes.join(","),
+        applied_outcome.unwrap_or("none"),
+        args.history_path.display(),
+    );
+    Ok(())
+}
+
 async fn run_book_ticker_check(
     transport: &Arc<ReqwestHttpTransport>,
     symbols: &BinanceSmokeSymbols,
@@ -815,12 +1107,12 @@ fn load_binance_testnet_credentials() -> Result<(String, String)> {
     let api_key = auth
         .api_key
         .expose_secret()
-        .context("testnet-smoke --call-reconcile requires BINANCE_API_KEY")?
+        .context("authenticated Binance Testnet commands require BINANCE_API_KEY")?
         .to_owned();
     let api_secret = auth
         .api_secret
         .expose_secret()
-        .context("testnet-smoke --call-reconcile requires BINANCE_API_SECRET")?
+        .context("authenticated Binance Testnet commands require BINANCE_API_SECRET")?
         .to_owned();
     Ok((api_key, api_secret))
 }

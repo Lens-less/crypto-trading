@@ -17,9 +17,10 @@ mod unsupported;
 
 pub use binance::BinancePublicExchange;
 pub use binance_testnet::{
-    BinanceHmacSha256Signer, BinanceRequestSigner, BinanceServerOrderRef, BinanceTestnetProtocol,
+    BinanceHmacSha256Signer, BinanceRequestSigner, BinanceServerOrderRef, BinanceTestnetBalance,
+    BinanceTestnetProtocol,
 };
-pub use binance_testnet_exchange::BinanceTestnetExchange;
+pub use binance_testnet_exchange::{BinanceTestnetAccountSnapshot, BinanceTestnetExchange};
 pub use bounded::BoundedExchangeHandle;
 pub use endpoint::{BinanceProduct, BinanceTestnetEndpoints, HyperliquidTestnetEndpoint};
 pub use error::{ExchangeError, ExchangeOperation, RemoteFailureMetadata, RemoteRetryAfter};

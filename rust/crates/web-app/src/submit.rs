@@ -28,7 +28,7 @@ use crypto_trading_control_plane::{
 };
 use crypto_trading_web::{
     SettingsResponse, WebAccessPolicy, WebRequestRateLimiter, WebServerConfig,
-    app_router_with_settings,
+    add_security_headers, app_router_with_settings,
 };
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -169,8 +169,13 @@ pub async fn bind_trusted_submit_app_with_settings(
         .route("/api/v1/submit", post(submit))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, authorize_submit));
+    // The security-header layer must wrap the merged router. Applying it
+    // inside `app_router_with_settings` and merging afterwards would leave
+    // /api/v1/submit without the frame, referrer, and permissions headers
+    // every other route carries.
     let router = app_router_with_settings(control_plane, read_access, settings, rate_limiter)
-        .merge(submit_router);
+        .merge(submit_router)
+        .layer(middleware::from_fn(add_security_headers));
     Ok(TrustedSubmitApplication {
         listener,
         router,
@@ -199,10 +204,13 @@ async fn authorize_submit(
         }
         return next.run(request).await;
     }
+    // The read API answers a 401 with `authentication_required`. The browser
+    // client keys its re-authentication path off that code, so the submit
+    // route must not invent a second spelling.
     let mut response = error_response(
         StatusCode::UNAUTHORIZED,
-        "unauthorized",
-        "bearer authentication required",
+        "authentication_required",
+        "valid bearer authentication is required",
     );
     response
         .headers_mut()

@@ -527,7 +527,7 @@ impl SubmitService {
             SUBMIT_ACCEPTED_DECISION,
             &SubmitJournalFact::Accepted {
                 schema_version: SUBMIT_SCHEMA_VERSION,
-                envelope: envelope.clone(),
+                envelope: Box::new(envelope.clone()),
             },
             envelope.target_task_id(),
         )
@@ -622,7 +622,7 @@ fn shared_submit_gate(path: &Path) -> Arc<Mutex<()>> {
 enum SubmitJournalFact {
     Accepted {
         schema_version: u16,
-        envelope: SubmitEnvelope,
+        envelope: Box<SubmitEnvelope>,
     },
     Terminal {
         schema_version: u16,
@@ -659,7 +659,7 @@ fn project_binding_from_snapshot(
                         return Err(SubmitServiceError::InvalidJournal);
                     }
                     if identifiers_collide(&envelope, incoming) {
-                        if envelope != *incoming {
+                        if envelope.as_ref() != incoming {
                             return Err(SubmitServiceError::Conflict);
                         }
                         if accepted {

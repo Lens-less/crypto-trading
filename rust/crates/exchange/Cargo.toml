@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Exchange adapters: the in-process paper exchange, Binance public market data, and the Binance testnet protocol."
+# The workspace ships as an application, not as crates.io libraries.
+# Publishing is refused explicitly so it cannot happen by accident.
+publish = false
 
 [dependencies]
 async-trait.workspace = true

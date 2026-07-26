@@ -5,7 +5,8 @@ use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symb
 use crypto_trading_runtime::{
     DecisionRecord, FileJournalSnapshotSource, JournalSnapshotSource, JsonlHistory,
     PaperAccountAuthority, PaperAccountConfig, PaperAccountError, PaperAccountReadModel,
-    PaperCostModel, PaperReconciliationOutcome, PaperReservationAdmission, PaperReservationLeg,
+    PaperCostModel, PaperReconciliationEvidence, PaperReconciliationOutcome,
+    PaperReconciliationProof, PaperReservationAdmission, PaperReservationLeg,
     PaperReservationRequest, ProjectionStatus,
 };
 use rust_decimal::Decimal;
@@ -45,6 +46,31 @@ fn reservation_request() -> PaperReservationRequest {
             PaperReservationLeg::from_intent(0, &left, money("100")).unwrap(),
             PaperReservationLeg::from_intent(1, &right, money("100")).unwrap(),
         ],
+    )
+    .unwrap()
+}
+
+fn mismatch_proof(
+    account_id: &str,
+    reservation_id: Uuid,
+    batch_id: Uuid,
+    snapshot_id: &str,
+    snapshot_sequence: u64,
+    source_state_digest: &str,
+) -> PaperReconciliationProof {
+    PaperReconciliationProof::from_evidence(
+        PaperReconciliationEvidence::mismatch(
+            "contract-fixture",
+            source_state_digest,
+            account_id,
+            reservation_id,
+            batch_id,
+            snapshot_id,
+            snapshot_sequence,
+            money("1000"),
+            "fixture_mismatch",
+        )
+        .unwrap(),
     )
     .unwrap()
 }
@@ -269,18 +295,14 @@ async fn replay_rejects_lower_sequence_from_different_snapshot_id() {
         .await
         .unwrap();
     authority
-        .record_reconciliation_failure(
-            crypto_trading_runtime::PaperReconciliationProof::new(
-                "paper-main",
-                reservation_id,
-                batch_id,
-                "binance/account-2026-07-25T00:30:00Z",
-                7,
-                crypto_trading_runtime::PaperReconciliationDigestAlgorithm::Fnv1a64,
-                "0123456789abcdef",
-            )
-            .unwrap(),
-        )
+        .record_reconciliation_failure(mismatch_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:30:00Z",
+            7,
+            "0123456789abcdef",
+        ))
         .await
         .unwrap();
 
@@ -350,18 +372,14 @@ async fn replay_rejects_equal_sequence_from_different_snapshot_id() {
         .await
         .unwrap();
     authority
-        .record_reconciliation_failure(
-            crypto_trading_runtime::PaperReconciliationProof::new(
-                "paper-main",
-                reservation_id,
-                batch_id,
-                "binance/account-2026-07-25T00:31:00Z",
-                8,
-                crypto_trading_runtime::PaperReconciliationDigestAlgorithm::Fnv1a64,
-                "0123456789abcdef",
-            )
-            .unwrap(),
-        )
+        .record_reconciliation_failure(mismatch_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "binance/account-2026-07-25T00:31:00Z",
+            8,
+            "0123456789abcdef",
+        ))
         .await
         .unwrap();
 

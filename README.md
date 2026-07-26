@@ -10,6 +10,14 @@
 
 > [!WARNING]
 > **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、连续运行、权威账户风控和多腿故障补偿尚未达到开放门槛。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 结果不包含真实手续费、资金费率、滑点、撮合队列优先级或跨进程持仓。
+> 唯一具备下单权限的路径是 Binance **Testnet**（模拟资金的真实外部环境），且需要精确确认短语。
+> 本项目按原样提供，不含任何担保，也不构成投资建议；使用后果由使用者自行承担。
+>
+> **This is not a production trading bot and must not be used with real funds.**
+> Live adapters, continuous operation, authoritative account risk, and
+> multi-leg failure compensation all fail closed. The only path with order
+> authority is Binance Testnet, behind an exact acknowledgement phrase.
+> Provided as is, without warranty; not investment advice.
 
 ## 项目定位
 
@@ -31,13 +39,29 @@
 
 | CLI 命令 | 配置能力 | Paper one-shot | 连续运行 | Live | 当前行为 |
 | --- | --- | --- | --- | --- | --- |
+| `capabilities` | 不适用 | 不适用 | 不适用 | 不可用 | 输出版本化 capability manifest 与 adapter 支持矩阵；这是「本程序被允许做什么」的权威来源 |
 | `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；对 public path loaders、public from_str loaders 和 shared raw reader 统一施加 1 MiB / YAML 读入护栏；发现不支持配置、读取错误或预算耗尽时非零退出 |
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
-| `monitor` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验后明确报告运行时尚未实现并非零退出 |
+| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model |
+| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
 | `price-alert` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验后失败关闭 |
 | `scanner` | 检查显式配置路径 | 不可用 | 不可用 | 不可用 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态退出 |
+
+### Binance Testnet 命令
+
+> [!IMPORTANT]
+> 下面四条命令中的 `testnet-lifecycle` 会用真实凭证向 **Binance Testnet** 提交并撤销
+> **真实订单**。Testnet 使用模拟资金，但它是一个真实的外部交易所环境。这些命令需要
+> 精确确认短语才会执行，且在任何情况下都不会接触主网。
+
+| CLI 命令 | 订单权限 | 连续运行 | Live | 当前行为 |
+| --- | --- | --- | --- | --- |
+| `testnet-smoke` | 无 | 不可用 | 不可用 | 显式选择后执行 Spot/USD-M 只读行情和鉴权对账探针；不提交也不撤销订单 |
+| `testnet-lifecycle` | **Testnet 下单/撤单** | 不可用 | 不可用 | 精确确认短语授权的 submit-query-cancel owner；UUID 与 intent 先写 journal，恢复时 query-first，绝不盲目重复提交 |
+| `testnet-reconcile` | 无 | 不可用 | 不可用 | 默认只报告的 clean-account gate；把签名 Testnet 余额/挂单/持仓与 exact committed Paper reservation 比对，只有精确确认后才写 release/failure transition |
+| `testnet-soak` | 无 | 可用（只读） | 不可用 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
 
 Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Variational
 出现在配置或冻结的 Python tree 中，只表示兼容/迁移范围，不表示对应私有交易适配器已经可以实盘下单。
@@ -146,6 +170,8 @@ cargo run --locked -- <COMMAND> --help
 ```text
 crypto-trading capabilities [--json]
 crypto-trading testnet-smoke [OPTIONS]
+crypto-trading testnet-lifecycle [OPTIONS]
+crypto-trading testnet-reconcile [OPTIONS]
 crypto-trading testnet-soak --mode <serve|status|stop|verify> [OPTIONS]
 crypto-trading grid <CONFIG> [OPTIONS]
 crypto-trading arbitrage [OPTIONS]
@@ -155,6 +181,43 @@ crypto-trading price-alert [CONFIG] [OPTIONS]
 crypto-trading scanner [OPTIONS]
 crypto-trading config-check <PATHS>... [--json]
 ```
+
+## Binance Testnet lifecycle
+
+`testnet-lifecycle` 是显式授权、journal-first 的 Binance Testnet
+submit-query-cancel owner。它会在提交前持久化 campaign 与 UUID client order ID，
+在恢复时先按该 UUID 查询，确认 open 或 controlled partial fill 后撤单，并且只有最终
+查询到 `cancelled` 才报告完成。凭证只从 `BINANCE_API_KEY` /
+`BINANCE_API_SECRET` 进程环境变量读取；该命令没有 mainnet 开关。
+
+```powershell
+cargo run --locked -- testnet-lifecycle --help
+```
+
+真实 open-order、controlled partial-fill 与 kill/restart 演练必须使用不同 campaign /
+client UUID，并保留 CLI JSON、journal 与候选二进制校验和。完整、可复制的门禁与
+失败恢复步骤见
+[`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md#binance-testnet-order-lifecycle-gate)。
+本地确定性契约不会被当作真实凭据证据。
+
+## Binance Testnet reconciliation
+
+`testnet-reconcile` 是 M4 Paper reconcile transition 的首个真实账户消费者。它先冻结一个
+exact committed Paper reservation，再用签名请求读取所选 Binance Testnet 产品的余额、
+全部挂单和持仓。默认只输出报告；只有传入精确确认短语时，匹配结果才写入
+`reconcile_release`，失配结果则写入 durable reconciliation failure。该命令没有
+mainnet 开关。
+
+```powershell
+cargo run --locked -- testnet-reconcile --help
+```
+
+当前 gate 有意限定为单一 Binance 产品、单一配置 symbol 与单一 settlement asset：
+连续两次完整采样必须稳定，Testnet 账户必须处于 clean-account 状态，非 settlement
+asset 余额必须为零，且 settlement asset 的可用余额必须等于该 reservation 释放后的
+本地可用额度。mixed-exchange reservation、未知 symbol、挂单、持仓、采样漂移或余额
+差异都会失败关闭。真实凭据命令、应用确认短语与留证步骤见
+[`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md#binance-testnet-account-reconciliation-gate)。
 
 ## Binance Testnet soak
 
@@ -239,6 +302,39 @@ cargo build --release --locked
 
 Windows 对应文件为 `target\release\crypto-trading.exe`。
 
+## Web 控制面
+
+除了 CLI，仓库还交付一个**只读**的本地操作台 `crypto-trading-web`。它把同一份
+journal 投影成人类可读的视图：授权状态、行情新鲜度、adapter 健康、批次计划与结果、
+未恢复的执行状态。它**没有任何写路由**，因此无法通过浏览器构造交易权限。
+
+设计规范见 [`docs/design-system.md`](docs/design-system.md)。前端是内嵌在二进制里的免构建原生 JS，
+没有前端工具链，也没有远程字体或 CDN 依赖。
+
+直接运行：
+
+```bash
+cd rust
+export CRYPTO_TRADING_WEB_TOKEN="$(openssl rand -hex 32)"
+cargo run --locked --package crypto-trading-web-app --bin crypto-trading-web -- \
+  --history-path var/operations.jsonl \
+  --journal-id "$(uuidgen)" \
+  --bearer-token-env CRYPTO_TRADING_WEB_TOKEN
+```
+
+服务只绑定 `127.0.0.1:8787`，且这是在代码里强制的，不是配置项。除非你自己加一层
+经过审查的反向代理，否则它对其他主机不可达。
+
+容器化部署（单容器、只读根文件系统、非 root、只挂载 journal 卷）：
+
+```bash
+docker compose -f deploy/compose.yaml up -d
+curl --fail http://127.0.0.1:8787/api/v1/health
+```
+
+完整的部署契约、健康检查、备份/恢复演练和回滚步骤见
+[`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md)。
+
 ## 配置与凭证
 
 当前配置位于 [`rust/config/`](rust/config/)：
@@ -287,7 +383,7 @@ cargo run --locked -- config-check config/exchanges/paradex_config.yaml
 6. **Paper 不计算真实交易成本**：手续费、资金费率、网络延迟、队列优先级和市场冲击不在当前结果中。
 7. **不完整执行不得直接重试**：先根据 history 中的批次、腿和对账摘要确认状态，否则可能重复提交。
 
-更完整的门禁与剩余风险见 [`rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。
+更完整的门禁与剩余风险见 [`docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。
 
 ## 架构
 
@@ -307,18 +403,22 @@ strategy decision ──► risk + execution policy
         completed / partial / incomplete history
 ```
 
-Rust workspace 包含六个 crate：
+Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依赖任何其他 crate，
+`web` 不能构造交易权限。
 
 | Crate | 职责 |
 | --- | --- |
-| `apps` | `crypto-trading` 二进制、CLI 参数、配置检查与 one-shot 编排 |
-| `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
 | `domain` | Symbol、MarketSnapshot、Order、Position、Price、Quantity、Money 等领域类型 |
+| `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
 | `strategy` | 网格、分段套利、风险、价格提醒、做量和虚拟网格算法 |
-| `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、有界 actor 和 instrument rules |
-| `runtime` | 执行模式、路由、批次、提交策略、部分结果对账和 JSONL history |
+| `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |
+| `runtime` | 执行模式、路由、批次、提交策略、部分结果对账、JSONL journal、operator read model 与 capability 清单 |
+| `control-plane` | journal 与各操作界面之间的最小权限读取/提交 seam |
+| `web` | HTTP API 与内嵌的免构建操作台前端 |
+| `web-app` | `crypto-trading-web` 二进制，只在 loopback 上提供只读控制面 |
+| `apps` | `crypto-trading` 二进制、CLI 参数、配置检查、one-shot 与 Testnet 编排 |
 
-详细的兼容面与设计目标见 [`rust/RUST_REFACTOR_PLAN.md`](rust/RUST_REFACTOR_PLAN.md)。
+详细的兼容面与设计目标见 [`docs/internal/specs/RUST_REFACTOR_PLAN.md`](docs/internal/specs/RUST_REFACTOR_PLAN.md)。
 
 ## 执行历史与恢复
 
@@ -336,23 +436,39 @@ Rust workspace 包含六个 crate：
 | `execution_partial` | 提交过程报错且已有部分结果，同时保存有界对账摘要 |
 | `execution_incomplete` | 提交返回，但结果数量或状态不足以判定完整成功 |
 
-历史写入在构造时固定相对路径；单条、单批和单文件上限仍然存在，单文件达到 `64 MiB` 后失败关闭，目前不自动轮转。同一进程内的路径别名锁协调已改进，但没有跨进程 OS lock、轮转或 transactional saga。取消、进程死亡或抢占中断都可能留下 planned-only 状态，重试前必须先 reconcile。
+历史写入在构造时固定相对路径；单条、单批和单文件上限仍然存在，单文件达到 `64 MiB` 后失败关闭，目前不自动轮转。同一 journal 路径通过 sibling lock file 获取跨进程 OS writer lease，竞争者立即失败关闭；它仍不提供 journal 自动轮转或通用 transactional saga。取消、进程死亡或抢占中断都可能留下 planned-only 状态，重试前必须先 reconcile。
 
 ## 项目结构
 
 ```text
 crypto-trading/
-├── .github/workflows/rust.yml   # 跨平台 CI 与 RustSec
+├── .github/
+│   ├── workflows/rust.yml       # 跨平台 CI、RustSec、cargo-deny、镜像构建
+│   └── ISSUE_TEMPLATE/
 ├── rust/                        # 唯一活动项目
-│   ├── crates/                  # Rust workspace 源码
+│   ├── crates/                  # Rust workspace 源码（九个 crate）
 │   ├── config/                  # 当前配置副本
+│   ├── fixtures/                # 契约测试消费的 journal fixture
+│   ├── deny.toml                # 许可证 / 依赖来源策略
 │   ├── Cargo.toml
 │   ├── Cargo.lock
 │   ├── rust-toolchain.toml
 │   └── README.md                # 详细操作与安全边界
+├── docs/
+│   ├── README.md                # 文档索引
+│   ├── adapter-support.md       # capability 清单的人类可读投影
+│   ├── design-system.md         # Web 控制面视觉规范
+│   ├── releasing.md             # 发布流程
+│   ├── runbooks/                # 生产候选运维手册与发布门禁
+│   └── internal/                # 审计、规格、计划、研究（历史快照）
+├── deploy/                      # Compose 部署与备份/恢复演练脚本
+├── Dockerfile                   # 单容器交付
 ├── archive/
 │   ├── README.md                # 归档来源与完整性说明
 │   └── python-legacy/           # 冻结的旧 Python tree
+├── SECURITY.md                  # 漏洞披露与威胁模型
+├── CONTRIBUTING.md
+├── CHANGELOG.md
 └── README.md
 ```
 
@@ -386,7 +502,7 @@ CI 还会：
 
 ### 为什么配置校验成功，但命令仍然报 `runtime is unavailable`？
 
-配置解析与运行能力是两道独立门禁。`monitor`、`volume-maker`、`price-alert`、`scanner` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。
+配置解析与运行能力是两道独立门禁。`volume-maker`、`price-alert`、`scanner` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor` 是例外：它的 `serve/status/stop` 模式可以运行，但只接受精确双源 replay，不接受真实外部源。
 
 ### 为什么 `--live` 仍然无法下单？
 
@@ -413,7 +529,8 @@ CI 还会：
 
 ## 参与贡献
 
-提交 issue 或 pull request 前：
+完整的贡献规则、不可跨越的边界和本地门禁见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
+要点：
 
 1. 只在 `rust/` 中开发当前功能；把 `archive/python-legacy/` 视为只读证据。
 2. 新增行为时先补测试，并保持 live 路径失败关闭。
@@ -421,16 +538,31 @@ CI 还会：
 4. 运行“开发与验证”中的完整门禁。
 5. 在 PR 中说明安全边界、已验证内容和未覆盖风险。
 
+**安全问题不要开 issue**，请走 [`SECURITY.md`](SECURITY.md) 中的私有披露通道。
+
 ## 延伸文档
 
+操作与安全：
+
 - [`rust/README.md`](rust/README.md)：详细命令、配置分类和安全边界。
-- [`rust/RUST_REFACTOR_PLAN.md`](rust/RUST_REFACTOR_PLAN.md)：Rust-first 迁移目标、模块设计与验收门槛。
-- [`rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](rust/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)：审计复核、修复证据和剩余 NO-GO 项。
+- [`docs/adapter-support.md`](docs/adapter-support.md)：adapter 支持矩阵，由合约测试与 capability 清单保持一致。
+- [`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md)：部署契约、Testnet 发布门禁、备份恢复演练与回滚。
+- [`SECURITY.md`](SECURITY.md)：威胁模型与漏洞私有披露流程。
+
+参与开发：
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)：本地门禁、不可跨越的边界、依赖与测试规则。
+- [`CHANGELOG.md`](CHANGELOG.md)：版本历史，每个版本都标注权限是否变化。
+- [`docs/design-system.md`](docs/design-system.md)：Web 控制面视觉规范。
+
+背景与证据：
+
+- [`docs/internal/specs/RUST_REFACTOR_PLAN.md`](docs/internal/specs/RUST_REFACTOR_PLAN.md)：Rust-first 迁移目标、模块设计与验收门槛。
+- [`docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)：审计复核、修复证据和剩余 NO-GO 项（2026-07-17 的快照，不是活文档）。
 - [`archive/README.md`](archive/README.md)：旧 Python tree 的来源提交和完整性校验。
-- [`LICENSE`](LICENSE)：仓库根目录的权威 MIT 许可证文本。
 
 ## 许可与免责声明
 
-Rust workspace 的 package metadata 当前声明为 MIT，仓库根目录也已提供 [`LICENSE`](LICENSE)；正式再分发时以该文件为权威许可证文本。
+本项目以 MIT 许可证发布，权威文本见 [`LICENSE`](LICENSE)；workspace 中所有 crate 均继承该声明。
 
-本项目仅用于软件工程、策略研究和 paper 模拟，不构成投资建议。数字资产交易具有高风险，任何使用者都应独立评估并承担由配置、部署或交易决策产生的后果。
+本项目仅用于软件工程、策略研究和 paper 模拟，**不构成投资建议，不提供任何形式的担保**。数字资产交易具有高风险，任何使用者都应独立评估并自行承担由配置、部署或交易决策产生的全部后果。

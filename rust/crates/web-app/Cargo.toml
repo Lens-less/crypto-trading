@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Binary that serves the read-only operator control plane over loopback."
+# The workspace ships as an application, not as crates.io libraries.
+# Publishing is refused explicitly so it cannot happen by accident.
+publish = false
 
 [lib]
 name = "crypto_trading_web_app"
@@ -12,6 +17,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "crypto-trading-web"
 path = "src/main.rs"
+# The binary's documentation output path collides with the `crypto-trading-web`
+# library's. The binary is an entry point with no API to document, so only the
+# library is documented.
+doc = false
 
 [dependencies]
 anyhow.workspace = true

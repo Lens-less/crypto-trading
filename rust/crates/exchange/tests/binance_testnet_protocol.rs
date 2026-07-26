@@ -11,6 +11,7 @@ use crypto_trading_exchange::{
     BinanceHmacSha256Signer, BinanceProduct, BinanceRequestSigner, BinanceServerOrderRef,
     BinanceTestnetEndpoints, BinanceTestnetProtocol, ExchangeError, ExchangeSymbol,
     ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules, RemoteHttpMethod,
+    TradingReceipt,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -328,8 +329,27 @@ fn cancellation_and_reconciliation_routes_remain_product_specific() {
             .starts_with("symbol=BTCUSDT")
     );
 
+    let client_order_id = Uuid::parse_str("0f3c807d-776f-4de4-85d0-93760a82dfcf").unwrap();
+    let queried_order = protocol
+        .build_query_order_request(
+            &perpetual,
+            MarketType::Perpetual,
+            client_order_id,
+            1_722_000_002_004,
+        )
+        .unwrap();
+    assert_eq!(queried_order.method(), RemoteHttpMethod::Get);
+    assert_eq!(queried_order.url().path(), "/fapi/v1/order");
+    assert!(
+        queried_order
+            .url()
+            .query()
+            .unwrap()
+            .starts_with("symbol=BTCUSDT&origClientOrderId=0f3c807d-776f-4de4-85d0-93760a82dfcf")
+    );
+
     let positions = protocol
-        .build_positions_request(Some(&perpetual), 1_722_000_002_004)
+        .build_positions_request(Some(&perpetual), 1_722_000_002_005)
         .unwrap();
     assert_eq!(positions.method(), RemoteHttpMethod::Get);
     assert_eq!(positions.url().path(), "/fapi/v2/positionRisk");
@@ -339,6 +359,85 @@ fn cancellation_and_reconciliation_routes_remain_product_specific() {
             .query()
             .unwrap()
             .starts_with("symbol=BTCUSDT")
+    );
+
+    let spot_balances = protocol
+        .build_account_balances_request(BinanceProduct::Spot, 1_722_000_002_006)
+        .unwrap();
+    assert_eq!(spot_balances.method(), RemoteHttpMethod::Get);
+    assert_eq!(spot_balances.url().path(), "/api/v3/account");
+    assert!(
+        spot_balances
+            .url()
+            .query()
+            .unwrap()
+            .starts_with("omitZeroBalances=true&recvWindow=5000&timestamp=1722000002006")
+    );
+
+    let usdm_balances = protocol
+        .build_account_balances_request(BinanceProduct::UsdM, 1_722_000_002_007)
+        .unwrap();
+    assert_eq!(usdm_balances.method(), RemoteHttpMethod::Get);
+    assert_eq!(usdm_balances.url().path(), "/fapi/v3/balance");
+    assert!(
+        usdm_balances
+            .url()
+            .query()
+            .unwrap()
+            .starts_with("recvWindow=5000&timestamp=1722000002007")
+    );
+}
+
+#[test]
+fn account_balances_preserve_product_semantics_and_reject_duplicate_assets() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+
+    let spot = protocol
+        .parse_account_balances_response(
+            BinanceProduct::Spot,
+            br#"{
+                "balances": [
+                    {"asset":"USDT","free":"900.25","locked":"99.75"},
+                    {"asset":"BTC","free":"0.010","locked":"0"}
+                ]
+            }"#,
+        )
+        .unwrap();
+    assert_eq!(spot.len(), 2);
+    assert_eq!(spot[0].asset, "BTC");
+    assert_eq!(spot[1].asset, "USDT");
+    assert_eq!(spot[1].wallet_balance, decimal("1000.00"));
+    assert_eq!(spot[1].available_balance, decimal("900.25"));
+    assert_eq!(spot[1].locked_balance, Some(decimal("99.75")));
+
+    let usdm = protocol
+        .parse_account_balances_response(
+            BinanceProduct::UsdM,
+            br#"[
+                {
+                    "asset":"USDT",
+                    "balance":"1000.50",
+                    "availableBalance":"950.25"
+                }
+            ]"#,
+        )
+        .unwrap();
+    assert_eq!(usdm.len(), 1);
+    assert_eq!(usdm[0].wallet_balance, decimal("1000.50"));
+    assert_eq!(usdm[0].available_balance, decimal("950.25"));
+    assert_eq!(usdm[0].locked_balance, None);
+
+    assert!(
+        protocol
+            .parse_account_balances_response(
+                BinanceProduct::UsdM,
+                br#"[
+                    {"asset":"USDT","balance":"1","availableBalance":"1"},
+                    {"asset":"USDT","balance":"1","availableBalance":"1"}
+                ]"#,
+            )
+            .is_err()
     );
 }
 
@@ -461,7 +560,7 @@ fn positions_reconciliation_maps_signed_quantities_into_typed_positions() {
                     "updateTime":1722000000456
                 },
                 {
-                    "symbol":"BTCUSDT",
+                    "symbol":"ETHUSDT",
                     "positionAmt":"0"
                 }
             ]"#,
@@ -473,6 +572,16 @@ fn positions_reconciliation_maps_signed_quantities_into_typed_positions() {
     assert_eq!(positions[0].symbol.as_str(), "BTC-USDC-PERP");
     assert_eq!(positions[0].side, crypto_trading_domain::PositionSide::Long);
     assert_eq!(positions[0].quantity.as_decimal(), decimal("0.005"));
+
+    assert!(
+        protocol
+            .parse_positions_response(
+                br#"[{"symbol":"ETHUSDT","positionAmt":"0.005"}]"#,
+                received_at,
+            )
+            .is_err(),
+        "unknown non-zero positions must still fail closed"
+    );
 }
 
 #[test]
@@ -492,5 +601,128 @@ fn server_order_refs_round_trip_through_cancel_identity() {
             wire_symbol: "BTCUSDT".to_owned(),
             order_id: 42,
         }
+    );
+}
+
+#[test]
+fn spot_cancel_responses_correlate_on_the_original_client_order_id() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+    let received_at = Utc.with_ymd_and_hms(2026, 7, 25, 8, 9, 10).unwrap();
+
+    // Binance Spot answers a cancel with the cancelled order's identity in
+    // `origClientOrderId` and the cancel request's own generated identity in
+    // `clientOrderId`. Correlating on the latter would read every cancelled
+    // order as foreign and break the cancel path against the real venue.
+    let receipt = protocol
+        .parse_order_response(
+            BinanceProduct::Spot,
+            br#"{
+                "symbol":"BTCUSDT",
+                "origClientOrderId":"0f3c807d-776f-4de4-85d0-93760a82dfcf",
+                "orderId":28,
+                "clientOrderId":"cancelMyOrder1",
+                "transactTime":1722000000123,
+                "price":"50000.10",
+                "origQty":"0.0010",
+                "executedQty":"0.0000",
+                "cummulativeQuoteQty":"0.000000",
+                "status":"CANCELED",
+                "timeInForce":"GTC",
+                "type":"LIMIT",
+                "side":"BUY"
+            }"#,
+            received_at,
+        )
+        .expect("a cancelled order identified by origClientOrderId stays owned");
+
+    let TradingReceipt::Submitted { order, .. } = receipt else {
+        panic!("a parsed single-order response reports the order it describes");
+    };
+    assert_eq!(
+        order.intent.client_order_id,
+        Uuid::parse_str("0f3c807d-776f-4de4-85d0-93760a82dfcf").unwrap(),
+    );
+}
+
+#[test]
+fn cancel_all_responses_keep_foreign_orders_distinguishable() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+    let received_at = Utc.with_ymd_and_hms(2026, 7, 25, 8, 9, 10).unwrap();
+
+    let (orders, foreign_orders) = protocol
+        .parse_open_orders_response(
+            BinanceProduct::Spot,
+            br#"[
+                {
+                    "symbol":"BTCUSDT",
+                    "origClientOrderId":"0f3c807d-776f-4de4-85d0-93760a82dfcf",
+                    "orderId":28,
+                    "clientOrderId":"cancelMyOrder1",
+                    "transactTime":1722000000123,
+                    "price":"50000.10",
+                    "origQty":"0.0010",
+                    "executedQty":"0.0000",
+                    "cummulativeQuoteQty":"0.000000",
+                    "status":"CANCELED",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"BUY"
+                },
+                {
+                    "symbol":"BTCUSDT",
+                    "origClientOrderId":"manual-order",
+                    "orderId":29,
+                    "clientOrderId":"cancelMyOrder2",
+                    "transactTime":1722000000456,
+                    "price":"50001.00",
+                    "origQty":"0.0020",
+                    "executedQty":"0.0000",
+                    "cummulativeQuoteQty":"0.000000",
+                    "status":"CANCELED",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"SELL"
+                }
+            ]"#,
+            received_at,
+        )
+        .expect("a cancel-all batch parses");
+
+    assert_eq!(orders.len(), 1, "the owned UUID order stays owned");
+    assert_eq!(
+        orders[0].intent.client_order_id,
+        Uuid::parse_str("0f3c807d-776f-4de4-85d0-93760a82dfcf").unwrap(),
+    );
+    assert_eq!(foreign_orders.len(), 1, "the manual order stays foreign");
+    assert_eq!(
+        foreign_orders[0].client_order_id.as_deref(),
+        Some("manual-order"),
+        "a foreign order reports the identity it was submitted under",
+    );
+}
+
+#[test]
+fn usdm_cancel_all_acknowledgements_are_read_from_the_body() {
+    BinanceTestnetProtocol::parse_usdm_cancel_all_response(
+        br#"{"code":200,"msg":"The operation of cancel all open order is done."}"#,
+    )
+    .expect("the documented success code is accepted");
+
+    // USD-M reports refusals inside a HTTP 200 body, so trusting the status
+    // code alone would report a refused cancellation as a completed one.
+    let error = BinanceTestnetProtocol::parse_usdm_cancel_all_response(
+        br#"{"code":-1102,"msg":"Mandatory parameter 'symbol' was not sent."}"#,
+    )
+    .expect_err("an in-body failure code must not read as a completed cancellation");
+    assert!(
+        error.to_string().contains("-1102"),
+        "the reported code stays visible to the operator: {error}"
+    );
+
+    assert!(
+        BinanceTestnetProtocol::parse_usdm_cancel_all_response(b"not json").is_err(),
+        "an unrecognised acknowledgement fails closed"
     );
 }

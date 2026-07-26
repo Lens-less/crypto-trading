@@ -10,8 +10,9 @@ use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symb
 use crypto_trading_runtime::{
     JsonlHistory, PAPER_COST_MODEL_VERSION, PaperAccountAuthority, PaperAccountConfig,
     PaperAccountError, PaperCostModel, PaperReconciliationDigestAlgorithm,
-    PaperReconciliationOutcome, PaperReconciliationProof, PaperReservationAdmission,
-    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
+    PaperReconciliationEvidence, PaperReconciliationOutcome, PaperReconciliationProof,
+    PaperReservationAdmission, PaperReservationLeg, PaperReservationPhase, PaperReservationRequest,
+    ProjectionStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -56,22 +57,53 @@ fn reservation_request(
     .unwrap()
 }
 
-fn reconciliation_proof(
+fn reconciliation_match_proof(
     account_id: &str,
     reservation_id: Uuid,
     batch_id: Uuid,
     snapshot_id: &str,
     snapshot_sequence: u64,
     digest: &str,
+    expected_available: Money,
 ) -> PaperReconciliationProof {
-    PaperReconciliationProof::new(
-        account_id,
-        reservation_id,
-        batch_id,
-        snapshot_id,
-        snapshot_sequence,
-        PaperReconciliationDigestAlgorithm::Fnv1a64,
-        digest,
+    PaperReconciliationProof::from_evidence(
+        PaperReconciliationEvidence::clean_match(
+            "contract-fixture",
+            digest,
+            account_id,
+            reservation_id,
+            batch_id,
+            snapshot_id,
+            snapshot_sequence,
+            expected_available,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn reconciliation_mismatch_proof(
+    account_id: &str,
+    reservation_id: Uuid,
+    batch_id: Uuid,
+    snapshot_id: &str,
+    snapshot_sequence: u64,
+    digest: &str,
+    expected_available: Money,
+) -> PaperReconciliationProof {
+    PaperReconciliationProof::from_evidence(
+        PaperReconciliationEvidence::mismatch(
+            "contract-fixture",
+            digest,
+            account_id,
+            reservation_id,
+            batch_id,
+            snapshot_id,
+            snapshot_sequence,
+            expected_available,
+            "fixture_mismatch",
+        )
+        .unwrap(),
     )
     .unwrap()
 }
@@ -251,13 +283,14 @@ async fn uncertain_commit_reconcile_and_safe_release_transitions_survive_restart
     );
 
     let failed = restarted
-        .record_reconciliation_failure(reconciliation_proof(
+        .record_reconciliation_failure(reconciliation_mismatch_proof(
             "paper-main",
             reservation_id,
             request.batch_id(),
             "binance/account-2026-07-25T00:00:01Z",
             41,
             "0123456789abcdef",
+            money("1000"),
         ))
         .await
         .unwrap();
@@ -282,13 +315,14 @@ async fn uncertain_commit_reconcile_and_safe_release_transitions_survive_restart
     );
 
     let released = restarted_again
-        .reconcile_release(reconciliation_proof(
+        .reconcile_release(reconciliation_match_proof(
             "paper-main",
             reservation_id,
             request.batch_id(),
             "binance/account-2026-07-25T00:00:01Z",
             42,
             "fedcba9876543210",
+            money("1000"),
         ))
         .await
         .unwrap();
@@ -306,7 +340,7 @@ async fn uncertain_commit_reconcile_and_safe_release_transitions_survive_restart
     assert!(records.contains("\"decision\":\"paper_account_reconcile_failed\""));
     assert!(records.contains("\"decision\":\"paper_account_released\""));
     assert!(records.contains("\"snapshot_sequence\":42"));
-    assert!(records.contains("\"digest\":\"fedcba9876543210\""));
+    assert!(records.contains("\"source_state_digest\":\"fedcba9876543210\""));
 }
 
 #[tokio::test]
@@ -354,13 +388,14 @@ async fn committed_reconciliation_requires_bound_non_conflicting_proof() {
         .unwrap();
 
     let wrong_account = authority
-        .reconcile_release(reconciliation_proof(
+        .reconcile_release(reconciliation_match_proof(
             "paper-alt",
             reservation_id,
             batch_id,
             "binance/account-2026-07-25T00:10:00Z",
             1,
             "0011223344556677",
+            money("1000"),
         ))
         .await
         .unwrap_err();
@@ -370,37 +405,40 @@ async fn committed_reconciliation_requires_bound_non_conflicting_proof() {
     ));
 
     authority
-        .record_reconciliation_failure(reconciliation_proof(
+        .record_reconciliation_failure(reconciliation_mismatch_proof(
             "paper-main",
             reservation_id,
             batch_id,
             "binance/account-2026-07-25T00:10:00Z",
             5,
             "0011223344556677",
+            money("1000"),
         ))
         .await
         .unwrap();
     let conflicting = authority
-        .reconcile_release(reconciliation_proof(
+        .reconcile_release(reconciliation_match_proof(
             "paper-main",
             reservation_id,
             batch_id,
             "binance/account-2026-07-25T00:10:00Z",
             5,
             "8899aabbccddeeff",
+            money("1000"),
         ))
         .await
         .unwrap_err();
     assert!(matches!(conflicting, PaperAccountError::InvalidTransition));
 
     let lower_different_snapshot = authority
-        .reconcile_release(reconciliation_proof(
+        .reconcile_release(reconciliation_match_proof(
             "paper-main",
             reservation_id,
             batch_id,
             "binance/account-2026-07-25T00:09:59Z",
             4,
             "0011223344556677",
+            money("1000"),
         ))
         .await
         .unwrap_err();
@@ -410,13 +448,14 @@ async fn committed_reconciliation_requires_bound_non_conflicting_proof() {
     ));
 
     let equal_different_snapshot = authority
-        .record_reconciliation_failure(reconciliation_proof(
+        .record_reconciliation_failure(reconciliation_mismatch_proof(
             "paper-main",
             reservation_id,
             batch_id,
             "binance/account-2026-07-25T00:10:01Z",
             5,
             "0011223344556677",
+            money("1000"),
         ))
         .await
         .unwrap_err();
@@ -437,6 +476,47 @@ async fn committed_reconciliation_requires_bound_non_conflicting_proof() {
     )
     .unwrap_err();
     assert!(matches!(malformed, PaperAccountError::InvalidRequest(_)));
+}
+
+#[tokio::test]
+async fn opaque_digest_cannot_release_committed_exposure() {
+    let path = temp_path("opaque-reconcile-proof");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let request = reservation_request("arb:btc", "open:opaque", Uuid::new_v4(), Uuid::new_v4());
+    let reservation_id = request.reservation_id();
+    let batch_id = request.batch_id();
+    authority.reserve(request).await.unwrap();
+    authority
+        .commit(reservation_id, money("150"))
+        .await
+        .unwrap();
+
+    let error = authority
+        .reconcile_release(
+            PaperReconciliationProof::new(
+                "paper-main",
+                reservation_id,
+                batch_id,
+                "binance/account-2026-07-25T00:09:00Z",
+                1,
+                PaperReconciliationDigestAlgorithm::Fnv1a64,
+                "0011223344556677",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, PaperAccountError::InvalidTransition));
+    let snapshot = authority.snapshot().await.unwrap();
+    assert_eq!(snapshot.available, money("850"));
+    assert_eq!(snapshot.committed_exposure, money("150"));
+    assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 2);
 }
 
 #[tokio::test]
@@ -485,4 +565,56 @@ fn temp_path(label: &str) -> std::path::PathBuf {
         "crypto-trading-paper-account-{label}-{}.jsonl",
         Uuid::new_v4()
     ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_spellings_of_one_journal_share_a_single_capacity_authority() {
+    // The authority serializes the read-modify-write of available capacity.
+    // If it keyed on the raw path while the journal writer keyed on the
+    // normalized one, two spellings of the same file would each get their own
+    // authority and could admit the same capacity twice.
+    let directory =
+        std::env::temp_dir().join(format!("crypto-trading-lock-key-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let lowercase = directory.join("paper-account.jsonl");
+    let mixed_case = directory.join("Paper-Account.jsonl");
+
+    let journal_id = Uuid::new_v4();
+    let config = PaperAccountConfig::new("paper-main", money("300")).unwrap();
+    let first =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&lowercase), config.clone())
+            .unwrap();
+    let second =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&mixed_case), config).unwrap();
+
+    // Each reservation costs 200.60, so exactly one of the two fits in 300.
+    // Issuing them concurrently is what distinguishes a shared authority from
+    // two independent ones: without a common lock both can read the starting
+    // capacity before either appends, and both admit.
+    let (left, right) = tokio::join!(
+        first.reserve(reservation_request(
+            "arb:btc",
+            "open:0001",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )),
+        second.reserve(reservation_request(
+            "arb:eth",
+            "open:0002",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )),
+    );
+
+    let admitted = [&left, &right]
+        .into_iter()
+        .filter(|outcome| matches!(outcome, Ok(PaperReservationAdmission::Reserved(_))))
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "exactly one concurrent reservation may consume the shared capacity; \
+         left={left:?} right={right:?}"
+    );
+
+    std::fs::remove_dir_all(&directory).ok();
 }

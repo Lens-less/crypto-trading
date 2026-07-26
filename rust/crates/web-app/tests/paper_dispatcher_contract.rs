@@ -329,7 +329,7 @@ fn catalog_from_replays(
             arbitrage_config_path,
             monitor_config_path,
             replay_path: arbitrage_replay_path,
-            shutdown_grace: StdDuration::from_millis(10),
+            shutdown_grace: StdDuration::from_secs(1),
         })
     } else {
         None
@@ -342,7 +342,7 @@ fn catalog_from_replays(
             strategy_revision: "grid.v1".to_owned(),
             config_path: grid_config_path,
             replay_path: grid_replay_path,
-            shutdown_grace: StdDuration::from_millis(10),
+            shutdown_grace: StdDuration::from_secs(1),
         }),
         arbitrage,
     })

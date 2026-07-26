@@ -2,6 +2,10 @@
 
 这是仓库唯一的当前运行项目。Rust 源码、当前配置、构建输出和运行数据都位于本目录；运行时不依赖 `../archive/python-legacy/` 中的任何文件。
 
+> [!WARNING]
+> **不得用于真实资金。** Live 适配器、连续运行、权威账户风控和多腿故障补偿尚未达到开放门槛；`--live` 即使带确认短语也会失败关闭。唯一具备下单权限的路径是 Binance **Testnet**，需要精确确认短语。Paper 结果不含手续费、资金费率、滑点、撮合队列优先级或跨进程持仓。本项目按原样提供，不含任何担保，也不构成投资建议。
+> 项目定位、安装与部署见[仓库根 README](../README.md)。
+
 ## 能力矩阵
 
 | 命令 | 配置检查 | Paper 单次执行 | 连续运行 | Live 执行 | 当前行为 |
@@ -9,6 +13,8 @@
 | `capabilities [--json]` | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
 | `config-check` | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；public path loaders、public `from_str` loaders 和 shared raw reader 共享 1 MiB / YAML 读入护栏；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
 | `testnet-smoke` | 不适用 | 否 | 否 | 否 | 显式选择后执行 Binance Testnet Spot/USD-M 只读行情和鉴权对账探针；不会提交或撤销订单 |
+| `testnet-lifecycle` | 不适用 | 否 | 否 | 否 | 精确确认短语授权的 Binance Testnet submit-query-cancel owner；UUID 与 intent 先写 journal，恢复时 query-first，mainnet 始终关闭 |
+| `testnet-reconcile` | 不适用 | 否 | 否 | 否 | 默认只报告的 clean-account gate；将签名 Testnet 余额/挂单/持仓与 exact committed Paper reservation 比对，精确确认后才写 release/failure transition |
 | `testnet-soak` | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
 | `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
 | `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
@@ -96,6 +102,38 @@ cargo run -- config-check config/exchanges/paradex_config.yaml
 
 不要把密钥写入仓库。各 exchange YAML 仅用于字段映射；私有 live 适配器仍未开放。
 
+## Binance Testnet 订单生命周期
+
+`testnet-lifecycle` 使用独立 append-only journal 运行或恢复一个有界
+submit-query-cancel campaign。它要求精确确认短语、稳定 campaign ID 与 UUID client
+order ID，只从进程环境读取 Binance Testnet 凭证；恢复与含糊响应都先执行签名单订单
+查询，不会直接重复提交。只有最终查询确认 `cancelled` 才完成：
+
+```powershell
+cargo run --locked -- testnet-lifecycle --help
+```
+
+真实 open-order、controlled partial-fill、kill/restart 演练和留证清单见
+[`../docs/runbooks/production-candidate.md`](../docs/runbooks/production-candidate.md#binance-testnet-order-lifecycle-gate)。
+确定性本地测试不替代真实凭据证据，mainnet 仍不可用。
+
+## Binance Testnet 账户对账
+
+`testnet-reconcile` 先冻结本地 Paper account 投影，再读取一个 Binance Testnet 产品的
+签名余额、全部挂单与持仓。默认模式不会修改 journal；只有
+`--apply-reconciliation "I APPLY VERIFIED BINANCE TESTNET RECONCILIATION"` 才会把
+新采样结果应用为 verified release 或 durable failure。mixed-exchange/mixed-product
+reservation、非 clean account、余额差异与未知 instrument 一律失败关闭：
+
+```powershell
+cargo run --locked -- testnet-reconcile --help
+```
+
+该 tracer 要求连续两次完整产品采样稳定，并拒绝任何非 settlement asset 的非零余额。
+它只支持单一配置 symbol 与 settlement asset，不代表通用多资产净值换算或 mainnet
+账户风控。真实 Spot/USD-M 留证步骤见
+[`../docs/runbooks/production-candidate.md`](../docs/runbooks/production-candidate.md#binance-testnet-account-reconciliation-gate)。
+
 ## Binance Testnet 24 小时演练
 
 `testnet-soak` 只执行 Spot `bookTicker`、USD-M `bookTicker` 和鉴权对账，不具有下单或撤单权限。凭证必须仅通过 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 进程环境变量提供。生产候选要求使用同一 `task_id`、history 和 control port 完成一次真实强制终止后重启，并在累计有探针活动时长达到 24 小时后干净停止：
@@ -111,11 +149,11 @@ cargo run --locked -- testnet-soak --mode verify --help
 
 ## 安全边界
 
-- 默认不授予写权限；当前可下单路径仅限显式 Paper one-shot 和 bearer-protected、严格 profile 匹配的 replay-backed Paper owner。
+- 默认不授予外部写权限；当前外部下单路径仅限精确确认短语授权的 Binance Testnet lifecycle，Paper 写入口限于显式 one-shot 和 bearer-protected、严格 profile 匹配的 replay-backed owner；mainnet 始终关闭。
 - 不受支持的外部连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
 - 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、正的 `max_position_value`、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
 - `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；`equity` 与 `available_balance` 也尚未参与资金或保证金校验。它不代表跨进程仓位、账户资金、挂单风险 reservation、多腿补偿或真实账户风控已经完成。
 - Grid one-shot 仍只验证网格规划与 paper 挂单语义；连续 Grid/Arbitrage owner 另行使用 journal-backed `PaperAccountAuthority` 做 pending/uncertain/committed 预留。两者都不代表真实交易所权益、保证金、持仓真相或 live 风控已经完成。
 - 历史 Python 实现冻结在 `../archive/python-legacy/`，不得作为当前 Rust 入口。
 
-架构、兼容面和验收门槛见 [`RUST_REFACTOR_PLAN.md`](RUST_REFACTOR_PLAN.md)；审计复核、修复证据和剩余 NO-GO 项见 [`RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。
+架构、兼容面和验收门槛见 [`docs/internal/specs/RUST_REFACTOR_PLAN.md`](../docs/internal/specs/RUST_REFACTOR_PLAN.md)；审计复核、修复证据和剩余 NO-GO 项见 [`docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](../docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。

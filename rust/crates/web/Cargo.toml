@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "HTTP API and embedded no-build operator control plane for the trading runtime."
+# The workspace ships as an application, not as crates.io libraries.
+# Publishing is refused explicitly so it cannot happen by accident.
+publish = false
 
 [dependencies]
 axum.workspace = true

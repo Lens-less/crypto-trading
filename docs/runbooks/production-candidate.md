@@ -33,13 +33,16 @@ export CRYPTO_TRADING_WEB_TOKEN="$(openssl rand -hex 32)"
 
 docker compose -f deploy/compose.yaml build --pull
 docker compose -f deploy/compose.yaml up -d
+curl --fail http://127.0.0.1:8787/api/v1/health
 curl --fail \
   -H "Authorization: Bearer $CRYPTO_TRADING_WEB_TOKEN" \
   http://127.0.0.1:8787/api/v1/system
 ```
 
-The startup probe must report `live_trading_enabled: false`, the expected
-`journal_id`, and a non-degraded projection before promotion.
+The unauthenticated readiness probe is deliberately data-free and must report
+healthy. The authenticated startup probe must report
+`live_trading_enabled: false`, the expected `journal_id`, and a non-degraded
+projection before promotion.
 
 ## Operations
 
@@ -50,9 +53,202 @@ docker compose -f deploy/compose.yaml restart operator
 docker compose -f deploy/compose.yaml down
 ```
 
+Compose probes `/api/v1/health` every 30 seconds and rotates container JSON logs
+at 10 MiB with five retained files. The authenticated `/api/v1/risk` and
+`/api/v1/settings` projections are the operator source for Paper account
+reservations, effective paths, configured credential state, and the shared
+240-request/60-second Web limit. They never return credential values. Treat
+HTTP `429` plus `Retry-After` as backpressure; do not bypass it with additional
+clients.
+
 Treat projection conflicts, `recovery_required`, a journal-integrity error, or a
 capability-manifest validation error as release blockers. Do not work around a
 failed startup by replacing the journal UUID or deleting journal records.
+
+## Binance Testnet order-lifecycle gate
+
+Run this gate before the soak. It is the only candidate path with order
+authority, and that authority is limited to Binance Testnet. Each campaign
+persists its UUID client order ID before submission, uses signed single-order
+queries as the recovery authority, cancels the order, and records the final
+cancelled state. There is no `--live` option.
+
+Build the exact candidate and create a private, dedicated evidence file:
+
+```sh
+cargo build \
+  --manifest-path rust/Cargo.toml \
+  --release \
+  --locked \
+  --package crypto-trading-apps \
+  --bin crypto-trading
+
+umask 077
+install -d -m 0700 /srv/crypto-trading/lifecycle
+
+export BINANCE_API_KEY='...'
+export BINANCE_API_SECRET='...'
+export LIFECYCLE_BIN="$PWD/rust/target/release/crypto-trading"
+export LIFECYCLE_HISTORY='/srv/crypto-trading/lifecycle/binance-testnet.jsonl'
+export LIFECYCLE_CAMPAIGN='binance-spot-open-001'
+export LIFECYCLE_CLIENT_ID="$(uuidgen)"
+export LIFECYCLE_PRICE='<POST_ONLY_PRICE>'
+
+"$LIFECYCLE_BIN" testnet-lifecycle \
+  --acknowledge-testnet-lifecycle \
+  'I AUTHORIZE BINANCE TESTNET ORDER LIFECYCLE' \
+  --campaign-id "$LIFECYCLE_CAMPAIGN" \
+  --client-order-id "$LIFECYCLE_CLIENT_ID" \
+  --history-path "$LIFECYCLE_HISTORY" \
+  --market spot \
+  --side buy \
+  --quantity 0.001 \
+  --price "$LIFECYCLE_PRICE" \
+  --time-in-force post-only \
+  --expected-observation open \
+  --poll-interval-ms 2000 \
+  --maximum-queries 30 \
+  --timeout-ms 10000 \
+  --json \
+  | tee /srv/crypto-trading/lifecycle/open-order-result.json
+```
+
+Replace the price placeholder with a non-marketable price that satisfies the
+current Testnet instrument filters. Never paste the placeholder into a real
+invocation. The result must say `authority: "testnet"`,
+`mainnet_enabled: false`, and `final_status: "cancelled"`. The journal must
+contain, in order, `testnet_lifecycle_planned`, a submit observation, at least
+one signed query observation that proves the expected state, cancel planned, a
+final cancelled query observation, and `testnet_lifecycle_completed`. A normal
+cancel response also emits `testnet_lifecycle_cancel_observed`. If cancel
+dispatch is ambiguous, `testnet_lifecycle_outcome_unknown` followed by the
+authoritative final cancelled query is valid; the cancel response fact is then
+intentionally absent.
+
+Create a second campaign and client UUID for the controlled partial-fill case.
+Use `--time-in-force gtc --expected-observation partially-filled` and arrange a
+small fill from an independently controlled Testnet account or test fixture
+while the lifecycle is polling. Use a quantity and price that satisfy the
+current filters and leave a cancellable remainder. If the partial fill is not
+observed within the bounded query budget, the owner cancels any known open
+order, records failure, and exits nonzero; that is not passing evidence.
+Cleanup intent records whether the expected observation was already proven, so
+a restart during failed cleanup cannot turn that campaign into a passing one.
+
+For the restart drill, use a third campaign with the partial-fill expectation
+and a long enough polling interval to intervene. Start it in the foreground,
+wait until the journal contains `testnet_lifecycle_submit_observed`, then send
+`SIGKILL`. Rerun the *identical* command with the same campaign ID, client UUID,
+intent, and history path. The resumed invocation must append
+`testnet_lifecycle_resumed`, query by the persisted UUID before any mutation,
+avoid a second submit, cancel the recovered order, and finish cancelled:
+
+```sh
+jq -r 'select(.details.campaign_id == env.LIFECYCLE_CAMPAIGN) | .decision' \
+  "$LIFECYCLE_HISTORY"
+```
+
+Count exactly one `testnet_lifecycle_planned` and one
+`testnet_lifecycle_submit_observed` for the recovered campaign. A process killed
+after the plan record but before a submit receipt is intentionally fail-closed:
+the next run queries first and may report `outcome_unknown`; it never guesses
+that resubmission is safe. Use a new campaign only after an authoritative query
+or operator reconciliation proves the old UUID has no order.
+
+The polling interval and maximum query count are part of the durable campaign
+identity. Query attempts are planned in the journal before network I/O and the
+budget is cumulative across restarts; changing either policy for the same
+campaign fails closed. If the campaign exhausts its budget, stop rerunning it,
+reconcile the persisted client UUID manually, and retain the unresolved
+campaign as failed release evidence.
+
+Archive the candidate checksum, redacted command arguments, CLI JSON outputs,
+and journal. Exercise and record Spot open-order, controlled partial-fill, and
+kill/restart recovery. A timeout or ambiguous submit/cancel must be followed by
+the signed query-first path. A timestamp-skew response gets one clock-sync
+retry. Treat venue rate limiting as a failed gate and retry later according to
+the venue response; do not increase the bounded query budget to overwhelm it.
+Never archive credentials or an environment dump.
+
+## Binance Testnet account-reconciliation gate
+
+Run this gate after the order-lifecycle campaign has cancelled its test order
+and before the 24-hour soak. It is the first real consumer of the Paper account
+reconciliation transition: one stable double-sampled signed Binance Testnet
+product snapshot is compared with one exact committed Paper reservation. The command is
+report-only unless the exact apply acknowledgement is present, and it never
+enables mainnet.
+
+Stop the Paper owner before this gate. `testnet-reconcile` holds the journal's
+cross-process writer lease while it freezes local state, samples the venue, and
+optionally appends one transition. Record the exact journal generation,
+starting capacity, account, reservation, product, symbol mapping, and
+settlement asset:
+
+```bash
+export BINANCE_API_KEY='<TESTNET_ONLY_KEY>'
+export BINANCE_API_SECRET='<TESTNET_ONLY_SECRET>'
+export RECONCILE_BIN="$PWD/rust/target/release/crypto-trading"
+export PAPER_HISTORY='/srv/crypto-trading/journal/paper-grid.jsonl'
+export PAPER_JOURNAL_ID='<JOURNAL_UUID>'
+export PAPER_ACCOUNT_ID='paper-main'
+export PAPER_INITIAL_AVAILABLE='<EXACT_STARTING_CAPACITY>'
+export PAPER_RESERVATION_ID='<COMMITTED_RESERVATION_UUID>'
+
+"$RECONCILE_BIN" testnet-reconcile \
+  --history-path "$PAPER_HISTORY" \
+  --journal-id "$PAPER_JOURNAL_ID" \
+  --account-id "$PAPER_ACCOUNT_ID" \
+  --initial-available "$PAPER_INITIAL_AVAILABLE" \
+  --reservation-id "$PAPER_RESERVATION_ID" \
+  --market spot \
+  --settlement-asset USDT \
+  --spot-symbol BTC-USDT-SPOT \
+  --perpetual-symbol BTC-USDT-PERP \
+  --wire-symbol BTCUSDT \
+  --timeout-ms 15000 \
+  --json > /srv/crypto-trading/evidence/testnet-reconcile-report.json
+```
+
+A passing report has `matches: true`, zero owned/foreign orders, zero
+positions, no mismatch codes, and a 16-character FNV-1a proof digest. The
+adapter takes two complete consecutive balance/order/position samples and
+rejects observed state drift. The selected Testnet settlement balance must
+equal the Paper account's projected availability after releasing this
+reservation; wallet and available balances must converge, Spot locked balance
+must be zero, and every non-settlement asset balance must be zero. This
+deliberately strict clean-account gate does not perform multi-asset valuation
+or infer ownership for unrelated venue activity.
+
+Re-sample and apply the result only with the exact acknowledgement:
+
+```bash
+"$RECONCILE_BIN" testnet-reconcile \
+  --history-path "$PAPER_HISTORY" \
+  --journal-id "$PAPER_JOURNAL_ID" \
+  --account-id "$PAPER_ACCOUNT_ID" \
+  --initial-available "$PAPER_INITIAL_AVAILABLE" \
+  --reservation-id "$PAPER_RESERVATION_ID" \
+  --market spot \
+  --settlement-asset USDT \
+  --spot-symbol BTC-USDT-SPOT \
+  --perpetual-symbol BTC-USDT-PERP \
+  --wire-symbol BTCUSDT \
+  --timeout-ms 15000 \
+  --apply-reconciliation \
+  'I APPLY VERIFIED BINANCE TESTNET RECONCILIATION' \
+  --json > /srv/crypto-trading/evidence/testnet-reconcile-applied.json
+```
+
+For USD-M, use `--market usdm` and make the committed reservation's only lane
+match the configured perpetual symbol. Run and archive both product variants
+when both products are in the release scope. A matching applied result records
+`released`; a mismatching applied result durably records `failure_recorded`,
+keeps committed exposure held, prints the proof, and exits non-zero. Missing
+assets, non-zero untracked assets, any open or foreign order, any non-flat
+position, unknown wire symbols, rate limiting, partial or unstable HTTP
+samples, projection degradation, or balance differences are release blockers.
+Never edit the journal to force a match, and never archive credentials.
 
 ## Binance Testnet 24-hour soak gate
 
@@ -221,9 +417,11 @@ never moved over the live journal.
 
 ## Promotion and rollback
 
-Promotion requires all repository quality gates, the backup/restore drill, and
-the planned testnet lifecycle/soak evidence. A local deterministic harness is
-not a substitute for credentialed Binance Testnet evidence or the 24-hour soak.
+Promotion requires all repository quality gates, healthy and non-degraded Web
+projections, the backup/restore drill, both credentialed Testnet reconciliation
+products, the three credentialed Testnet lifecycle cases above, and the 24-hour
+soak evidence. A local deterministic harness is not a substitute for
+credentialed Binance Testnet evidence or the 24-hour soak.
 
 To roll back, keep the data volume and journal UUID unchanged, deploy the prior
 image digest, and repeat the system projection check. Never roll back by

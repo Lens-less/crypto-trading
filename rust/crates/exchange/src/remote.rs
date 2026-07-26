@@ -238,6 +238,14 @@ impl ReqwestHttpTransport {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .user_agent("crypto-trading/0.1 testnet-protocol")
+            // Signed requests carry the venue API key in a custom header and
+            // the signature in the query string. reqwest preserves custom
+            // headers across redirects, so following one would replay both to
+            // whatever host the response names. Endpoint construction already
+            // pins the scheme and host; refusing redirects keeps a response
+            // from widening that pin. A 3xx surfaces as an ordinary
+            // non-success response instead.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| ExchangeError::unavailable("unable to build remote HTTP transport"))?;
         Ok(Self { client })

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Bounded, fail-closed loaders for the trading system's YAML and JSON configuration surface."
+# The workspace ships as an application, not as crates.io libraries.
+# Publishing is refused explicitly so it cannot happen by accident.
+publish = false
 
 [dependencies]
 crypto-trading-domain = { path = "../domain" }

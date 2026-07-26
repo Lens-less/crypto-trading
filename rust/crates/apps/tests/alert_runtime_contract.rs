@@ -428,7 +428,12 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
         Arc::clone(&clock),
         &path,
         vec![Box::new(panicking), Box::new(healthy)],
-        dispatcher_config(4),
+        NotificationDispatcherConfig::new(
+            4,
+            StdDuration::from_secs(5),
+            StdDuration::from_millis(200),
+        )
+        .unwrap(),
     );
 
     runtime
@@ -445,7 +450,7 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
         enqueue.adapter_id == "panicking" && enqueue.state == NotificationEnqueueState::Queued
     }));
     release.notify_one();
-    tokio::time::timeout(StdDuration::from_millis(100), async {
+    tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             let body = std::fs::read_to_string(&path).unwrap_or_default();
             if body.contains("price_alert_delivery_failed") {

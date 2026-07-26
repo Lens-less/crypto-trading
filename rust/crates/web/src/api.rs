@@ -330,20 +330,33 @@ pub(crate) fn api_routes_with_settings(
         .route("/settings", get(runtime_settings))
         .route("/executions", get(executions))
         .route("/events", get(events))
-        .layer(middleware::from_fn_with_state(access_state, authorize));
-    Router::new()
+        .layer(middleware::from_fn_with_state(
+            access_state.clone(),
+            authorize,
+        ));
+    // The readiness probe stays unauthenticated so a supervisor can reach it,
+    // but it is still rate limited: without that it is an unauthenticated
+    // route any local process could hammer.
+    let readiness = Router::new()
         .route("/health", get(health))
+        .layer(middleware::from_fn_with_state(access_state, rate_limit));
+    Router::new()
+        .merge(readiness)
         .merge(protected)
         .with_state(state)
 }
 
-async fn health(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
-    Ok(Json(HealthResponse {
+/// Reports process readiness without reading the journal.
+///
+/// This is the only unauthenticated route. It answers from the static
+/// capability manifest, so an unauthenticated caller can neither observe
+/// operational data nor force a journal projection.
+async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
         schema_version: API_SCHEMA_VERSION,
         status: HealthStatus::Ready,
-        live_trading_enabled: snapshot.capabilities.live_trading_enabled,
-    }))
+        live_trading_enabled: state.control_plane.capabilities().live_trading_enabled,
+    })
 }
 
 async fn capabilities(State(state): State<ApiState>) -> Json<CapabilityManifest> {
@@ -579,7 +592,22 @@ async fn authorize(State(state): State<ApiAccessState>, request: Request, next: 
     next.run(request).await
 }
 
-pub(crate) async fn add_security_headers(request: Request, next: Next) -> Response {
+/// Applies backpressure without requiring authentication.
+///
+/// Used for the readiness probe, which a supervisor must be able to reach
+/// before it holds a token.
+async fn rate_limit(State(state): State<ApiAccessState>, request: Request, next: Next) -> Response {
+    if let Err(retry_after) = state.rate_limiter.try_acquire() {
+        let mut response = ApiError::rate_limited().into_response();
+        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(RETRY_AFTER, value);
+        }
+        return response;
+    }
+    next.run(request).await
+}
+
+pub async fn add_security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let ui_asset = response
         .headers()

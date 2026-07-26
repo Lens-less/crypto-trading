@@ -4,15 +4,33 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::{
-    BinanceProduct, BinanceServerOrderRef, BinanceTestnetProtocol, CancellationDisposition,
-    ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeStatus,
-    MarketSubscription, ReconcileReceipt, ReconcileScope, RemoteHttpResponse, RemoteHttpTransport,
-    SubscriptionReceipt, TradingCommand, TradingReceipt,
+    BinanceProduct, BinanceServerOrderRef, BinanceTestnetBalance, BinanceTestnetProtocol,
+    CancellationDisposition, ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode,
+    ExchangeStatus, ForeignOrder, MarketSubscription, ReconcileReceipt, ReconcileScope,
+    RemoteHttpResponse, RemoteHttpTransport, SubscriptionReceipt, TradingCommand, TradingReceipt,
 };
 
 const EXCHANGE: &str = "binance";
 
+/// Largest difference accepted between the venue clock and the local clock.
+///
+/// Binance's default `recvWindow` is 5 seconds; this bound is deliberately
+/// wider so ordinary network latency still synchronises, while a nonsensical
+/// server time or a tampered `Date` header is rejected rather than adopted.
+const MAXIMUM_CLOCK_OFFSET_MS: i64 = 60_000;
+
 type Clock = dyn Fn() -> DateTime<Utc> + Send + Sync;
+
+/// One product-scoped Binance Testnet account truth snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceTestnetAccountSnapshot {
+    pub product: BinanceProduct,
+    pub balances: Vec<BinanceTestnetBalance>,
+    pub orders: Vec<crypto_trading_domain::Order>,
+    pub foreign_orders: Vec<ForeignOrder>,
+    pub positions: Vec<crypto_trading_domain::Position>,
+    pub observed_at: DateTime<Utc>,
+}
 
 /// Executable Binance Spot/USD-M testnet adapter backed by the authenticated
 /// protocol and a caller-supplied transport.
@@ -57,6 +75,116 @@ impl BinanceTestnetExchange {
             time_offset_ms: Mutex::new(0),
             observed_at: Mutex::new(now),
         }
+    }
+
+    /// Queries one order by the UUID client identity that callers persisted
+    /// before dispatch.
+    ///
+    /// This is the recovery seam for ambiguous submissions: it never expands
+    /// to all open orders and retries once after an authoritative clock sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded exchange error when the request fails, the response
+    /// is malformed, or Binance returns a different client identity.
+    pub async fn query_order(
+        &self,
+        symbol: &crypto_trading_domain::Symbol,
+        market_type: crypto_trading_domain::MarketType,
+        client_order_id: uuid::Uuid,
+    ) -> Result<crypto_trading_domain::Order, ExchangeError> {
+        let response = self
+            .send_authenticated_request(product_for_market(market_type), |timestamp_ms| {
+                self.protocol.build_query_order_request(
+                    symbol,
+                    market_type,
+                    client_order_id,
+                    timestamp_ms,
+                )
+            })
+            .await?;
+        if !response.is_success() {
+            return Err(BinanceTestnetProtocol::remote_failure_from_response(
+                &response,
+            ));
+        }
+        let observed_at = self.observe_response(&response);
+        let receipt = self.protocol.parse_order_response(
+            product_for_market(market_type),
+            response.body(),
+            observed_at,
+        )?;
+        let TradingReceipt::Submitted { order, .. } = receipt else {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance single-order query returned a non-order receipt",
+            ));
+        };
+        if order.intent.client_order_id != client_order_id {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance single-order query returned a different client order id",
+            ));
+        }
+        Ok(order)
+    }
+
+    /// Queries balance, open-order, and position truth for exactly one Testnet
+    /// product using two complete consecutive samples.
+    ///
+    /// Spot snapshots contain no positions. USD-M snapshots include the
+    /// product-wide position-risk response. The two samples must have identical
+    /// balance/order/position state; observed drift fails closed instead of
+    /// returning a torn composite snapshot. Every signed route retains the
+    /// adapter's one-shot clock-skew recovery and bounded response handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded exchange error if any component cannot be sampled or
+    /// parsed. Partial snapshots are never returned.
+    pub async fn account_snapshot(
+        &self,
+        product: BinanceProduct,
+    ) -> Result<BinanceTestnetAccountSnapshot, ExchangeError> {
+        let first = self.sample_account_snapshot(product).await?;
+        let second = self.sample_account_snapshot(product).await?;
+        if !same_account_state(&first, &second) {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance Testnet account state changed across the bounded double sample",
+            ));
+        }
+        Ok(second)
+    }
+
+    async fn sample_account_snapshot(
+        &self,
+        product: BinanceProduct,
+    ) -> Result<BinanceTestnetAccountSnapshot, ExchangeError> {
+        let (balances, observed_balances) = self.account_balances(product).await?;
+        let market_type = match product {
+            BinanceProduct::Spot => crypto_trading_domain::MarketType::Spot,
+            BinanceProduct::UsdM => crypto_trading_domain::MarketType::Perpetual,
+        };
+        let (orders, foreign_orders, observed_orders) =
+            self.reconcile_orders(market_type, None).await?;
+        let (positions, observed_positions) = match product {
+            BinanceProduct::Spot => (Vec::new(), observed_orders),
+            BinanceProduct::UsdM => self.reconcile_positions(None).await?,
+        };
+        let observed_at = self.observe_at(
+            observed_balances
+                .max(observed_orders)
+                .max(observed_positions),
+        );
+        Ok(BinanceTestnetAccountSnapshot {
+            product,
+            balances,
+            orders,
+            foreign_orders,
+            positions,
+            observed_at,
+        })
     }
 
     async fn execute_submit(
@@ -135,10 +263,18 @@ impl BinanceTestnetExchange {
                 "Binance cancel_all needs an explicit market type or a market-qualified symbol",
             ));
         };
+        // Binance has no account-wide cancel endpoint: every cancel-all is
+        // scoped to one symbol. Reject a missing symbol here rather than
+        // panicking deeper in the dispatch closure.
+        let Some(symbol) = symbol else {
+            return Err(ExchangeError::invalid(
+                "Binance cancel_all needs an explicit symbol",
+            ));
+        };
         let product = product_for_market(market_type);
         let response = self
             .dispatch_with_clock_retry(product, |timestamp_ms| {
-                let symbol = symbol.as_ref().unwrap_or_else(|| unreachable!()).clone();
+                let symbol = symbol.clone();
                 async move {
                     self.protocol
                         .dispatch_cancel_all(&*self.transport, &symbol, market_type, timestamp_ms)
@@ -170,10 +306,13 @@ impl BinanceTestnetExchange {
                     disposition,
                 })
             }
-            BinanceProduct::UsdM => Ok(TradingReceipt::Cancelled {
-                orders: Vec::new(),
-                disposition: CancellationDisposition::Cancelled,
-            }),
+            BinanceProduct::UsdM => {
+                BinanceTestnetProtocol::parse_usdm_cancel_all_response(response.body())?;
+                Ok(TradingReceipt::Cancelled {
+                    orders: Vec::new(),
+                    disposition: CancellationDisposition::Cancelled,
+                })
+            }
         }
     }
 
@@ -233,6 +372,15 @@ impl BinanceTestnetExchange {
         let offset = server_time
             .signed_duration_since(local_now)
             .num_milliseconds();
+        // An unbounded offset lets one wrong server time silently shift every
+        // later signed request, which the venue then rejects as clock skew.
+        // Refuse the sample instead of adopting it.
+        if offset.saturating_abs() > MAXIMUM_CLOCK_OFFSET_MS {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance server time differs from local time beyond the accepted clock offset",
+            ));
+        }
         *self
             .time_offset_ms
             .lock()
@@ -259,12 +407,19 @@ impl BinanceTestnetExchange {
         self.observe_at(response.server_time().unwrap_or(fallback))
     }
 
+    /// Observation timestamps are monotonic and drive reconciliation
+    /// sequencing, so a single far-future response header would otherwise
+    /// permanently block later snapshots. Candidates are clamped to the local
+    /// clock plus the accepted offset before they can advance the watermark.
     fn observe_at(&self, candidate: DateTime<Utc>) -> DateTime<Utc> {
+        let ceiling = (self.clock)()
+            .checked_add_signed(TimeDelta::milliseconds(MAXIMUM_CLOCK_OFFSET_MS))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
         let mut observed = self
             .observed_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *observed = (*observed).max(candidate);
+        *observed = (*observed).max(candidate.min(ceiling));
         *observed
     }
 
@@ -319,6 +474,28 @@ impl BinanceTestnetExchange {
             .protocol
             .parse_positions_response(response.body(), observed_at)?;
         Ok((positions, observed_at))
+    }
+
+    async fn account_balances(
+        &self,
+        product: BinanceProduct,
+    ) -> Result<(Vec<BinanceTestnetBalance>, DateTime<Utc>), ExchangeError> {
+        let response = self
+            .send_authenticated_request(product, |timestamp_ms| {
+                self.protocol
+                    .build_account_balances_request(product, timestamp_ms)
+            })
+            .await?;
+        if !response.is_success() {
+            return Err(BinanceTestnetProtocol::remote_failure_from_response(
+                &response,
+            ));
+        }
+        let observed_at = self.observe_response(&response);
+        let balances = self
+            .protocol
+            .parse_account_balances_response(product, response.body())?;
+        Ok((balances, observed_at))
     }
 }
 
@@ -487,4 +664,15 @@ fn products_for_scope(
             crypto_trading_domain::MarketType::Perpetual,
         ],
     }
+}
+
+fn same_account_state(
+    left: &BinanceTestnetAccountSnapshot,
+    right: &BinanceTestnetAccountSnapshot,
+) -> bool {
+    left.product == right.product
+        && left.balances == right.balances
+        && left.orders == right.orders
+        && left.foreign_orders == right.foreign_orders
+        && left.positions == right.positions
 }

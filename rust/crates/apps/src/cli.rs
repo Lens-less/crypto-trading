@@ -6,7 +6,17 @@ use uuid::Uuid;
 
 /// Rust-first command surface replacing the legacy Python launch scripts.
 #[derive(Debug, Parser)]
-#[command(name = "crypto-trading", version, about = "多交易所策略自动化系统")]
+#[command(
+    name = "crypto-trading",
+    version,
+    about = "Multi-exchange strategy kernel with deterministic paper execution and an auditable journal.",
+    long_about = "Multi-exchange strategy kernel with deterministic paper execution and an \
+                  auditable JSONL journal.\n\n\
+                  Mainnet trading is disabled and fails closed. The only path with order \
+                  authority is Binance Testnet, and it requires an exact acknowledgement \
+                  phrase. Run `capabilities --json` for the authoritative statement of what \
+                  this build is permitted to do."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -19,6 +29,12 @@ pub enum Command {
     /// Run bounded Binance testnet connectivity and reconcile smoke checks.
     #[command(name = "testnet-smoke")]
     TestnetSmoke(TestnetSmokeArgs),
+    /// Run or recover one durable Binance testnet order lifecycle.
+    #[command(name = "testnet-lifecycle")]
+    TestnetLifecycle(TestnetLifecycleArgs),
+    /// Compare signed Binance Testnet account truth to one committed Paper reservation.
+    #[command(name = "testnet-reconcile")]
+    TestnetReconcile(TestnetReconciliationArgs),
     /// Run, inspect, stop, or verify a durable Binance testnet soak campaign.
     #[command(name = "testnet-soak")]
     TestnetSoak(TestnetSoakArgs),
@@ -63,10 +79,10 @@ pub struct TestnetSmokeArgs {
     #[arg(long)]
     pub call_reconcile: bool,
     /// Standard spot symbol mapped to the selected wire symbol.
-    #[arg(long, default_value = "BTC-USDC-SPOT")]
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
     pub spot_symbol: String,
     /// Standard perpetual symbol mapped to the selected wire symbol.
-    #[arg(long, default_value = "BTC-USDC-PERP")]
+    #[arg(long, default_value = "BTC-USDT-PERP")]
     pub perpetual_symbol: String,
     /// Exact Binance wire symbol used for both spot and perpetual probes.
     #[arg(long, default_value = "BTCUSDT")]
@@ -74,6 +90,131 @@ pub struct TestnetSmokeArgs {
     /// Total HTTP timeout for each remote call in milliseconds.
     #[arg(long, default_value_t = 10_000)]
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct TestnetLifecycleArgs {
+    /// Emit the final durable proof as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Exact acknowledgement required before any Testnet mutation.
+    #[arg(long, value_name = "PHRASE")]
+    pub acknowledge_testnet_lifecycle: String,
+    /// Stable campaign identity reused for recovery.
+    #[arg(long)]
+    pub campaign_id: String,
+    /// Stable UUID persisted before submission and reused for every query.
+    #[arg(long)]
+    pub client_order_id: Uuid,
+    /// Dedicated append-only JSONL evidence path.
+    #[arg(long)]
+    pub history_path: PathBuf,
+    /// Binance product selected for this Testnet order.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleMarket::Spot)]
+    pub market: TestnetLifecycleMarket,
+    /// Order side.
+    #[arg(long, value_enum)]
+    pub side: TestnetLifecycleSide,
+    /// Positive base-asset quantity that satisfies the configured instrument rule.
+    #[arg(long)]
+    pub quantity: Decimal,
+    /// Positive limit price that satisfies the configured instrument rule.
+    #[arg(long)]
+    pub price: Decimal,
+    /// GTC supports manual partial-fill evidence; post-only is the safer open-order default.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleTimeInForce::PostOnly)]
+    pub time_in_force: TestnetLifecycleTimeInForce,
+    /// Order state that a signed single-order query must prove before cancellation.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleExpected::Open)]
+    pub expected_observation: TestnetLifecycleExpected,
+    /// Permit reduce-only semantics for a USD-M order.
+    #[arg(long)]
+    pub reduce_only: bool,
+    /// Standard spot symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub spot_symbol: String,
+    /// Standard perpetual symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDT-PERP")]
+    pub perpetual_symbol: String,
+    /// Exact Binance wire symbol used by the Testnet request.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Delay between authoritative single-order queries.
+    #[arg(long, default_value_t = 2_000)]
+    pub poll_interval_ms: u64,
+    /// Maximum signed single-order query attempts across the durable campaign.
+    #[arg(long, default_value_t = 30)]
+    pub maximum_queries: u16,
+    /// Total HTTP timeout for each remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct TestnetReconciliationArgs {
+    /// Emit the reconciliation verdict and proof as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Paper account journal containing the committed reservation.
+    #[arg(long)]
+    pub history_path: PathBuf,
+    /// Exact journal generation UUID used by the Paper account authority.
+    #[arg(long)]
+    pub journal_id: Uuid,
+    /// Exact Paper account identity.
+    #[arg(long)]
+    pub account_id: String,
+    /// Original Paper account starting quote capacity.
+    #[arg(long)]
+    pub initial_available: Decimal,
+    /// Exact committed Paper reservation to reconcile.
+    #[arg(long)]
+    pub reservation_id: Uuid,
+    /// Binance product selected for this account comparison.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleMarket::Spot)]
+    pub market: TestnetLifecycleMarket,
+    /// Settlement asset whose available balance must match local post-release capacity.
+    #[arg(long, default_value = "USDT")]
+    pub settlement_asset: String,
+    /// Standard spot symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub spot_symbol: String,
+    /// Standard perpetual symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDT-PERP")]
+    pub perpetual_symbol: String,
+    /// Exact Binance wire symbol used to parse account order and position truth.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Total HTTP timeout for each signed remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
+    /// Apply the verified release/failure transition using the exact acknowledgement phrase.
+    #[arg(long, value_name = "PHRASE")]
+    pub apply_reconciliation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum TestnetLifecycleMarket {
+    Spot,
+    Usdm,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum TestnetLifecycleSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum TestnetLifecycleTimeInForce {
+    Gtc,
+    PostOnly,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum TestnetLifecycleExpected {
+    Open,
+    PartiallyFilled,
 }
 
 #[derive(Debug, Args)]
@@ -88,10 +229,10 @@ pub struct TestnetSoakArgs {
     #[arg(long)]
     pub history_path: PathBuf,
     /// Spot symbol mapped to the selected wire symbol.
-    #[arg(long, default_value = "BTC-USDC-SPOT")]
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
     pub spot_symbol: String,
     /// Perpetual symbol mapped to the selected wire symbol.
-    #[arg(long, default_value = "BTC-USDC-PERP")]
+    #[arg(long, default_value = "BTC-USDT-PERP")]
     pub perpetual_symbol: String,
     /// Exact Binance wire symbol used for both spot and perpetual probes.
     #[arg(long, default_value = "BTCUSDT")]

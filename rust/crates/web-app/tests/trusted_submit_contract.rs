@@ -316,3 +316,44 @@ async fn invalid_unknown_and_oversized_bodies_fail_closed_without_echoing_input(
     drop(listener);
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn submit_route_carries_the_same_security_headers_and_401_code_as_the_read_api() {
+    let (_listener, router, _path, _calls) = application("headers").await;
+    let envelope = paper_stop(Uuid::new_v4(), "stop-headers", "paper-grid-btc-usdt");
+
+    let unauthorized = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/submit",
+            Body::from(serde_json::to_vec(&envelope).unwrap()),
+            false,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    // The submit router is merged into the application router, so it must sit
+    // under the same security-header layer every read route does.
+    let headers = unauthorized.headers();
+    for header in [
+        "cache-control",
+        "content-security-policy",
+        "permissions-policy",
+        "referrer-policy",
+        "x-content-type-options",
+        "x-frame-options",
+    ] {
+        assert!(
+            headers.contains_key(header),
+            "submit response is missing {header}"
+        );
+    }
+
+    // The browser client keys re-authentication off this code, so the two
+    // routes must not spell it differently.
+    let body = to_bytes(unauthorized.into_body(), 65_536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "authentication_required");
+}

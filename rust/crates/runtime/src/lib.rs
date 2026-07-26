@@ -70,9 +70,10 @@ pub use paper_account::{
     MAX_PAPER_ACCOUNT_RESERVATIONS, PAPER_ACCOUNT_SCHEMA_VERSION, PAPER_COST_MODEL_VERSION,
     PaperAccountAuthority, PaperAccountConfig, PaperAccountError, PaperAccountProjectionError,
     PaperAccountReadModel, PaperAccountSnapshot, PaperCostModel,
-    PaperReconciliationDigestAlgorithm, PaperReconciliationOutcome, PaperReconciliationProof,
-    PaperReconciliationRecord, PaperReservationAdmission, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, PaperReservationView,
+    PaperReconciliationDigestAlgorithm, PaperReconciliationEvidence, PaperReconciliationOutcome,
+    PaperReconciliationProof, PaperReconciliationRecord, PaperReconciliationVerdict,
+    PaperReservationAdmission, PaperReservationLeg, PaperReservationPhase, PaperReservationRequest,
+    PaperReservationView,
 };
 pub use read_model::{
     ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,
