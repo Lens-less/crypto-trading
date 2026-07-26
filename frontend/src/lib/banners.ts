@@ -6,8 +6,10 @@
 import type {
   ArbitrageMonitorReadModel,
   OperatorReadModel,
+  PaperAccountReadModel,
   PriceAlertReadModel,
   ReadOnlyTaskReadModel,
+  VirtualGridScannerReadModel,
 } from "./api-types";
 import {
   countPendingAlertDeliveries,
@@ -142,6 +144,69 @@ export function monitorBanner(
     message:
       "最后一个有效监控结果已停止展示;无效事件或不完整尾记录修复前,不把旧机会提升为可信状态。",
   };
+}
+
+/**
+ * scanner 投影横幅:降级时保留最后有效历史排行(而非隐藏),
+ * 但明确声明它不能被解释为当前结果;截断时说明展示范围。
+ */
+export function scannerBanners(
+  model: VirtualGridScannerReadModel | null | undefined,
+): BannerDescriptor[] {
+  if (!model) {
+    return [];
+  }
+  const banners: BannerDescriptor[] = [];
+  if (model.projection_status !== "complete") {
+    banners.push({
+      key: "scanner-degraded",
+      tone: "danger",
+      title: "scanner 投影已降级",
+      tag: "保留最后有效历史排行",
+      message:
+        "当前仅保留最后有效历史排行;无效事实或部分尾记录修复前,不把它解释为当前结果。",
+    });
+  }
+  if (model.latest !== null && model.latest.truncated) {
+    banners.push({
+      key: "scanner-truncated",
+      tone: "warning",
+      title: "排行已截断",
+      tag: "部分投影",
+      message: `本次排行只展示 ${model.latest.rows.length} / ${model.latest.eligible_count} 个符合条件的候选,超出行上限的候选已被有界淘汰。`,
+    });
+  }
+  return banners;
+}
+
+/** Paper 账户投影横幅:降级即为一等状态,不把可疑敞口提升为健康。 */
+export function riskBanners(
+  model: PaperAccountReadModel | null | undefined,
+): BannerDescriptor[] {
+  if (!model) {
+    return [];
+  }
+  const banners: BannerDescriptor[] = [];
+  if (model.projection_status !== "complete") {
+    banners.push({
+      key: "risk-degraded",
+      tone: "danger",
+      title: "Paper 账户投影已降级",
+      tag: "最后有效事实",
+      message:
+        "账户与预留数字只反映最后通过校验的持久事实;修复 journal 前,不把这些敞口解释为当前可用额度。",
+    });
+  }
+  if (model.invalid_event_count > 0) {
+    banners.push({
+      key: "risk-invalid-events",
+      tone: "warning",
+      title: "存在无效账户事件",
+      tag: "已拒绝计入",
+      message: `journal 中有 ${model.invalid_event_count} 条账户事件未通过校验,已被拒绝计入投影;数字不包含这些事实。`,
+    });
+  }
+  return banners;
 }
 
 /** 任务投影横幅:降级 + 存活性未验证。 */

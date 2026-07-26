@@ -106,6 +106,26 @@ const TOKEN_LABELS = new Map<string, string>([
   ["paper-once", "单次模拟"],
   ["validate-only", "仅校验"],
   ["contract-only", "仅契约"],
+  // 适配器支持矩阵
+  ["implemented", "已实现"],
+  ["protocol-only", "仅协议"],
+  ["request-only", "仅请求"],
+  ["config-only", "仅配置"],
+  ["not-applicable", "不适用"],
+  // scanner 排行
+  ["benchmark", "基准"],
+  ["standard", "标准"],
+  ["explicit_benchmark_then_apr_desc", "显式 benchmark 优先,按 APR 降序"],
+  // settings 投影
+  ["stdout_stderr", "标准输出 / 标准错误"],
+  ["journal_projection", "journal 投影"],
+  ["not_configured", "未配置"],
+  ["not_accepted", "不接受"],
+  ["not_projected", "未投影"],
+  ["grid", "Paper 网格"],
+  ["arbitrage", "Paper 套利"],
+  // submit 回执
+  ["applied", "已写入"],
   // 系统运行信号
   ["not_available", "暂不可用"],
 ]);
@@ -116,4 +136,41 @@ export function humanizeToken(token: string | null | undefined): string {
     return "--";
   }
   return TOKEN_LABELS.get(token) ?? token;
+}
+
+/**
+ * 凭据配置状态专用文案:只表示配置完整性,不返回值。
+ * 单独成表以避免与执行批次的 "partial"(部分完成)语义冲突。
+ */
+const CREDENTIAL_LABELS = new Map<string, string>([
+  ["configured", "已配置"],
+  ["partial", "部分配置"],
+  ["not_configured", "未配置"],
+  ["not_accepted", "不接受"],
+  ["not_projected", "未投影"],
+]);
+
+export function credentialLabel(token: string | null | undefined): string {
+  if (token === null || token === undefined || token === "") {
+    return "--";
+  }
+  return CREDENTIAL_LABELS.get(token) ?? token;
+}
+
+/**
+ * Paper 预留阶段专用文案:与预警投递的 "pending"(最后记录:未决)
+ * 语义分离,预留阶段是账户敞口状态而非通知状态。
+ */
+const RESERVATION_PHASE_LABELS = new Map<string, string>([
+  ["pending", "待处理"],
+  ["uncertain", "不确定"],
+  ["committed", "已提交"],
+  ["released", "已释放"],
+]);
+
+export function reservationPhaseLabel(token: string | null | undefined): string {
+  if (token === null || token === undefined || token === "") {
+    return "--";
+  }
+  return RESERVATION_PHASE_LABELS.get(token) ?? token;
 }

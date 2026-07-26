@@ -120,12 +120,45 @@ export interface Capability {
   evidence: string[];
 }
 
+/** 适配器支持矩阵的一个证据单元(runtime::AdapterFacetSupport)。 */
+export type AdapterSupportLevel =
+  | "implemented"
+  | "protocol-only"
+  | "request-only"
+  | "config-only"
+  | "unavailable"
+  | "not-applicable";
+
+export interface AdapterFacetSupport {
+  level: AdapterSupportLevel;
+  blockers: string[];
+  evidence: string[];
+}
+
+export type AdapterFacetId =
+  | "public_data"
+  | "testnet_protocol"
+  | "authenticated"
+  | "reconcile"
+  | "live";
+
+/** 一个交易所适配器行(runtime::AdapterSupport,五个能力面)。 */
+export interface AdapterSupport {
+  id: string;
+  name: string;
+  public_data: AdapterFacetSupport;
+  testnet_protocol: AdapterFacetSupport;
+  authenticated: AdapterFacetSupport;
+  reconcile: AdapterFacetSupport;
+  live: AdapterFacetSupport;
+}
+
 export interface CapabilityManifest {
   schema_version: typeof CAPABILITY_SCHEMA_VERSION;
   product_version: string;
   release_stage: ReleaseStage;
   live_trading_enabled: boolean;
-  adapters: unknown[];
+  adapters: AdapterSupport[];
   capabilities: Capability[];
 }
 
@@ -489,4 +522,294 @@ export const controlPlaneEventsPageSchema = z.looseObject({
   journal_id: z.string(),
   events: z.array(z.looseObject({ sequence: z.number(), kind: z.string() })),
   next_cursor: z.string().nullable(),
+});
+
+/* ------------------------------------------------------ GET /api/v1/scanner */
+
+/** benchmark 是展示优先级,不是评分加成。 */
+export type ScannerPriority = "benchmark" | "standard";
+
+/** 评级是估算证据,不是安全状态;呈现时用中性/强调色而非安全色。 */
+export type ScannerRatingGrade = "s" | "a" | "b" | "c" | "d";
+
+export interface ScannerInstrumentView {
+  exchange: string;
+  symbol: string;
+  market_type: MarketType;
+}
+
+/** 十进制数值保持后端给定的规范字符串,前端不做浮点转换。 */
+export interface VirtualGridScanRowView {
+  rank: number;
+  priority: ScannerPriority;
+  instrument: ScannerInstrumentView;
+  started_at: string;
+  last_observed_at: string;
+  observation_count: number;
+  last_observation_sequence: number;
+  current_price: string;
+  lower_price: string;
+  upper_price: string;
+  pending_buy_price: string;
+  pending_sell_price: string;
+  grid_width_percent: string;
+  grid_interval_percent: string;
+  grid_count: number;
+  running_seconds: number;
+  buy_crosses: number;
+  sell_crosses: number;
+  total_crosses: number;
+  complete_cycles: number;
+  recent_five_minute_cycles: number;
+  cycles_per_hour: string;
+  estimated_apr: string;
+  volume_24h_usdc: string;
+  price_change_24h_percent: string | null;
+  rating_grade: ScannerRatingGrade;
+  rating_score: string;
+}
+
+export interface VirtualGridScanView {
+  source_sequence: number;
+  event_id: string;
+  recorded_at: string;
+  run_id: string;
+  ranking_policy: string;
+  apr_window_seconds: number;
+  min_complete_cycles: number;
+  row_limit: number;
+  candidate_count: number;
+  eligible_count: number;
+  filtered_by_cycles_count: number;
+  truncated: boolean;
+  rows: VirtualGridScanRowView[];
+}
+
+export interface VirtualGridScannerReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  journal_head_sequence: number | null;
+  projection_status: ProjectionStatus;
+  latest: VirtualGridScanView | null;
+  invalid_event_count: number;
+}
+
+export const virtualGridScannerReadModelSchema = z.looseObject({
+  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+  journal_id: z.string(),
+  projection_status: z.enum(["complete", "windowed", "degraded"]),
+  latest: z.nullable(
+    z.looseObject({
+      run_id: z.string(),
+      rows: z.array(z.looseObject({ rank: z.number() })),
+    }),
+  ),
+  invalid_event_count: z.number(),
+});
+
+/* --------------------------------------------------------- GET /api/v1/risk */
+
+/** Paper 预留阶段(runtime::PaperReservationPhase)。 */
+export type PaperReservationPhase =
+  | "pending"
+  | "uncertain"
+  | "committed"
+  | "released";
+
+export type PaperReconciliationOutcome = "released" | "failed";
+
+export interface PaperCostModel {
+  version: number;
+  fee_bps: number;
+  funding_buffer_bps: number;
+  slippage_bps: number;
+}
+
+export interface PaperReservationLeg {
+  index: number;
+  exchange: string;
+  symbol: string;
+  market_type: MarketType;
+  side: string;
+  /** Money 序列化为规范十进制字符串。 */
+  reserved_notional: string;
+}
+
+export interface PaperReconciliationRecord {
+  outcome: PaperReconciliationOutcome;
+  /** 对账证明细节(前端只展示 outcome 与证据序号,不解释 digest)。 */
+  proof: unknown;
+  evidence_sequence: number;
+}
+
+export interface PaperReservationView {
+  reservation_id: string;
+  task_id: string;
+  idempotency_key: string;
+  batch_id: string;
+  cost_model: PaperCostModel;
+  legs: PaperReservationLeg[];
+  reserved_exposure: string;
+  held_exposure: string;
+  phase: PaperReservationPhase;
+  first_sequence: number;
+  last_sequence: number;
+  reconciliation: PaperReconciliationRecord | null;
+}
+
+export interface PaperAccountSnapshot {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  projection_status: ProjectionStatus;
+  invalid_event_count: number;
+  account_id: string;
+  initial_available: string;
+  available: string;
+  pending_reserved: string;
+  uncertain_reserved: string;
+  committed_exposure: string;
+  reservations: PaperReservationView[];
+}
+
+export interface PaperAccountReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  projection_status: ProjectionStatus;
+  invalid_event_count: number;
+  accounts: PaperAccountSnapshot[];
+}
+
+export const paperAccountReadModelSchema = z.looseObject({
+  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+  journal_id: z.string(),
+  projection_status: z.enum(["complete", "windowed", "degraded"]),
+  invalid_event_count: z.number(),
+  accounts: z.array(
+    z.looseObject({ account_id: z.string(), available: z.string() }),
+  ),
+});
+
+/* ----------------------------------------------------- GET /api/v1/settings */
+
+export const SETTINGS_SCHEMA_VERSION = 1;
+
+/** 凭据只投影配置完整性,永不返回值。 */
+export type CredentialConfiguration =
+  | "configured"
+  | "partial"
+  | "not_configured"
+  | "not_accepted"
+  | "not_projected";
+
+export type PaperProfileKind = "grid" | "arbitrage";
+
+export interface PaperProfileSettings {
+  kind: PaperProfileKind;
+  task_id: string;
+  strategy_id: string;
+  strategy_revision: string;
+  configuration_files: string[];
+  replay_file: string;
+}
+
+export interface CredentialSettings {
+  web_bearer: CredentialConfiguration;
+  binance_testnet: CredentialConfiguration;
+  mainnet: CredentialConfiguration;
+}
+
+export interface RequestLimitSettings {
+  maximum_requests: number;
+  window_seconds: number;
+}
+
+export interface SettingsResponse {
+  schema_version: typeof SETTINGS_SCHEMA_VERSION;
+  data_directory: string | null;
+  journal_path: string | null;
+  log_sink: "stdout_stderr";
+  notification_evidence: "journal_projection";
+  credentials: CredentialSettings;
+  /**
+   * 写路径探测:组合根仅在 --enable-paper-writes 生效时发布该字段
+   * (web-app/src/lib.rs),浏览器据此决定是否渲染写控件。
+   */
+  paper_principal_id: string | null;
+  paper_profiles: PaperProfileSettings[];
+  request_limit: RequestLimitSettings;
+}
+
+export const settingsResponseSchema = z.looseObject({
+  schema_version: z.literal(SETTINGS_SCHEMA_VERSION),
+  credentials: z.looseObject({
+    web_bearer: z.string(),
+    binance_testnet: z.string(),
+    mainnet: z.string(),
+  }),
+  paper_principal_id: z.string().nullable(),
+  paper_profiles: z.array(z.looseObject({ task_id: z.string() })),
+  request_limit: z.looseObject({
+    maximum_requests: z.number(),
+    window_seconds: z.number(),
+  }),
+});
+
+/* ---------------------------------------------------- POST /api/v1/submit */
+
+export const SUBMIT_SCHEMA_VERSION = 1;
+
+/** 浏览器唯一允许构造的角色;Reconciler 面永不在 UI 出现。 */
+export type SubmitRole = "paper_operator";
+export type SubmitRiskConfirmation = "paper_only";
+
+export type SubmitCommandKind =
+  | "start_paper_arbitrage"
+  | "start_paper_grid"
+  | "stop_task"
+  | "cancel_task";
+
+export type SubmitCommand =
+  | {
+      kind: "start_paper_arbitrage" | "start_paper_grid";
+      strategy_id: string;
+      strategy_revision: string;
+    }
+  | { kind: "stop_task" | "cancel_task" };
+
+export interface SubmitPermission {
+  principal_id: string;
+  role: SubmitRole;
+}
+
+export interface SubmitEnvelope {
+  schema_version: typeof SUBMIT_SCHEMA_VERSION;
+  command_id: string;
+  idempotency_key: string;
+  target_task_id: string;
+  permission: SubmitPermission;
+  risk_confirmation: SubmitRiskConfirmation;
+  command: SubmitCommand;
+}
+
+export type SubmitStatus = "applied" | "rejected" | "outcome_unknown";
+
+export const SUBMIT_JOURNAL_PROJECTION = "submit_command_v1";
+export const SUBMIT_JOURNAL_SOURCE = "durable_journal";
+
+export interface SubmitReceipt {
+  schema_version: typeof SUBMIT_SCHEMA_VERSION;
+  command_id: string;
+  target_task_id: string;
+  status: SubmitStatus;
+  journal_projection: string;
+  source: string;
+}
+
+export const submitReceiptSchema = z.looseObject({
+  schema_version: z.literal(SUBMIT_SCHEMA_VERSION),
+  command_id: z.string(),
+  target_task_id: z.string(),
+  status: z.enum(["applied", "rejected", "outcome_unknown"]),
+  journal_projection: z.string(),
+  source: z.string(),
 });

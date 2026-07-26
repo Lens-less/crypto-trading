@@ -1,4 +1,4 @@
-# W3 Parity 清单:overview / executions / alerts
+# W3 Parity 清单:overview / executions / alerts(W4 已勾销)
 
 来源:`git show e5fdbc8:rust/crates/web/tests/ui_contract.rs`(757 行旧 UI 契约,锁定旧
 `rust/crates/web/assets/app.js` 的中文文案与行为)+ 对应 app.js 渲染逻辑。
@@ -9,8 +9,8 @@
 - **保留原样**:语义与关键文案照搬(或仅排版差异);
 - **改进措辞**:语义保留,文案/呈现方式在 React 版中改进;
 - **不适用**:旧实现细节在 React + Vite 架构下不复存在,附理由;
-- **W4**:属于其余六页(scanner / integrations / strategies / risk / replay / settings)
-  或提交面(submit),本轮不做。
+- **W4 已完成**:原标记 W4 的其余六页(scanner / integrations / strategies /
+  risk / replay / settings)与提交面(submit)义务,已在 W4 轮完成并注明落点。
 
 ## 1. 全局 / 三页共享语义
 
@@ -19,8 +19,8 @@
 | 1 | 不暴露 `live-enable` / `order-submit` 等交易权限入口 | 保留原样 | 前端只读展示;浏览器永不构造 live 权限(overview 权限卡也只读后端声明) |
 | 2 | 禁 `localStorage`/`sessionStorage`/`document.cookie` 存业务态(storage 白名单仅 ct-theme) | 保留原样 | bearer token 只存内存(`lib/api.ts`);游标只存 React state / query key(`lib/cursorPager.ts`) |
 | 3 | 禁 `.innerHTML` / `insertAdjacentHTML` | 不适用 | React JSX 渲染路径本身不拼 HTML,契约由框架保证 |
-| 4 | 禁 PUT/PATCH/DELETE 写方法 | 保留原样 | `lib/api.ts` 的 `request()` 只发 GET;POST 提交面属 W4 |
-| 5 | 消费 `/api/v1/system` `/alerts` `/executions` `/events` `/capabilities` `/tasks` | 保留原样 | W3 三页覆盖以上端点;`/scanner` `/risk` `/settings` 消费属 W4 |
+| 4 | 禁 PUT/PATCH/DELETE 写方法 | 保留原样 | `lib/api.ts` 的 `request()` 只发 GET;唯一的写请求是 `lib/submit.ts` `postSubmitEnvelope()` 的 POST /api/v1/submit(W4) |
+| 5 | 消费 `/api/v1/system` `/alerts` `/executions` `/events` `/capabilities` `/tasks` | 保留原样 | W3 三页覆盖以上端点;`/scanner` `/risk` `/settings` 已随 W4 六页接入 |
 | 6 | 「不透明恢复游标只保存在页面内存」 | 保留原样 | 文案与语义都保留(executions「最近事件通知」卡副标题) |
 | 7 | 呈现 `market_data_freshness` / `kill_switch` / `adapter_health`(not_available 一等呈现) | 保留原样 | system 卡「kill switch / 行情新鲜度 / 适配器健康:暂不可用(受监督前不声明健康)」 |
 | 8 | `TOKEN_LABELS` 稳定 token → 中文映射 | 改进措辞 | 收敛为 `lib/labels.ts` 的 `humanizeToken`;关键条目(最后记录:运行中 / 最后记录:未决 等)原文保留 |
@@ -51,7 +51,7 @@
 | 28 | tasks:「没有启动、停止、重连或自动恢复入口」 | 保留原样 | 卡片脚注;页面无任何任务操作入口 |
 | 29 | tasks:投影降级 → 「任务投影已降级」最后有效事实横幅 | 保留原样 | `taskBanners`,有测试 |
 | 30 | tasks:investigate → 「任务存活性未验证」「历史事实 / 不自动重放」横幅 | 保留原样 | `taskBanners`,有测试 |
-| 31 | tasks:任务明细表(双源健康、事件计数、恢复判断列) | W4 | W3 总览只承载计数摘要(运行中/已停止/失败/总数/无效事件);明细表随策略/任务页深化 |
+| 31 | tasks:任务明细表(双源健康、事件计数、恢复判断列) | W4 已完成 | `/strategies`「只读连续任务明细」表(`lib/columns/taskColumns.tsx`:任务/最后事实、阶段+exit/failure、双源健康、恢复判断、序号范围、登记时间),有测试(strategies.test.tsx) |
 | 32 | 能力脉冲:capabilities 计数(可用/只读/单次模拟/仅校验/不可用)+ 发布阶段 / 实盘交易 / 能力项 | 保留原样 | 「权限总览」卡:PAPER 可用 / LIVE CLOSED + 六级计数 + 能力项总数 |
 | 33 | 能力脉冲副标题「蓝色表示交互,而非权限」 | 改进措辞 | 改为「浏览器永不构造 live 权限」,直接陈述红线 |
 | 34 | 最近执行摘要:最近批次 + 「绝不构造交易权限」 | 保留原样 | 侧栏「最近执行」卡(按 last_sequence 取最近 5 条,状态 pill 文字+安全色) |
@@ -85,7 +85,7 @@
 | 57 | 执行筛选:全部/需要关注/已完成/部分完成/失败/冲突/结果未知;筛选与所选批次保留在 URL | 保留原样 | `useSearchParams`(`state` / `batch`);游标仍只存内存 |
 | 58 | 空态:「没有执行批次符合当前筛选」/「这个有界快照中没有执行批次」 | 保留原样 | 按是否筛选区分两种空态 |
 | 59 | 全宽表横向滚动容器(role=region + tabindex + aria-label),页面不横向滚动 | 保留原样 | `DataTable` 容器 `overflow-x-auto` + min-width,`aria-label="执行账本,可横向滚动"` |
-| 60 | `outcome_unknown` 锁提交等 submit 联动(pendingSubmission / 提交回执校验) | W4 | 属提交面(strategies);执行页本轮纯只读 |
+| 60 | `outcome_unknown` 锁提交等 submit 联动(pendingSubmission / 提交回执校验) | W4 已完成 | `lib/submit.ts` 纯函数状态机:`submitFormReducer` / `syncSubmitLock`(outcome_unknown 锁死直至 complete 任务投影确认指纹推进+预期阶段)/ `validateSubmitReceipt`;每条语义有专项测试(submit.test.ts) |
 
 ## 4. /alerts
 
@@ -113,21 +113,21 @@
 | 80 | 空态:「当前冻结快照中还没有价格预警 occurrence」+ 已检查来源说明 | 保留原样 | EmptyState 原文 |
 | 81 | 概览侧摘要(最新序号/标的/类型/价格/确认/通知计数) | 改进措辞 | 总览侧栏「告警流」以最近 N 条流式呈现(severity 着色);计数摘要由投影状态卡承载 |
 
-## 5. 其余六页(本轮不做,标 W4)
+## 5. 其余六页(W4 已完成,逐条落点)
 
-| # | 旧契约面 | 状态 |
-|---|---|---|
-| 82 | scanner 面(确定性虚拟网格排行、benchmark 优先、排行截断、scanner 降级横幅、980px 表) | W4 |
-| 83 | strategies 面(策略运行面 / 只读策略证据 / 配置区 / Paper profile 表) | W4 |
-| 84 | trusted submit 面(/api/v1/submit、pendingSubmission、outcome_unknown 锁、回执校验、幂等键) | W4 |
-| 85 | risk 面(风险总览 / pending_reserved / committed_exposure / 恢复账本) | W4 |
-| 86 | replay 面(回放快照 / 历史投影时间 / 回放面表) | W4 |
-| 87 | settings 面(访问与外壳 / 只读边界 / data_directory / request_limit / 凭据投影) | W4 |
-| 88 | integrations 面(适配器矩阵 / 能力证据筛选) | W4 |
+| # | 旧契约面 | 状态 | 落点 |
+|---|---|---|---|
+| 82 | scanner 面(确定性虚拟网格排行、benchmark 优先、排行截断、scanner 降级横幅、980px 表) | W4 已完成 | `pages/scanner.tsx` + `lib/columns/scannerColumns.tsx`(排行政策原文、截断/降级横幅 `lib/banners.ts scannerBanners`、62rem 横向滚动表、APR/评分等宽数字、评级徽章只用中性/强调色);测试 scanner.test.tsx + banners.w4.test.ts |
+| 83 | strategies 面(策略运行面 / 只读策略证据 / 配置区 / Paper profile 表) | W4 已完成 | `pages/strategies.tsx`(任务明细 + Paper 任务控制双表单;Paper profile 预填自 settings.paper_profiles;profile 表本体在 `/settings`「Paper profiles」卡与 `/replay`「回放文件来源」卡) |
+| 84 | trusted submit 面(/api/v1/submit、pendingSubmission、outcome_unknown 锁、回执校验、幂等键) | W4 已完成 | `lib/submit.ts`(状态机纯函数化)+ `pages/strategies.tsx`(表单/二次确认/回执与生效三态);写能力探测 = settings.paper_principal_id(与 web-app 组合根契约一致),404 兜底文案;secure_random_unavailable / 幂等键跨认证保留 / 422 幂等重放 / projection≠complete 禁提交 / token 仅内存,全部有测试(submit.test.ts、strategies.test.tsx) |
+| 85 | risk 面(风险总览 / pending_reserved / committed_exposure / 恢复账本) | W4 已完成 | `pages/risk.tsx`(PaperAccountReadModel 全字段:initial_available/available/pending_reserved/uncertain_reserved/committed_exposure、reservations 明细含对账状态、BigInt 十进制聚合 `lib/decimal.ts`、kill switch 展示位不造假);恢复账本语义由 `/executions` 筛选「需要关注」承载;测试 risk.test.tsx |
+| 86 | replay 面(回放快照 / 历史投影时间 / 回放面表) | W4 已完成 | `pages/replay.tsx`(monitor 完整历史投影:pair 双侧/价差/recorded_at/market generation + 常驻「不是实时行情」横幅 + 历史投影水位卡 + settings paper_profiles 的 replay 文件);测试 replay.test.tsx |
+| 87 | settings 面(访问与外壳 / 只读边界 / data_directory / request_limit / 凭据投影) | W4 已完成 | `pages/settings.tsx`(访问与外壳、运行设置投影、请求限流说明、凭据配置状态永不显示值、bearer 输入仅内存 + changeBearerToken 重建流、主题切换整合);测试 settings.test.tsx |
+| 88 | integrations 面(适配器矩阵 / 能力证据筛选) | W4 已完成 | `pages/integrations.tsx`(五能力面适配器矩阵、能力账本 `<details>` 折叠展开 evidence 文件名/阻塞项、凭据配置状态卡;不可用保持中性);测试 integrations.test.tsx |
 
 ## 统计
 
 - 保留原样:**69** 条(#1–2, 4–7, 9–15, 20–30, 32, 34–35, 37–55, 57–59, 61–80)
 - 改进措辞:**7** 条(#8, 18–19, 33, 36, 56, 81)
 - 不适用:**3** 条(#3, 16–17)
-- W4:**9** 条(#31, 60, 82–88)
+- W4 已完成:**9** 条(#31, 60, 82–88;本表与上文逐条注明落点)
