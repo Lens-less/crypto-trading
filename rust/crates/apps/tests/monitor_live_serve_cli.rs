@@ -32,6 +32,9 @@ fn repo_root() -> PathBuf {
         .unwrap()
 }
 
+// One end-to-end serve/status/stop pass over two live stubs does not divide
+// without losing the shared process lifecycle it asserts.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn monitor_live_serve_polls_both_loopback_venues_and_stops_cleanly() {
     let task_id = format!("monitor-live-serve-smoke-{}", std::process::id());

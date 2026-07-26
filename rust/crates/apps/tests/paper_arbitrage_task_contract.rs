@@ -642,9 +642,13 @@ async fn cancel_retains_unknown_two_leg_capacity_as_uncertain_and_never_releases
         .unwrap();
     wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
 
+    // Whether the owner notices the cancel signal before the 2x-grace
+    // deadline decides which error variant surfaces; both paths retain the
+    // capacity as uncertain and record the same durable failure, so either
+    // variant satisfies the contract.
     assert!(matches!(
         task.cancel().await.unwrap_err(),
-        ArbitragePaperTaskError::RecoveryRequired
+        ArbitragePaperTaskError::RecoveryRequired | ArbitragePaperTaskError::ShutdownTimedOut
     ));
     assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
     assert_eq!(
