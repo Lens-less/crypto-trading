@@ -36,6 +36,10 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates reference each other by path without a version, which the
+# wildcard ban would otherwise flag. Every crate here is publish = false, so
+# path-only dependencies never leak into a published manifest.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

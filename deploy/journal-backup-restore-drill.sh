@@ -83,7 +83,9 @@ log="$restore_dir/verifier.log"
 verifier_pid=$!
 
 cleanup() {
+    # shellcheck disable=SC2317  # invoked indirectly via the trap below
     kill "$verifier_pid" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2317
     wait "$verifier_pid" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT HUP INT TERM

@@ -325,8 +325,11 @@ async fn full_or_stuck_notification_adapter_never_blocks_the_monitor_loop() {
     entered.notified().await;
     for revision in 2..=3 {
         clock.set(timestamp(i64::try_from(revision).unwrap()));
+        // The bound only has to distinguish "does not wait on delivery" from
+        // blocking until the 30s dispatch deadline; a generous margin keeps
+        // slow CI filesystems from failing the append inside process().
         let report = tokio::time::timeout(
-            StdDuration::from_millis(50),
+            StdDuration::from_secs(5),
             runtime.process(observation(
                 revision,
                 timestamp(i64::try_from(revision).unwrap()),

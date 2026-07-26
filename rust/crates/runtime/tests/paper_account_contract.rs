@@ -572,20 +572,47 @@ async fn two_spellings_of_one_journal_share_a_single_capacity_authority() {
     // The authority serializes the read-modify-write of available capacity.
     // If it keyed on the raw path while the journal writer keyed on the
     // normalized one, two spellings of the same file would each get their own
-    // authority and could admit the same capacity twice.
+    // authority and could admit the same capacity twice. The alias here is a
+    // lexical one (a redundant `.` component) because it names the same file
+    // on every filesystem; case-different spellings only alias on Windows and
+    // are covered by the platform-specific test below.
     let directory =
         std::env::temp_dir().join(format!("crypto-trading-lock-key-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
+    let direct = directory.join("paper-account.jsonl");
+    let lexical_alias = directory.join(".").join("paper-account.jsonl");
+    assert_two_spellings_share_capacity(&directory, &direct, &lexical_alias).await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn case_spellings_of_one_journal_share_a_single_capacity_authority() {
+    // Case-different spellings name the same file only on case-insensitive
+    // filesystems; on Linux they are genuinely distinct journals, so this
+    // aliasing contract is Windows-specific.
+    let directory =
+        std::env::temp_dir().join(format!("crypto-trading-lock-case-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
     let lowercase = directory.join("paper-account.jsonl");
     let mixed_case = directory.join("Paper-Account.jsonl");
+    assert_two_spellings_share_capacity(&directory, &lowercase, &mixed_case).await;
+}
 
+async fn assert_two_spellings_share_capacity(
+    directory: &std::path::Path,
+    first_spelling: &std::path::Path,
+    second_spelling: &std::path::Path,
+) {
     let journal_id = Uuid::new_v4();
     let config = PaperAccountConfig::new("paper-main", money("300")).unwrap();
-    let first =
-        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&lowercase), config.clone())
-            .unwrap();
+    let first = PaperAccountAuthority::new(
+        journal_id,
+        JsonlHistory::new(first_spelling),
+        config.clone(),
+    )
+    .unwrap();
     let second =
-        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&mixed_case), config).unwrap();
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(second_spelling), config).unwrap();
 
     // Each reservation costs 200.60, so exactly one of the two fits in 300.
     // Issuing them concurrently is what distinguishes a shared authority from
@@ -616,5 +643,5 @@ async fn two_spellings_of_one_journal_share_a_single_capacity_authority() {
          left={left:?} right={right:?}"
     );
 
-    std::fs::remove_dir_all(&directory).ok();
+    std::fs::remove_dir_all(directory).ok();
 }
