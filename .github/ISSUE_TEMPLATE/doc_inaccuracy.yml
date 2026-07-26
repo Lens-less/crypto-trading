@@ -1,0 +1,33 @@
+name: Documentation inaccuracy
+description: A document claims something the code does not do, or omits something it does.
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Documentation that overstates what this software may do is treated as a
+        defect of the same severity as a code bug, because operators rely on it
+        to decide what is safe to run.
+
+  - type: input
+    id: location
+    attributes:
+      label: Document and line
+      placeholder: "README.md:37"
+    validations:
+      required: true
+
+  - type: textarea
+    id: claim
+    attributes:
+      label: The claim as written
+    validations:
+      required: true
+
+  - type: textarea
+    id: contradiction
+    attributes:
+      label: What the code actually does
+      description: Cite the source file and line that contradicts the claim.
+    validations:
+      required: true

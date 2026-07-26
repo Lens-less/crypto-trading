@@ -1,0 +1,22 @@
+# Default owner for everything in the repository.
+* @Lens-less
+
+# Authority seams. A change to any of these can widen what the software is
+# permitted to do, so they are called out separately from ordinary code.
+/rust/crates/runtime/src/capability.rs   @Lens-less
+/rust/crates/runtime/src/mode.rs         @Lens-less
+/rust/crates/runtime/src/paper_account.rs @Lens-less
+/rust/crates/exchange/src/binance_testnet.rs          @Lens-less
+/rust/crates/exchange/src/binance_testnet_exchange.rs @Lens-less
+/rust/crates/exchange/src/endpoint.rs    @Lens-less
+/docs/adapter-support.md                 @Lens-less
+
+# Release, deployment, and supply-chain surfaces.
+/.github/workflows/  @Lens-less
+/rust/deny.toml      @Lens-less
+/Dockerfile          @Lens-less
+/deploy/             @Lens-less
+/SECURITY.md         @Lens-less
+
+# The frozen evidence tree must not change.
+/archive/            @Lens-less

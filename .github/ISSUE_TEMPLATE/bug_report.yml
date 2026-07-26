@@ -1,0 +1,59 @@
+name: Bug report
+description: Something behaves differently from what the documentation or tests promise.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Use the private channel in
+        [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Credential check
+      options:
+        - label: I have removed every API key, secret, bearer token, and account identifier from this report, including from command lines, logs, and journal excerpts.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: The full command line, with secrets redacted.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: capabilities
+    attributes:
+      label: Capability manifest
+      description: Output of `cargo run --locked -- capabilities --json`. This states what your build believes it is permitted to do.
+      render: json
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system and `rustc -V`.
+      placeholder: "Windows 11 / rustc 1.89.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: journal
+    attributes:
+      label: Relevant journal records
+      description: The journal lines around the failure, with identifiers redacted. Leave blank if not applicable.
+      render: json

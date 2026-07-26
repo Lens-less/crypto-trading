@@ -1,0 +1,43 @@
+# Supply-chain policy for the workspace.
+#
+# RustSec advisories are checked separately by the `audit` job; this file
+# covers the parts an advisory feed does not: license compatibility, duplicate
+# dependency versions, and where crates are allowed to come from.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses only. The workspace itself ships under MIT, and a
+# copyleft dependency would change the terms under which this can be
+# redistributed, so it must be an explicit decision rather than a silent
+# transitive addition.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+# Verified against the current lock file: every one of the 226 resolved
+# packages satisfies this list. Adding a license here is a redistribution
+# decision and belongs in a reviewed commit, not in a dependency bump.
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

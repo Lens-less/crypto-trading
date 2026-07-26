@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a capability or an improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+
+  - type: dropdown
+    id: authority
+    attributes:
+      label: Does this expand trading authority?
+      description: >
+        Anything that lets the software submit, modify, or cancel orders on a
+        venue it cannot reach today — or that touches mainnet — expands
+        authority and is held to the release gates in the production-candidate
+        runbook.
+      options:
+        - "No — read-only, offline, or paper-only"
+        - "Yes — it reaches a new venue or a new product"
+        - "Yes — it involves mainnet"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How would this be verified?
+      description: What contract test or recorded environment evidence would prove it works?

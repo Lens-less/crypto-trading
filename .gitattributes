@@ -5,3 +5,8 @@
 # The archive is also excluded from language statistics.
 archive/python-legacy/** linguist-vendored linguist-detectable=false -whitespace
 rust/config/** -whitespace
+
+# Journal fixtures are embedded byte-for-byte with include_bytes! and their
+# records are checksummed, so a CRLF checkout on Windows would change the
+# bytes the tests assert on.
+rust/fixtures/** text eol=lf

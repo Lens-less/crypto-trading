@@ -1,6 +1,10 @@
 # Rust build artifacts
+/target/
 /rust/target/
 **/*.rs.bk
+
+# Scratch directories a test run can leave behind in the working tree
+/rust/temp-*/
 
 # Python compatibility runtime artifacts
 __pycache__/
