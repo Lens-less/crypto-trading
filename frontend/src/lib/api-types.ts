@@ -134,3 +134,38 @@ export const capabilityManifestSchema = z.looseObject({
   release_stage: z.literal("paper-only"),
   live_trading_enabled: z.boolean(),
 });
+
+/* ------------------------------------------------------ GET /api/v1/events */
+
+/**
+ * SSE `operation_page` 事件体(ControlPlaneEventsPage,schema_version = 1,
+ * CONTROL_PLANE_EVENTS_SCHEMA_VERSION)。payload-free 变更通知:事件只说明
+ * 「哪个聚合变了」,不携带业务数据;数据一律由 REST 端点重新拉取。
+ */
+export const CONTROL_PLANE_EVENTS_SCHEMA_VERSION = 1;
+
+export interface ControlPlaneEventNotice {
+  sequence: number;
+  event_id: string;
+  recorded_at: string;
+  kind: string;
+  aggregate_kind: string;
+  aggregate_id: string;
+  producer: string;
+}
+
+export interface ControlPlaneEventsPage {
+  schema_version: typeof CONTROL_PLANE_EVENTS_SCHEMA_VERSION;
+  journal_id: string;
+  events: ControlPlaneEventNotice[];
+  /** 不透明恢复游标;只存内存,重连时经 Last-Event-ID/`?cursor=` 回传。 */
+  next_cursor: string | null;
+  boundary: { kind: "snapshot_end" | "page_limit" | "partial_tail" };
+}
+
+export const controlPlaneEventsPageSchema = z.looseObject({
+  schema_version: z.literal(CONTROL_PLANE_EVENTS_SCHEMA_VERSION),
+  journal_id: z.string(),
+  events: z.array(z.looseObject({ sequence: z.number(), kind: z.string() })),
+  next_cursor: z.string().nullable(),
+});

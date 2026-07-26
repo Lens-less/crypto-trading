@@ -8,6 +8,7 @@ import {
 } from "../lib/api-types";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/cn";
+import { NotificationChannelBadge } from "../components/NotificationChannelBadge";
 import {
   applyTheme,
   resolveTheme,
@@ -136,6 +137,7 @@ export function AppShell() {
             </NavLink>
           ))}
         </nav>
+        <NotificationChannelBadge />
         <div className="border-t border-border p-3">
           <ThemeToggle />
         </div>
