@@ -16,7 +16,7 @@ pub const MAX_READ_ONLY_TASKS: usize = 64;
 const TASK_STRATEGY: &str = "read_only_task";
 const TASK_SYMBOL: &str = "control-plane";
 const MAX_TASK_TEXT_BYTES: usize = 128;
-const GRID_SOURCE_COUNT: usize = 1;
+const SINGLE_SOURCE_COUNT: usize = 1;
 const ARBITRAGE_SOURCE_COUNT: usize = 2;
 
 /// Durable task lifecycle projection reconstructed only from journal facts.
@@ -51,6 +51,7 @@ pub enum ReadOnlyTaskKind {
     ArbitrageMonitor,
     ArbitragePaper,
     GridPaper,
+    PriceAlert,
 }
 
 /// Last durably recorded aggregate phase.
@@ -420,6 +421,7 @@ fn parse_task_fact(
         "arbitrage_monitor" => ReadOnlyTaskKind::ArbitrageMonitor,
         "arbitrage_paper" => ReadOnlyTaskKind::ArbitragePaper,
         "grid_paper" => ReadOnlyTaskKind::GridPaper,
+        "price_alert" => ReadOnlyTaskKind::PriceAlert,
         _ => return Err(()),
     };
     let phase_text = required_text(details, "phase")?;
@@ -430,7 +432,7 @@ fn parse_task_fact(
     let processed_event_count = required_u64(details, "processed_event_count")?;
     let sources = parse_sources(required(details, "sources")?)?;
     let expected_source_count = match kind {
-        ReadOnlyTaskKind::GridPaper => GRID_SOURCE_COUNT,
+        ReadOnlyTaskKind::GridPaper | ReadOnlyTaskKind::PriceAlert => SINGLE_SOURCE_COUNT,
         ReadOnlyTaskKind::ArbitrageMonitor | ReadOnlyTaskKind::ArbitragePaper => {
             ARBITRAGE_SOURCE_COUNT
         }

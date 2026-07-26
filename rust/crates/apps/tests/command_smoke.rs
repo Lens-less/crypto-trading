@@ -141,10 +141,12 @@ fn config_check_returns_nonzero_for_a_missing_file() {
 
 #[test]
 fn unfinished_commands_fail_closed_instead_of_reporting_success() {
+    // `price-alert` is no longer in this list: its default validate mode now
+    // succeeds, and alert_serve_cli_contract.rs covers its serve/status/stop
+    // task host plus the fail-closed no-replay path.
     let cases = [
         vec!["monitor"],
         vec!["volume-maker"],
-        vec!["price-alert"],
         vec!["scanner"],
         vec!["arbitrage"],
     ];

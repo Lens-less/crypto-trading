@@ -218,12 +218,71 @@ fn grid_paper_projects_a_single_source_task_without_fabricating_a_pair() {
 }
 
 #[test]
+fn price_alert_projects_a_single_source_task_without_fabricating_a_pair() {
+    let snapshot = snapshot(jsonl(&[
+        task_record_with_kind(
+            "price_alert",
+            "task_registered",
+            "registered",
+            0,
+            grid_registered_sources(),
+            None,
+            None,
+            "2026-07-25T00:00:00Z",
+        ),
+        task_record_with_kind(
+            "price_alert",
+            "task_running",
+            "running",
+            0,
+            grid_running_sources(0, "unknown"),
+            None,
+            None,
+            "2026-07-25T00:00:01Z",
+        ),
+        task_record_with_kind(
+            "price_alert",
+            "task_checkpointed",
+            "running",
+            2,
+            grid_running_sources(2, "healthy"),
+            None,
+            None,
+            "2026-07-25T00:00:02Z",
+        ),
+        task_record_with_kind(
+            "price_alert",
+            "task_stopped",
+            "stopped",
+            2,
+            grid_stopped_sources(2),
+            Some("stop_requested"),
+            None,
+            "2026-07-25T00:00:03Z",
+        ),
+    ]));
+
+    let model = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Complete);
+    assert_eq!(model.tasks.len(), 1);
+    assert_eq!(model.tasks[0].kind, ReadOnlyTaskKind::PriceAlert);
+    assert_eq!(model.tasks[0].phase, ReadOnlyTaskPhase::Stopped);
+    assert_eq!(model.tasks[0].recovery, ReadOnlyTaskRecovery::None);
+    assert_eq!(model.tasks[0].processed_event_count, 2);
+    assert_eq!(model.tasks[0].sources.len(), 1);
+    assert_eq!(model.tasks[0].exit, Some(ReadOnlyTaskExit::StopRequested));
+}
+
+#[test]
 fn task_kind_rejects_the_wrong_source_cardinality() {
     let cases = [
         ("arbitrage_monitor", grid_registered_sources()),
         ("arbitrage_paper", grid_registered_sources()),
         ("grid_paper", registered_sources()),
         ("grid_paper", json!([])),
+        ("price_alert", registered_sources()),
+        ("price_alert", json!([])),
     ];
 
     for (kind, sources) in cases {

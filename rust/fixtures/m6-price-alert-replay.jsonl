@@ -1,0 +1,6 @@
+{"exchange":"binance","symbol":"BTC/USDT","market_type":"spot","bid":"100000","ask":"100001","last":"100000","timestamp":"2026-07-25T00:00:00Z"}
+{"exchange":"binance","symbol":"BTC/USDT","market_type":"spot","bid":"100100","ask":"100101","last":"100100","timestamp":"2026-07-25T00:00:01Z"}
+{"exchange":"binance","symbol":"BTC/USDT","market_type":"spot","bid":"100200","ask":"100201","last":"100200","timestamp":"2026-07-25T00:00:02Z"}
+{"exchange":"binance","symbol":"ETH/USDT","market_type":"spot","bid":"3000","ask":"3001","last":"3000","timestamp":"2026-07-25T00:00:03Z"}
+{"exchange":"binance","symbol":"BTC/USDT","market_type":"spot","bid":"100300","ask":"100301","last":"100300","timestamp":"2026-07-25T00:00:04Z"}
+{"exchange":"binance","symbol":"BTC/USDT","market_type":"spot","bid":"100400","ask":"100401","last":"100400","timestamp":"2026-07-25T00:00:05Z"}

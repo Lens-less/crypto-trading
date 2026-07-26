@@ -21,7 +21,7 @@
 | `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model |
 | `monitor` | 是 | 否 | 是（只读 replay） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
-| `price-alert` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
+| `price-alert` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert owner，状态可降级到 journal 投影 |
 | `scanner` | 路径存在性 | 否 | 否 | 否 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态报告运行时尚未实现 |
 
 `grid` 和 `arbitrage` 的 one-shot 以及连续 Paper owner 都会先持久化计划/预留事实，再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。不确定结果不得直接重试，必须先按 journal 投影和权威对账处理。

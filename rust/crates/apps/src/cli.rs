@@ -445,10 +445,39 @@ pub struct VolumeMakerArgs {
 
 #[derive(Debug, Args)]
 pub struct PriceAlertArgs {
+    #[arg(long, default_value_t = PriceAlertMode::Validate, value_enum)]
+    pub mode: PriceAlertMode,
     #[arg(default_value = "config/price_alert/binance_alert.yaml")]
     pub config: PathBuf,
+    /// Finite JSONL replay of validated top-of-book snapshots.
+    #[arg(long, value_name = "PATH")]
+    pub replay: Option<PathBuf>,
+    /// Service task identity for long-running price-alert operations.
+    #[arg(long)]
+    pub task_id: Option<String>,
+    /// Append read-only price-alert outcomes to this JSONL journal.
+    #[arg(long, default_value = "var/history/price-alert.jsonl")]
+    pub history_path: PathBuf,
     #[arg(long)]
     pub debug: bool,
+    /// Local loopback control port override used by price-alert serve/status/stop.
+    #[arg(long, hide = true)]
+    pub control_port: Option<u16>,
+    /// Serve-loop status polling interval used for bounded local tests.
+    #[arg(long, hide = true, default_value_t = 100)]
+    pub control_poll_interval_ms: u64,
+    /// Supervisor shutdown grace override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub shutdown_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, ValueEnum)]
+pub enum PriceAlertMode {
+    #[default]
+    Validate,
+    Serve,
+    Status,
+    Stop,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]

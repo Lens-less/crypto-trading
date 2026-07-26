@@ -121,6 +121,17 @@ fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
     );
     assert!(
         price_alert
+            .evidence
+            .contains(&"rust/crates/apps/tests/alert_serve_cli_contract.rs".to_owned())
+    );
+    assert!(
+        price_alert
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("replay-backed only"))
+    );
+    assert!(
+        !price_alert
             .blockers
             .iter()
             .any(|blocker| blocker.contains("not yet registered in the durable task lifecycle"))

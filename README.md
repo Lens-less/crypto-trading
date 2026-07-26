@@ -46,7 +46,7 @@
 | `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model |
 | `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
-| `price-alert` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验后失败关闭 |
+| `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
 | `scanner` | 检查显式配置路径 | 不可用 | 不可用 | 不可用 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态退出 |
 
 ### Binance Testnet 命令
@@ -502,7 +502,7 @@ CI 还会：
 
 ### 为什么配置校验成功，但命令仍然报 `runtime is unavailable`？
 
-配置解析与运行能力是两道独立门禁。`volume-maker`、`price-alert`、`scanner` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor` 是例外：它的 `serve/status/stop` 模式可以运行，但只接受精确双源 replay，不接受真实外部源。
+配置解析与运行能力是两道独立门禁。`volume-maker`、`scanner` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor` 和 `price-alert` 是例外：它们的 `serve/status/stop` 模式可以运行，但只接受精确 replay 数据源（monitor 为双源，price-alert 为单源），不接受真实外部源；`price-alert` 的默认 `--mode validate` 校验成功后正常返回。
 
 ### 为什么 `--live` 仍然无法下单？
 

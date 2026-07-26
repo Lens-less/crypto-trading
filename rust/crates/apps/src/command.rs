@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use crypto_trading_config::{
-    ArbitrageConfig, GridConfig, MonitorConfig, load_arbitrage_config_from_str,
+    ArbitrageConfig, GridConfig, MonitorConfig, PriceAlertConfig, load_arbitrage_config_from_str,
     load_exchange_auth_from_str, load_grid_config_from_str, load_monitor_config_from_str,
     load_price_alert_config_from_str, load_symbol_conversions_from_str,
     load_volume_maker_config_from_str, read_bounded_config,
@@ -55,12 +55,21 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+use crate::alert::{
+    AlertDeliveryMode, MAX_RECENT_ALERT_OCCURRENCES, NotificationDispatcherConfig,
+    PriceAlertRuntime, PriceAlertRuntimeConfig,
+};
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
     MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs,
-    PaperTaskArgs, PriceAlertArgs, ScannerArgs, TestnetLifecycleArgs, TestnetLifecycleExpected,
-    TestnetLifecycleMarket, TestnetLifecycleSide, TestnetLifecycleTimeInForce,
-    TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs, TestnetSoakMode, VolumeMakerArgs,
+    PaperTaskArgs, PriceAlertArgs, PriceAlertMode, ScannerArgs, TestnetLifecycleArgs,
+    TestnetLifecycleExpected, TestnetLifecycleMarket, TestnetLifecycleSide,
+    TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs,
+    TestnetSoakMode, VolumeMakerArgs,
+};
+use crate::continuous_alert::{
+    ContinuousAlertTask, ContinuousAlertTaskConfig, ContinuousAlertTaskExit,
+    ContinuousAlertTaskStatus,
 };
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
@@ -107,7 +116,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Arbitrage(args) => run_arbitrage(&args).await,
         Command::Monitor(args) => run_monitor(&args).await,
         Command::VolumeMaker(args) => run_volume_maker(&args),
-        Command::PriceAlert(args) => run_price_alert(&args),
+        Command::PriceAlert(args) => run_price_alert(&args).await,
         Command::Scanner(args) => run_scanner(&args),
         Command::Paper(args) => run_paper(args).await,
     }
@@ -629,6 +638,7 @@ const fn task_kind_name(kind: ReadOnlyTaskKind) -> &'static str {
         ReadOnlyTaskKind::ArbitrageMonitor => "arbitrage_monitor",
         ReadOnlyTaskKind::ArbitragePaper => "arbitrage_paper",
         ReadOnlyTaskKind::GridPaper => "grid_paper",
+        ReadOnlyTaskKind::PriceAlert => "price_alert",
     }
 }
 
@@ -2114,7 +2124,7 @@ async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
         &symbol,
     )?;
     let mut task = ContinuousMonitorTask::start(
-        ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args)?)?,
+        ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?,
         read_monitor,
         left_source,
         right_source,
@@ -2170,7 +2180,11 @@ async fn run_monitor_status(args: &MonitorArgs) -> Result<()> {
     }
     print!(
         "{}",
-        render_projected_monitor_status(&project_monitor_status(&args.history_path, task_id)?)
+        render_projected_task_status(&project_task_status(
+            &args.history_path,
+            task_id,
+            MONITOR_TASK_PROJECTION,
+        )?)
     );
     Ok(())
 }
@@ -2185,9 +2199,9 @@ async fn run_monitor_stop(args: &MonitorArgs) -> Result<()> {
         print!("{response}");
         return Ok(());
     }
-    let projected = project_monitor_status(&args.history_path, task_id)?;
+    let projected = project_task_status(&args.history_path, task_id, MONITOR_TASK_PROJECTION)?;
     if projected.phase == "stopped" || projected.phase == "failed" {
-        print!("{}", render_projected_monitor_status(&projected));
+        print!("{}", render_projected_task_status(&projected));
         return Ok(());
     }
     bail!(
@@ -2237,11 +2251,11 @@ fn serve_market_type(symbol: &Symbol) -> MarketType {
     }
 }
 
-fn supervisor_config(args: &MonitorArgs) -> Result<MarketSupervisorConfig> {
-    match args.shutdown_grace_ms {
+fn supervisor_config(shutdown_grace_ms: Option<u64>) -> Result<MarketSupervisorConfig> {
+    match shutdown_grace_ms {
         Some(milliseconds) => MarketSupervisorConfig::new(StdDuration::from_millis(milliseconds))
             .map_err(anyhow::Error::msg)
-            .context("invalid monitor shutdown grace override"),
+            .context("invalid task shutdown grace override"),
         None => Ok(MarketSupervisorConfig::default()),
     }
 }
@@ -2306,7 +2320,7 @@ fn filter_serve_replay_events(
 }
 
 #[derive(Debug)]
-struct ProjectedMonitorStatus {
+struct ProjectedTaskStatus {
     task_id: String,
     phase: String,
     recovery: String,
@@ -2317,10 +2331,33 @@ struct ProjectedMonitorStatus {
     runtime_failure: String,
 }
 
-fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<ProjectedMonitorStatus> {
+/// Durable `task_kind` filter and operator-facing label for one journal-backed
+/// task projection.
+#[derive(Clone, Copy, Debug)]
+struct TaskProjectionScope {
+    task_kind: &'static str,
+    label: &'static str,
+}
+
+const MONITOR_TASK_PROJECTION: TaskProjectionScope = TaskProjectionScope {
+    task_kind: "arbitrage_monitor",
+    label: "monitor",
+};
+
+const PRICE_ALERT_TASK_PROJECTION: TaskProjectionScope = TaskProjectionScope {
+    task_kind: "price_alert",
+    label: "price-alert",
+};
+
+fn project_task_status(
+    history_path: &Path,
+    task_id: &str,
+    scope: TaskProjectionScope,
+) -> Result<ProjectedTaskStatus> {
     if !history_path.exists() {
         bail!(
-            "monitor status failed: history file {} does not exist",
+            "{} status failed: history file {} does not exist",
+            scope.label,
             history_path.display()
         );
     }
@@ -2333,7 +2370,8 @@ fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<Projecte
     {
         let record: Value = serde_json::from_str(line).with_context(|| {
             format!(
-                "failed to parse monitor task record {} from {}",
+                "failed to parse {} task record {} from {}",
+                scope.label,
                 index + 1,
                 history_path.display()
             )
@@ -2341,7 +2379,7 @@ fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<Projecte
         if record["strategy"].as_str() != Some("read_only_task") {
             continue;
         }
-        if record["details"]["task_kind"].as_str() != Some("arbitrage_monitor") {
+        if record["details"]["task_kind"].as_str() != Some(scope.task_kind) {
             continue;
         }
         if record["details"]["task_id"].as_str() != Some(task_id) {
@@ -2349,7 +2387,7 @@ fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<Projecte
         }
         let phase = record["details"]["phase"]
             .as_str()
-            .context("monitor task status record is missing phase")?
+            .with_context(|| format!("{} task status record is missing phase", scope.label))?
             .to_owned();
         let failure = record["details"]["failure"]
             .as_str()
@@ -2365,7 +2403,7 @@ fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<Projecte
             "investigate"
         }
         .to_owned();
-        projected = Some(ProjectedMonitorStatus {
+        projected = Some(ProjectedTaskStatus {
             task_id: task_id.to_owned(),
             phase,
             recovery,
@@ -2379,11 +2417,11 @@ fn project_monitor_status(history_path: &Path, task_id: &str) -> Result<Projecte
         });
     }
 
-    projected.context(format!("monitor task not found: {task_id}"))
+    projected.context(format!("{} task not found: {task_id}", scope.label))
 }
 
 fn render_live_monitor_status(status: &ContinuousMonitorTaskStatus) -> String {
-    format_monitor_status(&MonitorStatusRender {
+    format_task_status(&TaskStatusRender {
         task_id: &status.task_id,
         phase: Cow::Owned(status.phase.to_string()),
         recovery: Cow::Borrowed("none"),
@@ -2418,8 +2456,8 @@ fn render_live_monitor_stop(
     render_live_monitor_status(status)
 }
 
-fn render_projected_monitor_status(status: &ProjectedMonitorStatus) -> String {
-    format_monitor_status(&MonitorStatusRender {
+fn render_projected_task_status(status: &ProjectedTaskStatus) -> String {
+    format_task_status(&TaskStatusRender {
         task_id: &status.task_id,
         phase: Cow::Borrowed(&status.phase),
         recovery: Cow::Borrowed(&status.recovery),
@@ -2431,7 +2469,7 @@ fn render_projected_monitor_status(status: &ProjectedMonitorStatus) -> String {
     })
 }
 
-struct MonitorStatusRender<'a> {
+struct TaskStatusRender<'a> {
     task_id: &'a str,
     phase: Cow<'a, str>,
     recovery: Cow<'a, str>,
@@ -2442,7 +2480,7 @@ struct MonitorStatusRender<'a> {
     runtime_failure: Cow<'a, str>,
 }
 
-fn format_monitor_status(status: &MonitorStatusRender<'_>) -> String {
+fn format_task_status(status: &TaskStatusRender<'_>) -> String {
     format!(
         "task_id={task_id}\nphase={phase}\nrecovery={recovery}\nfailure={}\nprocessed_event_count={processed_event_count}\nupdated_at={}\nexit={}\nruntime_failure={}\n",
         status.failure,
@@ -2477,7 +2515,25 @@ fn run_volume_maker(args: &VolumeMakerArgs) -> Result<()> {
     )
 }
 
-fn run_price_alert(args: &PriceAlertArgs) -> Result<()> {
+/// Bounded staleness horizon for replay-backed price-alert readiness checks.
+const PRICE_ALERT_MAX_SNAPSHOT_AGE_SECONDS: i64 = 300;
+/// Fixed local notification budgets for the journal-only CLI task host.
+const PRICE_ALERT_NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+const PRICE_ALERT_NOTIFICATION_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+
+async fn run_price_alert(args: &PriceAlertArgs) -> Result<()> {
+    match args.mode {
+        PriceAlertMode::Validate => {
+            run_price_alert_validate(args)?;
+            Ok(())
+        }
+        PriceAlertMode::Serve => run_price_alert_serve(args).await,
+        PriceAlertMode::Status => run_price_alert_status(args).await,
+        PriceAlertMode::Stop => run_price_alert_stop(args).await,
+    }
+}
+
+fn run_price_alert_validate(args: &PriceAlertArgs) -> Result<PriceAlertConfig> {
     let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
     let config = load_price_alert_config_from_str(&body).with_context(|| {
         format!(
@@ -2485,12 +2541,220 @@ fn run_price_alert(args: &PriceAlertArgs) -> Result<()> {
             args.config.display()
         )
     })?;
-    bail!(
-        "price-alert runtime is unavailable (validated exchange={} symbols={} from {})",
+    println!(
+        "valid: price-alert {} exchange={} symbols={} enabled={}",
+        args.config.display(),
         config.exchange,
         config.symbols.len(),
-        args.config.display()
+        config
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.enabled)
+            .count()
+    );
+    Ok(config)
+}
+
+async fn run_price_alert_serve(args: &PriceAlertArgs) -> Result<()> {
+    let config = run_price_alert_validate(args)?;
+    let replay_path = args.replay.as_ref().context(
+        "price-alert serve currently requires --replay until external continuous source adapters are wired into this task host",
+    )?;
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("price-alert serve mode requires --task-id")?;
+    let history = JsonlHistory::new(&args.history_path);
+    let dispatcher = NotificationDispatcherConfig::new(
+        PRICE_ALERT_NOTIFICATION_QUEUE_CAPACITY,
+        PRICE_ALERT_NOTIFICATION_TIMEOUT,
+        PRICE_ALERT_NOTIFICATION_TIMEOUT,
     )
+    .map_err(anyhow::Error::new)
+    .context("invalid price-alert notification budgets")?;
+    let runtime_config = PriceAlertRuntimeConfig::new(
+        AlertDeliveryMode::JournalOnly,
+        dispatcher,
+        MAX_RECENT_ALERT_OCCURRENCES,
+    )
+    .map_err(anyhow::Error::new)
+    .context("invalid price-alert runtime bounds")?;
+    let runtime = PriceAlertRuntime::new(
+        &config,
+        MarketFreshnessPolicy::new(
+            Duration::seconds(PRICE_ALERT_MAX_SNAPSHOT_AGE_SECONDS),
+            Duration::seconds(1),
+        )?,
+        Arc::new(SystemMarketDataClock),
+        history.clone(),
+        runtime_config,
+        Vec::new(),
+    )
+    .map_err(anyhow::Error::new)
+    .context("failed to build the price-alert runtime")?;
+    let source = build_alert_serve_replay_source(replay_path, &config)?;
+    let mut task = ContinuousAlertTask::start(
+        ContinuousAlertTaskConfig::new(
+            task_id,
+            &config.exchange,
+            supervisor_config(args.shutdown_grace_ms)?,
+        )
+        .map_err(anyhow::Error::new)?,
+        runtime,
+        source,
+        history,
+    )
+    .await
+    .map_err(anyhow::Error::new)
+    .context("failed to start continuous price-alert task")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind price-alert control socket on {address}"))?;
+
+    println!(
+        "continuous price-alert task started: task_id={} control={} history={}",
+        task_id,
+        address,
+        args.history_path.display()
+    );
+
+    let outcome = serve_host(
+        &mut task,
+        listener,
+        StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
+        render_live_alert_status,
+        render_live_alert_stop,
+    )
+    .await
+    .map_err(|error| anyhow::Error::new(error).context("price-alert control host failed"))?;
+
+    match outcome {
+        TaskHostServeOutcome::StopRequested(exit) => {
+            println!("continuous price-alert task stopped: task_id={task_id} exit={exit}");
+        }
+        TaskHostServeOutcome::Terminal(status) => {
+            println!(
+                "continuous price-alert task terminated: task_id={} phase={} processed_event_count={}",
+                status.task_id, status.phase, status.processed_event_count
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_price_alert_status(args: &PriceAlertArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("price-alert status mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
+        print!("{response}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        render_projected_task_status(&project_task_status(
+            &args.history_path,
+            task_id,
+            PRICE_ALERT_TASK_PROJECTION,
+        )?)
+    );
+    Ok(())
+}
+
+async fn run_price_alert_stop(args: &PriceAlertArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("price-alert stop mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
+        print!("{response}");
+        return Ok(());
+    }
+    let projected = project_task_status(&args.history_path, task_id, PRICE_ALERT_TASK_PROJECTION)?;
+    if projected.phase == "stopped" || projected.phase == "failed" {
+        print!("{}", render_projected_task_status(&projected));
+        return Ok(());
+    }
+    bail!(
+        "price-alert task control endpoint is unavailable at {address}; the task is not confirmed stopped"
+    );
+}
+
+/// One replay-backed source scoped to the exact configured alert universe, so
+/// out-of-universe records never reach the fail-closed market book.
+fn build_alert_serve_replay_source(
+    replay_path: &Path,
+    config: &PriceAlertConfig,
+) -> Result<ServeReplaySource> {
+    let mut instruments = Vec::new();
+    for symbol in config.symbols.iter().filter(|symbol| symbol.enabled) {
+        instruments.push(MarketInstrument::new(
+            &config.exchange,
+            symbol.symbol.clone(),
+            symbol.market_type,
+        )?);
+    }
+    let events = load_market_snapshot_replay(replay_path)?
+        .into_iter()
+        .filter(|event| match event {
+            MarketDataEvent::Observation(observation) => {
+                MarketInstrument::from_snapshot(&observation.snapshot)
+                    .is_ok_and(|instrument| instruments.contains(&instrument))
+            }
+            MarketDataEvent::SourceGap { exchange, .. }
+            | MarketDataEvent::SourceUnavailable { exchange, .. } => *exchange == config.exchange,
+        })
+        .collect::<VecDeque<_>>();
+    if events.is_empty() {
+        bail!(
+            "price-alert replay {} has no events inside the configured alert universe",
+            replay_path.display()
+        );
+    }
+    Ok(ServeReplaySource {
+        source_id: config.exchange.clone(),
+        events,
+    })
+}
+
+fn render_live_alert_status(status: &ContinuousAlertTaskStatus) -> String {
+    format_task_status(&TaskStatusRender {
+        task_id: &status.task_id,
+        phase: Cow::Owned(status.phase.to_string()),
+        recovery: Cow::Borrowed("none"),
+        failure: Cow::Owned(
+            status
+                .failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+        processed_event_count: status.processed_event_count,
+        updated_at: Cow::Owned(
+            status
+                .last_recorded_at
+                .map_or_else(|| "none".to_owned(), |recorded_at| recorded_at.to_rfc3339()),
+        ),
+        exit: Cow::Owned(
+            status
+                .exit
+                .map_or("none".to_owned(), |exit| exit.to_string()),
+        ),
+        runtime_failure: Cow::Owned(
+            status
+                .runtime_failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+    })
+}
+
+fn render_live_alert_stop(
+    status: &ContinuousAlertTaskStatus,
+    _exit: ContinuousAlertTaskExit,
+) -> String {
+    render_live_alert_status(status)
 }
 
 fn run_scanner(args: &ScannerArgs) -> Result<()> {
