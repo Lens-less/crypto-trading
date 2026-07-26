@@ -393,7 +393,12 @@ running the drill. The script independently:
    validates the journal's sequence and FNV boundary anchors;
 6. saves the projected `/api/v1/system` result as evidence.
 
-Build the verifier first, then run:
+Build the verifier first, then run it. The drill consumes only the JSON API,
+so building without `frontend/dist/` is acceptable here (the binary then serves
+a placeholder shell instead of the operator UI); the deployable container image
+always builds and embeds the frontend bundle inside the Dockerfile. To verify
+with the embedded UI, run `pnpm install --frozen-lockfile && pnpm build` in
+`frontend/` before the cargo build:
 
 ```sh
 cargo build \

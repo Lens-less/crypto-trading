@@ -1,0 +1,1 @@
+{"schema_version":1,"data_directory":null,"journal_path":null,"log_sink":"stdout_stderr","notification_evidence":"journal_projection","credentials":{"web_bearer":"not_projected","binance_testnet":"not_projected","mainnet":"not_accepted"},"paper_principal_id":null,"paper_profiles":[],"request_limit":{"maximum_requests":240,"window_seconds":60}}

@@ -18,7 +18,8 @@
 | `testnet-soak` | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
 | `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
 | `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
-| `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`） |
+| `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`）；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
+| `paper risk` | 可选 `--paper-account-risk-config` 限额（缺省全部禁用） | 不适用 | 是（Paper） | 否 | `pause`/`resume`/`kill-switch` 经同一 loopback trusted-submit 服务写入持久事实；kill switch 需要专属 `account_kill_switch_armed` 风险确认与 CLI 精确确认短语，且闩锁不可解除 |
 | `monitor` | 是 | 否 | 是（只读 replay） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 相同地失败关闭）；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 是 | 否 | 否 | 否 | 验证配置后以非零状态报告运行时尚未实现 |
 | `price-alert` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert owner，状态可降级到 journal 投影 |
@@ -28,7 +29,19 @@
 
 ## 快速验证
 
-在本目录运行：
+`web` crate 在编译期嵌入 `../frontend/dist/`（React 操作台 bundle）。与 CI 完全一致的
+验证需要先构建前端；跳过则以占位 shell 模式编译（只读 API 与全部测试仍然成立，但
+`ui_contract` 审计的是占位 shell 而非真实 bundle）：
+
+```powershell
+cd ../frontend
+corepack enable
+pnpm install --frozen-lockfile
+pnpm build
+cd ../rust
+```
+
+然后在本目录运行：
 
 ```powershell
 cargo +1.89.0 check --workspace --all-targets --all-features --locked
@@ -36,6 +49,11 @@ cargo +1.89.0 fmt --all -- --check
 cargo +1.89.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo +1.89.0 test --workspace --all-targets --all-features --locked
 ```
+
+Web API 的响应形状由 fixture 交叉契约钉死（`crates/web/tests/api_fixture_contract.rs`
+↔ `../frontend/src/lib/api-fixtures.test.ts`，共享 `fixtures/web-api/`）。有意变更
+序列化后用 `UPDATE_FIXTURES=1 cargo test -p crypto-trading-web --test
+api_fixture_contract` 再生成快照，并与前端 schema 变更同一提交评审。
 
 ## 命令示例
 

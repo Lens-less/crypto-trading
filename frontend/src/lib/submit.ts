@@ -4,7 +4,8 @@
  * 事实来源:rust/crates/control-plane/src/submit.rs(SubmitEnvelope schema)
  * 与 rust/crates/web-app/src/submit.rs(HTTP 语义)。
  *
- * 不可协商语义(逐条移植自旧 assets/app.js,均有测试):
+ * 不可协商语义(逐条移植自已删除的旧原生 JS 前端,见
+ * frontend/docs/ui-contract-migration.md;均有测试):
  * - crypto.randomUUID / getRandomValues 不可用 → secure_random_unavailable,
  *   拒绝生成命令(绝不用弱随机源伪造 command_id);
  * - 幂等键与 pendingSubmission 跨认证变更保留(authReset 不清 envelope 身份);

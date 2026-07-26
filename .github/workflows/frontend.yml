@@ -50,6 +50,47 @@ jobs:
           path: frontend/dist
           if-no-files-found: error
 
+  # Real-browser contract: Playwright drives the shipped artifact — the
+  # crypto-trading-web binary with frontend/dist embedded — not a dev server.
+  # Runs on ubuntu only; the same suite runs locally on Windows via `pnpm e2e`.
+  e2e:
+    name: Browser contract against the embedded binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - run: corepack enable
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Build the frontend bundle for embedding
+        working-directory: frontend
+        run: pnpm build
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.89.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: "rust -> target"
+          key: e2e
+      - name: Build the web control-plane binary
+        working-directory: rust
+        run: cargo build --locked -p crypto-trading-web-app --bin crypto-trading-web
+      - name: Install Chromium
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run the Playwright browser contract
+        working-directory: frontend
+        run: pnpm e2e
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: playwright-traces
+          path: frontend/test-results
+          if-no-files-found: ignore
+
   supply-chain-frontend:
     name: Frontend registry, advisory, and license policy
     runs-on: ubuntu-latest

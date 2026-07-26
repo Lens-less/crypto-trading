@@ -9,13 +9,14 @@
 当前主线位于 [`rust/`](rust/README.md)。原 Python 项目已冻结到 [`archive/python-legacy/`](archive/python-legacy/)，只用于审计、行为对照和迁移参考。
 
 > [!WARNING]
-> **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、连续运行、权威账户风控和多腿故障补偿尚未达到开放门槛。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 结果不包含真实手续费、资金费率、滑点、撮合队列优先级或跨进程持仓。
+> **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、真实交易所账户风控真相（equity/margin/持仓）和多腿故障补偿尚未达到开放门槛；账户级风控权威目前仅覆盖 Paper 模拟账本。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 结果不包含真实手续费、资金费率、滑点、撮合队列优先级或跨进程持仓。
 > 唯一具备下单权限的路径是 Binance **Testnet**（模拟资金的真实外部环境），且需要精确确认短语。
 > 本项目按原样提供，不含任何担保，也不构成投资建议；使用后果由使用者自行承担。
 >
 > **This is not a production trading bot and must not be used with real funds.**
-> Live adapters, continuous operation, authoritative account risk, and
-> multi-leg failure compensation all fail closed. The only path with order
+> Live adapters, real exchange account truth (equity/margin/positions), and
+> multi-leg failure compensation all fail closed; the account-level risk
+> authority governs the paper ledger only. The only path with order
 > authority is Binance Testnet, behind an exact acknowledgement phrase.
 > Provided as is, without warranty; not investment advice.
 
@@ -43,7 +44,8 @@
 | `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；对 public path loaders、public from_str loaders 和 shared raw reader 统一施加 1 MiB / YAML 读入护栏；发现不支持配置、读取错误或预算耗尽时非零退出 |
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
-| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓；Arbitrage owner 可选历史决策模式（`history_decision`）：用 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级并标注 `funding_degraded` |
+| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓；Arbitrage owner 可选历史决策模式（`history_decision`）：用 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级并标注 `funding_degraded`；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（journal-backed：单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
+| `paper risk` | 可通过 `--paper-account-risk-config` 加载可选限额（缺省全部禁用） | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝、owner 消费 close 指令后停止 |
 | `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
@@ -308,19 +310,55 @@ Windows 对应文件为 `target\release\crypto-trading.exe`。
 journal 投影成人类可读的视图：授权状态、行情新鲜度、adapter 健康、批次计划与结果、
 未恢复的执行状态。它**没有任何写路由**，因此无法通过浏览器构造交易权限。
 
-设计规范见 [`docs/design-system.md`](docs/design-system.md)。前端是内嵌在二进制里的免构建原生 JS，
-没有前端工具链，也没有远程字体或 CDN 依赖。
+设计规范见 [`docs/design-system.md`](docs/design-system.md)。操作台前端是 `frontend/` 下的
+React + Vite + TypeScript 应用；`pnpm build` 产出的 `frontend/dist/` 在编译期由
+`rust/crates/web` 的 build script 通过 `include_dir!` 整体嵌入二进制。产物不引用任何
+远程字体或 CDN 资源，运行时也没有文件系统访问——每个字节在编译期固定。
 
-直接运行：
+### 构建（两步：pnpm → cargo）
 
 ```bash
-cd rust
+# 1. 构建前端 bundle（需要 Node 22+;corepack 会激活锁定的 pnpm 版本）
+cd frontend
+corepack enable
+pnpm install --frozen-lockfile
+pnpm build
+
+# 2. 编译并运行二进制(dist 会被自动嵌入)
+cd ../rust
 export CRYPTO_TRADING_WEB_TOKEN="$(openssl rand -hex 32)"
 cargo run --locked --package crypto-trading-web-app --bin crypto-trading-web -- \
   --history-path var/operations.jsonl \
   --journal-id "$(uuidgen)" \
   --bearer-token-env CRYPTO_TRADING_WEB_TOKEN
 ```
+
+跳过第 1 步也能编译：二进制会服务一个占位 shell 并保持只读 API 可用，同时明确说明
+UI 资产未构建——不会静默降级。
+
+### 前端开发模式
+
+```bash
+cd frontend
+pnpm dev        # Vite dev server,仅绑定 127.0.0.1,/api 代理到 127.0.0.1:8787
+pnpm typecheck && pnpm lint && pnpm test   # 质量门禁(vitest 含 fixture 交叉契约)
+```
+
+### 真浏览器合约(Playwright)
+
+`frontend/e2e/` 用 Playwright 驱动**真实交付物**(嵌入 dist 的二进制,而非 dev
+server),覆盖权限脊柱、历史投影事实、SSE 通知徽标三态与降级恢复、浏览器存储纪律
+(仅 `ct-theme`)以及受信 Paper 写路径全流程：
+
+```bash
+cd frontend && pnpm build
+cd ../rust && cargo build --locked -p crypto-trading-web-app --bin crypto-trading-web
+cd ../frontend
+pnpm exec playwright install chromium   # 首次
+pnpm e2e
+```
+
+CI 中该套件在 ubuntu 上运行(`.github/workflows/frontend.yml` 的 e2e job)。
 
 服务只绑定 `127.0.0.1:8787`，且这是在代码里强制的，不是配置项。除非你自己加一层
 经过审查的反向代理，否则它对其他主机不可达。
@@ -415,7 +453,7 @@ Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依�
 | `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |
 | `runtime` | 执行模式、路由、批次、提交策略、部分结果对账、JSONL journal、operator read model 与 capability 清单 |
 | `control-plane` | journal 与各操作界面之间的最小权限读取/提交 seam |
-| `web` | HTTP API 与内嵌的免构建操作台前端 |
+| `web` | HTTP API 与编译期嵌入的 React 操作台 bundle(`frontend/dist`) |
 | `web-app` | `crypto-trading-web` 二进制，只在 loopback 上提供只读控制面 |
 | `apps` | `crypto-trading` 二进制、CLI 参数、配置检查、one-shot 与 Testnet 编排 |
 
@@ -446,7 +484,12 @@ Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依�
 crypto-trading/
 ├── .github/
 │   ├── workflows/rust.yml       # 跨平台 CI、RustSec、cargo-deny、镜像构建
+│   ├── workflows/frontend.yml   # 前端门禁、供应链策略与 Playwright 浏览器合约
 │   └── ISSUE_TEMPLATE/
+├── frontend/                    # React + Vite 操作台(构建产物嵌入 web 二进制)
+│   ├── src/                     # 页面、组件与 zod 窄校验 API 类型
+│   ├── e2e/                     # Playwright 真浏览器合约
+│   └── docs/                    # UI 契约迁移映射与 parity 清单
 ├── rust/                        # 唯一活动项目
 │   ├── crates/                  # Rust workspace 源码（九个 crate）
 │   ├── config/                  # 当前配置副本
