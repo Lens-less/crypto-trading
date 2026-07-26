@@ -52,6 +52,7 @@ pub enum ReadOnlyTaskKind {
     ArbitragePaper,
     GridPaper,
     PriceAlert,
+    Scanner,
 }
 
 /// Last durably recorded aggregate phase.
@@ -422,6 +423,7 @@ fn parse_task_fact(
         "arbitrage_paper" => ReadOnlyTaskKind::ArbitragePaper,
         "grid_paper" => ReadOnlyTaskKind::GridPaper,
         "price_alert" => ReadOnlyTaskKind::PriceAlert,
+        "scanner" => ReadOnlyTaskKind::Scanner,
         _ => return Err(()),
     };
     let phase_text = required_text(details, "phase")?;
@@ -432,7 +434,9 @@ fn parse_task_fact(
     let processed_event_count = required_u64(details, "processed_event_count")?;
     let sources = parse_sources(required(details, "sources")?)?;
     let expected_source_count = match kind {
-        ReadOnlyTaskKind::GridPaper | ReadOnlyTaskKind::PriceAlert => SINGLE_SOURCE_COUNT,
+        ReadOnlyTaskKind::GridPaper | ReadOnlyTaskKind::PriceAlert | ReadOnlyTaskKind::Scanner => {
+            SINGLE_SOURCE_COUNT
+        }
         ReadOnlyTaskKind::ArbitrageMonitor | ReadOnlyTaskKind::ArbitragePaper => {
             ARBITRAGE_SOURCE_COUNT
         }

@@ -322,16 +322,31 @@ fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
     assert_eq!(scanner.scope.access, CapabilityAccess::Local);
     for evidence in [
         "rust/crates/apps/src/scanner.rs",
+        "rust/crates/apps/src/continuous_scanner.rs",
+        "rust/crates/apps/tests/scanner_cli_contract.rs",
+        "rust/crates/config/src/scanner.rs",
         "rust/crates/runtime/src/scanner_read_model.rs",
+        "rust/crates/runtime/src/task_read_model.rs",
         "rust/crates/web/tests/ui_contract.rs",
     ] {
         assert!(scanner.evidence.contains(&evidence.to_owned()));
     }
     assert!(
+        scanner.summary.contains("scanner configuration schema"),
+        "{}",
+        scanner.summary
+    );
+    assert!(
+        !scanner.blockers.iter().any(
+            |blocker| blocker.contains("not implemented; the existing CLI remains fail-closed")
+        ),
+        "the config-schema/CLI-bootstrap blocker must be gone once the task host ships"
+    );
+    assert!(
         scanner
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("CLI/service bootstrap"))
+            .any(|blocker| blocker.contains("replay-backed only"))
     );
     assert!(
         scanner

@@ -505,14 +505,47 @@ pub enum LogLevel {
 
 #[derive(Debug, Args)]
 pub struct ScannerArgs {
+    #[arg(long, default_value_t = ScannerMode::Validate, value_enum)]
+    pub mode: ScannerMode,
+    /// Legacy exchange selector kept for CLI compatibility; the validated
+    /// scanner config file is the runtime source of truth.
     #[arg(long, value_enum, default_value_t)]
     pub exchange: ExchangeChoice,
+    /// Legacy duration hint kept for CLI compatibility; serve runs until stop.
     #[arg(long)]
     pub duration: Option<u64>,
-    #[arg(long)]
-    pub config: Option<PathBuf>,
+    /// Scanner YAML configuration validated by every mode that starts work.
+    #[arg(long, default_value = "config/scanner/binance_scanner.yaml")]
+    pub config: PathBuf,
     #[arg(long, value_enum, default_value_t)]
     pub log_level: LogLevel,
+    /// Finite JSONL replay of validated top-of-book snapshots.
+    #[arg(long, value_name = "PATH")]
+    pub replay: Option<PathBuf>,
+    /// Service task identity for long-running scanner operations.
+    #[arg(long)]
+    pub task_id: Option<String>,
+    /// Append read-only scanner outcomes to this JSONL journal.
+    #[arg(long, default_value = "var/history/scanner.jsonl")]
+    pub history_path: PathBuf,
+    /// Local loopback control port override used by scanner serve/status/stop.
+    #[arg(long, hide = true)]
+    pub control_port: Option<u16>,
+    /// Serve-loop status polling interval used for bounded local tests.
+    #[arg(long, hide = true, default_value_t = 100)]
+    pub control_poll_interval_ms: u64,
+    /// Supervisor shutdown grace override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub shutdown_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, ValueEnum)]
+pub enum ScannerMode {
+    #[default]
+    Validate,
+    Serve,
+    Status,
+    Stop,
 }
 
 #[derive(Debug, Args)]

@@ -47,7 +47,7 @@
 | `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；真实外部双源和自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 不可用 | 不可用 | 校验执行控制与策略配置后失败关闭 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
-| `scanner` | 检查显式配置路径 | 不可用 | 不可用 | 不可用 | 只做有界存在性 / 读取安全检查；不做 scanner schema/runtime validation；以非零状态退出 |
+| `scanner` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
 
 ### Binance Testnet 命令
 
@@ -345,6 +345,7 @@ rust/config/
 ├── exchanges/       # 交易所字段映射和市场元数据
 ├── grid/            # 网格策略配置
 ├── price_alert/     # 价格提醒配置
+├── scanner/         # 虚拟网格扫描器配置
 ├── volume_maker/    # 做量策略配置
 ├── logging.yaml
 └── symbol_conversion.yaml
@@ -358,7 +359,7 @@ rust/config/
 - Paper one-shot 只接受 `runtime-executable` strict schema；拼错或未消费字段会在写入 history 前失败。
 - 批量检查最多保留 512 条摘要，文本与 JSON 输出各有 `1 MiB` 预算。
 - 目录扫描或输出预算耗尽时会停止并非零退出，不会声称剩余文件已经检查。
-- `scanner` 显式配置只做有界存在性 / 读取安全检查，不做 schema/runtime validation；它以非零状态报告未实现。
+- `scanner` 配置使用 fail-closed 严格 schema：有界符号列表、虚拟网格几何与扫描窗口都会显式校验；`--mode validate` 成功后正常返回。
 
 Rust 程序只读取**进程环境变量**，不会自动加载 `.env`。例如：
 
@@ -502,7 +503,7 @@ CI 还会：
 
 ### 为什么配置校验成功，但命令仍然报 `runtime is unavailable`？
 
-配置解析与运行能力是两道独立门禁。`volume-maker`、`scanner` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor` 和 `price-alert` 是例外：它们的 `serve/status/stop` 模式可以运行，但只接受精确 replay 数据源（monitor 为双源，price-alert 为单源），不接受真实外部源；`price-alert` 的默认 `--mode validate` 校验成功后正常返回。
+配置解析与运行能力是两道独立门禁。`volume-maker` 和无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor`、`price-alert` 和 `scanner` 是例外：它们的 `serve/status/stop` 模式可以运行，但只接受精确 replay 数据源（monitor 为双源，price-alert 和 scanner 为单源），不接受真实外部源；`price-alert` 与 `scanner` 的默认 `--mode validate` 校验成功后正常返回。
 
 ### 为什么 `--live` 仍然无法下单？
 

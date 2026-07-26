@@ -141,15 +141,11 @@ fn config_check_returns_nonzero_for_a_missing_file() {
 
 #[test]
 fn unfinished_commands_fail_closed_instead_of_reporting_success() {
-    // `price-alert` is no longer in this list: its default validate mode now
-    // succeeds, and alert_serve_cli_contract.rs covers its serve/status/stop
-    // task host plus the fail-closed no-replay path.
-    let cases = [
-        vec!["monitor"],
-        vec!["volume-maker"],
-        vec!["scanner"],
-        vec!["arbitrage"],
-    ];
+    // `price-alert` and `scanner` are no longer in this list: their default
+    // validate modes now succeed, and alert_serve_cli_contract.rs plus
+    // scanner_cli_contract.rs cover their serve/status/stop task hosts and the
+    // fail-closed no-replay paths.
+    let cases = [vec!["monitor"], vec!["volume-maker"], vec!["arbitrage"]];
 
     for args in cases {
         let output = Command::new(binary())
@@ -212,7 +208,7 @@ fn scanner_checks_an_explicit_config_path_before_failing_closed() {
 }
 
 #[test]
-fn scanner_reports_unavailable_validation_for_an_arbitrary_existing_file() {
+fn scanner_rejects_an_arbitrary_existing_file_through_schema_validation() {
     let config = write_temp("scanner-arbitrary-config", "txt", "not scanner yaml\n");
 
     let output = Command::new(binary())
@@ -226,18 +222,7 @@ fn scanner_reports_unavailable_validation_for_an_arbitrary_existing_file() {
     std::fs::remove_file(config).unwrap();
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("only completed file-access and input-safety checks"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("no scanner config parsing or schema validation was performed"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("scanner runtime is unavailable"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("failed to load scanner config"), "{stderr}");
 }
 
 #[test]
@@ -1354,6 +1339,7 @@ fn config_check_recognizes_every_supported_schema() {
             "config/arbitrage/monitor_v2.yaml",
             "config/volume_maker/backpack_btc_volume_maker.yaml",
             "config/price_alert/binance_alert.yaml",
+            "config/scanner/binance_scanner.yaml",
             "config/symbol_conversion.yaml",
             "config/exchanges/paradex_config.example.yaml",
             "--json",
@@ -1369,6 +1355,7 @@ fn config_check_recognizes_every_supported_schema() {
         "monitor",
         "volume-maker",
         "price-alert",
+        "scanner",
         "symbol-conversion",
         "exchange-auth",
     ] {
@@ -1417,7 +1404,7 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
     assert!(output.status.success(), "{output:?}");
     let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let summaries = summaries.as_array().unwrap();
-    assert_eq!(summaries.len(), 60, "{summaries:#?}");
+    assert_eq!(summaries.len(), 61, "{summaries:#?}");
     for summary in summaries {
         assert!(summary["parseable"].is_boolean(), "{summary}");
         assert!(summary["executable"].is_boolean(), "{summary}");
@@ -1464,6 +1451,13 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
         true,
         false,
         "partial",
+        "unavailable",
+    );
+    assert_status(
+        entry("config/scanner/binance_scanner.yaml"),
+        true,
+        false,
+        "parse-only",
         "unavailable",
     );
     assert_status(

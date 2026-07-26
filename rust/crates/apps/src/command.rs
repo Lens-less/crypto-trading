@@ -13,10 +13,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use crypto_trading_config::{
-    ArbitrageConfig, GridConfig, MonitorConfig, PriceAlertConfig, load_arbitrage_config_from_str,
-    load_exchange_auth_from_str, load_grid_config_from_str, load_monitor_config_from_str,
-    load_price_alert_config_from_str, load_symbol_conversions_from_str,
-    load_volume_maker_config_from_str, read_bounded_config,
+    ArbitrageConfig, GridConfig, MonitorConfig, PriceAlertConfig, ScannerConfig,
+    load_arbitrage_config_from_str, load_exchange_auth_from_str, load_grid_config_from_str,
+    load_monitor_config_from_str, load_price_alert_config_from_str, load_scanner_config_from_str,
+    load_symbol_conversions_from_str, load_volume_maker_config_from_str, read_bounded_config,
 };
 use crypto_trading_control_plane::{
     SubmitCommand, SubmitEnvelope, SubmitPermission, SubmitReceipt, SubmitRiskConfirmation,
@@ -62,7 +62,7 @@ use crate::alert::{
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
     MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs,
-    PaperTaskArgs, PriceAlertArgs, PriceAlertMode, ScannerArgs, TestnetLifecycleArgs,
+    PaperTaskArgs, PriceAlertArgs, PriceAlertMode, ScannerArgs, ScannerMode, TestnetLifecycleArgs,
     TestnetLifecycleExpected, TestnetLifecycleMarket, TestnetLifecycleSide,
     TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs,
     TestnetSoakMode, VolumeMakerArgs,
@@ -74,6 +74,10 @@ use crate::continuous_alert::{
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
     ContinuousMonitorTaskStatus,
+};
+use crate::continuous_scanner::{
+    ContinuousScannerTask, ContinuousScannerTaskConfig, ContinuousScannerTaskExit,
+    ContinuousScannerTaskStatus, ScannerCandidateSpec, ScannerReplayRuntime,
 };
 use crate::monitor::{
     ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor, ReplayMarketDataClock,
@@ -117,7 +121,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Monitor(args) => run_monitor(&args).await,
         Command::VolumeMaker(args) => run_volume_maker(&args),
         Command::PriceAlert(args) => run_price_alert(&args).await,
-        Command::Scanner(args) => run_scanner(&args),
+        Command::Scanner(args) => run_scanner(&args).await,
         Command::Paper(args) => run_paper(args).await,
     }
 }
@@ -639,6 +643,7 @@ const fn task_kind_name(kind: ReadOnlyTaskKind) -> &'static str {
         ReadOnlyTaskKind::ArbitragePaper => "arbitrage_paper",
         ReadOnlyTaskKind::GridPaper => "grid_paper",
         ReadOnlyTaskKind::PriceAlert => "price_alert",
+        ReadOnlyTaskKind::Scanner => "scanner",
     }
 }
 
@@ -2349,6 +2354,11 @@ const PRICE_ALERT_TASK_PROJECTION: TaskProjectionScope = TaskProjectionScope {
     label: "price-alert",
 };
 
+const SCANNER_TASK_PROJECTION: TaskProjectionScope = TaskProjectionScope {
+    task_kind: "scanner",
+    label: "scanner",
+};
+
 fn project_task_status(
     history_path: &Path,
     task_id: &str,
@@ -2698,6 +2708,16 @@ fn build_alert_serve_replay_source(
             symbol.market_type,
         )?);
     }
+    build_exact_universe_replay_source(replay_path, &config.exchange, &instruments, "price-alert")
+}
+
+/// One replay-backed single source restricted to an exact instrument universe.
+fn build_exact_universe_replay_source(
+    replay_path: &Path,
+    exchange: &str,
+    instruments: &[MarketInstrument],
+    label: &str,
+) -> Result<ServeReplaySource> {
     let events = load_market_snapshot_replay(replay_path)?
         .into_iter()
         .filter(|event| match event {
@@ -2705,18 +2725,24 @@ fn build_alert_serve_replay_source(
                 MarketInstrument::from_snapshot(&observation.snapshot)
                     .is_ok_and(|instrument| instruments.contains(&instrument))
             }
-            MarketDataEvent::SourceGap { exchange, .. }
-            | MarketDataEvent::SourceUnavailable { exchange, .. } => *exchange == config.exchange,
+            MarketDataEvent::SourceGap {
+                exchange: event_exchange,
+                ..
+            }
+            | MarketDataEvent::SourceUnavailable {
+                exchange: event_exchange,
+                ..
+            } => event_exchange == exchange,
         })
         .collect::<VecDeque<_>>();
     if events.is_empty() {
         bail!(
-            "price-alert replay {} has no events inside the configured alert universe",
+            "{label} replay {} has no events inside the configured {label} universe",
             replay_path.display()
         );
     }
     Ok(ServeReplaySource {
-        source_id: config.exchange.clone(),
+        source_id: exchange.to_owned(),
         events,
     })
 }
@@ -2757,28 +2783,209 @@ fn render_live_alert_stop(
     render_live_alert_status(status)
 }
 
-fn run_scanner(args: &ScannerArgs) -> Result<()> {
-    if let Some(path) = &args.config {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to inspect scanner config {}", path.display()))?;
-        if !metadata.is_file() {
-            bail!("scanner config {} must be a file", path.display());
+async fn run_scanner(args: &ScannerArgs) -> Result<()> {
+    match args.mode {
+        ScannerMode::Validate => {
+            run_scanner_validate(args)?;
+            Ok(())
         }
-        read_bounded_config(path).map_err(anyhow::Error::msg)?;
-        bail!(
-            "scanner config {} only completed file-access and input-safety checks; no scanner config parsing or schema validation was performed; scanner runtime is unavailable (requested exchange={:?} duration={:?} log={:?})",
-            path.display(),
-            args.exchange,
-            args.duration,
-            args.log_level
-        );
+        ScannerMode::Serve => run_scanner_serve(args).await,
+        ScannerMode::Status => run_scanner_status(args).await,
+        ScannerMode::Stop => run_scanner_stop(args).await,
+    }
+}
+
+fn run_scanner_validate(args: &ScannerArgs) -> Result<ScannerConfig> {
+    let body = read_bounded_config(&args.config).map_err(anyhow::Error::msg)?;
+    let config = load_scanner_config_from_str(&body)
+        .with_context(|| format!("failed to load scanner config {}", args.config.display()))?;
+    println!(
+        "valid: scanner {} exchange={} symbols={} enabled={}",
+        args.config.display(),
+        config.exchange,
+        config.symbols.len(),
+        config.enabled_symbols().count()
+    );
+    Ok(config)
+}
+
+async fn run_scanner_serve(args: &ScannerArgs) -> Result<()> {
+    let config = run_scanner_validate(args)?;
+    let replay_path = args.replay.as_ref().context(
+        "scanner serve currently requires --replay until external market-discovery adapters are wired into this task host",
+    )?;
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("scanner serve mode requires --task-id")?;
+    let history = JsonlHistory::new(&args.history_path);
+    let specs = scanner_candidate_specs(&config)?;
+    let instruments = specs
+        .iter()
+        .map(|spec| spec.instrument.clone())
+        .collect::<Vec<_>>();
+    let runtime = ScannerReplayRuntime::new(
+        task_id,
+        config.apr_window_seconds,
+        config.min_complete_cycles,
+        config.row_limit,
+        specs,
+    )
+    .map_err(anyhow::Error::new)
+    .context("scanner runtime rejected the validated configuration")?;
+    // Pacing keeps every replay observation intact across the supervisor's
+    // O(1) event retention, which the deterministic ranking depends on.
+    let source = runtime.pace(build_exact_universe_replay_source(
+        replay_path,
+        &config.exchange,
+        &instruments,
+        "scanner",
+    )?);
+    let mut task = ContinuousScannerTask::start(
+        ContinuousScannerTaskConfig::new(
+            task_id,
+            &config.exchange,
+            supervisor_config(args.shutdown_grace_ms)?,
+        )
+        .map_err(anyhow::Error::new)?,
+        runtime,
+        source,
+        history,
+    )
+    .await
+    .map_err(anyhow::Error::new)
+    .context("failed to start continuous scanner task")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind scanner control socket on {address}"))?;
+
+    println!(
+        "continuous scanner task started: task_id={} control={} history={}",
+        task_id,
+        address,
+        args.history_path.display()
+    );
+
+    let outcome = serve_host(
+        &mut task,
+        listener,
+        StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
+        render_live_scanner_status,
+        render_live_scanner_stop,
+    )
+    .await
+    .map_err(|error| anyhow::Error::new(error).context("scanner control host failed"))?;
+
+    match outcome {
+        TaskHostServeOutcome::StopRequested(exit) => {
+            println!("continuous scanner task stopped: task_id={task_id} exit={exit}");
+        }
+        TaskHostServeOutcome::Terminal(status) => {
+            println!(
+                "continuous scanner task terminated: task_id={} phase={} processed_event_count={}",
+                status.task_id, status.phase, status.processed_event_count
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_scanner_status(args: &ScannerArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("scanner status mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
+        print!("{response}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        render_projected_task_status(&project_task_status(
+            &args.history_path,
+            task_id,
+            SCANNER_TASK_PROJECTION,
+        )?)
+    );
+    Ok(())
+}
+
+async fn run_scanner_stop(args: &ScannerArgs) -> Result<()> {
+    let task_id = args
+        .task_id
+        .as_deref()
+        .context("scanner stop mode requires --task-id")?;
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
+        print!("{response}");
+        return Ok(());
+    }
+    let projected = project_task_status(&args.history_path, task_id, SCANNER_TASK_PROJECTION)?;
+    if projected.phase == "stopped" || projected.phase == "failed" {
+        print!("{}", render_projected_task_status(&projected));
+        return Ok(());
     }
     bail!(
-        "scanner runtime is unavailable (requested exchange={:?} duration={:?} log={:?})",
-        args.exchange,
-        args.duration,
-        args.log_level
-    )
+        "scanner task control endpoint is unavailable at {address}; the task is not confirmed stopped"
+    );
+}
+
+/// Exact enabled scan candidates derived from one validated scanner config.
+fn scanner_candidate_specs(config: &ScannerConfig) -> Result<Vec<ScannerCandidateSpec>> {
+    let mut specs = Vec::new();
+    for symbol in config.enabled_symbols() {
+        specs.push(ScannerCandidateSpec {
+            instrument: MarketInstrument::new(
+                &config.exchange,
+                symbol.symbol.clone(),
+                symbol.market_type,
+            )?,
+            grid_width_percent: symbol.grid_width_percent,
+            grid_interval_percent: symbol.grid_interval_percent,
+            volume_24h_usdc: symbol.volume_24h_usdc,
+            price_change_24h_percent: symbol.price_change_24h_percent,
+            benchmark: symbol.benchmark,
+        });
+    }
+    Ok(specs)
+}
+
+fn render_live_scanner_status(status: &ContinuousScannerTaskStatus) -> String {
+    format_task_status(&TaskStatusRender {
+        task_id: &status.task_id,
+        phase: Cow::Owned(status.phase.to_string()),
+        recovery: Cow::Borrowed("none"),
+        failure: Cow::Owned(
+            status
+                .failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+        processed_event_count: status.processed_event_count,
+        updated_at: Cow::Owned(
+            status
+                .last_recorded_at
+                .map_or_else(|| "none".to_owned(), |recorded_at| recorded_at.to_rfc3339()),
+        ),
+        exit: Cow::Owned(
+            status
+                .exit
+                .map_or("none".to_owned(), |exit| exit.to_string()),
+        ),
+        runtime_failure: Cow::Owned(
+            status
+                .runtime_failure
+                .map_or("none".to_owned(), |failure| failure.to_string()),
+        ),
+    })
+}
+
+fn render_live_scanner_stop(
+    status: &ContinuousScannerTaskStatus,
+    _exit: ContinuousScannerTaskExit,
+) -> String {
+    render_live_scanner_status(status)
 }
 
 async fn execute_grid_paper(
@@ -4051,14 +4258,9 @@ fn inspect_config_inner(path: &Path) -> Result<Value, ConfigInspectionFailure> {
             Some(&detail),
         ))
     } else if has("price_alert") {
-        load_price_alert_config_from_str(&body)
-            .map_err(|error| invalid_config_error("price-alert", &error))?;
-        Ok(config_summary(
-            path,
-            "price-alert",
-            ConfigSupport::ParseOnly,
-            Some("runtime command is unavailable"),
-        ))
+        inspect_price_alert_config(path, &body)
+    } else if has("scanner") {
+        inspect_scanner_config(path, &body)
     } else if is_arbitrage(mapping) {
         inspect_arbitrage_config(path, &body, &document)
     } else if has("exchanges") && has("symbols") {
@@ -4117,6 +4319,27 @@ fn inspect_config_inner(path: &Path) -> Result<Value, ConfigInspectionFailure> {
     }?;
 
     Ok(reject_auxiliary_filename_mismatch(summary, auxiliary_kind))
+}
+
+fn inspect_price_alert_config(path: &Path, body: &str) -> Result<Value, ConfigInspectionFailure> {
+    load_price_alert_config_from_str(body)
+        .map_err(|error| invalid_config_error("price-alert", &error))?;
+    Ok(config_summary(
+        path,
+        "price-alert",
+        ConfigSupport::ParseOnly,
+        Some("runtime command is unavailable"),
+    ))
+}
+
+fn inspect_scanner_config(path: &Path, body: &str) -> Result<Value, ConfigInspectionFailure> {
+    load_scanner_config_from_str(body).map_err(|error| invalid_config_error("scanner", &error))?;
+    Ok(config_summary(
+        path,
+        "scanner",
+        ConfigSupport::ParseOnly,
+        Some("replay-backed serve/status/stop only; real-time discovery runtime unavailable"),
+    ))
 }
 
 fn inspect_grid_config(
