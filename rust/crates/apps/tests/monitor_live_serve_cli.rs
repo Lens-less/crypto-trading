@@ -240,10 +240,7 @@ fn spawn_stub(hits: Arc<AtomicUsize>, expect_post: bool, response: String) -> St
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let mut request = Vec::new();
             let mut buffer = [0_u8; 2_048];
-            loop {
-                let Ok(read) = stream.read(&mut buffer) else {
-                    break;
-                };
+            while let Ok(read) = stream.read(&mut buffer) {
                 if read == 0 {
                     break;
                 }

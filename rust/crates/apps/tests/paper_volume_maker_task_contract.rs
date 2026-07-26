@@ -938,9 +938,9 @@ fn volume_maker_serve_runs_a_finite_replay_and_status_degrades_to_projection() {
 }
 
 fn checkpoint_count(path: &Path) -> usize {
-    std::fs::read_to_string(path)
-        .map(|body| body.matches("\"decision\":\"task_checkpointed\"").count())
-        .unwrap_or(0)
+    std::fs::read_to_string(path).map_or(0, |body| {
+        body.matches("\"decision\":\"task_checkpointed\"").count()
+    })
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {
