@@ -135,6 +135,327 @@ export const capabilityManifestSchema = z.looseObject({
   live_trading_enabled: z.boolean(),
 });
 
+/* ------------------------------------------------------------- 共享投影原语 */
+
+export type MarketType = "spot" | "perpetual";
+
+/**
+ * Journal 页边界(runtime::JournalPageBoundary,serde tag = "kind")。
+ * partial_tail 额外携带 offset/bytes,前端只消费 kind 判别。
+ */
+export type BoundaryKind = "snapshot_end" | "page_limit" | "partial_tail";
+
+export interface JournalPageBoundary {
+  kind: BoundaryKind;
+  offset?: number;
+  bytes?: number;
+}
+
+export const READ_MODEL_SCHEMA_VERSION = 1;
+
+/* ------------------------------------------------------- GET /api/v1/monitor */
+
+export type MonitorProjectionState =
+  | "waiting"
+  | "no_opportunity"
+  | "opportunity"
+  | "analysis_rejected";
+
+export type MonitorFreshnessState = "missing" | "fresh" | "stale" | "future";
+
+export type MonitorContinuityState =
+  | "missing"
+  | "continuous"
+  | "gap"
+  | "duplicate"
+  | "out_of_order"
+  | "duplicate_timestamp"
+  | "out_of_order_timestamp"
+  | "out_of_order_receipt"
+  | "source_gap"
+  | "unavailable";
+
+export interface MonitorLegView {
+  exchange: string;
+  symbol: string;
+  market_type: MarketType;
+}
+
+export type ArbitrageMonitorProjection =
+  | {
+      type: "waiting";
+      instrument: MonitorLegView;
+      freshness: MonitorFreshnessState;
+      continuity: MonitorContinuityState;
+    }
+  | {
+      type: "no_opportunity" | "opportunity";
+      buy_exchange: string;
+      sell_exchange: string;
+      buy_price: string;
+      sell_price: string;
+      absolute_spread: string;
+      spread_percent: string;
+      threshold_percent: string;
+    }
+  | { type: "analysis_rejected"; failure: string };
+
+export interface ArbitrageMonitorView {
+  source_sequence: number;
+  event_id: string;
+  /** journal 持久化时间;监控数据是历史投影,永不暗示实时行情。 */
+  recorded_at: string;
+  monitor_sequence: number;
+  market_generation: number;
+  symbol: string;
+  state: MonitorProjectionState;
+  left: MonitorLegView;
+  right: MonitorLegView;
+  projection: ArbitrageMonitorProjection;
+}
+
+export interface ArbitrageMonitorReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  journal_head_sequence: number | null;
+  projection_status: ProjectionStatus;
+  latest: ArbitrageMonitorView | null;
+  invalid_event_count: number;
+}
+
+export const arbitrageMonitorReadModelSchema = z.looseObject({
+  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+  journal_id: z.string(),
+  projection_status: z.enum(["complete", "windowed", "degraded"]),
+  latest: z.nullable(z.looseObject({ recorded_at: z.string() })),
+  invalid_event_count: z.number(),
+});
+
+/* -------------------------------------------------------- GET /api/v1/alerts */
+
+/** 后端有界窗口:read model 最多保留 256 条 occurrence。 */
+export const MAX_ALERT_OCCURRENCES = 256;
+
+export type AlertOccurrenceKind =
+  | "volatility_up"
+  | "volatility_down"
+  | "upper_limit"
+  | "lower_limit";
+
+export type AlertDeliveryStatus =
+  | "pending"
+  | "dropped"
+  | "succeeded"
+  | "failed"
+  | "timed_out";
+
+export type AlertDeliveryFailure =
+  | "backpressure"
+  | "adapter_closed"
+  | "device_unavailable"
+  | "rejected"
+  | "worker_failed"
+  | "timeout";
+
+export interface AlertDeliveryView {
+  adapter_id: string;
+  status: AlertDeliveryStatus;
+  failure: AlertDeliveryFailure | null;
+  updated_at: string;
+}
+
+export interface AlertOccurrenceView {
+  source_sequence: number;
+  event_id: string;
+  alert_sequence: number;
+  recorded_at: string;
+  exchange: string;
+  symbol: string;
+  market_type: MarketType;
+  kind: AlertOccurrenceKind;
+  price: string;
+  change_percent: string | null;
+  acknowledged_at: string | null;
+  deliveries: AlertDeliveryView[];
+}
+
+export interface PriceAlertReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  journal_head_sequence: number | null;
+  boundary: JournalPageBoundary;
+  projection_status: ProjectionStatus;
+  occurrences: AlertOccurrenceView[];
+  occurrences_truncated: boolean;
+  invalid_event_count: number;
+}
+
+export const priceAlertReadModelSchema = z.looseObject({
+  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+  journal_id: z.string(),
+  projection_status: z.enum(["complete", "windowed", "degraded"]),
+  boundary: z.looseObject({ kind: z.string() }),
+  occurrences: z.array(z.looseObject({ alert_sequence: z.number() })),
+  occurrences_truncated: z.boolean(),
+  invalid_event_count: z.number(),
+});
+
+/* --------------------------------------------------------- GET /api/v1/tasks */
+
+export type ReadOnlyTaskKind =
+  | "arbitrage_monitor"
+  | "arbitrage_paper"
+  | "grid_paper"
+  | "price_alert"
+  | "scanner";
+
+export type ReadOnlyTaskPhase =
+  | "registered"
+  | "running"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+export type ReadOnlyTaskRecovery = "none" | "investigate";
+
+export interface ReadOnlyTaskSourceView {
+  source_id: string;
+  event_sequence: number;
+  phase: string;
+  health: string;
+}
+
+export interface ReadOnlyTaskView {
+  task_id: string;
+  kind: ReadOnlyTaskKind;
+  first_sequence: number;
+  last_sequence: number;
+  registered_at: string;
+  updated_at: string;
+  phase: ReadOnlyTaskPhase;
+  recovery: ReadOnlyTaskRecovery;
+  processed_event_count: number;
+  sources: ReadOnlyTaskSourceView[];
+  exit: string | null;
+  failure: string | null;
+}
+
+export interface ReadOnlyTaskReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  journal_head_sequence: number | null;
+  projection_status: ProjectionStatus;
+  tasks: ReadOnlyTaskView[];
+  invalid_event_count: number;
+}
+
+export const readOnlyTaskReadModelSchema = z.looseObject({
+  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+  journal_id: z.string(),
+  projection_status: z.enum(["complete", "windowed", "degraded"]),
+  tasks: z.array(z.looseObject({ task_id: z.string(), phase: z.string() })),
+});
+
+/* ---------------------------------------------- GET /api/v1/executions?cursor= */
+
+export type ExecutionBatchState =
+  | "outcome_unknown"
+  | "completed"
+  | "partial"
+  | "incomplete"
+  | "failed"
+  | "conflict";
+
+export type RecoveryDirective = "none" | "reconcile_required" | "investigate";
+
+export type ExecutionPhase =
+  | "planned"
+  | "completed"
+  | "partial"
+  | "incomplete"
+  | "failed";
+
+export type ReadModelWarningCode =
+  | "conflicting_duplicate"
+  | "duplicate_ignored"
+  | "invalid_execution_event"
+  | "metadata_conflict"
+  | "orphan_outcome"
+  | "out_of_order_planned"
+  | "partial_tail"
+  | "resolved_batch_evicted"
+  | "terminal_conflict"
+  | "timestamp_regressed";
+
+export interface ReadModelWarning {
+  code: ReadModelWarningCode;
+  sequence: number | null;
+  event_id: string | null;
+  batch_id: string | null;
+  detail: string;
+}
+
+export interface ExecutionBatchView {
+  batch_id: string;
+  strategy: string;
+  symbol: string;
+  first_sequence: number;
+  last_sequence: number;
+  first_seen_at: string;
+  updated_at: string;
+  planned_at: string | null;
+  outcome_at: string | null;
+  state: ExecutionBatchState;
+  recovery: RecoveryDirective;
+  status_summary: string;
+  leg_count: number | null;
+  receipt_count: number | null;
+  expected_receipt_count: number | null;
+  failed_index: number | null;
+  unattempted_count: number | null;
+  reconciliation_observation_count: number | null;
+  reconciliation_error_count: number | null;
+  failure_recorded: boolean;
+  phases: ExecutionPhase[];
+}
+
+export interface OperatorReadModel {
+  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
+  journal_id: string;
+  head_sequence: number | null;
+  head_event_id: string | null;
+  projection_status: ProjectionStatus;
+  batches: ExecutionBatchView[];
+  batches_truncated: boolean;
+  warnings: ReadModelWarning[];
+  warnings_truncated: boolean;
+}
+
+/** 完整有界执行投影 + 携带游标的变更水位(changes)。 */
+export interface ExecutionsResponse {
+  schema_version: typeof API_SCHEMA_VERSION;
+  operator: OperatorReadModel;
+  changes: ControlPlaneEventsPage;
+}
+
+export const executionsResponseSchema = z.looseObject({
+  schema_version: z.literal(API_SCHEMA_VERSION),
+  operator: z.looseObject({
+    schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
+    journal_id: z.string(),
+    projection_status: z.enum(["complete", "windowed", "degraded"]),
+    batches: z.array(z.looseObject({ batch_id: z.string() })),
+    batches_truncated: z.boolean(),
+    warnings_truncated: z.boolean(),
+  }),
+  changes: z.looseObject({
+    journal_id: z.string(),
+    events: z.array(z.looseObject({ sequence: z.number() })),
+    next_cursor: z.string().nullable(),
+    boundary: z.looseObject({ kind: z.string() }),
+  }),
+});
+
 /* ------------------------------------------------------ GET /api/v1/events */
 
 /**
