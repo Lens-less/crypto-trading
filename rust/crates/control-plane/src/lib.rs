@@ -325,7 +325,8 @@ impl ControlPlaneSnapshotError {
             )
             | Self::AccountRiskProjection(
                 AccountRiskProjectionError::ScopeLimitExceeded { .. }
-                | AccountRiskProjectionError::OpenPositionLimitExceeded { .. },
+                | AccountRiskProjectionError::OpenPositionLimitExceeded { .. }
+                | AccountRiskProjectionError::OpenAdmissionLimitExceeded { .. },
             ) => ReadFailureKind::ResourceLimit,
             Self::Projection(ReadModelError::NonAdvancingPage)
             | Self::PaperAccountProjection(
@@ -388,7 +389,8 @@ impl ControlPlaneReadError {
             )
             | Self::AccountRiskProjection(
                 AccountRiskProjectionError::ScopeLimitExceeded { .. }
-                | AccountRiskProjectionError::OpenPositionLimitExceeded { .. },
+                | AccountRiskProjectionError::OpenPositionLimitExceeded { .. }
+                | AccountRiskProjectionError::OpenAdmissionLimitExceeded { .. },
             ) => ReadFailureKind::ResourceLimit,
             Self::Projection(ReadModelError::NonAdvancingPage)
             | Self::PaperAccountProjection(

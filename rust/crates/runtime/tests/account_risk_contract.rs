@@ -83,6 +83,41 @@ async fn reserve_paper_exposure(journal_id: Uuid, path: &std::path::Path, accoun
     account.reserve(request).await.unwrap();
 }
 
+/// Reserves one buy leg under the documented per-operation identity
+/// `<owner>/op/<sequence>` so the admitted notional of `owner_task_id` is
+/// settled the way real owners settle it.
+async fn reserve_owner_leg(
+    journal_id: Uuid,
+    path: &std::path::Path,
+    account_id: &str,
+    owner_task_id: &str,
+    notional: &str,
+) {
+    let account = PaperAccountAuthority::new(
+        journal_id,
+        JsonlHistory::new(path),
+        PaperAccountConfig::new(account_id, money("1000")).unwrap(),
+    )
+    .unwrap();
+    let intent = OrderIntent::market(
+        "paper-left",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    let request = PaperReservationRequest::new(
+        Uuid::new_v4(),
+        format!("{owner_task_id}/op/000001"),
+        format!("risk-gap:{owner_task_id}"),
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        vec![PaperReservationLeg::from_intent(0, &intent, money(notional)).unwrap()],
+    )
+    .unwrap();
+    account.reserve(request).await.unwrap();
+}
+
 #[tokio::test]
 async fn daily_trade_cap_counts_admissions_and_resets_at_utc_midnight() {
     let path = temp_path("daily-cap");
@@ -142,6 +177,125 @@ async fn daily_trade_cap_counts_admissions_and_resets_at_utc_midnight() {
     ));
     let state = restarted.state().await.unwrap();
     assert_eq!(state.daily_trade_count_at(next_day), 1);
+}
+
+#[tokio::test]
+async fn daily_trade_cap_ignores_backwards_date_changes() {
+    let path = temp_path("daily-cap-regress");
+    let journal_id = Uuid::new_v4();
+    let limits = || AccountRiskLimits {
+        max_daily_trades: Some(2),
+        ..AccountRiskLimits::default()
+    };
+    let risk = authority(journal_id, &path, limits());
+
+    let day_one = at(10, 0);
+    let day_two = day_one + Duration::days(1);
+    assert!(matches!(
+        risk.admit(&candidate("owner", "BTC-USDC-PERP", "10"), day_one)
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    assert!(matches!(
+        risk.admit(&candidate("owner", "BTC-USDC-PERP", "10"), day_two)
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+
+    // Owners feed replay-driven clocks that can regress across UTC midnight;
+    // a backdated admission must count against the latched later day instead
+    // of resetting the cap on every date flip.
+    assert!(matches!(
+        risk.admit(
+            &candidate("owner", "BTC-USDC-PERP", "10"),
+            day_one + Duration::hours(1)
+        )
+        .await
+        .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    assert!(matches!(
+        risk.admit(
+            &candidate("owner", "BTC-USDC-PERP", "10"),
+            day_one + Duration::hours(2)
+        )
+        .await
+        .unwrap(),
+        AccountRiskAdmission::Rejected(AccountRiskRejection::DailyTradeLimitReached {
+            count: 2,
+            limit: 2
+        })
+    ));
+    assert!(matches!(
+        risk.admit(
+            &candidate("owner", "BTC-USDC-PERP", "10"),
+            day_two + Duration::hours(1)
+        )
+        .await
+        .unwrap(),
+        AccountRiskAdmission::Rejected(AccountRiskRejection::DailyTradeLimitReached {
+            count: 2,
+            limit: 2
+        })
+    ));
+
+    let state = risk.state().await.unwrap();
+    // Regressed instants report the latched count (fail closed), a future day
+    // reports zero until its first admission rolls the date forward.
+    assert_eq!(state.daily_trade_count_at(day_one), 2);
+    assert_eq!(state.daily_trade_count_at(day_two), 2);
+    assert_eq!(state.daily_trade_count_at(day_two + Duration::days(1)), 0);
+}
+
+#[tokio::test]
+async fn admitted_but_unreserved_notional_counts_toward_exposure_caps() {
+    let path = temp_path("admit-reserve-gap");
+    let journal_id = Uuid::new_v4();
+    let limits = || AccountRiskLimits {
+        max_symbol_exposure: Some(money("150")),
+        max_total_exposure: Some(money("150")),
+        ..AccountRiskLimits::default()
+    };
+    let risk = authority(journal_id, &path, limits());
+
+    // Owner A is admitted but has not reserved yet: its in-flight notional
+    // must already occupy the caps for concurrent owners.
+    assert!(matches!(
+        risk.admit(&candidate("owner-a", "BTC-USDT", "100"), at(9, 0))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    assert!(matches!(
+        risk.admit(&candidate("owner-b", "BTC-USDT", "60"), at(9, 1))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+    ));
+
+    // Once owner A's reservation lands, the admitted notional moves into the
+    // reservation projection and is not double counted.
+    reserve_owner_leg(journal_id, &path, "paper-main", "owner-a", "100").await;
+    assert!(matches!(
+        risk.admit(&candidate("owner-b", "BTC-USDT", "40"), at(9, 2))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+
+    // Closing an owner's position clock clears its leftover admitted
+    // notional, so a stalled owner cannot occupy the caps forever.
+    risk.record_position_closed("owner-b", at(9, 3))
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.admit(&candidate("owner-d", "BTC-USDT", "40"), at(9, 4))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
 }
 
 #[tokio::test]
@@ -371,4 +525,54 @@ async fn position_clocks_raise_timeout_directives_until_closed() {
     let state = restarted.state().await.unwrap();
     assert!(state.open_positions.is_empty());
     assert_eq!(state.admitted_count, 1);
+}
+
+#[tokio::test]
+async fn sealed_chain_without_active_file_replays_the_latched_kill_switch() {
+    let path = temp_path("sealed-chain");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+
+    assert!(matches!(
+        risk.admit(&candidate("owner", "BTC-USDC-PERP", "10"), at(9, 0))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    risk.engage_kill_switch("operator drill", at(9, 1))
+        .await
+        .unwrap();
+
+    // Crash point between sealing the active file and recreating it: the
+    // sealed chain `<path>.1` alone is the complete durable record and must
+    // replay every risk fact, not silently read as an empty journal.
+    let sealed = {
+        let mut sealed = path.clone().into_os_string();
+        sealed.push(".1");
+        std::path::PathBuf::from(sealed)
+    };
+    std::fs::rename(&path, &sealed).unwrap();
+
+    let restarted = authority(journal_id, &path, AccountRiskLimits::default());
+    let state = restarted.state().await.unwrap();
+    assert!(state.kill_switch_engaged);
+    assert_eq!(state.admitted_count, 1);
+    assert!(matches!(
+        restarted
+            .admit(&candidate("owner", "BTC-USDC-PERP", "10"), at(9, 2))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Rejected(AccountRiskRejection::KillSwitchEngaged { .. })
+    ));
+
+    // A journal with neither an active file nor sealed segments still loads
+    // as a fresh empty scope.
+    let fresh = authority(
+        Uuid::new_v4(),
+        &temp_path("sealed-chain-fresh"),
+        AccountRiskLimits::default(),
+    );
+    let state = fresh.state().await.unwrap();
+    assert!(!state.kill_switch_engaged);
+    assert_eq!(state.admitted_count, 0);
 }

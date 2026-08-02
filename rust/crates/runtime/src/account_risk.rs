@@ -1,12 +1,17 @@
 //! Durable, paper-only account-level risk authority.
 //!
 //! The authority owns account-scoped admission truth: daily trade counts with
-//! UTC-midnight reset, owner-level open-position clocks, pause/resume facts,
-//! and a latching kill switch. Every mutation is reconstructed from the shared
-//! operations journal before another mutation is admitted, and every
-//! deterministic rejection is itself a durable fact. Exposure and balance
-//! observations come from the paper-account projection of the same journal
-//! generation, so risk state can never be newer than account state.
+//! forward-only UTC-midnight reset (admission timestamps that regress across
+//! midnight keep counting against the latest observed day), owner-level
+//! open-position clocks, pause/resume facts, and a latching kill switch.
+//! Every mutation is reconstructed from the shared operations journal before
+//! another mutation is admitted, and every deterministic rejection is itself
+//! a durable fact. Exposure and balance observations come from the
+//! paper-account projection of the same journal generation, plus each owner's
+//! admitted-but-not-yet-reserved notional replayed from this scope's own
+//! admission facts, so risk state can never be newer than account state and
+//! concurrent owners cannot double-spend the exposure caps between admission
+//! and reservation.
 //!
 //! Facts join the shared operations journal (the same journal that owns
 //! paper-account reservation facts) instead of a dedicated file: the control
@@ -14,11 +19,7 @@
 //! control facts are low-volume, and a separate chain would let risk state and
 //! account state drift across generations.
 
-use std::{
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{io::ErrorKind, path::Path, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use crypto_trading_domain::Money;
@@ -34,8 +35,11 @@ use uuid::Uuid;
 use crate::{
     DecisionRecord, FileJournalSnapshotSource, HistoryError, JournalPageBoundary, JournalReadError,
     JournalSnapshot, JournalSnapshotSource, JsonlHistory, LegacyJsonlJournalReader,
-    PaperAccountProjectionError, PaperAccountReadModel, PaperReservationPhase, ProjectionStatus,
-    paper_account::{AuthorityLock, bounded_identity, shared_authority_lock},
+    PaperAccountProjectionError, PaperAccountReadModel, PaperReservationPhase,
+    PaperReservationRequest, ProjectionStatus,
+    paper_account::{
+        AuthorityLock, PAPER_ACCOUNT_RESERVED, bounded_identity, shared_authority_lock,
+    },
 };
 
 /// Stable version of every durable account-risk fact and view.
@@ -146,7 +150,9 @@ pub struct AccountRiskStateView {
     pub pause_reason: Option<String>,
     pub kill_switch_engaged: bool,
     pub kill_switch_reason: Option<String>,
-    /// UTC date (YYYY-MM-DD) that `daily_trade_count` belongs to.
+    /// Latest UTC date (YYYY-MM-DD) observed on an admission fact. The count
+    /// resets only when this date rolls forward; backdated admissions keep
+    /// counting against it.
     pub trade_date_utc: Option<String>,
     pub daily_trade_count: u32,
     pub open_positions: Vec<AccountRiskOpenPositionView>,
@@ -175,10 +181,16 @@ impl AccountRiskStateView {
         }
     }
 
-    /// Admitted trades already counted for the supplied instant's UTC day.
+    /// Admitted trades already counted at the supplied instant's UTC day.
+    ///
+    /// `YYYY-MM-DD` orders lexicographically as it does chronologically. An
+    /// instant before the latched trade date means admission timestamps
+    /// regressed across UTC midnight (owners feed replay-driven clocks), so
+    /// the latched count is reported as-is instead of a fresh zero: the cap
+    /// must fail closed rather than reset on a backwards date change.
     #[must_use]
     pub fn daily_trade_count_at(&self, now: DateTime<Utc>) -> u32 {
-        if self.trade_date_utc.as_deref() == Some(utc_date(now).as_str()) {
+        if self.trade_date_utc.as_deref() >= Some(utc_date(now).as_str()) {
             self.daily_trade_count
         } else {
             0
@@ -291,7 +303,11 @@ impl AccountRiskReadModel {
                 recorded_at,
                 ..
             } => {
-                if scope.trade_date_utc.as_deref() != Some(utc_date.as_str()) {
+                // Reset only on a forward UTC-date roll: a fact dated before
+                // the latched day (owners feed replay-driven clocks that can
+                // regress across midnight) keeps counting against the latched
+                // day instead of zeroing the daily cap.
+                if scope.trade_date_utc.as_deref() < Some(utc_date.as_str()) {
                     scope.trade_date_utc = Some(utc_date);
                     scope.daily_trade_count = 0;
                 }
@@ -455,9 +471,20 @@ impl AccountRiskAuthority {
         now: DateTime<Utc>,
     ) -> Result<AccountRiskAdmission, AccountRiskError> {
         let _guard = self.authority_lock.lock().await;
-        let (state, accounts) = self.load().await?;
-        let (symbol_exposure, total_exposure, total_balance) =
+        let (state, accounts, snapshot) = self.load().await?;
+        let (mut symbol_exposure, mut total_exposure, total_balance) =
             exposures(&accounts, candidate.symbol())?;
+        // Owners hold the shared lock for admission only, not for the later
+        // reservation, so admitted-but-not-yet-reserved notional is invisible
+        // to the reservation-based exposures. Replaying it here closes the
+        // gap: a concurrent owner admitted between this owner's admission and
+        // reservation still observes the in-flight notional.
+        for admission in open_admissions(&snapshot, &self.scope_id)? {
+            total_exposure = checked_add(total_exposure, admission.notional)?;
+            if admission.symbol.eq_ignore_ascii_case(candidate.symbol()) {
+                symbol_exposure = checked_add(symbol_exposure, admission.notional)?;
+            }
+        }
         let input = AccountRiskInput {
             candidate_symbol: candidate.symbol().to_owned(),
             candidate_notional: candidate.notional(),
@@ -528,7 +555,7 @@ impl AccountRiskAuthority {
         let task_id =
             bounded_identity(task_id, "task id").map_err(AccountRiskError::InvalidRequest)?;
         let _guard = self.authority_lock.lock().await;
-        let (state, _) = self.load().await?;
+        let (state, _, _) = self.load().await?;
         if !state
             .open_positions
             .iter()
@@ -562,7 +589,7 @@ impl AccountRiskAuthority {
     ) -> Result<AccountRiskStateView, AccountRiskError> {
         let reason = bounded_reason(reason)?;
         let _guard = self.authority_lock.lock().await;
-        let (state, _) = self.load().await?;
+        let (state, _, _) = self.load().await?;
         if state.paused && state.pause_reason.as_deref() == Some(reason.as_str()) {
             return Ok(state);
         }
@@ -591,7 +618,7 @@ impl AccountRiskAuthority {
         now: DateTime<Utc>,
     ) -> Result<AccountRiskStateView, AccountRiskError> {
         let _guard = self.authority_lock.lock().await;
-        let (state, _) = self.load().await?;
+        let (state, _, _) = self.load().await?;
         if !state.paused {
             return Ok(state);
         }
@@ -622,7 +649,7 @@ impl AccountRiskAuthority {
     ) -> Result<AccountRiskStateView, AccountRiskError> {
         let reason = bounded_reason(reason)?;
         let _guard = self.authority_lock.lock().await;
-        let (state, _) = self.load().await?;
+        let (state, _, _) = self.load().await?;
         if state.kill_switch_engaged {
             return Ok(state);
         }
@@ -651,7 +678,7 @@ impl AccountRiskAuthority {
         now: DateTime<Utc>,
     ) -> Result<Vec<AccountRiskDirective>, AccountRiskError> {
         let _guard = self.authority_lock.lock().await;
-        let (state, accounts) = self.load().await?;
+        let (state, accounts, _) = self.load().await?;
         let mut directives = Vec::new();
         if state.kill_switch_engaged {
             directives.push(AccountRiskDirective::CloseAllPositions {
@@ -693,7 +720,8 @@ impl AccountRiskAuthority {
 
     async fn load(
         &self,
-    ) -> Result<(AccountRiskStateView, PaperAccountReadModel), AccountRiskError> {
+    ) -> Result<(AccountRiskStateView, PaperAccountReadModel, JournalSnapshot), AccountRiskError>
+    {
         let snapshot = load_journal_snapshot(self.journal_id, self.history.path()).await?;
         let risk = AccountRiskReadModel::from_legacy_snapshot(&snapshot)?;
         let accounts = PaperAccountReadModel::from_legacy_snapshot(&snapshot)?;
@@ -706,7 +734,7 @@ impl AccountRiskAuthority {
             .scope(&self.scope_id)
             .cloned()
             .unwrap_or_else(|| AccountRiskStateView::empty(self.scope_id.clone()));
-        Ok((state, accounts))
+        Ok((state, accounts, snapshot))
     }
 
     async fn append_fact(
@@ -733,17 +761,185 @@ async fn load_journal_snapshot(
     path: &Path,
 ) -> Result<JournalSnapshot, AccountRiskError> {
     let source = FileJournalSnapshotSource::new(journal_id, path)?;
-    let source_path: PathBuf = source.path().to_owned();
-    tokio::task::spawn_blocking(move || match std::fs::metadata(&source_path) {
-        Ok(_) => source.snapshot(),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+    tokio::task::spawn_blocking(move || match source.snapshot() {
+        // A fresh journal is the only state read as empty: the chain reader
+        // surfaces a missing active file as `Open(NotFound)` solely when no
+        // sealed segment exists. A missing active file behind sealed segments
+        // (the legal crash point between sealing and recreating it) replays
+        // the sealed chain inside `snapshot()` and must never reset durable
+        // risk facts such as the latched kill switch.
+        Err(JournalReadError::Open(error)) if error.kind() == ErrorKind::NotFound => {
             JournalSnapshot::new(journal_id, Vec::new())
         }
-        Err(error) => Err(JournalReadError::Metadata(error)),
+        result => result,
     })
     .await
     .map_err(|_| AccountRiskError::SnapshotTaskFailed)?
     .map_err(AccountRiskError::JournalRead)
+}
+
+/// One owner's admitted-but-not-yet-reserved notional for one symbol.
+#[derive(Debug)]
+struct OpenAdmission {
+    task_id: String,
+    symbol: String,
+    notional: Money,
+}
+
+/// Replays this scope's admission facts against later paper reservations to
+/// derive the notional each owner was admitted for but has not reserved yet.
+///
+/// A reservation settles the owner's pending notional (floored at zero) the
+/// moment its fact lands, because from then on the reservation-based
+/// exposures count it. A closed position clock clears the owner's leftovers,
+/// bounding the conservative residue an owner leaves behind when it fails
+/// between admission and reservation.
+fn open_admissions(
+    snapshot: &JournalSnapshot,
+    scope_id: &str,
+) -> Result<Vec<OpenAdmission>, AccountRiskError> {
+    let mut pending: Vec<OpenAdmission> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())
+            .map_err(AccountRiskProjectionError::Journal)?;
+        for event in page.events() {
+            apply_open_admission_event(&mut pending, scope_id, event.payload())?;
+        }
+        match page.boundary() {
+            // A partial tail already degrades the main projections, which
+            // fails the admission closed before this list is consulted.
+            JournalPageBoundary::SnapshotEnd | JournalPageBoundary::PartialTail { .. } => break,
+            JournalPageBoundary::PageLimit => {
+                let next = page.next_cursor().cloned();
+                if next == cursor {
+                    return Err(AccountRiskProjectionError::NonAdvancingPage.into());
+                }
+                cursor = next;
+            }
+        }
+    }
+    Ok(pending)
+}
+
+fn apply_open_admission_event(
+    pending: &mut Vec<OpenAdmission>,
+    scope_id: &str,
+    payload: &Value,
+) -> Result<(), AccountRiskError> {
+    let Some(decision) = payload.get("decision").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    match decision {
+        ACCOUNT_RISK_ADMITTED | ACCOUNT_RISK_POSITION_CLOSED => {
+            // Malformed facts are skipped here rather than counted: the main
+            // projection already degrades on them, failing admission closed.
+            let fact = payload
+                .get("details")
+                .cloned()
+                .map(serde_json::from_value::<AccountRiskFact>);
+            let Some(Ok(fact)) = fact else {
+                return Ok(());
+            };
+            if fact.schema_version() != ACCOUNT_RISK_SCHEMA_VERSION
+                || fact.matches_decision(decision).is_none()
+                || fact.scope_id() != scope_id
+            {
+                return Ok(());
+            }
+            match fact {
+                AccountRiskFact::Admitted {
+                    task_id,
+                    symbol,
+                    notional,
+                    ..
+                } => record_open_admission(pending, task_id, symbol, notional)?,
+                AccountRiskFact::PositionClosed { task_id, .. } => {
+                    pending.retain(|entry| entry.task_id != task_id);
+                }
+                _ => {}
+            }
+        }
+        PAPER_ACCOUNT_RESERVED => {
+            let request = payload
+                .get("details")
+                .and_then(|details| details.get("request"))
+                .cloned()
+                .map(serde_json::from_value::<PaperReservationRequest>);
+            let Some(Ok(request)) = request else {
+                return Ok(());
+            };
+            for leg in request.legs() {
+                settle_open_admission(
+                    pending,
+                    request.task_id(),
+                    leg.symbol().as_str(),
+                    leg.reserved_notional(),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn record_open_admission(
+    pending: &mut Vec<OpenAdmission>,
+    task_id: String,
+    symbol: String,
+    notional: Money,
+) -> Result<(), AccountRiskError> {
+    if let Some(entry) = pending
+        .iter_mut()
+        .find(|entry| entry.task_id == task_id && entry.symbol.eq_ignore_ascii_case(&symbol))
+    {
+        entry.notional = checked_add(entry.notional, notional)?;
+        return Ok(());
+    }
+    if pending.len() >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS {
+        return Err(AccountRiskProjectionError::OpenAdmissionLimitExceeded {
+            limit: MAX_ACCOUNT_RISK_SCOPE_POSITIONS,
+        }
+        .into());
+    }
+    pending.push(OpenAdmission {
+        task_id,
+        symbol,
+        notional,
+    });
+    Ok(())
+}
+
+/// Consumes reserved notional from the owner's pending admission, floored at
+/// zero. Owners admit under their lifecycle identity but reserve under the
+/// documented per-operation identity `<owner>/op/<sequence>`, so ownership is
+/// matched by that prefix (or an exact identity match).
+fn settle_open_admission(
+    pending: &mut Vec<OpenAdmission>,
+    reservation_task_id: &str,
+    symbol: &str,
+    reserved: Money,
+) {
+    let Some(index) = pending.iter().position(|entry| {
+        (entry.task_id == reservation_task_id
+            || reservation_task_id
+                .strip_prefix(entry.task_id.as_str())
+                .is_some_and(|rest| rest.starts_with("/op/")))
+            && entry.symbol.eq_ignore_ascii_case(symbol)
+    }) else {
+        return;
+    };
+    let remaining = pending[index]
+        .notional
+        .as_decimal()
+        .checked_sub(reserved.as_decimal())
+        .map(Money::new);
+    match remaining {
+        Some(remaining) if remaining > Money::default() => pending[index].notional = remaining,
+        _ => {
+            pending.remove(index);
+        }
+    }
 }
 
 /// Symbol, global, and total-balance observations derived conservatively from
@@ -915,6 +1111,8 @@ pub enum AccountRiskProjectionError {
     ScopeLimitExceeded { limit: usize },
     #[error("account risk projection exceeds the {limit}-open-position bound")]
     OpenPositionLimitExceeded { limit: usize },
+    #[error("account risk projection exceeds the {limit}-open-admission bound")]
+    OpenAdmissionLimitExceeded { limit: usize },
 }
 
 #[derive(Debug, Error)]
