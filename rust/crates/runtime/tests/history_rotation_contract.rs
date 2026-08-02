@@ -310,20 +310,19 @@ async fn segment_and_chain_budgets_fail_closed_without_writing() {
 }
 
 #[tokio::test]
-async fn crash_left_partial_tail_blocks_appends_until_quarantined() {
+async fn crash_left_partial_tail_is_truncated_at_the_last_complete_record_before_append() {
     let root = temp_root("history-rotation-partial-tail");
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("decisions.jsonl");
     let history = JsonlHistory::new(&path);
-    history
-        .append(&record("execution_planned", 0))
-        .await
-        .unwrap();
+    let first = record("execution_planned", 0);
+    history.append(&first).await.unwrap();
+    let partial = encoded(&record("execution_partial", 1));
 
     // Crash mid-write: the last record loses its terminating newline.
-    let mut truncated = std::fs::read(&path).unwrap();
-    truncated.pop();
-    std::fs::write(&path, &truncated).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&partial[..partial.len() - 1]);
+    std::fs::write(&path, &bytes).unwrap();
 
     // Readers still see a detectable, recoverable partial-tail boundary...
     let source = FileJournalSnapshotSource::new(Uuid::from_bytes([13; 16]), &path).unwrap();
@@ -333,20 +332,70 @@ async fn crash_left_partial_tail_blocks_appends_until_quarantined() {
         JournalPageBoundary::PartialTail { .. }
     ));
 
-    // ...because the writer refuses to glue new records onto the fragment or
-    // seal it into a read-only segment.
-    let error = history.append(&record("blocked", 1)).await.unwrap_err();
-    assert!(matches!(error, HistoryError::PartialTail { .. }));
-    assert_eq!(std::fs::read(&path).unwrap(), truncated);
-
-    // Quarantining the fragment (here: dropping the sole partial record)
-    // restores appends.
-    std::fs::write(&path, b"").unwrap();
+    // ...and the writer quarantines only the crash-left tail before
+    // continuing, preserving the valid prefix.
     let resumed = record("execution_completed", 2);
     history.append(&resumed).await.unwrap();
-    assert_eq!(read_journal_chain(&path).unwrap(), encoded(&resumed));
+    let mut expected = encoded(&first);
+    expected.extend_from_slice(&encoded(&resumed));
+    assert_eq!(read_journal_chain(&path).unwrap(), expected);
+    let quarantines = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("decisions.jsonl.partial-tail.")
+                        && name.ends_with(".quarantine")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(
+        std::fs::read(&quarantines[0]).unwrap(),
+        partial[..partial.len() - 1]
+    );
 
     drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn crash_left_tail_without_a_complete_record_anchor_still_fails_closed() {
+    let root = temp_root("history-rotation-unanchored-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    let fragment = br#"{"decision":"trunc"#;
+    std::fs::write(&path, fragment).unwrap();
+
+    let error = history.append(&record("blocked", 0)).await.unwrap_err();
+
+    assert!(matches!(error, HistoryError::PartialTail { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), fragment);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn recovery_refuses_to_truncate_past_a_complete_malformed_record() {
+    let root = temp_root("history-rotation-malformed-prefix");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    let mut bytes = encoded(&record("execution_planned", 0));
+    bytes.extend_from_slice(b"{bad json}\n");
+    bytes.extend_from_slice(br#"{"decision":"partial"#);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 2, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
     std::fs::remove_dir_all(root).unwrap();
 }
 

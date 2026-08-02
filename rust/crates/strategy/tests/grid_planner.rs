@@ -123,7 +123,7 @@ fn martingale_long_matches_the_legacy_ten_level_quantity_ladder() {
 
 // Golden vector for the legacy engine's DOCUMENTED short-martingale intent
 // (`archive/python-legacy/core/services/grid/models/grid_config.py:565-569`:
-// "价格越高（grid_index 越大），数量越多" — higher price sells more). The
+// "higher price (larger grid_index) means larger quantity"). The
 // legacy formula `order_amount + (grid_index - 1) * martingale_increment`
 // delivered the opposite because Grid 1 is the highest short price
 // (`grid_config.py:311-314`); this port deliberately deviates from that

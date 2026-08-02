@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
     sync::Arc,
     thread,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant as StdInstant},
 };
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -14,11 +14,11 @@ use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_exchange::BinancePublicExchange;
 use crypto_trading_runtime::{
     BinancePollingRoute, BinancePublicPollingSource, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION,
-    MarketContinuity, MarketDataBook, MarketDataClock, MarketDataError, MarketDataEvent,
-    MarketDataEventFuture, MarketDataEventSource, MarketDataFreshness, MarketDataObservation,
-    MarketDataSourceFailure, MarketFreshnessPolicy, MarketInstrument, MarketPollingPolicy,
-    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorExit, MarketSupervisorHealth,
-    MarketSupervisorPhase, MarketUniverse,
+    MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS, MarketContinuity, MarketDataBook, MarketDataClock,
+    MarketDataError, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
+    MarketDataFreshness, MarketDataObservation, MarketDataSourceFailure, MarketFreshnessPolicy,
+    MarketInstrument, MarketPollingPolicy, MarketSupervisor, MarketSupervisorConfig,
+    MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase, MarketUniverse,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -339,11 +339,103 @@ async fn binance_polling_keeps_wire_sequence_separate_from_poll_continuity() {
 }
 
 #[tokio::test]
+async fn binance_due_targets_are_fetched_concurrently_and_emitted_in_route_order() {
+    let request_count = 3;
+    let response_delay = StdDuration::from_millis(250);
+    let (base_url, server) = delayed_binance_stub_server(request_count, response_delay);
+    let clock = Arc::new(FixedClock { now: timestamp(1) });
+    let mut source = BinancePublicPollingSource::new(
+        BinancePublicExchange::with_base_url(&base_url).unwrap(),
+        vec![
+            route("CCC-USDT", "CCCUSDT"),
+            route("AAA-USDT", "AAAUSDT"),
+            route("BBB-USDT", "BBBUSDT"),
+        ],
+        polling_policy(StdDuration::from_millis(1)),
+        clock,
+    )
+    .unwrap();
+
+    let started = StdInstant::now();
+    let mut symbols = Vec::new();
+    for _ in 0..request_count {
+        let event = source.next_event().await.unwrap().unwrap();
+        let MarketDataEvent::Observation(observation) = event else {
+            panic!("delayed fixture must return a valid observation");
+        };
+        symbols.push(observation.snapshot.symbol.as_str().to_owned());
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(symbols, ["AAA-USDT", "BBB-USDT", "CCC-USDT"]);
+    assert!(
+        elapsed < StdDuration::from_millis(650),
+        "one due-target round took {elapsed:?}; serial polling would take at least {:?}",
+        response_delay * u32::try_from(request_count).unwrap()
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_retains_one_concurrent_poll_round_without_synthetic_gaps() {
+    let request_count = 3;
+    let (base_url, server) =
+        delayed_binance_stub_server(request_count, StdDuration::from_millis(25));
+    let clock = Arc::new(FixedClock { now: timestamp(1) });
+    let source = BinancePublicPollingSource::new(
+        BinancePublicExchange::with_base_url(&base_url).unwrap(),
+        vec![
+            route("CCC-USDT", "CCCUSDT"),
+            route("AAA-USDT", "AAAUSDT"),
+            route("BBB-USDT", "BBBUSDT"),
+        ],
+        MarketPollingPolicy::new(
+            StdDuration::from_secs(30),
+            StdDuration::from_secs(30),
+            StdDuration::from_secs(30),
+        )
+        .unwrap(),
+        clock,
+    )
+    .unwrap();
+    let mut supervisor = MarketSupervisor::start(
+        Uuid::from_u128(46),
+        source,
+        supervisor_config(StdDuration::from_secs(5)),
+    )
+    .unwrap();
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while supervisor.status().event_sequence < u64::try_from(request_count).unwrap() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut symbols = Vec::new();
+    for _ in 0..request_count {
+        let event = supervisor.next_event().await.unwrap().unwrap();
+        let MarketDataEvent::Observation(observation) = event else {
+            panic!("one bounded poll round must not synthesize a source gap");
+        };
+        symbols.push(observation.snapshot.symbol.as_str().to_owned());
+    }
+
+    assert_eq!(symbols, ["AAA-USDT", "BBB-USDT", "CCC-USDT"]);
+    assert_eq!(
+        supervisor.stop().await.unwrap(),
+        MarketSupervisorExit::StopRequested
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memory() {
     let base = timestamp(0);
+    let event_count = u64::try_from(MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS).unwrap() + 3;
     let source = ScriptedSource::new(
         "binance",
-        (1..=3)
+        (1..=event_count)
             .map(|revision| observation("binance", "BTCUSDT", revision, base))
             .collect(),
     );
@@ -356,7 +448,7 @@ async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memor
 
     tokio::time::timeout(StdDuration::from_secs(10), async {
         loop {
-            if supervisor.status().event_sequence == 3 {
+            if supervisor.status().event_sequence == event_count {
                 break;
             }
             tokio::task::yield_now().await;
@@ -369,13 +461,14 @@ async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memor
         supervisor.next_event().await.unwrap().unwrap(),
         MarketDataEvent::SourceGap {
             exchange,
-            skipped: 2,
+            skipped,
             observed_at,
-        } if exchange == "binance" && observed_at == base
+        } if exchange == "binance" && skipped == event_count - 1 && observed_at == base
     ));
     assert!(matches!(
         supervisor.next_event().await.unwrap().unwrap(),
-        MarketDataEvent::Observation(MarketDataObservation { revision: 3, .. })
+        MarketDataEvent::Observation(MarketDataObservation { revision, .. })
+            if revision == event_count
     ));
     assert!(supervisor.next_event().await.unwrap().is_none());
 
@@ -609,6 +702,54 @@ fn stub_server(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
                     .starts_with("GET /api/v3/ticker/bookTicker?symbol=LTCBTC HTTP/1.1\r\n")
             );
             stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (base_url, server)
+}
+
+fn delayed_binance_stub_server(
+    request_count: usize,
+    response_delay: StdDuration,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut handlers = Vec::with_capacity(request_count);
+        for _ in 0..request_count {
+            let (mut stream, _) = listener.accept().unwrap();
+            handlers.push(thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1_024];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let symbol = request
+                    .split("symbol=")
+                    .nth(1)
+                    .and_then(|suffix| suffix.split_whitespace().next())
+                    .expect("request must carry an exact wire symbol");
+                thread::sleep(response_delay);
+                let body = format!(
+                    r#"{{"symbol":"{symbol}","bidPrice":"99","bidQty":"1","askPrice":"101","askQty":"1","u":1}}"#
+                );
+                stream
+                    .write_all(http_response("200 OK", &body).as_bytes())
+                    .unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
         }
     });
     (base_url, server)

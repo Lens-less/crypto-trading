@@ -495,6 +495,48 @@ async fn uncertain_reservation_still_accepts_reason_based_release() {
     let snapshot = authority.snapshot().await.unwrap();
     assert_eq!(snapshot.available, money("1000"));
     assert_eq!(snapshot.committed_exposure, Money::default());
+    assert!(
+        snapshot.reservations.is_empty(),
+        "released reservations should not stay in the live capacity projection"
+    );
+}
+
+#[tokio::test]
+async fn released_request_is_pruned_from_snapshot_but_still_idempotent() {
+    let path = temp_path("released-idempotent-history");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let request = reservation_request("arb:btc", "open:released", Uuid::new_v4(), Uuid::new_v4());
+    let reservation_id = request.reservation_id();
+
+    authority.reserve(request.clone()).await.unwrap();
+    let released = authority
+        .release(reservation_id, "confirmed_no_submission")
+        .await
+        .unwrap();
+
+    let live_snapshot = authority.snapshot().await.unwrap();
+    assert!(live_snapshot.reservations.is_empty());
+
+    assert_eq!(
+        authority
+            .release(reservation_id, "confirmed_no_submission")
+            .await
+            .unwrap(),
+        released,
+        "a released reservation must remain idempotently addressable"
+    );
+
+    let retry = authority.reserve(request).await.unwrap();
+    let PaperReservationAdmission::Existing(existing) = retry else {
+        panic!("released duplicate should resolve from historical idempotency");
+    };
+    assert_eq!(existing.phase, PaperReservationPhase::Released);
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
 }
 
 #[tokio::test]
@@ -808,6 +850,7 @@ async fn exact_settlement_matches_hand_worked_fee_and_pnl_vector() {
         "110",
         "110",
     );
+    let close_retry = close.clone();
     let close_receipt = filled_receipt_for_leg(&close.legs()[0], "close-1", "110");
     let close_id = close.reservation_id();
     authority.reserve(close).await.unwrap();
@@ -823,22 +866,19 @@ async fn exact_settlement_matches_hand_worked_fee_and_pnl_vector() {
     assert_eq!(settled.available, money("1009.79"));
     assert_eq!(settled.committed_exposure, Money::default());
     assert!(settled.open_lots.is_empty());
-    assert!(
-        settled
-            .reservations
-            .iter()
-            .all(|r| r.phase == PaperReservationPhase::Released)
-    );
+    assert!(settled.reservations.is_empty());
+    let PaperReservationAdmission::Existing(close_terminal) =
+        authority.reserve(close_retry).await.unwrap()
+    else {
+        panic!("settled duplicate should resolve from historical idempotency");
+    };
+    assert_eq!(close_terminal.phase, PaperReservationPhase::Released);
     assert_eq!(
-        settled.reservations[1]
-            .settlement
-            .as_ref()
-            .unwrap()
-            .fees_paid,
+        close_terminal.settlement.as_ref().unwrap().fees_paid,
         money("0.11")
     );
     assert_eq!(
-        settled.reservations[1]
+        close_terminal
             .settlement
             .as_ref()
             .unwrap()

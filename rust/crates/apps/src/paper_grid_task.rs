@@ -18,12 +18,12 @@ use crypto_trading_runtime::{
     AccountRiskDirective, AccountRiskError, DecisionRecord, ExecutionBatch,
     FileJournalSnapshotSource, HistoryError, JournalReadError, JournalSnapshot,
     JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent,
-    MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError,
-    MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
-    PaperAccountAuthority, PaperAccountError, PaperCostModel, PaperReconciliationOutcome,
-    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
-    ReadModelError, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
-    ReadOnlyTaskView, RuntimeError,
+    MarketDataEventSource, MarketDataObservation, MarketSupervisor, MarketSupervisorConfig,
+    MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
+    MarketSupervisorStatus, PaperAccountAuthority, PaperAccountError, PaperCostModel,
+    PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
+    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     GridDirective, GridFill, GridProtectionMachine, GridProtectionObservation,
@@ -38,6 +38,10 @@ use tokio::{
 
 use crate::{
     DurablePaperSingleLegSaga, PaperSingleLegRequest, PaperSingleLegSagaError,
+    paper_admission::{
+        PaperAdmissionCompensationError, discard_planned_admission as discard_shared_admission,
+        retain_cancelled_reservation,
+    },
     task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture},
 };
 
@@ -56,9 +60,22 @@ const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type GridPaperExecutionFuture =
     Pin<Box<dyn Future<Output = Result<Vec<TradingReceipt>, RuntimeError>> + Send + 'static>>;
+/// Boxed hook that applies one consumed market observation to an execution
+/// adapter before the owner evaluates crossings against it.
+pub type GridPaperObservationFuture =
+    Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'static>>;
 
 /// Minimal object-safe execution seam owned by the trusted task process.
 pub trait GridPaperExecutor: Send + Sync + 'static {
+    /// Applies one observation at consumer time.
+    ///
+    /// Live executors can keep the default no-op. Replay executors use this
+    /// hook to prevent a fast source from advancing their paper book beyond
+    /// the event the owner is currently processing.
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture;
 }
 
@@ -579,6 +596,19 @@ async fn run_owner(
                         .await;
                     }
                 };
+                if let MarketDataEvent::Observation(observation) = &event
+                    && let Err(error) = executor.observe_market(observation.clone()).await
+                {
+                    return fail_owner(
+                        &mut source,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        GridPaperTaskFailure::ExecutionFailed,
+                        GridPaperTaskError::Runtime(error),
+                    )
+                    .await;
+                }
                 // Durable account-risk close directives run first: a kill
                 // switch, a critically low balance, or an expired position
                 // clock stops the owner exactly like a protection exit.
@@ -992,7 +1022,15 @@ async fn run_owner(
                             .checked_add(1)
                             .ok_or(GridPaperTaskError::InvalidRequest)?;
                     }
-                    let request = match build_operation(&config, &grid, cross, operation_sequence) {
+                    let reservation_price =
+                        conservative_reservation_price(&event, cross.side, cross.trigger_price);
+                    let request = match build_operation(
+                        &config,
+                        &grid,
+                        cross,
+                        reservation_price,
+                        operation_sequence,
+                    ) {
                         Ok(request) => request,
                         Err(error) => {
                             if let Err(cancel_error) = discard_planned_admission(
@@ -1284,60 +1322,16 @@ async fn retain_cancelled_operation(
     request: &PaperSingleLegRequest,
     now: DateTime<Utc>,
 ) -> Result<bool, GridPaperTaskError> {
-    let reservation_id = request.reservation().reservation_id();
-    let snapshot = account
-        .snapshot()
-        .await
-        .map_err(GridPaperTaskError::Account)?;
-    let Some(reservation) = snapshot
-        .reservations
-        .iter()
-        .find(|reservation| reservation.reservation_id == reservation_id)
-    else {
-        let (Some(risk), Some(ticket)) = (risk, admission_ticket) else {
-            return Ok(false);
-        };
-        if cancel_unreserved_admission(risk, owner_task_id, ticket, now)
-            .await
-            .map_err(GridPaperTaskError::AccountRisk)?
-        {
-            return Ok(false);
-        }
-        let retry_snapshot = account
-            .snapshot()
-            .await
-            .map_err(GridPaperTaskError::Account)?;
-        let Some(retry_reservation) = retry_snapshot
-            .reservations
-            .iter()
-            .find(|reservation| reservation.reservation_id == reservation_id)
-        else {
-            return Err(GridPaperTaskError::RecoveryRequired);
-        };
-        if retry_reservation.phase == PaperReservationPhase::Pending {
-            let _ = account
-                .mark_uncertain(reservation_id)
-                .await
-                .map_err(GridPaperTaskError::Account)?;
-        }
-        return Ok(true);
-    };
-    if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account
-            .mark_uncertain(reservation_id)
-            .await
-            .map_err(GridPaperTaskError::Account)?;
-    }
-    Ok(true)
-}
-
-async fn cancel_unreserved_admission(
-    risk: &AccountRiskAuthority,
-    task_id: &str,
-    ticket: &AccountRiskAdmissionTicket,
-    now: DateTime<Utc>,
-) -> Result<bool, AccountRiskError> {
-    risk.cancel_admission(task_id, ticket, now).await
+    retain_cancelled_reservation(
+        account,
+        risk,
+        owner_task_id,
+        admission_ticket,
+        request.reservation().reservation_id(),
+        now,
+    )
+    .await
+    .map_err(GridPaperTaskError::from)
 }
 
 async fn discard_planned_admission(
@@ -1346,14 +1340,9 @@ async fn discard_planned_admission(
     ticket: Option<&AccountRiskAdmissionTicket>,
     now: DateTime<Utc>,
 ) -> Result<(), GridPaperTaskError> {
-    let (Some(risk), Some(ticket)) = (risk, ticket) else {
-        return Ok(());
-    };
-    match cancel_unreserved_admission(risk, task_id, ticket, now).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(GridPaperTaskError::RecoveryRequired),
-        Err(error) => Err(GridPaperTaskError::AccountRisk(error)),
-    }
+    discard_shared_admission(risk, task_id, ticket, now)
+        .await
+        .map_err(GridPaperTaskError::from)
 }
 
 fn grid_crosses(
@@ -1639,6 +1628,7 @@ fn build_operation(
     config: &GridPaperTaskConfig,
     grid: &VirtualGrid,
     cross: VirtualGridCross,
+    reservation_price: Price,
     operation_sequence: u64,
 ) -> Result<PaperSingleLegRequest, GridPaperTaskError> {
     let side = match cross.side {
@@ -1654,8 +1644,7 @@ fn build_operation(
         cross.trigger_price,
     );
     let batch = ExecutionBatch::planned(vec![intent.clone()])?;
-    let reserved_notional = cross
-        .trigger_price
+    let reserved_notional = reservation_price
         .as_decimal()
         .checked_mul(config.quantity.as_decimal())
         .map(Money::new)
@@ -1675,6 +1664,25 @@ fn build_operation(
     )?;
     PaperSingleLegRequest::new(grid.config().symbol.clone(), batch, reservation)
         .map_err(GridPaperTaskError::Saga)
+}
+
+fn conservative_reservation_price(
+    event: &MarketDataEvent,
+    side: GridFill,
+    trigger_price: Price,
+) -> Price {
+    let MarketDataEvent::Observation(observation) = event else {
+        return trigger_price;
+    };
+    let touch = match side {
+        GridFill::Buy => observation.snapshot.ask(),
+        GridFill::Sell => observation.snapshot.bid(),
+    };
+    if touch.as_decimal() > trigger_price.as_decimal() {
+        touch
+    } else {
+        trigger_price
+    }
 }
 
 async fn stop_owner(
@@ -2048,6 +2056,16 @@ impl From<PaperAccountError> for GridPaperTaskError {
     }
 }
 
+impl From<PaperAdmissionCompensationError> for GridPaperTaskError {
+    fn from(value: PaperAdmissionCompensationError) -> Self {
+        match value {
+            PaperAdmissionCompensationError::Account(error) => Self::Account(error),
+            PaperAdmissionCompensationError::AccountRisk(error) => Self::AccountRisk(error),
+            PaperAdmissionCompensationError::RecoveryRequired => Self::RecoveryRequired,
+        }
+    }
+}
+
 impl From<JournalReadError> for GridPaperTaskError {
     fn from(value: JournalReadError) -> Self {
         Self::JournalRead(value)
@@ -2137,7 +2155,7 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
-    use super::cancel_unreserved_admission;
+    use crate::paper_admission::cancel_unreserved_admission;
 
     fn money(value: &str) -> Money {
         Money::new(Decimal::from_str(value).unwrap())

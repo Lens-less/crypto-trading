@@ -1065,6 +1065,8 @@ pub enum MarketDataError {
     EventBufferTooLarge { count: usize, limit: usize },
     #[error("invalid market-data polling policy: {0}")]
     InvalidPollingPolicy(&'static str),
+    #[error("a bounded market-data polling task terminated unexpectedly")]
+    PollingTaskFailed,
     #[error("polling is unsupported for instrument {instrument:?}")]
     UnsupportedPollingInstrument { instrument: MarketInstrument },
     #[error("polling route for instrument {instrument:?} is duplicated")]

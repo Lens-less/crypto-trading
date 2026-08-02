@@ -7,6 +7,7 @@ pub mod continuous_alert;
 pub mod continuous_monitor;
 pub mod continuous_scanner;
 pub mod monitor;
+mod paper_admission;
 pub mod paper_arbitrage_saga;
 pub mod paper_arbitrage_task;
 pub mod paper_grid_task;
@@ -34,8 +35,8 @@ pub use paper_arbitrage_task::{
 };
 pub use paper_grid_task::{
     GRID_PAPER_TASK_STATUS_SCHEMA_VERSION, GridPaperExecutionFuture, GridPaperExecutor,
-    GridPaperTask, GridPaperTaskConfig, GridPaperTaskError, GridPaperTaskExit,
-    GridPaperTaskFailure, GridPaperTaskPhase, GridPaperTaskStatus,
+    GridPaperObservationFuture, GridPaperTask, GridPaperTaskConfig, GridPaperTaskError,
+    GridPaperTaskExit, GridPaperTaskFailure, GridPaperTaskPhase, GridPaperTaskStatus,
 };
 pub use paper_profile::{
     ArbitragePaperProfileInput, GridPaperProfileInput, PaperProfileCatalog,

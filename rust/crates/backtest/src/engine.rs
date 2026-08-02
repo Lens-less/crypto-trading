@@ -1,28 +1,44 @@
 use chrono::{DateTime, Utc};
+use crypto_trading_domain::{MarketSnapshot, Money, OrderIntent, OrderType, Price, Quantity, Side};
 use crypto_trading_indicators::{PerformanceMetrics, RatioConfig, summarize_performance};
 use rust_decimal::Decimal;
 
 use crate::{BacktestError, ledger::Ledger};
 
+/// Which production quote field should become the deterministic backtest mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketEventPrice {
+    LastOrMid,
+    Mid,
+    Bid,
+    Ask,
+}
+
+impl Default for MarketEventPrice {
+    fn default() -> Self {
+        Self::LastOrMid
+    }
+}
+
 /// Deterministic market data event consumed by a backtest tape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketEvent {
     pub occurred_at: DateTime<Utc>,
-    pub price: Decimal,
+    pub price: Price,
 }
 
 impl MarketEvent {
-    /// Creates a market event.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BacktestError::NonPositivePrice`] when `price <= 0`.
-    pub fn new(occurred_at: DateTime<Utc>, price: Decimal) -> Result<Self, BacktestError> {
-        if price <= Decimal::ZERO {
-            return Err(BacktestError::NonPositivePrice);
-        }
+    #[must_use]
+    pub const fn new(occurred_at: DateTime<Utc>, price: Price) -> Self {
+        Self { occurred_at, price }
+    }
 
-        Ok(Self { occurred_at, price })
+    #[must_use]
+    pub fn from_snapshot(snapshot: &MarketSnapshot, price_source: MarketEventPrice) -> Self {
+        Self {
+            occurred_at: snapshot.timestamp,
+            price: snapshot_price(snapshot, price_source),
+        }
     }
 }
 
@@ -48,6 +64,24 @@ impl EventTape {
         }
 
         Ok(Self { events })
+    }
+
+    /// Adapts production snapshots into a validated deterministic tape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::NonMonotonicTape`] when timestamps move
+    /// backwards.
+    pub fn from_market_snapshots(
+        snapshots: &[MarketSnapshot],
+        price_source: MarketEventPrice,
+    ) -> Result<Self, BacktestError> {
+        Self::new(
+            snapshots
+                .iter()
+                .map(|snapshot| MarketEvent::from_snapshot(snapshot, price_source))
+                .collect(),
+        )
     }
 
     /// Returns all tape events.
@@ -86,13 +120,6 @@ impl SimClock {
     }
 }
 
-/// Order side for the single simulated instrument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
 /// Liquidity assumption applied by the fill model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liquidity {
@@ -104,7 +131,7 @@ pub enum Liquidity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRequest {
     pub side: Side,
-    pub quantity: Decimal,
+    pub quantity: Quantity,
     pub liquidity: Liquidity,
 }
 
@@ -114,8 +141,12 @@ impl OrderRequest {
     /// # Errors
     ///
     /// Returns [`BacktestError::InvalidQuantity`] when `quantity <= 0`.
-    pub fn new(side: Side, quantity: Decimal, liquidity: Liquidity) -> Result<Self, BacktestError> {
-        if quantity <= Decimal::ZERO {
+    pub fn new(
+        side: Side,
+        quantity: Quantity,
+        liquidity: Liquidity,
+    ) -> Result<Self, BacktestError> {
+        if quantity.as_decimal() <= Decimal::ZERO {
             return Err(BacktestError::InvalidQuantity);
         }
 
@@ -125,6 +156,41 @@ impl OrderRequest {
             liquidity,
         })
     }
+
+    /// Adapts one production order intent into the deterministic execution
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BacktestError::UnsupportedOrderIntent`] for non-market
+    /// intents because the current fill model does not simulate resting-book
+    /// behavior.
+    pub fn from_order_intent(
+        intent: &OrderIntent,
+        liquidity: Liquidity,
+    ) -> Result<Self, BacktestError> {
+        if intent.order_type != OrderType::Market {
+            return Err(BacktestError::UnsupportedOrderIntent);
+        }
+
+        Self::new(intent.side, intent.quantity, liquidity)
+    }
+}
+
+/// Adapts a batch of production order intents into deterministic requests.
+///
+/// # Errors
+///
+/// Returns [`BacktestError::UnsupportedOrderIntent`] when any intent is not a
+/// market order.
+pub fn adapt_order_intents(
+    intents: &[OrderIntent],
+    liquidity: Liquidity,
+) -> Result<Vec<OrderRequest>, BacktestError> {
+    intents
+        .iter()
+        .map(|intent| OrderRequest::from_order_intent(intent, liquidity))
+        .collect()
 }
 
 /// Explicit maker/taker fill assumptions expressed in basis points.
@@ -194,6 +260,7 @@ impl FillModel {
         let fill_price = match order.side {
             Side::Buy => event
                 .price
+                .as_decimal()
                 .checked_mul(
                     Decimal::ONE
                         .checked_add(slippage_factor)
@@ -202,6 +269,7 @@ impl FillModel {
                 .ok_or(BacktestError::ArithmeticOverflow)?,
             Side::Sell => event
                 .price
+                .as_decimal()
                 .checked_mul(
                     Decimal::ONE
                         .checked_sub(slippage_factor)
@@ -209,16 +277,18 @@ impl FillModel {
                 )
                 .ok_or(BacktestError::ArithmeticOverflow)?,
         };
-        let notional = fill_price
-            .checked_mul(order.quantity)
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        let fee = notional
-            .checked_mul(
-                fee_bps
-                    .checked_div(decimal_bps_denominator())
-                    .ok_or(BacktestError::ArithmeticOverflow)?,
-            )
-            .ok_or(BacktestError::ArithmeticOverflow)?;
+        let fill_price = Price::new(fill_price)?;
+        let notional = notional(fill_price, order.quantity)?;
+        let fee = Money::new(
+            notional
+                .as_decimal()
+                .checked_mul(
+                    fee_bps
+                        .checked_div(decimal_bps_denominator())
+                        .ok_or(BacktestError::ArithmeticOverflow)?,
+                )
+                .ok_or(BacktestError::ArithmeticOverflow)?,
+        );
 
         Ok(TradeFill {
             occurred_at: event.occurred_at,
@@ -237,29 +307,29 @@ impl FillModel {
 pub struct TradeFill {
     pub occurred_at: DateTime<Utc>,
     pub side: Side,
-    pub quantity: Decimal,
+    pub quantity: Quantity,
     pub liquidity: Liquidity,
-    pub reference_price: Decimal,
-    pub fill_price: Decimal,
-    pub fee: Decimal,
+    pub reference_price: Price,
+    pub fill_price: Price,
+    pub fee: Money,
 }
 
 /// Executed trade plus the resulting ledger state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trade {
     pub fill: TradeFill,
-    pub realized_pnl_delta: Decimal,
-    pub cumulative_realized_pnl: Decimal,
+    pub realized_pnl_delta: Money,
+    pub cumulative_realized_pnl: Money,
     pub position_qty: Decimal,
-    pub equity: Decimal,
+    pub equity: Money,
 }
 
 /// Point on the mark-to-market equity curve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EquityPoint {
     pub occurred_at: DateTime<Utc>,
-    pub price: Decimal,
-    pub equity: Decimal,
+    pub price: Price,
+    pub equity: Money,
 }
 
 /// Read-only strategy context for the current event.
@@ -278,9 +348,9 @@ pub trait Strategy {
 /// Summary metrics attached to a finished backtest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacktestMetrics {
-    pub realized_pnl: Decimal,
-    pub unrealized_pnl: Decimal,
-    pub ending_equity: Decimal,
+    pub realized_pnl: Money,
+    pub unrealized_pnl: Money,
+    pub ending_equity: Money,
     pub performance: PerformanceMetrics,
 }
 
@@ -295,7 +365,7 @@ pub struct BacktestResult {
 /// Minimal single-instrument backtest engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacktestEngine {
-    initial_cash: Decimal,
+    initial_cash: Money,
     fill_model: FillModel,
     ratio_config: RatioConfig,
 }
@@ -306,8 +376,8 @@ impl BacktestEngine {
     /// # Errors
     ///
     /// Returns [`BacktestError::InvalidInitialCash`] when `initial_cash < 0`.
-    pub fn new(initial_cash: Decimal, fill_model: FillModel) -> Result<Self, BacktestError> {
-        if initial_cash < Decimal::ZERO {
+    pub fn new(initial_cash: Money, fill_model: FillModel) -> Result<Self, BacktestError> {
+        if initial_cash.as_decimal() < Decimal::ZERO {
             return Err(BacktestError::InvalidInitialCash);
         }
 
@@ -369,16 +439,18 @@ impl BacktestEngine {
             });
         }
 
-        let latest_price = tape.events().last().map(|event| event.price);
-        let terminal = match latest_price {
-            Some(price) => ledger.snapshot(price)?,
-            None => ledger.snapshot(Decimal::ONE)?,
+        let terminal = match tape.events().last() {
+            Some(event) => ledger.snapshot(event.price)?,
+            None => ledger.snapshot(Price::new(Decimal::ONE)?)?,
         };
         let trade_pnls: Vec<Decimal> = trades
             .iter()
-            .map(|trade| trade.realized_pnl_delta)
+            .map(|trade| trade.realized_pnl_delta.as_decimal())
             .collect();
-        let equity_values: Vec<Decimal> = equity_curve.iter().map(|point| point.equity).collect();
+        let equity_values: Vec<Decimal> = equity_curve
+            .iter()
+            .map(|point| point.equity.as_decimal())
+            .collect();
         let returns = equity_returns(&equity_values)?;
         let performance =
             summarize_performance(&equity_values, &trade_pnls, &returns, self.ratio_config)
@@ -395,6 +467,24 @@ impl BacktestEngine {
             },
         })
     }
+}
+
+fn snapshot_price(snapshot: &MarketSnapshot, price_source: MarketEventPrice) -> Price {
+    match price_source {
+        MarketEventPrice::LastOrMid => snapshot.last.unwrap_or_else(|| snapshot.mid_price()),
+        MarketEventPrice::Mid => snapshot.mid_price(),
+        MarketEventPrice::Bid => snapshot.bid(),
+        MarketEventPrice::Ask => snapshot.ask(),
+    }
+}
+
+fn notional(price: Price, quantity: Quantity) -> Result<Money, BacktestError> {
+    Ok(Money::new(
+        price
+            .as_decimal()
+            .checked_mul(quantity.as_decimal())
+            .ok_or(BacktestError::ArithmeticOverflow)?,
+    ))
 }
 
 fn equity_returns(equity_curve: &[Decimal]) -> Result<Vec<Decimal>, BacktestError> {

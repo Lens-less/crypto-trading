@@ -316,9 +316,10 @@ impl GridPlanner {
             // (lowest price for long, highest price for short), so martingale
             // sizing is largest there. The legacy short formula
             // (`grid_config.py:565-569`, `order_amount + (grid_index - 1) *
-            // increment`) contradicts its own documented intent ("价格越高，
-            // 数量越多") because legacy Grid 1 is the highest short price; we
-            // deliberately deviate to deliver the documented intent.
+            // increment`) contradicts its own documented intent ("higher
+            // price, larger quantity") because legacy Grid 1 is the highest
+            // short price. We deliberately deviate to deliver the documented
+            // intent.
             let increment_count = count - index;
             let quantity_increment = self
                 .config

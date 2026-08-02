@@ -4,9 +4,10 @@
 //! forward-only UTC-midnight reset (admission timestamps that regress across
 //! midnight keep counting against the latest observed day), owner-level
 //! open-position clocks, pause/resume facts, and a latching kill switch.
-//! Every mutation is reconstructed from the shared operations journal before
-//! another mutation is admitted, and every deterministic rejection is itself
-//! a durable fact. Exposure and balance observations come from the
+//! Authorities cold-replay the shared operations journal once, then refresh a
+//! shared incremental projection before another mutation is admitted; every
+//! deterministic rejection is itself a durable fact. Exposure and balance
+//! observations come from the
 //! paper-account projection of the same journal generation, plus each owner's
 //! admitted-but-not-yet-reserved notional replayed from this scope's own
 //! admission facts, so risk state can never be newer than account state and
@@ -19,7 +20,7 @@
 //! control facts are low-volume, and a separate chain would let risk state and
 //! account state drift across generations.
 
-use std::{io::ErrorKind, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use crypto_trading_domain::Money;
@@ -32,11 +33,11 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::authority_state::{AuthorityStateCache, AuthorityStateError};
 use crate::{
-    DecisionRecord, FileJournalSnapshotSource, HistoryError, JournalPageBoundary, JournalReadError,
-    JournalSnapshot, JournalSnapshotSource, JsonlHistory, LegacyJsonlJournalReader,
-    PaperAccountProjectionError, PaperAccountReadModel, PaperExecutionLedgerKind,
-    PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
+    DecisionRecord, HistoryError, JournalPageBoundary, JournalReadError, JournalSnapshot,
+    JsonlHistory, LegacyJsonlJournalReader, PaperAccountProjectionError, PaperAccountReadModel,
+    PaperExecutionLedgerKind, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
     paper_account::{
         AuthorityLock, PAPER_ACCOUNT_RESERVED, bounded_identity, shared_authority_lock,
     },
@@ -184,7 +185,7 @@ pub struct AccountRiskStateView {
 }
 
 impl AccountRiskStateView {
-    fn empty(scope_id: String) -> Self {
+    pub(crate) fn empty(scope_id: String) -> Self {
         Self {
             schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
             scope_id,
@@ -443,6 +444,10 @@ impl ProjectionBuilder {
         }
     }
 
+    pub(crate) fn from_model(model: AccountRiskReadModel) -> Self {
+        Self { model }
+    }
+
     pub(crate) fn observe_event(
         &mut self,
         event: &crate::OperationEventEnvelope,
@@ -474,6 +479,7 @@ pub struct AccountRiskAuthority {
     scope_id: String,
     policy: AccountRiskPolicy,
     authority_lock: Arc<AuthorityLock>,
+    state_cache: AuthorityStateCache,
 }
 
 impl AccountRiskAuthority {
@@ -499,12 +505,14 @@ impl AccountRiskAuthority {
             .map_err(AccountRiskError::InvalidConfig)?;
         let authority_lock =
             shared_authority_lock(&crate::history::normalized_lock_key(history.path()));
+        let state_cache = AuthorityStateCache::new(journal_id, &history);
         Ok(Self {
             journal_id,
             history,
             scope_id,
             policy,
             authority_lock,
+            state_cache,
         })
     }
 
@@ -856,18 +864,19 @@ impl AccountRiskAuthority {
         ),
         AccountRiskError,
     > {
-        let snapshot = load_journal_snapshot(self.journal_id, self.history.path()).await?;
-        let (risk, accounts, open_admissions) = project_authority_state(&snapshot, &self.scope_id)?;
-        if risk.projection_status != ProjectionStatus::Complete
-            || accounts.projection_status != ProjectionStatus::Complete
-        {
-            return Err(AccountRiskError::DegradedState);
-        }
-        let state = risk
-            .scope(&self.scope_id)
-            .cloned()
-            .unwrap_or_else(|| AccountRiskStateView::empty(self.scope_id.clone()));
-        Ok((state, accounts, open_admissions))
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_risk)?;
+        let state = projection
+            .risk_state(&self.scope_id)
+            .map_err(map_authority_state_error_to_risk)?;
+        Ok((
+            state,
+            projection.paper_live.clone(),
+            projection.open_admissions_for_scope(&self.scope_id),
+        ))
     }
 
     async fn append_fact(
@@ -889,87 +898,30 @@ impl AccountRiskAuthority {
     }
 }
 
-async fn load_journal_snapshot(
-    journal_id: Uuid,
-    path: &Path,
-) -> Result<JournalSnapshot, AccountRiskError> {
-    let source = FileJournalSnapshotSource::new(journal_id, path)?;
-    tokio::task::spawn_blocking(move || match source.snapshot() {
-        // A fresh journal is the only state read as empty: the chain reader
-        // surfaces a missing active file as `Open(NotFound)` solely when no
-        // sealed segment exists. A missing active file behind sealed segments
-        // (the legal crash point between sealing and recreating it) replays
-        // the sealed chain inside `snapshot()` and must never reset durable
-        // risk facts such as the latched kill switch.
-        Err(JournalReadError::Open(error)) if error.kind() == ErrorKind::NotFound => {
-            JournalSnapshot::new(journal_id, Vec::new())
+fn map_authority_state_error_to_risk(error: AuthorityStateError) -> AccountRiskError {
+    match error {
+        AuthorityStateError::History | AuthorityStateError::Degraded => {
+            AccountRiskError::DegradedState
         }
-        result => result,
-    })
-    .await
-    .map_err(|_| AccountRiskError::SnapshotTaskFailed)?
-    .map_err(AccountRiskError::JournalRead)
+        AuthorityStateError::Journal(error) => AccountRiskError::JournalRead(error),
+        AuthorityStateError::Paper(error) => AccountRiskError::PaperProjection(error),
+        AuthorityStateError::Risk(error) => AccountRiskError::Projection(error),
+    }
 }
 
 /// One owner's admitted-but-not-yet-reserved notional for one symbol.
-#[derive(Debug)]
-struct OpenAdmission {
-    task_id: String,
-    symbol: String,
-    ticket_id: Option<String>,
-    recorded_at: DateTime<Utc>,
-    notional: Money,
+#[derive(Clone, Debug)]
+pub(crate) struct OpenAdmission {
+    pub(crate) scope_id: String,
+    pub(crate) task_id: String,
+    pub(crate) symbol: String,
+    pub(crate) ticket_id: Option<String>,
+    pub(crate) recorded_at: DateTime<Utc>,
+    pub(crate) notional: Money,
 }
 
-/// Projects both authority-owned read models and pending admission notional in
-/// one pass over one immutable journal generation. Each event is still
-/// interpreted by its existing model builder, preserving replay semantics
-/// while removing two redundant pagination passes from every hot-path check.
-fn project_authority_state(
-    snapshot: &JournalSnapshot,
-    scope_id: &str,
-) -> Result<
-    (
-        AccountRiskReadModel,
-        PaperAccountReadModel,
-        Vec<OpenAdmission>,
-    ),
-    AccountRiskError,
-> {
-    let mut risk = ProjectionBuilder::new(snapshot.journal_id());
-    let mut accounts = crate::paper_account::ProjectionBuilder::new(snapshot.journal_id());
-    let mut pending: Vec<OpenAdmission> = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())
-            .map_err(AccountRiskProjectionError::Journal)?;
-        for event in page.events() {
-            risk.observe_event(event)?;
-            accounts.observe_event(event);
-            apply_open_admission_event(&mut pending, scope_id, event.payload())?;
-        }
-        match page.boundary() {
-            JournalPageBoundary::SnapshotEnd => break,
-            JournalPageBoundary::PartialTail { .. } => {
-                risk.mark_partial_tail();
-                accounts.mark_partial_tail();
-                break;
-            }
-            JournalPageBoundary::PageLimit => {
-                let next = page.next_cursor().cloned();
-                if next == cursor {
-                    return Err(AccountRiskProjectionError::NonAdvancingPage.into());
-                }
-                cursor = next;
-            }
-        }
-    }
-    Ok((risk.finish(), accounts.finish()?, pending))
-}
-
-fn apply_open_admission_event(
+pub(crate) fn apply_open_admission_event(
     pending: &mut Vec<OpenAdmission>,
-    scope_id: &str,
     payload: &Value,
 ) -> Result<(), AccountRiskError> {
     let Some(decision) = payload.get("decision").and_then(Value::as_str) else {
@@ -988,12 +940,12 @@ fn apply_open_admission_event(
             };
             if fact.schema_version() != ACCOUNT_RISK_SCHEMA_VERSION
                 || fact.matches_decision(decision).is_none()
-                || fact.scope_id() != scope_id
             {
                 return Ok(());
             }
             match fact {
                 AccountRiskFact::Admitted {
+                    scope_id,
                     task_id,
                     symbol,
                     ticket_id,
@@ -1002,17 +954,27 @@ fn apply_open_admission_event(
                     ..
                 } => record_open_admission(
                     pending,
+                    scope_id,
                     task_id,
                     symbol,
                     ticket_id,
                     recorded_at,
                     notional,
                 )?,
-                AccountRiskFact::AdmissionCancelled { ticket_id, .. } => {
-                    pending.retain(|entry| entry.ticket_id.as_deref() != Some(ticket_id.as_str()));
+                AccountRiskFact::AdmissionCancelled {
+                    scope_id,
+                    ticket_id,
+                    ..
+                } => {
+                    pending.retain(|entry| {
+                        entry.scope_id != scope_id
+                            || entry.ticket_id.as_deref() != Some(ticket_id.as_str())
+                    });
                 }
-                AccountRiskFact::PositionClosed { task_id, .. } => {
-                    pending.retain(|entry| entry.task_id != task_id);
+                AccountRiskFact::PositionClosed {
+                    scope_id, task_id, ..
+                } => {
+                    pending.retain(|entry| entry.scope_id != scope_id || entry.task_id != task_id);
                 }
                 _ => {}
             }
@@ -1027,12 +989,27 @@ fn apply_open_admission_event(
                 return Ok(());
             };
             for leg in request.legs() {
-                settle_open_admission(
-                    pending,
-                    request.task_id(),
-                    leg.symbol().as_str(),
-                    leg.reserved_notional(),
-                )?;
+                let mut matching_scopes = Vec::new();
+                for admission in pending.iter().filter(|admission| {
+                    admission_matches_reservation(
+                        admission,
+                        request.task_id(),
+                        leg.symbol().as_str(),
+                    )
+                }) {
+                    if !matching_scopes.contains(&admission.scope_id) {
+                        matching_scopes.push(admission.scope_id.clone());
+                    }
+                }
+                for scope_id in matching_scopes {
+                    settle_open_admission(
+                        pending,
+                        &scope_id,
+                        request.task_id(),
+                        leg.symbol().as_str(),
+                        leg.reserved_notional(),
+                    )?;
+                }
             }
         }
         _ => {}
@@ -1042,19 +1019,26 @@ fn apply_open_admission_event(
 
 fn record_open_admission(
     pending: &mut Vec<OpenAdmission>,
+    scope_id: String,
     task_id: String,
     symbol: String,
     ticket_id: Option<String>,
     recorded_at: DateTime<Utc>,
     notional: Money,
 ) -> Result<(), AccountRiskError> {
-    if pending.len() >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS {
+    if pending
+        .iter()
+        .filter(|entry| entry.scope_id == scope_id)
+        .count()
+        >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS
+    {
         return Err(AccountRiskProjectionError::OpenAdmissionLimitExceeded {
             limit: MAX_ACCOUNT_RISK_SCOPE_POSITIONS,
         }
         .into());
     }
     pending.push(OpenAdmission {
+        scope_id,
         task_id,
         symbol,
         ticket_id,
@@ -1070,6 +1054,7 @@ fn record_open_admission(
 /// matched by that prefix (or an exact identity match).
 fn settle_open_admission(
     pending: &mut Vec<OpenAdmission>,
+    scope_id: &str,
     reservation_task_id: &str,
     symbol: &str,
     reserved: Money,
@@ -1077,11 +1062,8 @@ fn settle_open_admission(
     let mut remaining = reserved;
     while remaining > Money::default() {
         let Some(index) = pending.iter().position(|entry| {
-            (entry.task_id == reservation_task_id
-                || reservation_task_id
-                    .strip_prefix(entry.task_id.as_str())
-                    .is_some_and(|rest| rest.starts_with("/op/")))
-                && entry.symbol.eq_ignore_ascii_case(symbol)
+            entry.scope_id == scope_id
+                && admission_matches_reservation(entry, reservation_task_id, symbol)
         }) else {
             break;
         };
@@ -1093,6 +1075,18 @@ fn settle_open_admission(
         pending.remove(index);
     }
     Ok(())
+}
+
+fn admission_matches_reservation(
+    admission: &OpenAdmission,
+    reservation_task_id: &str,
+    symbol: &str,
+) -> bool {
+    (admission.task_id == reservation_task_id
+        || reservation_task_id
+            .strip_prefix(admission.task_id.as_str())
+            .is_some_and(|rest| rest.starts_with("/op/")))
+        && admission.symbol.eq_ignore_ascii_case(symbol)
 }
 
 /// Symbol, global, and total-balance observations derived from the active
@@ -1326,4 +1320,128 @@ pub enum AccountRiskError {
     ArithmeticOverflow,
     #[error(transparent)]
     Strategy(StrategyError),
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symbol};
+    use rust_decimal::Decimal;
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
+    use super::{
+        ACCOUNT_RISK_ADMISSION_CANCELLED, ACCOUNT_RISK_ADMITTED, ACCOUNT_RISK_POSITION_CLOSED,
+        ACCOUNT_RISK_SCHEMA_VERSION, AccountRiskFact, OpenAdmission, PAPER_ACCOUNT_RESERVED,
+        apply_open_admission_event,
+    };
+    use crate::{PaperCostModel, PaperReservationLeg, PaperReservationRequest};
+
+    #[test]
+    fn composite_open_admissions_preserve_scope_isolation() {
+        let journal_id = Uuid::from_u128(1);
+        let recorded_at = Utc.with_ymd_and_hms(2026, 8, 3, 0, 0, 0).unwrap();
+        let mut pending = Vec::<OpenAdmission>::new();
+        for (scope_id, ticket_id) in [("scope-a", "ticket-a"), ("scope-b", "ticket-b")] {
+            apply_open_admission_event(
+                &mut pending,
+                &risk_payload(
+                    ACCOUNT_RISK_ADMITTED,
+                    &AccountRiskFact::Admitted {
+                        schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                        journal_id,
+                        scope_id: scope_id.to_owned(),
+                        task_id: "owner/a".to_owned(),
+                        symbol: "BTC-USDT".to_owned(),
+                        ticket_id: Some(ticket_id.to_owned()),
+                        notional: money("10"),
+                        utc_date: "2026-08-03".to_owned(),
+                        recorded_at,
+                        warnings: Vec::new(),
+                    },
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(pending.len(), 2);
+
+        apply_open_admission_event(
+            &mut pending,
+            &risk_payload(
+                ACCOUNT_RISK_ADMISSION_CANCELLED,
+                &AccountRiskFact::AdmissionCancelled {
+                    schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                    journal_id,
+                    scope_id: "scope-a".to_owned(),
+                    task_id: "owner/a".to_owned(),
+                    ticket_id: "ticket-a".to_owned(),
+                    admitted_at: recorded_at,
+                    recorded_at,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].scope_id, "scope-b");
+
+        apply_open_admission_event(
+            &mut pending,
+            &risk_payload(
+                ACCOUNT_RISK_POSITION_CLOSED,
+                &AccountRiskFact::PositionClosed {
+                    schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                    journal_id,
+                    scope_id: "scope-a".to_owned(),
+                    task_id: "owner/a".to_owned(),
+                    recorded_at,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1, "closing scope-a must not drain scope-b");
+
+        apply_open_admission_event(
+            &mut pending,
+            &json!({
+                "decision": PAPER_ACCOUNT_RESERVED,
+                "details": { "request": reservation_request() },
+                "strategy": "paper-account",
+                "symbol": "paper-main"
+            }),
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    fn risk_payload(decision: &str, fact: &AccountRiskFact) -> Value {
+        json!({
+            "decision": decision,
+            "details": fact,
+            "strategy": "account-risk",
+            "symbol": "paper"
+        })
+    }
+
+    fn reservation_request() -> PaperReservationRequest {
+        let intent = OrderIntent::market(
+            "paper-grid",
+            Symbol::new("BTC-USDT").unwrap(),
+            MarketType::Spot,
+            Side::Buy,
+            Quantity::new(Decimal::ONE).unwrap(),
+        );
+        PaperReservationRequest::new(
+            Uuid::from_u128(2),
+            "owner/a/op/000001",
+            "scope-isolation",
+            Uuid::from_u128(3),
+            PaperCostModel::v1(10, 0, 0).unwrap(),
+            vec![PaperReservationLeg::from_intent(0, &intent, money("10")).unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn money(value: &str) -> Money {
+        Money::new(Decimal::from_str_exact(value).unwrap())
+    }
 }

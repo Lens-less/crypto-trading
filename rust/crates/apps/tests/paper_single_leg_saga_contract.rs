@@ -163,10 +163,7 @@ async fn confirmed_cancel_releases_but_open_cancel_result_stays_uncertain() {
         .await
         .unwrap();
     assert!(matches!(result, PaperSingleLegRun::Cancelled { .. }));
-    assert_eq!(
-        account.snapshot().await.unwrap().reservations[0].phase,
-        PaperReservationPhase::Released
-    );
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
 
     let uncertain = request("grid:btc/op/000002", "cross:000002");
     let error = saga
@@ -181,7 +178,7 @@ async fn confirmed_cancel_releases_but_open_cancel_result_stays_uncertain() {
     assert!(matches!(error, PaperSingleLegSagaError::Incomplete(_)));
     let snapshot = account.snapshot().await.unwrap();
     assert_eq!(
-        snapshot.reservations[1].phase,
+        snapshot.reservations[0].phase,
         PaperReservationPhase::Uncertain
     );
     assert!(snapshot.uncertain_reserved > Money::default());

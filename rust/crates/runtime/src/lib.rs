@@ -2,6 +2,7 @@
 
 mod account_risk;
 mod alert_read_model;
+mod authority_state;
 mod capability;
 mod control_plane_projection;
 mod execution;
@@ -74,9 +75,10 @@ pub use market_polling::{
     HyperliquidPollingRoute, HyperliquidPublicPollingSource, MarketPollingPolicy,
 };
 pub use market_supervisor::{
-    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEventFuture, MarketDataEventSource,
-    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
-    MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
+    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS,
+    MarketDataEventFuture, MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig,
+    MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
+    MarketSupervisorStatus,
 };
 pub use mode::{ExecutionMode, LIVE_ACKNOWLEDGEMENT, ModeError};
 pub use monitor_read_model::{

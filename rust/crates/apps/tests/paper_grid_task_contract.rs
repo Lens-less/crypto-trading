@@ -863,7 +863,10 @@ async fn filled_level_reposts_the_reverse_side_one_interval_away() {
         vec![(Side::Buy, decimal("99")), (Side::Sell, decimal("100"))]
     );
     let snapshot = account.snapshot().await.unwrap();
-    assert_eq!(snapshot.reservations.len(), 2);
+    assert!(
+        snapshot.reservations.is_empty(),
+        "completed reverse repost must prune released reservations"
+    );
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {

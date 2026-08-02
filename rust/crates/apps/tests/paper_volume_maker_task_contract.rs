@@ -381,19 +381,10 @@ async fn market_mode_cycle_opens_and_closes_with_independent_reservations() {
         ]
     );
     let snapshot = account.snapshot().await.unwrap();
-    assert_eq!(snapshot.reservations.len(), 2);
-    assert_eq!(
-        snapshot
-            .reservations
-            .iter()
-            .map(|reservation| reservation.task_id.as_str())
-            .collect::<Vec<_>>(),
-        ["volume:market/op/000001", "volume:market/op/000002"]
+    assert!(
+        snapshot.reservations.is_empty(),
+        "completed market cycles should prune released reservations from the live snapshot"
     );
-    assert!(snapshot.reservations.iter().all(|reservation| {
-        reservation.phase == PaperReservationPhase::Released
-            && reservation.idempotency_key.starts_with("volume:")
-    }));
     assert!(snapshot.open_lots.is_empty());
     assert_eq!(snapshot.cumulative_fees, Money::new(decimal("0.203")));
     assert_eq!(snapshot.realized_pnl, Money::new(decimal("0.797")));
@@ -473,7 +464,10 @@ async fn limit_mode_virtual_quote_fills_only_after_a_crossing_observation() {
     );
     assert_eq!(task.status().completed_cycle_count, 1);
     let snapshot = account.snapshot().await.unwrap();
-    assert_eq!(snapshot.reservations.len(), 2);
+    assert!(
+        snapshot.reservations.is_empty(),
+        "completed limit cycles should prune released reservations from the live snapshot"
+    );
     let body = std::fs::read_to_string(path).unwrap();
     // Realized cycle: bought at 100, closed at the observed bid 98.
     assert!(body.contains("\"realized_pnl\":\"-2\""), "{body}");
@@ -734,7 +728,10 @@ async fn max_cycles_bound_stops_with_completed_exit_and_clean_restart() {
         second.wait().await.unwrap(),
         VolumeMakerPaperTaskExit::SourceEnded
     );
-    assert_eq!(account.snapshot().await.unwrap().reservations.len(), 2);
+    assert!(
+        account.snapshot().await.unwrap().reservations.is_empty(),
+        "restart after a bounded run should not retain released reservations"
+    );
 }
 
 #[tokio::test]

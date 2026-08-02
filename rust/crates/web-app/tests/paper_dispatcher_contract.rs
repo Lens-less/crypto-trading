@@ -777,6 +777,19 @@ async fn checked_in_grid_replay_keeps_the_owner_running_after_every_cross() {
     )
     .await;
     assert!(!journal.contains("\"decision\":\"task_failed\""));
+    let journal = wait_for_journal(
+        &fixture.history_path,
+        "\"processed_event_count\":3,\"schema_version\":1",
+    )
+    .await;
+    assert_eq!(
+        journal
+            .matches("\"decision\":\"paper_account_execution_settled\"")
+            .count(),
+        3,
+        "every crossed level must settle before the replay checkpoint"
+    );
+    assert!(!journal.contains("\"decision\":\"task_failed\""));
     wait_for_task(&fixture.router, "paper-grid-owner", "running").await;
 
     let stopped = submit(

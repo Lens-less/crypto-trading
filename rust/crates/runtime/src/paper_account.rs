@@ -1,14 +1,14 @@
 //! Durable, paper-only pending-reservation authority.
 //!
 //! This module deliberately separates account reservation truth from execution
-//! outcome truth. Every mutation is reconstructed from the synchronized JSONL
-//! journal before another mutation is admitted. The shared [`JsonlHistory`]
-//! writer owns a sibling lock-file lease, so competing processes fail closed
-//! before appending to the same normalized journal path.
+//! outcome truth. Authorities cold-replay the synchronized JSONL journal once,
+//! then refresh one shared in-memory projection from durable append receipts
+//! before another mutation is admitted. The shared [`JsonlHistory`] writer
+//! owns a sibling lock-file lease, so competing processes fail closed before
+//! appending to the same normalized journal path.
 
 use std::{
     collections::HashMap,
-    io::ErrorKind,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
@@ -25,10 +25,10 @@ use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use crate::authority_state::{AuthorityStateCache, AuthorityStateError};
 use crate::{
-    DecisionRecord, FileJournalSnapshotSource, HistoryError, JournalPageBoundary, JournalReadError,
-    JournalSnapshot, JournalSnapshotSource, JsonlHistory, LegacyJsonlJournalReader,
-    OperationEventEnvelope, ProjectionStatus,
+    DecisionRecord, HistoryError, JournalPageBoundary, JournalReadError, JournalSnapshot,
+    JsonlHistory, LegacyJsonlJournalReader, OperationEventEnvelope, ProjectionStatus,
 };
 
 pub const PAPER_ACCOUNT_SCHEMA_VERSION: u16 = 1;
@@ -965,13 +965,17 @@ pub struct PaperReservationView {
 }
 
 impl PaperReservationView {
-    fn matches(&self, request: &PaperReservationRequest) -> bool {
+    pub(crate) fn matches(&self, request: &PaperReservationRequest) -> bool {
         self.reservation_id == request.reservation_id
             && self.task_id == request.task_id
             && self.idempotency_key == request.idempotency_key
             && self.batch_id == request.batch_id
             && self.cost_model == request.cost_model
             && self.legs == request.legs
+    }
+
+    const fn is_active(&self) -> bool {
+        !matches!(self.phase, PaperReservationPhase::Released)
     }
 }
 
@@ -1037,6 +1041,7 @@ pub struct PaperAccountAuthority {
     history: JsonlHistory,
     config: PaperAccountConfig,
     authority_lock: Arc<AuthorityLock>,
+    state_cache: AuthorityStateCache,
 }
 
 impl PaperAccountAuthority {
@@ -1086,11 +1091,13 @@ impl PaperAccountAuthority {
         // would interleave and could commit the same capacity twice.
         let authority_lock =
             shared_authority_lock(&crate::history::normalized_lock_key(history.path()));
+        let state_cache = AuthorityStateCache::new(journal_id, &history);
         Ok(Self {
             journal_id,
             history,
             config,
             authority_lock,
+            state_cache,
         })
     }
 
@@ -1158,10 +1165,13 @@ impl PaperAccountAuthority {
         }) {
             return Err(PaperAccountError::ActiveTaskReservation);
         }
-        if snapshot.reservations.len() >= MAX_PAPER_ACCOUNT_RESERVATIONS {
+        if active_reservation_count(&snapshot.reservations) >= MAX_PAPER_ACCOUNT_RESERVATIONS {
             return Err(PaperAccountError::ReservationLimitExceeded {
                 limit: MAX_PAPER_ACCOUNT_RESERVATIONS,
             });
+        }
+        if let Some(existing) = self.find_historical_reservation(&request).await? {
+            return Ok(PaperReservationAdmission::Existing(existing));
         }
         let reserved_exposure = reserved_exposure(&request)?;
         let required =
@@ -1208,7 +1218,9 @@ impl PaperAccountAuthority {
         let _guard = self.authority_lock.lock().await;
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
-        let reservation = find_reservation(&snapshot, reservation_id)?;
+        let reservation = self
+            .find_transition_reservation(&snapshot, reservation_id)
+            .await?;
         match reservation.phase {
             PaperReservationPhase::Uncertain => return Ok(reservation.clone()),
             PaperReservationPhase::Pending => {}
@@ -1216,7 +1228,7 @@ impl PaperAccountAuthority {
                 return Err(PaperAccountError::InvalidTransition);
             }
         }
-        self.append_transition(PAPER_ACCOUNT_UNCERTAIN, reservation, None, None, None)
+        self.append_transition(PAPER_ACCOUNT_UNCERTAIN, &reservation, None, None, None)
             .await?;
         self.reloaded_reservation(reservation_id).await
     }
@@ -1236,7 +1248,9 @@ impl PaperAccountAuthority {
         let _guard = self.authority_lock.lock().await;
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
-        let reservation = find_reservation(&snapshot, reservation_id)?;
+        let reservation = self
+            .find_transition_reservation(&snapshot, reservation_id)
+            .await?;
         if reservation.phase == PaperReservationPhase::Committed {
             return if reservation.held_exposure == confirmed_exposure {
                 Ok(reservation.clone())
@@ -1254,7 +1268,7 @@ impl PaperAccountAuthority {
         }
         self.append_transition(
             PAPER_ACCOUNT_COMMITTED,
-            reservation,
+            &reservation,
             Some(confirmed_exposure),
             None,
             None,
@@ -1282,7 +1296,9 @@ impl PaperAccountAuthority {
         let _guard = self.authority_lock.lock().await;
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
-        let reservation = find_reservation(&snapshot, reservation_id)?;
+        let reservation = self
+            .find_transition_reservation(&snapshot, reservation_id)
+            .await?;
         if !matches!(
             reservation.phase,
             PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
@@ -1292,7 +1308,7 @@ impl PaperAccountAuthority {
         let fact = execution_settlement_fact(
             self.journal_id,
             self.config.account_id(),
-            reservation,
+            &reservation,
             receipts,
         )?;
         validate_reduce_only_settlement(&snapshot.open_lots, &fact.fills)?;
@@ -1321,7 +1337,9 @@ impl PaperAccountAuthority {
         let _guard = self.authority_lock.lock().await;
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
-        let reservation = find_reservation(&snapshot, reservation_id)?;
+        let reservation = self
+            .find_transition_reservation(&snapshot, reservation_id)
+            .await?;
         if reservation.phase == PaperReservationPhase::Released {
             return Ok(reservation.clone());
         }
@@ -1330,7 +1348,7 @@ impl PaperAccountAuthority {
         }
         self.append_transition(
             PAPER_ACCOUNT_RELEASED,
-            reservation,
+            &reservation,
             None,
             Some(reason),
             None,
@@ -1353,7 +1371,9 @@ impl PaperAccountAuthority {
         let _guard = self.authority_lock.lock().await;
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
-        let reservation = find_reservation(&snapshot, proof.reservation_id())?;
+        let reservation = self
+            .find_transition_reservation(&snapshot, proof.reservation_id())
+            .await?;
         ensure_reconciliation_proof_matches(
             &proof,
             self.config.account_id(),
@@ -1378,7 +1398,7 @@ impl PaperAccountAuthority {
         validate_reconciliation_evidence(
             &proof,
             &snapshot,
-            reservation,
+            &reservation,
             PaperReconciliationVerdict::Match,
         )?;
         validate_reconciliation_progress(
@@ -1386,8 +1406,14 @@ impl PaperAccountAuthority {
             PaperReconciliationOutcome::Released,
             &proof,
         )?;
-        self.append_transition(PAPER_ACCOUNT_RELEASED, reservation, None, None, Some(proof))
-            .await?;
+        self.append_transition(
+            PAPER_ACCOUNT_RELEASED,
+            &reservation,
+            None,
+            None,
+            Some(proof),
+        )
+        .await?;
         self.reloaded_reservation(reservation.reservation_id).await
     }
 
@@ -1405,7 +1431,9 @@ impl PaperAccountAuthority {
         let _guard = self.authority_lock.lock().await;
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
-        let reservation = find_reservation(&snapshot, proof.reservation_id())?;
+        let reservation = self
+            .find_transition_reservation(&snapshot, proof.reservation_id())
+            .await?;
         ensure_reconciliation_proof_matches(
             &proof,
             self.config.account_id(),
@@ -1419,7 +1447,7 @@ impl PaperAccountAuthority {
         validate_reconciliation_evidence(
             &proof,
             &snapshot,
-            reservation,
+            &reservation,
             PaperReconciliationVerdict::Mismatch,
         )?;
         if matches_reconciliation(
@@ -1436,7 +1464,7 @@ impl PaperAccountAuthority {
         )?;
         self.append_transition(
             PAPER_ACCOUNT_RECONCILE_FAILED,
-            reservation,
+            &reservation,
             None,
             None,
             Some(proof),
@@ -1491,57 +1519,79 @@ impl PaperAccountAuthority {
         &self,
         reservation_id: Uuid,
     ) -> Result<PaperReservationView, PaperAccountError> {
-        let updated = self.load_account_snapshot().await?;
+        let updated = self
+            .load_account_snapshot_with_terminal_retention(true)
+            .await?;
         require_writable(&updated)?;
         find_reservation(&updated, reservation_id).cloned()
     }
 
     async fn load_account_snapshot(&self) -> Result<PaperAccountSnapshot, PaperAccountError> {
-        let source = FileJournalSnapshotSource::new(self.journal_id, self.history.path())?;
-        let journal_id = self.journal_id;
-        let journal = tokio::task::spawn_blocking(move || match source.snapshot() {
-            // A fresh journal is the only state read as empty: the chain reader
-            // surfaces a missing active file as `Open(NotFound)` solely when no
-            // sealed segment exists. A missing active file behind sealed
-            // segments (the legal crash point between sealing and recreating
-            // it) replays the sealed chain inside `snapshot()` and must never
-            // reset the account balance to `initial_available`.
-            Err(JournalReadError::Open(error)) if error.kind() == ErrorKind::NotFound => {
-                JournalSnapshot::new(journal_id, Vec::new())
-            }
-            result => result,
-        })
-        .await
-        .map_err(|_| PaperAccountError::SnapshotTaskFailed)??;
-        let model = PaperAccountReadModel::from_legacy_snapshot(&journal)?;
-        if let Some(account) = model
-            .accounts
+        self.load_account_snapshot_with_terminal_retention(false)
+            .await
+    }
+
+    async fn load_account_snapshot_with_terminal_retention(
+        &self,
+        retain_terminal_reservations: bool,
+    ) -> Result<PaperAccountSnapshot, PaperAccountError> {
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)?;
+        projection
+            .paper_snapshot(
+                self.config.account_id(),
+                self.config.initial_available,
+                retain_terminal_reservations,
+            )
+            .map_err(map_authority_state_error_to_paper)
+    }
+
+    async fn find_historical_reservation(
+        &self,
+        request: &PaperReservationRequest,
+    ) -> Result<Option<PaperReservationView>, PaperAccountError> {
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)?;
+        projection.historical_reservation(self.config.account_id(), request)
+    }
+
+    async fn find_transition_reservation(
+        &self,
+        snapshot: &PaperAccountSnapshot,
+        reservation_id: Uuid,
+    ) -> Result<PaperReservationView, PaperAccountError> {
+        if let Some(reservation) = snapshot
+            .reservations
             .iter()
-            .find(|account| account.account_id == self.config.account_id)
+            .find(|reservation| reservation.reservation_id == reservation_id)
         {
-            if account.initial_available != self.config.initial_available {
-                return Err(PaperAccountError::AccountConfigConflict);
-            }
-            return Ok(account.clone());
+            return Ok(reservation.clone());
         }
-        Ok(PaperAccountSnapshot {
-            schema_version: PAPER_ACCOUNT_SCHEMA_VERSION,
-            journal_id: self.journal_id,
-            projection_status: model.projection_status,
-            invalid_event_count: model.invalid_event_count,
-            account_id: self.config.account_id.clone(),
-            initial_available: self.config.initial_available,
-            available: self.config.initial_available,
-            pending_reserved: Money::default(),
-            uncertain_reserved: Money::default(),
-            committed_exposure: Money::default(),
-            ledger_kind: PaperExecutionLedgerKind::LegacyReservationOnly,
-            cumulative_fees: Money::default(),
-            realized_pnl: Money::default(),
-            settled_equity_base: self.config.initial_available,
-            open_lots: Vec::new(),
-            reservations: Vec::new(),
-        })
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)?;
+        projection
+            .historical_reservation_by_id(self.config.account_id(), reservation_id)
+            .ok_or(PaperAccountError::UnknownReservation)
+    }
+}
+
+fn map_authority_state_error_to_paper(error: AuthorityStateError) -> PaperAccountError {
+    match error {
+        AuthorityStateError::History => PaperAccountError::DurableStateDegraded,
+        AuthorityStateError::Journal(error) => PaperAccountError::JournalRead(error),
+        AuthorityStateError::Paper(error) => PaperAccountError::Projection(error),
+        AuthorityStateError::Risk(_) | AuthorityStateError::Degraded => {
+            PaperAccountError::DurableStateDegraded
+        }
     }
 }
 
@@ -1585,6 +1635,7 @@ pub(crate) struct ProjectionBuilder {
     projection_status: ProjectionStatus,
     invalid_event_count: u64,
     accounts: Vec<AccountAccumulator>,
+    retain_terminal_reservations: bool,
 }
 
 impl ProjectionBuilder {
@@ -1594,6 +1645,34 @@ impl ProjectionBuilder {
             projection_status: ProjectionStatus::Complete,
             invalid_event_count: 0,
             accounts: Vec::new(),
+            retain_terminal_reservations: false,
+        }
+    }
+
+    pub(crate) const fn retain_terminal_reservations(
+        mut self,
+        retain_terminal_reservations: bool,
+    ) -> Self {
+        self.retain_terminal_reservations = retain_terminal_reservations;
+        self
+    }
+
+    pub(crate) fn from_model(
+        model: PaperAccountReadModel,
+        retain_terminal_reservations: bool,
+    ) -> Self {
+        Self {
+            journal_id: model.journal_id,
+            projection_status: model.projection_status,
+            invalid_event_count: model.invalid_event_count,
+            accounts: model
+                .accounts
+                .into_iter()
+                .map(|snapshot| {
+                    AccountAccumulator::from_snapshot(snapshot, retain_terminal_reservations)
+                })
+                .collect(),
+            retain_terminal_reservations,
         }
     }
 
@@ -1709,6 +1788,7 @@ impl ProjectionBuilder {
                     self.accounts.push(AccountAccumulator::new(
                         fact.account_id.clone(),
                         fact.initial_available,
+                        self.retain_terminal_reservations,
                     ));
                     self.accounts.len().saturating_sub(1)
                 };
@@ -1762,6 +1842,7 @@ struct AccountAccumulator {
     settled_equity_base: Money,
     open_lots: Vec<PaperOpenLotView>,
     reservations: Vec<PaperReservationView>,
+    retain_terminal_reservations: bool,
 }
 
 #[derive(Default)]
@@ -1857,7 +1938,11 @@ fn fill_matches_leg((fill, leg): (&PaperExecutedFill, &PaperReservationLeg)) -> 
 }
 
 impl AccountAccumulator {
-    fn new(account_id: String, initial_available: Money) -> Self {
+    fn new(
+        account_id: String,
+        initial_available: Money,
+        retain_terminal_reservations: bool,
+    ) -> Self {
         Self {
             account_id,
             initial_available,
@@ -1867,12 +1952,30 @@ impl AccountAccumulator {
             settled_equity_base: initial_available,
             open_lots: Vec::new(),
             reservations: Vec::new(),
+            retain_terminal_reservations,
+        }
+    }
+
+    pub(crate) fn from_snapshot(
+        snapshot: PaperAccountSnapshot,
+        retain_terminal_reservations: bool,
+    ) -> Self {
+        Self {
+            account_id: snapshot.account_id,
+            initial_available: snapshot.initial_available,
+            ledger_kind: snapshot.ledger_kind,
+            cumulative_fees: snapshot.cumulative_fees,
+            realized_pnl: snapshot.realized_pnl,
+            settled_equity_base: snapshot.settled_equity_base,
+            open_lots: snapshot.open_lots,
+            reservations: snapshot.reservations,
+            retain_terminal_reservations,
         }
     }
 
     fn reserve(&mut self, sequence: u64, fact: ReservedFact) -> Result<(), ()> {
         if self.initial_available != fact.initial_available
-            || self.reservations.len() >= MAX_PAPER_ACCOUNT_RESERVATIONS
+            || active_reservation_count(&self.reservations) >= MAX_PAPER_ACCOUNT_RESERVATIONS
             || self.reservations.iter().any(|reservation| {
                 reservation.reservation_id == fact.request.reservation_id
                     || reservation.batch_id == fact.request.batch_id
@@ -1981,6 +2084,7 @@ impl AccountAccumulator {
             _ => return Err(()),
         }
         reservation.last_sequence = sequence;
+        self.prune_terminal_reservations();
         Ok(())
     }
 
@@ -2035,6 +2139,7 @@ impl AccountAccumulator {
         reservation.settlement = Some(settlement);
 
         self.sync_exact_reservation_holds(sequence, &touched_reservations)?;
+        self.prune_terminal_reservations();
         Ok(())
     }
 
@@ -2182,6 +2287,14 @@ impl AccountAccumulator {
             }
         }
         Ok(())
+    }
+
+    fn prune_terminal_reservations(&mut self) {
+        if self.retain_terminal_reservations {
+            return;
+        }
+        self.reservations
+            .retain(|reservation| reservation.phase != PaperReservationPhase::Released);
     }
 
     fn finish(
@@ -2812,6 +2925,13 @@ fn find_reservation(
         .ok_or(PaperAccountError::UnknownReservation)
 }
 
+fn active_reservation_count(reservations: &[PaperReservationView]) -> usize {
+    reservations
+        .iter()
+        .filter(|reservation| reservation.is_active())
+        .count()
+}
+
 fn require_writable(snapshot: &PaperAccountSnapshot) -> Result<(), PaperAccountError> {
     if snapshot.projection_status != ProjectionStatus::Complete || snapshot.invalid_event_count != 0
     {
@@ -3061,7 +3181,7 @@ mod tests {
     #[test]
     fn one_thousand_round_trip_flips_do_not_exhaust_projected_balance() {
         let journal_id = Uuid::from_u128(1);
-        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"));
+        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"), false);
         let mut sequence = 1_u64;
 
         apply_fill_pair(&mut account, journal_id, sequence, 1, Side::Buy, "1", "0.1");
@@ -3094,6 +3214,77 @@ mod tests {
         assert_eq!(snapshot.realized_pnl, money("-0.2"));
         assert_eq!(snapshot.settled_equity_base, money("999.7999"));
         assert_eq!(snapshot.open_lots.len(), 1);
+    }
+
+    #[test]
+    fn released_reservations_do_not_consume_active_capacity_slots() {
+        let journal_id = Uuid::from_u128(9);
+        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"), false);
+        let mut sequence = 1_u64;
+
+        for identity in 0..(MAX_PAPER_ACCOUNT_RESERVATIONS as u128 + 8) {
+            let request = reservation_request(identity, Side::Buy, "0.5");
+            let reservation_id = request.reservation_id();
+            let batch_id = request.batch_id();
+            let reserved = reserved_exposure(&request).unwrap();
+            account
+                .reserve(
+                    sequence,
+                    ReservedFact {
+                        schema_version: PAPER_ACCOUNT_SCHEMA_VERSION,
+                        journal_id,
+                        account_id: "paper-main".to_owned(),
+                        initial_available: money("1000"),
+                        request,
+                        reserved_exposure: reserved,
+                    },
+                )
+                .unwrap();
+            account
+                .transition(
+                    sequence + 1,
+                    PAPER_ACCOUNT_RELEASED,
+                    &TransitionFact {
+                        schema_version: PAPER_ACCOUNT_SCHEMA_VERSION,
+                        journal_id,
+                        account_id: "paper-main".to_owned(),
+                        reservation_id,
+                        batch_id,
+                        confirmed_exposure: None,
+                        reason: Some("capacity_released".to_owned()),
+                        proof: None,
+                    },
+                )
+                .unwrap();
+            assert!(
+                account.reservations.is_empty(),
+                "released reservations should be pruned from the live projection"
+            );
+            sequence += 2;
+        }
+
+        let next =
+            reservation_request(MAX_PAPER_ACCOUNT_RESERVATIONS as u128 + 42, Side::Sell, "1");
+        let next_reserved = reserved_exposure(&next).unwrap();
+        account
+            .reserve(
+                sequence,
+                ReservedFact {
+                    schema_version: PAPER_ACCOUNT_SCHEMA_VERSION,
+                    journal_id,
+                    account_id: "paper-main".to_owned(),
+                    initial_available: money("1000"),
+                    request: next,
+                    reserved_exposure: next_reserved,
+                },
+            )
+            .unwrap();
+
+        let snapshot = account
+            .finish(journal_id, ProjectionStatus::Complete, 0)
+            .unwrap();
+        assert_eq!(snapshot.reservations.len(), 1);
+        assert_eq!(snapshot.pending_reserved, money("1.001"));
     }
 
     fn apply_fill_pair(
@@ -3165,6 +3356,26 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn reservation_request(
+        identity: u128,
+        side: Side,
+        reserved_notional: &str,
+    ) -> PaperReservationRequest {
+        let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+        let quantity = Quantity::from_str("1").unwrap();
+        let notional = money(reserved_notional);
+        let intent = OrderIntent::market("paper-grid", symbol, MarketType::Spot, side, quantity);
+        PaperReservationRequest::new(
+            Uuid::from_u128(identity.checked_mul(2).unwrap_or(identity + 1) + 10_000),
+            format!("capacity/{identity}"),
+            format!("capacity-key/{identity}"),
+            Uuid::from_u128(identity.checked_mul(2).unwrap_or(identity + 1) + 10_001),
+            PaperCostModel::v1(10, 0, 0).unwrap(),
+            vec![PaperReservationLeg::from_intent(0, &intent, notional).unwrap()],
+        )
+        .unwrap()
     }
 
     fn money(value: &str) -> Money {

@@ -324,10 +324,7 @@ async fn two_confirmed_cancellations_release_capacity_but_are_not_completed() {
     );
     let snapshot = account.snapshot().await.unwrap();
     assert_eq!(snapshot.available, money("1000"));
-    assert_eq!(
-        snapshot.reservations[0].phase,
-        PaperReservationPhase::Released
-    );
+    assert!(snapshot.reservations.is_empty());
 }
 
 #[tokio::test]

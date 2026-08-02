@@ -658,6 +658,27 @@ fn parse_legacy_event(
     .map_err(|source| JournalReadError::EventContract { sequence, source })
 }
 
+pub(crate) fn event_from_decision_record(
+    journal_id: Uuid,
+    sequence: u64,
+    record: &crate::DecisionRecord,
+) -> Result<OperationEventEnvelope, JournalReadError> {
+    let line = serde_json::to_vec(record).map_err(|source| JournalReadError::MalformedRecord {
+        sequence,
+        offset: 0,
+        source,
+    })?;
+    let bytes = line.len().saturating_add(1);
+    if bytes > MAX_HISTORY_RECORD_BYTES {
+        return Err(JournalReadError::RecordTooLarge {
+            offset: 0,
+            bytes,
+            limit: MAX_HISTORY_RECORD_BYTES,
+        });
+    }
+    parse_legacy_event(journal_id, sequence, 0, &line)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyDecisionRecord {

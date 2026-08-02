@@ -288,22 +288,27 @@ async fn comparator_proofs_drive_release_and_failure_transitions() {
     )
     .unwrap();
     let release_report = release_plan.compare(&remote("1000"), captured_at).unwrap();
-    release_authority
+    let release_proof = release_report.proof.clone();
+    let released_view = release_authority
         .reconcile_release(release_report.proof)
         .await
         .unwrap();
-    let released = release_authority.snapshot().await.unwrap();
+    assert_eq!(released_view.phase, PaperReservationPhase::Released);
     assert_eq!(
-        released.reservations[0].phase,
-        PaperReservationPhase::Released
+        released_view.reconciliation.as_ref().unwrap().outcome,
+        PaperReconciliationOutcome::Released
     );
     assert_eq!(
-        released.reservations[0]
-            .reconciliation
-            .as_ref()
-            .unwrap()
-            .outcome,
-        PaperReconciliationOutcome::Released
+        release_authority
+            .reconcile_release(release_proof)
+            .await
+            .unwrap(),
+        released_view
+    );
+    let released = release_authority.snapshot().await.unwrap();
+    assert!(
+        released.reservations.is_empty(),
+        "released reservations must not consume the bounded live snapshot"
     );
 
     let failure_history = temp_history("failure");

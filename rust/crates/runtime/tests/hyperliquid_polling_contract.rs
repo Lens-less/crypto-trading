@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::Arc,
     thread,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant as StdInstant},
 };
 
 use chrono::{DateTime, Duration, Utc};
@@ -203,6 +203,47 @@ async fn absent_venue_funding_stays_absent_instead_of_being_fabricated() {
 }
 
 #[tokio::test]
+async fn hyperliquid_due_targets_are_fetched_concurrently_and_emitted_in_route_order() {
+    let request_count = 3;
+    let response_delay = StdDuration::from_millis(250);
+    let (base_url, server) = delayed_stub_server(request_count, response_delay);
+    let clock = Arc::new(FixedClock {
+        now: Utc::now() + Duration::seconds(1),
+    });
+    let endpoint = HyperliquidPublicEndpoint::loopback(&base_url).unwrap();
+    let mut source = HyperliquidPublicPollingSource::new(
+        HyperliquidPublicExchange::with_endpoint(&endpoint).unwrap(),
+        vec![
+            route("THINUSDT", "THIN"),
+            route("BTCUSDT", "BTC"),
+            route("ETHUSDT", "ETH"),
+        ],
+        polling_policy(StdDuration::from_millis(1)),
+        clock,
+    )
+    .unwrap();
+
+    let started = StdInstant::now();
+    let mut symbols = Vec::new();
+    for _ in 0..request_count {
+        let event = source.next_event().await.unwrap().unwrap();
+        let MarketDataEvent::Observation(observation) = event else {
+            panic!("delayed fixture must return a valid observation");
+        };
+        symbols.push(observation.snapshot.symbol.as_str().to_owned());
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(symbols, ["BTCUSDT", "ETHUSDT", "THINUSDT"]);
+    assert!(
+        elapsed < StdDuration::from_millis(650),
+        "one due-target round took {elapsed:?}; serial polling would take at least {:?}",
+        response_delay * u32::try_from(request_count).unwrap()
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn two_real_polling_venues_compose_into_one_ready_exact_pair() {
     let (binance_url, binance_server) = binance_stub_server(vec![http_response(
         "200 OK",
@@ -306,6 +347,46 @@ fn binance_stub_server(responses: Vec<String>) -> (String, thread::JoinHandle<()
             "{request}"
         );
     })
+}
+
+fn delayed_stub_server(
+    request_count: usize,
+    response_delay: StdDuration,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut handlers = Vec::with_capacity(request_count);
+        for _ in 0..request_count {
+            let (mut stream, _) = listener.accept().unwrap();
+            handlers.push(thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2_048];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if text.ends_with(r#"{"type":"metaAndAssetCtxs"}"#) {
+                        break;
+                    }
+                }
+                thread::sleep(response_delay);
+                stream
+                    .write_all(http_response("200 OK", FIXTURE).as_bytes())
+                    .unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+    (base_url, server)
 }
 
 fn serve<F>(responses: Vec<String>, verify: F) -> (String, thread::JoinHandle<()>)

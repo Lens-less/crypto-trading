@@ -48,6 +48,10 @@ use tokio::{
 
 use crate::{
     DurablePaperSingleLegSaga, PaperSingleLegRequest, PaperSingleLegRun, PaperSingleLegSagaError,
+    paper_admission::{
+        PaperAdmissionCompensationError, discard_planned_admission as discard_shared_admission,
+        retain_cancelled_reservation,
+    },
     paper_grid_task::{account_risk_directive_record, account_risk_exit_reason},
     task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture},
 };
@@ -1067,60 +1071,16 @@ async fn retain_cancelled_operation(
     request: &PaperSingleLegRequest,
     now: DateTime<Utc>,
 ) -> Result<bool, VolumeMakerPaperTaskError> {
-    let reservation_id = request.reservation().reservation_id();
-    let snapshot = account
-        .snapshot()
-        .await
-        .map_err(VolumeMakerPaperTaskError::Account)?;
-    let Some(reservation) = snapshot
-        .reservations
-        .iter()
-        .find(|reservation| reservation.reservation_id == reservation_id)
-    else {
-        let (Some(risk), Some(ticket)) = (risk, admission_ticket) else {
-            return Ok(false);
-        };
-        if cancel_unreserved_admission(risk, owner_task_id, ticket, now)
-            .await
-            .map_err(VolumeMakerPaperTaskError::AccountRisk)?
-        {
-            return Ok(false);
-        }
-        let retry_snapshot = account
-            .snapshot()
-            .await
-            .map_err(VolumeMakerPaperTaskError::Account)?;
-        let Some(retry_reservation) = retry_snapshot
-            .reservations
-            .iter()
-            .find(|reservation| reservation.reservation_id == reservation_id)
-        else {
-            return Err(VolumeMakerPaperTaskError::RecoveryRequired);
-        };
-        if retry_reservation.phase == PaperReservationPhase::Pending {
-            let _ = account
-                .mark_uncertain(reservation_id)
-                .await
-                .map_err(VolumeMakerPaperTaskError::Account)?;
-        }
-        return Ok(true);
-    };
-    if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account
-            .mark_uncertain(reservation_id)
-            .await
-            .map_err(VolumeMakerPaperTaskError::Account)?;
-    }
-    Ok(true)
-}
-
-async fn cancel_unreserved_admission(
-    risk: &AccountRiskAuthority,
-    task_id: &str,
-    ticket: &AccountRiskAdmissionTicket,
-    now: DateTime<Utc>,
-) -> Result<bool, AccountRiskError> {
-    risk.cancel_admission(task_id, ticket, now).await
+    retain_cancelled_reservation(
+        account,
+        risk,
+        owner_task_id,
+        admission_ticket,
+        request.reservation().reservation_id(),
+        now,
+    )
+    .await
+    .map_err(VolumeMakerPaperTaskError::from)
 }
 
 async fn discard_planned_admission(
@@ -1129,14 +1089,9 @@ async fn discard_planned_admission(
     ticket: Option<&AccountRiskAdmissionTicket>,
     now: DateTime<Utc>,
 ) -> Result<(), VolumeMakerPaperTaskError> {
-    let (Some(risk), Some(ticket)) = (risk, ticket) else {
-        return Ok(());
-    };
-    match cancel_unreserved_admission(risk, task_id, ticket, now).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(VolumeMakerPaperTaskError::RecoveryRequired),
-        Err(error) => Err(VolumeMakerPaperTaskError::AccountRisk(error)),
-    }
+    discard_shared_admission(risk, task_id, ticket, now)
+        .await
+        .map_err(VolumeMakerPaperTaskError::from)
 }
 
 fn observation_view(
@@ -1937,6 +1892,16 @@ impl From<PaperAccountError> for VolumeMakerPaperTaskError {
     }
 }
 
+impl From<PaperAdmissionCompensationError> for VolumeMakerPaperTaskError {
+    fn from(value: PaperAdmissionCompensationError) -> Self {
+        match value {
+            PaperAdmissionCompensationError::Account(error) => Self::Account(error),
+            PaperAdmissionCompensationError::AccountRisk(error) => Self::AccountRisk(error),
+            PaperAdmissionCompensationError::RecoveryRequired => Self::RecoveryRequired,
+        }
+    }
+}
+
 impl From<JournalReadError> for VolumeMakerPaperTaskError {
     fn from(value: JournalReadError) -> Self {
         Self::JournalRead(value)
@@ -2026,7 +1991,7 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
-    use super::cancel_unreserved_admission;
+    use crate::paper_admission::cancel_unreserved_admission;
 
     fn money(value: &str) -> Money {
         Money::new(Decimal::from_str(value).unwrap())

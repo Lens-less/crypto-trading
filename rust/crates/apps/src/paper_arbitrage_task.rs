@@ -61,6 +61,10 @@ use crate::{
         ArbitrageMonitorError, ArbitrageMonitorEvent, ArbitrageMonitorOutcome,
         ReadOnlyArbitrageMonitor,
     },
+    paper_admission::{
+        PaperAdmissionCompensationError, discard_planned_admission as discard_shared_admission,
+        retain_cancelled_reservation,
+    },
     paper_grid_task::{account_risk_directive_record, account_risk_exit_reason},
     task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture},
 };
@@ -1731,72 +1735,16 @@ async fn retain_cancelled_operation(
     request: &PaperArbitrageRequest,
     now: DateTime<Utc>,
 ) -> Result<bool, ArbitragePaperTaskError> {
-    let reservation_id = request.reservation().reservation_id();
-    let snapshot = account
-        .snapshot()
-        .await
-        .map_err(ArbitragePaperTaskError::Account)?;
-    let Some(reservation) = snapshot
-        .reservations
-        .iter()
-        .find(|reservation| reservation.reservation_id == reservation_id)
-    else {
-        let (Some(risk), Some(ticket)) = (risk, admission_ticket) else {
-            return Ok(false);
-        };
-        if try_cancel_unreserved_admission(risk, owner_task_id, ticket, now).await? {
-            return Ok(false);
-        }
-        let retry_snapshot = account
-            .snapshot()
-            .await
-            .map_err(ArbitragePaperTaskError::Account)?;
-        let Some(retry_reservation) = retry_snapshot
-            .reservations
-            .iter()
-            .find(|reservation| reservation.reservation_id == reservation_id)
-        else {
-            return Err(ArbitragePaperTaskError::RecoveryRequired);
-        };
-        if retry_reservation.phase == PaperReservationPhase::Pending {
-            let _ = account
-                .mark_uncertain(reservation_id)
-                .await
-                .map_err(ArbitragePaperTaskError::Account)?;
-        }
-        return Ok(true);
-    };
-    if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account
-            .mark_uncertain(reservation_id)
-            .await
-            .map_err(ArbitragePaperTaskError::Account)?;
-    }
-    Ok(true)
-}
-
-async fn cancel_unreserved_admission(
-    risk: &AccountRiskAuthority,
-    task_id: &str,
-    ticket: &AccountRiskAdmissionTicket,
-    now: DateTime<Utc>,
-) -> Result<(), ArbitragePaperTaskError> {
-    if try_cancel_unreserved_admission(risk, task_id, ticket, now).await? {
-        Ok(())
-    } else {
-        Err(ArbitragePaperTaskError::RecoveryRequired)
-    }
-}
-
-async fn try_cancel_unreserved_admission(
-    risk: &AccountRiskAuthority,
-    task_id: &str,
-    ticket: &AccountRiskAdmissionTicket,
-    now: DateTime<Utc>,
-) -> Result<bool, ArbitragePaperTaskError> {
-    risk.cancel_admission(task_id, ticket, now)
-        .await
-        .map_err(ArbitragePaperTaskError::AccountRisk)
+    retain_cancelled_reservation(
+        account,
+        risk,
+        owner_task_id,
+        admission_ticket,
+        request.reservation().reservation_id(),
+        now,
+    )
+    .await
+    .map_err(ArbitragePaperTaskError::from)
 }
 
 async fn discard_planned_admission(
@@ -1805,10 +1753,9 @@ async fn discard_planned_admission(
     ticket: Option<&AccountRiskAdmissionTicket>,
     now: DateTime<Utc>,
 ) -> Result<(), ArbitragePaperTaskError> {
-    let (Some(risk), Some(ticket)) = (risk, ticket) else {
-        return Ok(());
-    };
-    cancel_unreserved_admission(risk, task_id, ticket, now).await
+    discard_shared_admission(risk, task_id, ticket, now)
+        .await
+        .map_err(ArbitragePaperTaskError::from)
 }
 
 async fn abort_inflight(
@@ -2527,6 +2474,16 @@ impl From<PaperAccountError> for ArbitragePaperTaskError {
     }
 }
 
+impl From<PaperAdmissionCompensationError> for ArbitragePaperTaskError {
+    fn from(value: PaperAdmissionCompensationError) -> Self {
+        match value {
+            PaperAdmissionCompensationError::Account(error) => Self::Account(error),
+            PaperAdmissionCompensationError::AccountRisk(error) => Self::AccountRisk(error),
+            PaperAdmissionCompensationError::RecoveryRequired => Self::RecoveryRequired,
+        }
+    }
+}
+
 impl From<JournalReadError> for ArbitragePaperTaskError {
     fn from(value: JournalReadError) -> Self {
         Self::JournalRead(value)
@@ -2652,7 +2609,8 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
-    use super::{ArbitragePaperTaskError, cancel_unreserved_admission, discard_planned_admission};
+    use super::discard_planned_admission;
+    use crate::paper_admission::cancel_unreserved_admission;
 
     fn money(value: &str) -> Money {
         Money::new(Decimal::from_str(value).unwrap())
@@ -2774,7 +2732,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2)).await,
-            Err(ArbitragePaperTaskError::RecoveryRequired)
+            Ok(false)
         ));
     }
 }

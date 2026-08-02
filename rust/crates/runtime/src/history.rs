@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::{OsStr, OsString},
     io::{self, Write},
     path::{Component, Path, PathBuf},
@@ -45,6 +45,7 @@ const HISTORY_CROSS_PROCESS_LOCK_SUFFIX: &str = "jsonl.lock";
 static DEAD_PATH_LOCK_HINT: AtomicUsize = AtomicUsize::new(0);
 static PATH_LOCKS: OnceLock<StdMutex<PathLockRegistry>> = OnceLock::new();
 static CROSS_PROCESS_LEASE_STATES: OnceLock<StdMutex<CrossProcessLeaseRegistry>> = OnceLock::new();
+static APPEND_RECEIPTS: OnceLock<StdMutex<AppendReceiptRegistry>> = OnceLock::new();
 
 struct ByteBudgetWriter {
     bytes: Vec<u8>,
@@ -355,6 +356,34 @@ impl Default for CrossProcessLeaseRegistry {
     }
 }
 
+const MAX_APPEND_RECEIPTS_PER_PATH: usize = 256;
+const MAX_APPEND_RECEIPT_RECORDS: usize = 2_048;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryChainHead {
+    pub(crate) sealed_segment_bytes: Vec<u64>,
+    pub(crate) active_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HistoryDelta {
+    pub(crate) head_before: HistoryChainHead,
+    pub(crate) head_after: HistoryChainHead,
+    pub(crate) records: Vec<DecisionRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct AppendReceiptEntry {
+    head_before: HistoryChainHead,
+    head_after: HistoryChainHead,
+    records: Vec<DecisionRecord>,
+}
+
+#[derive(Default)]
+struct AppendReceiptRegistry {
+    receipts: HashMap<PathBuf, VecDeque<AppendReceiptEntry>>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct DecisionRecord {
     pub timestamp: DateTime<Utc>,
@@ -389,6 +418,7 @@ pub struct DecisionRecord {
 #[derive(Clone, Debug)]
 pub struct JsonlHistory {
     path: PathBuf,
+    lock_key: PathBuf,
     path_lock: Arc<PathLock>,
     cross_process_lease_state: Arc<CrossProcessLeaseState>,
     startup_failure: Option<CrossProcessLeaseFailure>,
@@ -398,6 +428,12 @@ pub struct JsonlHistory {
 struct AppendBatchStats {
     batch_bytes: u64,
     rotated: bool,
+}
+
+struct AppendTarget {
+    file: tokio::fs::File,
+    head_before: HistoryChainHead,
+    head_after: HistoryChainHead,
 }
 
 impl Drop for JsonlHistory {
@@ -413,10 +449,11 @@ impl JsonlHistory {
         let path = stable_history_path(&path.into());
         let lock_key = normalized_lock_key(&path);
         let path_lock = shared_path_lock(lock_key.clone());
-        let cross_process_lease_state = shared_cross_process_lease_state(lock_key);
+        let cross_process_lease_state = shared_cross_process_lease_state(lock_key.clone());
         let startup_failure = prime_cross_process_lease(&path, &cross_process_lease_state).err();
         Self {
             path,
+            lock_key,
             path_lock,
             cross_process_lease_state,
             startup_failure,
@@ -426,6 +463,80 @@ impl JsonlHistory {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Quarantines and truncates a crash-left partial active tail when a valid
+    /// complete-record prefix anchors the repair.
+    ///
+    /// Authority refreshes call this before replay so a normal process restart
+    /// can recover without first attempting a write. An unanchored fragment or
+    /// malformed complete prefix remains fail-closed.
+    pub(crate) async fn repair_recoverable_tail(&self) -> Result<(), HistoryError> {
+        let _guard = self.path_lock.lock().await;
+        let _lease = self.active_cross_process_lease()?;
+        let mut file = match tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .await
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(HistoryError::Open(source)),
+        };
+        let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
+        if existing_bytes > MAX_HISTORY_FILE_BYTES {
+            return Err(HistoryError::FileTooLarge {
+                existing_bytes,
+                batch_bytes: 0,
+                limit: MAX_HISTORY_FILE_BYTES,
+            });
+        }
+        let retained_bytes = self
+            .ensure_active_tail_is_complete(&mut file, existing_bytes)
+            .await?;
+        if retained_bytes < existing_bytes {
+            drop(file);
+            self.truncate_active_tail(retained_bytes).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn inspect_chain_head(&self) -> Result<HistoryChainHead, HistoryError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || inspect_chain_head(&path))
+            .await
+            .map_err(|_| {
+                HistoryError::Metadata(io::Error::other("history head inspection task failed"))
+            })?
+    }
+
+    pub(crate) fn same_process_delta_since(&self, head: &HistoryChainHead) -> Option<HistoryDelta> {
+        let registry =
+            APPEND_RECEIPTS.get_or_init(|| StdMutex::new(AppendReceiptRegistry::default()));
+        let registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receipts = registry.receipts.get(&self.lock_key)?;
+        let start = receipts
+            .iter()
+            .position(|entry| &entry.head_before == head)?;
+        let mut records = Vec::new();
+        let mut expected = head.clone();
+        let mut head_after = None;
+        for entry in receipts.iter().skip(start) {
+            if entry.head_before != expected {
+                return None;
+            }
+            records.extend(entry.records.iter().cloned());
+            expected = entry.head_after.clone();
+            head_after = Some(expected.clone());
+        }
+        Some(HistoryDelta {
+            head_before: head.clone(),
+            head_after: head_after?,
+            records,
+        })
     }
 
     /// Appends one JSON record and syncs its data to the file before returning.
@@ -442,11 +553,12 @@ impl JsonlHistory {
     ///
     /// This prevents another task in the process from interleaving bytes inside
     /// the group. It is deliberately not described as a transaction: an OS
-    /// write failure can still leave a partial tail. Later appends fail closed
-    /// on such a tail ([`HistoryError::PartialTail`]) instead of merging it
-    /// into the next record or sealing it into a read-only segment, so the
-    /// damage stays detectable at the end of the chain until it is
-    /// quarantined.
+    /// write failure can still leave a partial tail. Later appends
+    /// automatically truncate only the crash-left suffix after the last
+    /// complete, valid record. A tail without a complete-record anchor, or any
+    /// complete malformed record in that retained prefix, still fails closed so
+    /// the writer never launders deeper corruption into the middle of the
+    /// journal.
     ///
     /// If the batch would push the active file past [`MAX_HISTORY_FILE_BYTES`],
     /// the active file is sealed as the next read-only chain segment before the
@@ -583,12 +695,18 @@ impl JsonlHistory {
         }
         let _lease = self.active_cross_process_lease()?;
 
-        let mut file = self
+        let AppendTarget {
+            mut file,
+            head_before,
+            head_after,
+        } = self
             .open_active_within_chain_budget(stats.batch_bytes, stats)
             .await?;
         file.write_all(&batch).await.map_err(HistoryError::Write)?;
         file.flush().await.map_err(HistoryError::Flush)?;
-        file.sync_data().await.map_err(HistoryError::Sync)
+        file.sync_data().await.map_err(HistoryError::Sync)?;
+        self.record_append_receipt(head_before, head_after, records);
+        Ok(())
     }
 
     /// Opens the active file with room for `batch_bytes`, sealing it as the
@@ -601,14 +719,18 @@ impl JsonlHistory {
         &self,
         batch_bytes: u64,
         stats: &mut AppendBatchStats,
-    ) -> Result<tokio::fs::File, HistoryError> {
+    ) -> Result<AppendTarget, HistoryError> {
         let sealed = self.inspect_sealed_segments_for_append().await?;
         let sealed_bytes = sealed
             .iter()
             .fold(0u64, |total, segment| total.saturating_add(segment.bytes));
+        let sealed_segment_bytes = sealed
+            .iter()
+            .map(|segment| segment.bytes)
+            .collect::<Vec<_>>();
 
         let mut file = self.open_active().await?;
-        let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
+        let mut existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
         if existing_bytes > MAX_HISTORY_FILE_BYTES || batch_bytes > MAX_HISTORY_FILE_BYTES {
             // An oversized active file was not produced by this writer; sealing
             // it would launder the violation into the read-only chain.
@@ -618,11 +740,31 @@ impl JsonlHistory {
                 limit: MAX_HISTORY_FILE_BYTES,
             });
         }
-        self.ensure_active_tail_is_complete(&mut file, existing_bytes)
+        let retained_bytes = self
+            .ensure_active_tail_is_complete(&mut file, existing_bytes)
             .await?;
+        if retained_bytes < existing_bytes {
+            drop(file);
+            self.truncate_active_tail(retained_bytes).await?;
+            file = self.open_active().await?;
+            existing_bytes = retained_bytes;
+        } else {
+            existing_bytes = retained_bytes;
+        }
         ensure_chain_budget(sealed_bytes, existing_bytes, batch_bytes)?;
+        let head_before = HistoryChainHead {
+            sealed_segment_bytes: sealed_segment_bytes.clone(),
+            active_bytes: existing_bytes,
+        };
         if existing_bytes.saturating_add(batch_bytes) <= MAX_HISTORY_FILE_BYTES {
-            return Ok(file);
+            return Ok(AppendTarget {
+                file,
+                head_before: head_before.clone(),
+                head_after: HistoryChainHead {
+                    sealed_segment_bytes,
+                    active_bytes: existing_bytes.saturating_add(batch_bytes),
+                },
+            });
         }
 
         // Rotation is reached only with a non-empty active file, so sealed
@@ -652,7 +794,16 @@ impl JsonlHistory {
                 limit: MAX_HISTORY_FILE_BYTES,
             });
         }
-        Ok(file)
+        let mut head_after_segments = sealed_segment_bytes;
+        head_after_segments.push(head_before.active_bytes);
+        Ok(AppendTarget {
+            file,
+            head_before,
+            head_after: HistoryChainHead {
+                sealed_segment_bytes: head_after_segments,
+                active_bytes: existing_bytes.saturating_add(batch_bytes),
+            },
+        })
     }
 
     async fn inspect_sealed_segments_for_append(&self) -> Result<Vec<SealedSegment>, HistoryError> {
@@ -669,23 +820,50 @@ impl JsonlHistory {
         })?
     }
 
-    /// Refuses to append to or seal an active file whose last byte is not a
-    /// record terminator.
+    fn record_append_receipt(
+        &self,
+        head_before: HistoryChainHead,
+        head_after: HistoryChainHead,
+        records: &[DecisionRecord],
+    ) {
+        let registry =
+            APPEND_RECEIPTS.get_or_init(|| StdMutex::new(AppendReceiptRegistry::default()));
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue = registry.receipts.entry(self.lock_key.clone()).or_default();
+        queue.push_back(AppendReceiptEntry {
+            head_before,
+            head_after,
+            records: records.to_vec(),
+        });
+        while queue.len() > MAX_APPEND_RECEIPTS_PER_PATH
+            || queue.iter().map(|entry| entry.records.len()).sum::<usize>()
+                > MAX_APPEND_RECEIPT_RECORDS
+        {
+            queue.pop_front();
+        }
+    }
+
+    /// Ensures the active file ends at the last complete record boundary.
     ///
     /// A crash or failed write can leave a partial record at the tail. Readers
     /// tolerate that state as a recoverable partial-tail boundary, but only
     /// while it stays at the end of the chain: appending would glue the
     /// fragment and the next record into one malformed line in the middle of
     /// the journal, and sealing would freeze it into a segment every future
-    /// chain read rejects. Both destroy the ability to detect and quarantine
-    /// the tail, so the writer fails closed instead.
+    /// chain read rejects. When there is an anchored complete prefix, the
+    /// caller truncates only the trailing fragment and syncs that repair
+    /// before continuing. Without such an anchor, or when the anchored prefix
+    /// already contains a complete malformed record, the writer still fails
+    /// closed.
     async fn ensure_active_tail_is_complete(
         &self,
         file: &mut tokio::fs::File,
         existing_bytes: u64,
-    ) -> Result<(), HistoryError> {
+    ) -> Result<u64, HistoryError> {
         if existing_bytes == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let mut tail = [0u8; 1];
         file.seek(io::SeekFrom::End(-1))
@@ -694,18 +872,38 @@ impl JsonlHistory {
         file.read_exact(&mut tail)
             .await
             .map_err(HistoryError::TailInspect)?;
-        if tail != [b'\n'] {
+        if tail == [b'\n'] {
+            return Ok(existing_bytes);
+        }
+
+        let bytes = self.read_active_bytes(file, existing_bytes).await?;
+        let Some(complete_prefix_len) = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+        else {
             return Err(HistoryError::PartialTail {
                 path: self.path.clone(),
             });
-        }
-        Ok(())
+        };
+        self.validate_complete_prefix(&bytes[..complete_prefix_len])?;
+        let quarantined = self
+            .quarantine_partial_tail(&bytes[complete_prefix_len..])
+            .await?;
+        warn!(
+            retained_bytes = complete_prefix_len,
+            quarantine_path = %quarantined.display(),
+            "history partial tail quarantined before append"
+        );
+
+        Ok(u64::try_from(complete_prefix_len).unwrap_or(u64::MAX))
     }
 
     async fn open_active(&self) -> Result<tokio::fs::File, HistoryError> {
         tokio::fs::OpenOptions::new()
             .create(true)
             .read(true)
+            .write(true)
             .append(true)
             .open(&self.path)
             .await
@@ -728,6 +926,85 @@ impl JsonlHistory {
                     "history writer lease was not available after successful startup",
                 ),
             })
+    }
+
+    async fn read_active_bytes(
+        &self,
+        file: &mut tokio::fs::File,
+        existing_bytes: u64,
+    ) -> Result<Vec<u8>, HistoryError> {
+        let expected_bytes = usize::try_from(existing_bytes).unwrap_or(usize::MAX);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve(expected_bytes)
+            .map_err(|_| HistoryError::Allocation {
+                resource: "history recovery buffer",
+                bytes: expected_bytes,
+            })?;
+        file.seek(io::SeekFrom::Start(0))
+            .await
+            .map_err(HistoryError::TailInspect)?;
+        file.read_to_end(&mut bytes)
+            .await
+            .map_err(HistoryError::TailInspect)?;
+        if bytes.len() != expected_bytes {
+            return Err(HistoryError::TailInspect(io::Error::other(format!(
+                "history file changed while repairing a partial tail: expected {expected_bytes} bytes, read {}",
+                bytes.len()
+            ))));
+        }
+        Ok(bytes)
+    }
+
+    fn validate_complete_prefix(&self, bytes: &[u8]) -> Result<(), HistoryError> {
+        for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            serde_json::from_slice::<DecisionRecord>(line).map_err(|source| {
+                HistoryError::MalformedActiveRecord {
+                    path: self.path.clone(),
+                    line: index + 1,
+                    source,
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn truncate_active_tail(&self, retained_bytes: u64) -> Result<(), HistoryError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(HistoryError::TailRepair)?;
+            file.set_len(retained_bytes)
+                .map_err(HistoryError::TailRepair)?;
+            file.sync_data().map_err(HistoryError::Sync)?;
+            warn!(
+                retained_bytes,
+                path = %path.display(),
+                "history partial tail truncated before append"
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            HistoryError::TailRepair(io::Error::other("history tail repair task failed"))
+        })?
+    }
+
+    async fn quarantine_partial_tail(&self, suffix: &[u8]) -> Result<PathBuf, HistoryError> {
+        let path = self.path.clone();
+        let quarantine_fallback = quarantine_candidate_path(&path, &uuid::Uuid::nil());
+        let suffix = suffix.to_vec();
+        tokio::task::spawn_blocking(move || quarantine_partial_tail(&path, &suffix))
+            .await
+            .map_err(|_| HistoryError::TailQuarantine {
+                path: quarantine_fallback,
+                source: io::Error::other("history partial-tail quarantine task failed"),
+            })?
     }
 }
 
@@ -1050,6 +1327,63 @@ fn shared_cross_process_lease_state(path: PathBuf) -> Arc<CrossProcessLeaseState
     lease_state
 }
 
+fn inspect_chain_head(path: &Path) -> Result<HistoryChainHead, HistoryError> {
+    let sealed = inspect_sealed_segments(path).map_err(SealedChainError::into_history_error)?;
+    let active_bytes = match std::fs::metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(HistoryError::SealedSegmentNotAFile {
+                    path: path.to_path_buf(),
+                });
+            }
+            if metadata.len() > MAX_HISTORY_FILE_BYTES {
+                return Err(HistoryError::FileTooLarge {
+                    existing_bytes: metadata.len(),
+                    batch_bytes: 0,
+                    limit: MAX_HISTORY_FILE_BYTES,
+                });
+            }
+            metadata.len()
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+        Err(source) => return Err(HistoryError::Metadata(source)),
+    };
+    Ok(HistoryChainHead {
+        sealed_segment_bytes: sealed.into_iter().map(|segment| segment.bytes).collect(),
+        active_bytes,
+    })
+}
+
+fn quarantine_candidate_path(path: &Path, quarantine_id: &uuid::Uuid) -> PathBuf {
+    let mut file_name = history_file_name(path);
+    file_name.push(format!(".partial-tail.{quarantine_id}.quarantine"));
+    path.with_file_name(file_name)
+}
+
+fn quarantine_partial_tail(path: &Path, suffix: &[u8]) -> Result<PathBuf, HistoryError> {
+    let quarantine_id = uuid::Uuid::new_v4();
+    let quarantine_path = quarantine_candidate_path(path, &quarantine_id);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&quarantine_path)
+        .map_err(|source| HistoryError::TailQuarantine {
+            path: quarantine_path.clone(),
+            source,
+        })?;
+    file.write_all(suffix)
+        .map_err(|source| HistoryError::TailQuarantine {
+            path: quarantine_path.clone(),
+            source,
+        })?;
+    file.sync_data()
+        .map_err(|source| HistoryError::TailQuarantine {
+            path: quarantine_path.clone(),
+            source,
+        })?;
+    Ok(quarantine_path)
+}
+
 #[derive(Debug, Error)]
 pub enum HistoryError {
     #[error("history record {index} has {bytes} bytes; maximum is {limit}")]
@@ -1109,10 +1443,25 @@ pub enum HistoryError {
     },
     #[error("failed to read the history file tail: {0}")]
     TailInspect(std::io::Error),
+    #[error("failed to truncate the history file tail: {0}")]
+    TailRepair(std::io::Error),
+    #[error("failed to quarantine the partial history tail in {path}: {source}")]
+    TailQuarantine {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
         "history file {path} ends in a partial record; quarantine the crash-left tail before appending"
     )]
     PartialTail { path: PathBuf },
+    #[error("history file {path} contains a malformed complete record at line {line}: {source}")]
+    MalformedActiveRecord {
+        path: PathBuf,
+        line: usize,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("failed to create history directory: {0}")]
     CreateDirectory(std::io::Error),
     #[error("failed to serialize decision record: {0}")]
@@ -1469,7 +1818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_fails_closed_on_a_crash_left_partial_tail() {
+    async fn append_still_fails_closed_when_a_partial_tail_has_no_complete_record_anchor() {
         let path = std::env::temp_dir().join(format!("history-partial-tail-{}", Uuid::new_v4()));
         let history = JsonlHistory::new(&path);
         // A crash mid-write leaves the last record without its terminator.
@@ -1493,7 +1842,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_refuses_to_seal_a_partial_tail_into_a_segment() {
+    async fn append_truncates_only_the_tail_after_the_last_complete_record() {
+        let path = std::env::temp_dir().join(format!("history-tail-recover-{}", Uuid::new_v4()));
+        let history = JsonlHistory::new(&path);
+        let first = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            strategy: "partial-recover".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "first".to_owned(),
+            details: Value::Null,
+        };
+        let resumed = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
+            strategy: "partial-recover".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "resumed".to_owned(),
+            details: Value::Null,
+        };
+        history.append(&first).await.unwrap();
+        let partial = b"{\"timestamp\":\"2023-11-14T22:13:20Z\",\"strategy\":\"partial-recover\",";
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(partial);
+        std::fs::write(&path, &bytes).unwrap();
+
+        history.append(&resumed).await.unwrap();
+
+        let mut expected = serde_json::to_vec(&first).unwrap();
+        expected.push(b'\n');
+        expected.extend_from_slice(&serde_json::to_vec(&resumed).unwrap());
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_to_seal_a_partial_tail_without_a_complete_record_anchor() {
         let path = std::env::temp_dir().join(format!("history-partial-seal-{}", Uuid::new_v4()));
         let history = JsonlHistory::new(&path);
         // An active file at the limit whose tail is a partial record: the
@@ -1518,6 +1901,33 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             MAX_HISTORY_FILE_BYTES
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tail_recovery_refuses_to_truncate_past_a_complete_malformed_record() {
+        let path = std::env::temp_dir().join(format!("history-tail-malformed-{}", Uuid::new_v4()));
+        let history = JsonlHistory::new(&path);
+        let first = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            strategy: "partial-malformed".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "first".to_owned(),
+            details: Value::Null,
+        };
+        let mut bytes = serde_json::to_vec(&first).unwrap();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{bad json}\n");
+        bytes.extend_from_slice(b"{\"decision\":\"partial\"");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = history.append(&first).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistoryError::MalformedActiveRecord { line: 2, .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::remove_file(path).unwrap();
     }
 

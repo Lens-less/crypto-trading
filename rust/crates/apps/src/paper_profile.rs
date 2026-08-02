@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::{
     ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperTask,
     ArbitragePaperTaskConfig, ArbitragePaperTaskError, GridPaperExecutionFuture, GridPaperExecutor,
-    GridPaperTask, GridPaperTaskConfig, GridPaperTaskError,
+    GridPaperObservationFuture, GridPaperTask, GridPaperTaskConfig, GridPaperTaskError,
     monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock, load_market_snapshot_replay},
 };
 
@@ -287,13 +287,8 @@ impl GridPaperProfile {
             paper_exchange(self.config.exchange.clone(), &clock)
                 .map_err(|_| GridPaperTaskError::InvalidConfig)?,
         );
-        let source = MirroredReplaySource::new(
-            self.config.exchange.clone(),
-            self.replay_events.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&latest),
-            vec![Arc::clone(&exchange)],
-        );
+        let source =
+            OwnerReplaySource::new(self.config.exchange.clone(), self.replay_events.clone());
         let history = JsonlHistory::new(history_path);
         let account = PaperAccountAuthority::new(
             journal_id,
@@ -514,6 +509,43 @@ struct MirroredReplaySource {
     exchanges: Vec<Arc<PaperExchange>>,
 }
 
+struct OwnerReplaySource {
+    source_id: String,
+    events: VecDeque<MarketDataEvent>,
+}
+
+impl fmt::Debug for OwnerReplaySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerReplaySource")
+            .field("source_id", &self.source_id)
+            .field("remaining_events", &self.events.len())
+            .finish()
+    }
+}
+
+impl OwnerReplaySource {
+    fn new(source_id: String, events: Vec<MarketDataEvent>) -> Self {
+        Self {
+            source_id,
+            events: events.into(),
+        }
+    }
+}
+
+impl MarketDataEventSource for OwnerReplaySource {
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn next_event(&mut self) -> MarketDataEventFuture<'_> {
+        let Some(event) = self.events.pop_front() else {
+            return Box::pin(async move { pending().await });
+        };
+        Box::pin(async move { Ok(Some(event)) })
+    }
+}
+
 impl fmt::Debug for MirroredReplaySource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -593,6 +625,21 @@ struct GridReplayExecutor {
 }
 
 impl GridPaperExecutor for GridReplayExecutor {
+    fn observe_market(&self, observation: MarketDataObservation) -> GridPaperObservationFuture {
+        let exchange = Arc::clone(&self.exchange);
+        let clock = Arc::clone(&self.clock);
+        let latest = Arc::clone(&self.latest);
+        Box::pin(async move {
+            clock.advance(observation.received_at);
+            exchange
+                .publish_snapshot(observation.snapshot.clone())
+                .await
+                .map_err(RuntimeError::from)?;
+            latest.update(observation.snapshot);
+            Ok(())
+        })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         let exchange = Arc::clone(&self.exchange);
         let exchange_name = self.exchange_name.clone();
