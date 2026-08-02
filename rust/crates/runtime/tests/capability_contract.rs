@@ -209,6 +209,11 @@ fn market_data_reflects_two_polling_venues_without_realtime_claims() {
         "the second real venue must be visible in the market-data summary"
     );
     assert!(
+        market_data.summary.contains("timestamp provenance")
+            && market_data.summary.contains("cross-venue skew rejection"),
+        "time provenance and pair-skew safety must stay visible in the capability contract"
+    );
+    assert!(
         market_data
             .blockers
             .iter()
@@ -318,6 +323,9 @@ fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() 
     );
     assert_eq!(account.scope.access, CapabilityAccess::PaperTrading);
     for summary_term in [
+        "exact FIFO lots",
+        "realized-PnL settlement",
+        "reduce-only capacity",
         "exposure caps",
         "daily trade caps",
         "pause/resume",
@@ -378,6 +386,38 @@ fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() 
             .blockers
             .iter()
             .any(|blocker| blocker.contains("automatic nonterminal restart"))
+    );
+}
+
+#[test]
+fn research_kernels_are_visible_without_overstating_execution_parity() {
+    let manifest = current_capability_manifest();
+    let backtest = manifest.capability("research.backtest").unwrap();
+    assert_eq!(backtest.area, CapabilityArea::Research);
+    assert_eq!(backtest.level, CapabilityLevel::Available);
+    assert_eq!(
+        backtest.scope.environments,
+        vec![CapabilityEnvironment::Offline]
+    );
+    assert_eq!(backtest.scope.access, CapabilityAccess::Local);
+    assert!(backtest.summary.contains("out-of-sample-only"));
+    assert!(
+        backtest
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not a profitability claim")
+                && blocker.contains("production MarketDataEvent/strategy adapters"))
+    );
+
+    let indicators = manifest.capability("research.indicators").unwrap();
+    assert_eq!(indicators.area, CapabilityArea::Research);
+    assert_eq!(indicators.level, CapabilityLevel::Available);
+    assert!(indicators.summary.contains("EWMA realized volatility"));
+    assert!(
+        indicators
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("microprice") && blocker.contains("not yet wired"))
     );
 }
 

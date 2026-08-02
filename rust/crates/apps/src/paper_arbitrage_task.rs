@@ -30,17 +30,17 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
-    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskError,
-    DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError, JournalReadError,
-    JournalSnapshot, JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION,
-    MarketDataError, MarketDataEvent, MarketDataEventSource, MarketSupervisor,
-    MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth,
-    MarketSupervisorPhase, MarketSupervisorStatus, ObservedMarketPair, PaperAccountAuthority,
-    PaperAccountError, PaperAccountSnapshot, PaperCostModel, PaperReconciliationOutcome,
-    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
-    ReadModelError, ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel,
-    ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError, SpreadHistoryReadModel,
-    SpreadHistorySampleView, read_journal_chain,
+    AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
+    AccountRiskError, DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError,
+    JournalReadError, JournalSnapshot, JournalSnapshotSource, JsonlHistory,
+    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataError, MarketDataEvent,
+    MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError,
+    MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
+    ObservedMarketPair, PaperAccountAuthority, PaperAccountError, PaperAccountSnapshot,
+    PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
+    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskKind, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    SpreadHistoryReadModel, SpreadHistorySampleView, read_journal_chain,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, ArbitrageDecision, ArbitrageDecisionKind, ArbitrageState,
@@ -361,7 +361,7 @@ impl ArbitragePaperTask {
         let task_history = history.clone();
         let task_config = config.clone();
         let join = tokio::spawn(async move {
-            run_owner(
+            Box::pin(run_owner(
                 task_config,
                 monitor,
                 left,
@@ -374,7 +374,7 @@ impl ArbitragePaperTask {
                 cancel_receiver,
                 running_at,
                 operation_sequence,
-            )
+            ))
             .await
         });
 
@@ -561,6 +561,7 @@ type OperationJoinResult = Result<Result<PaperArbitrageRun, PaperArbitrageSagaEr
 struct InFlightOperation {
     request: PaperArbitrageRequest,
     decision: ArbitrageDecision,
+    admission_ticket: Option<AccountRiskAdmissionTicket>,
     execution_started: Arc<AtomicBool>,
     join: Option<JoinHandle<Result<PaperArbitrageRun, PaperArbitrageSagaError>>>,
 }
@@ -596,6 +597,7 @@ impl Drop for InFlightOperation {
 struct PlannedOperation {
     request: PaperArbitrageRequest,
     decision: ArbitrageDecision,
+    admission_ticket: Option<AccountRiskAdmissionTicket>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -676,6 +678,8 @@ async fn run_owner(
                     in_flight.take(),
                     cancel_requested,
                     saga.account(),
+                    config.account_risk.as_ref(),
+                    &config.task_id,
                     &mut state,
                 )
                 .await;
@@ -752,7 +756,29 @@ async fn run_owner(
                                 Some(start_operation(&saga, Arc::clone(&executor), planned));
                             publish_operation_count(&status_sender, operation_sequence);
                         }
-                        Ok(Some(_) | None) => {}
+                        Ok(Some(planned)) => {
+                            if let Err(error) = discard_planned_admission(
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                planned.admission_ticket.as_ref(),
+                                Utc::now(),
+                            )
+                            .await
+                            {
+                                let failure = error.failure_bucket();
+                                return fail_owner(
+                                    &mut left,
+                                    &mut right,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(None) => {}
                         Err(error) => {
                             let failure = error.failure_bucket();
                             return fail_owner(
@@ -776,7 +802,26 @@ async fn run_owner(
                 let monitor_event = match monitor.process(event) {
                     Ok(event) => event,
                     Err(error) => {
-                        abort_inflight(&mut in_flight, saga.account()).await;
+                        if let Err(abort_error) = abort_inflight(
+                            &mut in_flight,
+                            saga.account(),
+                            config.account_risk.as_ref(),
+                            &config.task_id,
+                        )
+                        .await
+                        {
+                            let failure = abort_error.failure_bucket();
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                abort_error,
+                            )
+                            .await;
+                        }
                         return fail_owner(
                             &mut left,
                             &mut right,
@@ -799,7 +844,26 @@ async fn run_owner(
                             if let Some(machine) = history_machine.as_mut()
                                 && let Err(error) = machine.observe(sample.clone())
                             {
-                                abort_inflight(&mut in_flight, saga.account()).await;
+                                if let Err(abort_error) = abort_inflight(
+                                    &mut in_flight,
+                                    saga.account(),
+                                    config.account_risk.as_ref(),
+                                    &config.task_id,
+                                )
+                                .await
+                                {
+                                    let failure = abort_error.failure_bucket();
+                                    return fail_owner(
+                                        &mut left,
+                                        &mut right,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        failure,
+                                        abort_error,
+                                    )
+                                    .await;
+                                }
                                 return fail_owner(
                                     &mut left,
                                     &mut right,
@@ -815,7 +879,26 @@ async fn run_owner(
                         }
                         Ok(None) => {}
                         Err(()) => {
-                            abort_inflight(&mut in_flight, saga.account()).await;
+                            if let Err(abort_error) = abort_inflight(
+                                &mut in_flight,
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                            )
+                            .await
+                            {
+                                let failure = abort_error.failure_bucket();
+                                return fail_owner(
+                                    &mut left,
+                                    &mut right,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    abort_error,
+                                )
+                                .await;
+                            }
                             return fail_owner(
                                 &mut left,
                                 &mut right,
@@ -834,7 +917,26 @@ async fn run_owner(
                     if let Some(value) = next.processed_event_count.checked_add(1) {
                         value
                     } else {
-                        abort_inflight(&mut in_flight, saga.account()).await;
+                        if let Err(abort_error) = abort_inflight(
+                            &mut in_flight,
+                            saga.account(),
+                            config.account_risk.as_ref(),
+                            &config.task_id,
+                        )
+                        .await
+                        {
+                            let failure = abort_error.failure_bucket();
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                abort_error,
+                            )
+                            .await;
+                        }
                         return fail_owner(
                             &mut left,
                             &mut right,
@@ -874,7 +976,26 @@ async fn run_owner(
                     status_record(&next, "task_checkpointed", recorded_at),
                 ];
                 if let Err(error) = history.append_batch(&records).await {
-                    abort_inflight(&mut in_flight, saga.account()).await;
+                    if let Err(abort_error) = abort_inflight(
+                        &mut in_flight,
+                        saga.account(),
+                        config.account_risk.as_ref(),
+                        &config.task_id,
+                    )
+                    .await
+                    {
+                        let failure = abort_error.failure_bucket();
+                        return fail_owner(
+                            &mut left,
+                            &mut right,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            failure,
+                            abort_error,
+                        )
+                        .await;
+                    }
                     let _ = tokio::join!(left.stop(), right.stop());
                     publish_runtime_failure(
                         &status_sender,
@@ -891,7 +1012,26 @@ async fn run_owner(
                     let directives = match risk.directives(monitor_event.recorded_at).await {
                         Ok(directives) => directives,
                         Err(error) => {
-                            abort_inflight(&mut in_flight, saga.account()).await;
+                            if let Err(abort_error) = abort_inflight(
+                                &mut in_flight,
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                            )
+                            .await
+                            {
+                                let failure = abort_error.failure_bucket();
+                                return fail_owner(
+                                    &mut left,
+                                    &mut right,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    abort_error,
+                                )
+                                .await;
+                            }
                             return fail_owner(
                                 &mut left,
                                 &mut right,
@@ -917,7 +1057,26 @@ async fn run_owner(
                             ))
                             .await
                         {
-                            abort_inflight(&mut in_flight, saga.account()).await;
+                            if let Err(abort_error) = abort_inflight(
+                                &mut in_flight,
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                            )
+                            .await
+                            {
+                                let failure = abort_error.failure_bucket();
+                                return fail_owner(
+                                    &mut left,
+                                    &mut right,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    abort_error,
+                                )
+                                .await;
+                            }
                             return fail_owner(
                                 &mut left,
                                 &mut right,
@@ -940,6 +1099,8 @@ async fn run_owner(
                             in_flight.take(),
                             false,
                             saga.account(),
+                            config.account_risk.as_ref(),
+                            &config.task_id,
                             &mut state,
                         )
                         .await;
@@ -982,7 +1143,29 @@ async fn run_owner(
                                 Some(start_operation(&saga, Arc::clone(&executor), planned));
                             publish_operation_count(&status_sender, operation_sequence);
                         }
-                        Ok(Some(_) | None) => {}
+                        Ok(Some(planned)) => {
+                            if let Err(error) = discard_planned_admission(
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                planned.admission_ticket.as_ref(),
+                                Utc::now(),
+                            )
+                            .await
+                            {
+                                let failure = error.failure_bucket();
+                                return fail_owner(
+                                    &mut left,
+                                    &mut right,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(None) => {}
                         Err(error) => {
                             let failure = error.failure_bucket();
                             return fail_owner(
@@ -1010,12 +1193,33 @@ async fn run_owner(
                     in_flight.take(),
                     false,
                     saga.account(),
+                    config.account_risk.as_ref(),
+                    &config.task_id,
                     &mut state,
                 )
                 .await;
             }
             Selected::Left(Err(error)) | Selected::Right(Err(error)) => {
-                abort_inflight(&mut in_flight, saga.account()).await;
+                if let Err(abort_error) = abort_inflight(
+                    &mut in_flight,
+                    saga.account(),
+                    config.account_risk.as_ref(),
+                    &config.task_id,
+                )
+                .await
+                {
+                    let failure = abort_error.failure_bucket();
+                    return fail_owner(
+                        &mut left,
+                        &mut right,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        failure,
+                        abort_error,
+                    )
+                    .await;
+                }
                 return fail_owner(
                     &mut left,
                     &mut right,
@@ -1057,6 +1261,7 @@ async fn plan_latest_operation(
     // Opening exposure passes the durable account-level admission before any
     // reservation exists; a recorded rejection skips the opportunity while
     // reducing decisions stay exempt so risk can always be closed out.
+    let mut admission_ticket = None;
     if let Some(risk) = config.account_risk.as_ref()
         && matches!(
             decision.kind,
@@ -1088,24 +1293,59 @@ async fn plan_latest_operation(
             .await
             .map_err(ArbitragePaperTaskError::AccountRisk)?
         {
-            AccountRiskAdmission::Admitted { .. } => {}
+            AccountRiskAdmission::Admitted { ticket, .. } => admission_ticket = Some(ticket),
             AccountRiskAdmission::Rejected(_) => return Ok(None),
         }
     }
-    let account_snapshot = account.snapshot().await?;
-    let next_sequence = operation_sequence
-        .checked_add(1)
-        .ok_or(ArbitragePaperTaskError::InvalidRequest)?;
-    let request = build_operation(
+    let account_snapshot = match account.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            discard_planned_admission(
+                config.account_risk.as_ref(),
+                &config.task_id,
+                admission_ticket.as_ref(),
+                pair.observed_at,
+            )
+            .await?;
+            return Err(error.into());
+        }
+    };
+    let Some(next_sequence) = operation_sequence.checked_add(1) else {
+        discard_planned_admission(
+            config.account_risk.as_ref(),
+            &config.task_id,
+            admission_ticket.as_ref(),
+            pair.observed_at,
+        )
+        .await?;
+        return Err(ArbitragePaperTaskError::InvalidRequest);
+    };
+    let request = match build_operation(
         config,
         &pair,
         state,
         &account_snapshot,
         &decision,
         next_sequence,
-    )?;
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            discard_planned_admission(
+                config.account_risk.as_ref(),
+                &config.task_id,
+                admission_ticket.as_ref(),
+                pair.observed_at,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     *operation_sequence = next_sequence;
-    Ok(Some(PlannedOperation { request, decision }))
+    Ok(Some(PlannedOperation {
+        request,
+        decision,
+        admission_ticket,
+    }))
 }
 
 /// Applies the optional history ("natural spread") gate: without the mode
@@ -1442,6 +1682,7 @@ fn start_operation(
     planned: PlannedOperation,
 ) -> InFlightOperation {
     let request = planned.request.clone();
+    let admission_ticket = planned.admission_ticket.clone();
     let saga = saga.clone();
     let request_for_task = planned.request;
     let execution_started = Arc::new(AtomicBool::new(false));
@@ -1456,6 +1697,7 @@ fn start_operation(
     InFlightOperation {
         request,
         decision: planned.decision,
+        admission_ticket,
         execution_started,
         join: Some(join),
     }
@@ -1483,33 +1725,114 @@ fn complete_operation(
 
 async fn retain_cancelled_operation(
     account: &PaperAccountAuthority,
+    risk: Option<&AccountRiskAuthority>,
+    owner_task_id: &str,
+    admission_ticket: Option<&AccountRiskAdmissionTicket>,
     request: &PaperArbitrageRequest,
-) -> bool {
+    now: DateTime<Utc>,
+) -> Result<bool, ArbitragePaperTaskError> {
     let reservation_id = request.reservation().reservation_id();
-    let Ok(snapshot) = account.snapshot().await else {
-        return true;
-    };
+    let snapshot = account
+        .snapshot()
+        .await
+        .map_err(ArbitragePaperTaskError::Account)?;
     let Some(reservation) = snapshot
         .reservations
         .iter()
         .find(|reservation| reservation.reservation_id == reservation_id)
     else {
-        return false;
+        let (Some(risk), Some(ticket)) = (risk, admission_ticket) else {
+            return Ok(false);
+        };
+        if try_cancel_unreserved_admission(risk, owner_task_id, ticket, now).await? {
+            return Ok(false);
+        }
+        let retry_snapshot = account
+            .snapshot()
+            .await
+            .map_err(ArbitragePaperTaskError::Account)?;
+        let Some(retry_reservation) = retry_snapshot
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+        else {
+            return Err(ArbitragePaperTaskError::RecoveryRequired);
+        };
+        if retry_reservation.phase == PaperReservationPhase::Pending {
+            let _ = account
+                .mark_uncertain(reservation_id)
+                .await
+                .map_err(ArbitragePaperTaskError::Account)?;
+        }
+        return Ok(true);
     };
     if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account.mark_uncertain(reservation_id).await;
+        let _ = account
+            .mark_uncertain(reservation_id)
+            .await
+            .map_err(ArbitragePaperTaskError::Account)?;
     }
-    true
+    Ok(true)
+}
+
+async fn cancel_unreserved_admission(
+    risk: &AccountRiskAuthority,
+    task_id: &str,
+    ticket: &AccountRiskAdmissionTicket,
+    now: DateTime<Utc>,
+) -> Result<(), ArbitragePaperTaskError> {
+    if try_cancel_unreserved_admission(risk, task_id, ticket, now).await? {
+        Ok(())
+    } else {
+        Err(ArbitragePaperTaskError::RecoveryRequired)
+    }
+}
+
+async fn try_cancel_unreserved_admission(
+    risk: &AccountRiskAuthority,
+    task_id: &str,
+    ticket: &AccountRiskAdmissionTicket,
+    now: DateTime<Utc>,
+) -> Result<bool, ArbitragePaperTaskError> {
+    risk.cancel_admission(task_id, ticket, now)
+        .await
+        .map_err(ArbitragePaperTaskError::AccountRisk)
+}
+
+async fn discard_planned_admission(
+    risk: Option<&AccountRiskAuthority>,
+    task_id: &str,
+    ticket: Option<&AccountRiskAdmissionTicket>,
+    now: DateTime<Utc>,
+) -> Result<(), ArbitragePaperTaskError> {
+    let (Some(risk), Some(ticket)) = (risk, ticket) else {
+        return Ok(());
+    };
+    cancel_unreserved_admission(risk, task_id, ticket, now).await
 }
 
 async fn abort_inflight(
     operation: &mut Option<InFlightOperation>,
     account: &PaperAccountAuthority,
-) {
+    risk: Option<&AccountRiskAuthority>,
+    owner_task_id: &str,
+) -> Result<(), ArbitragePaperTaskError> {
     if let Some(mut operation) = operation.take() {
         operation.abort().await;
-        let _ = retain_cancelled_operation(account, &operation.request).await;
+        if retain_cancelled_operation(
+            account,
+            risk,
+            owner_task_id,
+            operation.admission_ticket.as_ref(),
+            &operation.request,
+            Utc::now(),
+        )
+        .await?
+        {
+            return Err(ArbitragePaperTaskError::RecoveryRequired);
+        }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1523,6 +1846,8 @@ async fn stop_owner(
     mut operation: Option<InFlightOperation>,
     cancel_requested: bool,
     account: &PaperAccountAuthority,
+    risk: Option<&AccountRiskAuthority>,
+    owner_task_id: &str,
     state: &mut ArbitrageState,
 ) -> TaskResult {
     let mut cancelled_reservation_needs_recovery = false;
@@ -1530,8 +1855,31 @@ async fn stop_owner(
         && (cancel_requested || !active.execution_started())
     {
         active.abort().await;
-        cancelled_reservation_needs_recovery =
-            retain_cancelled_operation(account, &active.request).await;
+        cancelled_reservation_needs_recovery = match retain_cancelled_operation(
+            account,
+            risk,
+            owner_task_id,
+            active.admission_ticket.as_ref(),
+            &active.request,
+            Utc::now(),
+        )
+        .await
+        {
+            Ok(needs_recovery) => needs_recovery,
+            Err(error) => {
+                let failure = error.failure_bucket();
+                return fail_owner(
+                    left,
+                    right,
+                    history,
+                    status_sender,
+                    last_recorded_at,
+                    failure,
+                    error,
+                )
+                .await;
+            }
+        };
         operation = None;
     }
 
@@ -1547,7 +1895,43 @@ async fn stop_owner(
     {
         if let Some(mut operation) = operation.take() {
             operation.abort().await;
-            let _ = retain_cancelled_operation(account, &operation.request).await;
+            match retain_cancelled_operation(
+                account,
+                risk,
+                owner_task_id,
+                operation.admission_ticket.as_ref(),
+                &operation.request,
+                Utc::now(),
+            )
+            .await
+            {
+                Ok(true) => {
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        ArbitragePaperTaskFailure::RecoveryRequired,
+                        ArbitragePaperTaskError::RecoveryRequired,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(retain_error) => {
+                    let failure = retain_error.failure_bucket();
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        failure,
+                        retain_error,
+                    )
+                    .await;
+                }
+            }
         }
         let _ = tokio::join!(left.stop(), right.stop());
         publish_runtime_failure(status_sender, ArbitragePaperTaskFailure::JournalUnavailable);
@@ -1560,7 +1944,43 @@ async fn stop_owner(
     let (Ok(left_exit), Ok(right_exit)) = (left_exit, right_exit) else {
         if let Some(mut operation) = operation.take() {
             operation.abort().await;
-            let _ = retain_cancelled_operation(account, &operation.request).await;
+            match retain_cancelled_operation(
+                account,
+                risk,
+                owner_task_id,
+                operation.admission_ticket.as_ref(),
+                &operation.request,
+                Utc::now(),
+            )
+            .await
+            {
+                Ok(true) => {
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        ArbitragePaperTaskFailure::RecoveryRequired,
+                        ArbitragePaperTaskError::RecoveryRequired,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(retain_error) => {
+                    let failure = retain_error.failure_bucket();
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        failure,
+                        retain_error,
+                    )
+                    .await;
+                }
+            }
         }
         return fail_owner(
             left,
@@ -1590,32 +2010,59 @@ async fn stop_owner(
     if let Some(mut operation) = operation {
         if cancel_requested {
             operation.abort().await;
-            let _ = retain_cancelled_operation(account, &operation.request).await;
-            return fail_owner(
-                left,
-                right,
-                history,
-                status_sender,
-                last_recorded_at,
-                ArbitragePaperTaskFailure::RecoveryRequired,
-                ArbitragePaperTaskError::RecoveryRequired,
+            let needs_recovery = match retain_cancelled_operation(
+                account,
+                risk,
+                owner_task_id,
+                operation.admission_ticket.as_ref(),
+                &operation.request,
+                Utc::now(),
             )
-            .await;
-        }
-        let result = operation.join_mut().await;
-        let _ = operation.join.take();
-        if let Err(error) = complete_operation(result, &operation.decision, state) {
-            let (failure, error) = classify_operation_error(error);
-            return fail_owner(
-                left,
-                right,
-                history,
-                status_sender,
-                last_recorded_at,
-                failure,
-                error,
-            )
-            .await;
+            .await
+            {
+                Ok(needs_recovery) => needs_recovery,
+                Err(error) => {
+                    let failure = error.failure_bucket();
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        failure,
+                        error,
+                    )
+                    .await;
+                }
+            };
+            if needs_recovery {
+                return fail_owner(
+                    left,
+                    right,
+                    history,
+                    status_sender,
+                    last_recorded_at,
+                    ArbitragePaperTaskFailure::RecoveryRequired,
+                    ArbitragePaperTaskError::RecoveryRequired,
+                )
+                .await;
+            }
+        } else {
+            let result = operation.join_mut().await;
+            let _ = operation.join.take();
+            if let Err(error) = complete_operation(result, &operation.decision, state) {
+                let (failure, error) = classify_operation_error(error);
+                return fail_owner(
+                    left,
+                    right,
+                    history,
+                    status_sender,
+                    last_recorded_at,
+                    failure,
+                    error,
+                )
+                .await;
+            }
         }
     }
 
@@ -2189,5 +2636,145 @@ impl Error for ArbitragePaperTaskError {
             | Self::TaskCancelled
             | Self::PreviouslyFailed(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use chrono::{TimeZone, Utc};
+    use crypto_trading_domain::Money;
+    use crypto_trading_runtime::{
+        AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, JsonlHistory,
+    };
+    use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
+    use rust_decimal::Decimal;
+    use uuid::Uuid;
+
+    use super::{ArbitragePaperTaskError, cancel_unreserved_admission, discard_planned_admission};
+
+    fn money(value: &str) -> Money {
+        Money::new(Decimal::from_str(value).unwrap())
+    }
+
+    fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 26, hour, minute, 0).unwrap()
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "crypto-trading-arbitrage-admission-{label}-{}.jsonl",
+            Uuid::new_v4()
+        ))
+    }
+
+    fn risk(path: &std::path::Path) -> AccountRiskAuthority {
+        AccountRiskAuthority::new(
+            Uuid::new_v4(),
+            JsonlHistory::new(path),
+            "paper",
+            AccountRiskPolicy::new(AccountRiskLimits {
+                max_symbol_exposure: Some(money("100")),
+                max_total_exposure: Some(money("100")),
+                ..AccountRiskLimits::default()
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn candidate(task_id: &str, notional: &str) -> AccountRiskCandidate {
+        AccountRiskCandidate::new(task_id, "BTC-USDT", money(notional)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pre_reservation_failure_releases_the_pending_admission() {
+        let path = temp_path("pre-reservation-failure");
+        let risk = risk(&path);
+        let ticket = match risk
+            .admit(&candidate("owner-a", "100"), at(9, 0))
+            .await
+            .unwrap()
+        {
+            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
+            AccountRiskAdmission::Rejected(rejection) => {
+                panic!("expected admission, got {rejection:?}")
+            }
+        };
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "1"), at(9, 1))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+        ));
+
+        assert!(
+            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "100"), at(9, 3))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Admitted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn discarded_planned_operation_releases_pending_admission() {
+        let path = temp_path("discarded-planned-operation");
+        let risk = risk(&path);
+        let ticket = match risk
+            .admit(&candidate("owner-a", "100"), at(9, 0))
+            .await
+            .unwrap()
+        {
+            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
+            AccountRiskAdmission::Rejected(rejection) => {
+                panic!("expected admission, got {rejection:?}")
+            }
+        };
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "1"), at(9, 1))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+        ));
+
+        discard_planned_admission(Some(&risk), "owner-a", Some(&ticket), at(9, 2))
+            .await
+            .unwrap();
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "100"), at(9, 3))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Admitted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_pending_admission_surfaces_recovery_required() {
+        let path = temp_path("missing-pending-admission");
+        let risk = risk(&path);
+        let ticket = match risk
+            .admit(&candidate("owner-a", "100"), at(9, 0))
+            .await
+            .unwrap()
+        {
+            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
+            AccountRiskAdmission::Rejected(rejection) => {
+                panic!("expected admission, got {rejection:?}")
+            }
+        };
+
+        cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2)).await,
+            Err(ArbitragePaperTaskError::RecoveryRequired)
+        ));
     }
 }

@@ -69,7 +69,10 @@ fn monitor_for(left_exchange: &str, right_exchange: &str) -> ReadOnlyArbitrageMo
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()]).unwrap();
     let book = MarketDataBook::new(
         universe,
-        MarketFreshnessPolicy::new(Duration::minutes(5), Duration::seconds(1)).unwrap(),
+        MarketFreshnessPolicy::new(Duration::minutes(5), Duration::seconds(1))
+            .unwrap()
+            .with_max_pair_skew(Duration::minutes(5))
+            .unwrap(),
         Arc::new(ReplayMarketDataClock::new(
             base_time() + Duration::minutes(1),
         )),
@@ -778,7 +781,15 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
     first.stop().await.unwrap();
 
-    let reservation = account.snapshot().await.unwrap().reservations[0].clone();
+    let account_snapshot = account.snapshot().await.unwrap();
+    let reservation = account_snapshot.reservations[0].clone();
+    let expected_available = Money::new(
+        account_snapshot
+            .available
+            .as_decimal()
+            .checked_add(reservation.held_exposure.as_decimal())
+            .unwrap(),
+    );
     account
         .record_reconciliation_failure(
             PaperReconciliationProof::from_evidence(
@@ -790,7 +801,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
                     reservation.batch_id,
                     "binance-testnet/account-snapshot-1",
                     1,
-                    Money::new(decimal("100000")),
+                    expected_available,
                     "fixture_mismatch",
                 )
                 .unwrap(),

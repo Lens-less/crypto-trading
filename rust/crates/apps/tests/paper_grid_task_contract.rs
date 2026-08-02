@@ -460,14 +460,14 @@ async fn timeout_marks_operation_uncertain_and_restart_fails_closed() {
     .unwrap();
 
     let error = task.wait().await.unwrap_err();
-    assert!(matches!(
-        error,
-        GridPaperTaskError::Saga(_) | GridPaperTaskError::Runtime(_)
-    ));
+    assert!(
+        matches!(error, GridPaperTaskError::RecoveryRequired),
+        "unexpected timeout error: {error:?}"
+    );
     assert_eq!(task.status().phase, GridPaperTaskPhase::Failed);
     assert_eq!(
         task.status().failure,
-        Some(GridPaperTaskFailure::ExecutionFailed)
+        Some(GridPaperTaskFailure::RecoveryRequired)
     );
     assert_eq!(
         account.snapshot().await.unwrap().reservations[0].phase,
@@ -507,7 +507,16 @@ async fn cancel_during_unknown_execution_retains_capacity_without_release() {
     wait_until(|| executor.started.load(Ordering::SeqCst)).await;
 
     let error = task.cancel().await.unwrap_err();
-    assert!(matches!(error, GridPaperTaskError::RecoveryRequired));
+    // The owner may preserve the unknown reservation before the outer
+    // two-grace deadline or the caller may observe that deadline first. Both
+    // outcomes are fail-closed and retain the same uncertain capacity.
+    assert!(
+        matches!(
+            error,
+            GridPaperTaskError::RecoveryRequired | GridPaperTaskError::ShutdownTimedOut
+        ),
+        "unexpected cancellation error: {error:?}"
+    );
     let snapshot = account.snapshot().await.unwrap();
     assert_eq!(snapshot.reservations.len(), 1);
     assert_eq!(
@@ -539,7 +548,15 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     .unwrap();
     first.wait().await.unwrap();
 
-    let reservation = account.snapshot().await.unwrap().reservations[0].clone();
+    let account_snapshot = account.snapshot().await.unwrap();
+    let reservation = account_snapshot.reservations[0].clone();
+    let expected_available = Money::new(
+        account_snapshot
+            .available
+            .as_decimal()
+            .checked_add(reservation.held_exposure.as_decimal())
+            .unwrap(),
+    );
     account
         .record_reconciliation_failure(
             PaperReconciliationProof::from_evidence(
@@ -551,7 +568,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
                     reservation.batch_id,
                     "binance-testnet/account-snapshot-1",
                     1,
-                    Money::new(decimal("10000")),
+                    expected_available,
                     "fixture_mismatch",
                 )
                 .unwrap(),

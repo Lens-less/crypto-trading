@@ -31,6 +31,7 @@ pub enum CapabilityArea {
     ControlPlane,
     Exchange,
     History,
+    Research,
     Risk,
     Runtime,
     Strategy,
@@ -43,6 +44,7 @@ impl fmt::Display for CapabilityArea {
             Self::ControlPlane => "control-plane",
             Self::Exchange => "exchange",
             Self::History => "history",
+            Self::Research => "research",
             Self::Risk => "risk",
             Self::Runtime => "runtime",
             Self::Strategy => "strategy",
@@ -316,17 +318,19 @@ impl CapabilityManifest {
 #[must_use]
 pub fn current_capability_manifest() -> CapabilityManifest {
     let adapters = adapter_support_matrix();
-    let capabilities = [
+    let mut capabilities = [
         foundation_capabilities(),
         exchange_capabilities(&adapters),
         state_and_risk_capabilities(),
+        research_capabilities(),
         runtime_execution_capabilities(),
         runtime_validation_capabilities(),
         strategy_capabilities(),
     ]
     .into_iter()
     .flatten()
-    .collect();
+    .collect::<Vec<_>>();
+    capabilities.sort_by(|left, right| left.id.cmp(&right.id));
     let manifest = CapabilityManifest {
         schema_version: CAPABILITY_SCHEMA_VERSION,
         product_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -725,9 +729,9 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Journal-backed paper account-level risk authority: per-symbol and global exposure caps, total-balance warning/forced-close thresholds, UTC-midnight daily trade caps, symbol deny/high-risk lists, owner position clocks with timeout close directives, durable pause/resume, and a latching kill switch wired ahead of every paper reservation and into the trusted submit path.",
+            "Journal-backed paper account-level risk authority: exact FIFO lots, immediate taker-fee and realized-PnL settlement for fully filled paper receipts, reduce-only capacity, settled-equity balance thresholds, per-symbol/global exposure caps, UTC-midnight daily trade caps, owner position clocks, durable pause/resume, and a latching kill switch.",
             &[
-                "The authority is paper-scoped only: it composes the journal-backed paper reservation model and does not own exchange equity, margin, mark-to-market, position truth, or any testnet/mainnet account state; those remain mandatory gates for live authority.",
+                "The authority is paper-scoped only: exact settlement currently covers synchronous fully filled taker receipts, not resting-maker lifecycle, funding, unrealized mark-to-market, margin/liquidation mechanics, or any testnet/mainnet account truth; those remain mandatory gates for live authority.",
                 "Close directives are demands recorded as durable facts; consumers stop the paper owner rather than submitting exchange orders, and the kill switch has deliberately no disengage transition.",
             ],
             &[
@@ -744,6 +748,41 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 "rust/crates/control-plane/src/submit.rs",
                 "rust/crates/web-app/src/paper_dispatcher.rs",
                 "rust/crates/web/tests/http_contract.rs",
+            ],
+        ),
+    ]
+}
+
+fn research_capabilities() -> Vec<Capability> {
+    vec![
+        capability(
+            "research.backtest",
+            CapabilityArea::Research,
+            CapabilityLevel::Available,
+            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
+            "Deterministic single-instrument SimClock/EventTape backtests with explicit maker/taker fees, slippage, FIFO-style ledger outputs, equity curves, metrics, and out-of-sample-only walk-forward windows.",
+            &[
+                "This is a bounded research kernel, not a profitability claim: production MarketDataEvent/strategy adapters, multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
+            ],
+            &[
+                "rust/crates/backtest/src/engine.rs",
+                "rust/crates/backtest/src/ledger.rs",
+                "rust/crates/backtest/src/walk_forward.rs",
+                "rust/crates/backtest/tests/backtest_contract.rs",
+            ],
+        ),
+        capability(
+            "research.indicators",
+            CapabilityArea::Research,
+            CapabilityLevel::Available,
+            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
+            "Incremental Decimal ATR, EMA, EWMA realized volatility, rolling z-score, Sharpe, Sortino, drawdown, win-rate, and profit-factor calculations with golden vectors.",
+            &[
+                "Order-book imbalance and microprice indicators are not implemented, and these indicators are not yet wired into continuous strategy configuration.",
+            ],
+            &[
+                "rust/crates/indicators/src",
+                "rust/crates/indicators/tests/indicators_contract.rs",
             ],
         ),
     ]
@@ -861,9 +900,9 @@ fn market_data_capability() -> Capability {
             ],
             CapabilityAccess::MarketData,
         ),
-        "Bounded exact-universe market book with freshness, continuity, deterministic replay, subscription gaps, credential-free Binance Spot polling, and credential-free Hyperliquid perpetual polling with an hourly funding-rate side feed.",
+        "Bounded exact-universe market book with explicit timestamp provenance, venue sequence metadata, cross-venue skew rejection, deterministic replay, subscription gaps, credential-free Binance Spot polling, and credential-free Hyperliquid perpetual polling with an hourly funding-rate side feed.",
         &[
-            "Both real venues are credential-free HTTP polling rather than realtime streams, and the executable live bootstrap is limited to the explicit opt-in binance+hyperliquid monitor pair; the funding side feed is observation-only and drives no decision yet.",
+            "Both real venues are credential-free HTTP polling rather than realtime streams. Their documented REST payloads do not expose venue event time, so observations are explicitly marked local-receipt-time; the executable live bootstrap remains limited to the opt-in binance+hyperliquid monitor pair, and the funding side feed drives no decision yet.",
         ],
         &[
             "rust/crates/runtime/src/market_data.rs",

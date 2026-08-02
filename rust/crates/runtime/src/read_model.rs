@@ -153,7 +153,7 @@ impl OperatorReadModel {
     }
 }
 
-struct ProjectionBuilder {
+pub(crate) struct ProjectionBuilder {
     journal_id: Uuid,
     head_sequence: Option<u64>,
     head_event_id: Option<Uuid>,
@@ -165,7 +165,7 @@ struct ProjectionBuilder {
 }
 
 impl ProjectionBuilder {
-    fn new(journal_id: Uuid) -> Self {
+    pub(crate) fn new(journal_id: Uuid) -> Self {
         Self {
             journal_id,
             head_sequence: None,
@@ -182,27 +182,14 @@ impl ProjectionBuilder {
         let mut cursor = None;
         loop {
             let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())?;
-            if let Some(event) = page.events().last() {
-                self.head_sequence = Some(event.sequence());
-                self.head_event_id = Some(event.event_id());
-            }
             for event in page.events() {
-                self.apply_event(event)?;
+                self.observe_event(event)?;
             }
 
             match page.boundary() {
                 JournalPageBoundary::SnapshotEnd => break,
                 JournalPageBoundary::PartialTail { offset, bytes } => {
-                    self.projection_status = ProjectionStatus::Degraded;
-                    self.push_warning(ReadModelWarning {
-                        code: ReadModelWarningCode::PartialTail,
-                        sequence: self.head_sequence.map(|value| value.saturating_add(1)),
-                        event_id: None,
-                        batch_id: None,
-                        detail: bounded_detail(format!(
-                            "ignored {bytes} trailing byte(s) at offset {offset}; projection stops at the last complete record"
-                        )),
-                    });
+                    self.mark_partial_tail(*offset, *bytes);
                     break;
                 }
                 JournalPageBoundary::PageLimit => {
@@ -221,7 +208,33 @@ impl ProjectionBuilder {
             }
         }
 
-        Ok(OperatorReadModel {
+        Ok(self.finish())
+    }
+
+    pub(crate) fn observe_event(
+        &mut self,
+        event: &OperationEventEnvelope,
+    ) -> Result<(), ReadModelError> {
+        self.head_sequence = Some(event.sequence());
+        self.head_event_id = Some(event.event_id());
+        self.apply_event(event)
+    }
+
+    pub(crate) fn mark_partial_tail(&mut self, offset: u64, bytes: usize) {
+        self.projection_status = ProjectionStatus::Degraded;
+        self.push_warning(ReadModelWarning {
+            code: ReadModelWarningCode::PartialTail,
+            sequence: self.head_sequence.map(|value| value.saturating_add(1)),
+            event_id: None,
+            batch_id: None,
+            detail: bounded_detail(format!(
+                "ignored {bytes} trailing byte(s) at offset {offset}; projection stops at the last complete record"
+            )),
+        });
+    }
+
+    pub(crate) fn finish(self) -> OperatorReadModel {
+        OperatorReadModel {
             schema_version: OPERATOR_READ_MODEL_SCHEMA_VERSION,
             journal_id: self.journal_id,
             head_sequence: self.head_sequence,
@@ -235,7 +248,7 @@ impl ProjectionBuilder {
             batches_truncated: self.batches_truncated,
             warnings: self.warnings,
             warnings_truncated: self.warnings_truncated,
-        })
+        }
     }
 
     fn apply_event(&mut self, event: &OperationEventEnvelope) -> Result<(), ReadModelError> {

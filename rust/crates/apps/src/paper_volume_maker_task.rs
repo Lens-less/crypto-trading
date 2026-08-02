@@ -26,15 +26,15 @@ use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use crypto_trading_domain::{MarketSnapshot, Money, OrderIntent, Price, Quantity, Side, Symbol};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
-    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskError,
-    DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError, JournalReadError,
-    JournalSnapshot, JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION,
-    MarketDataEvent, MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig,
-    MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
-    MarketSupervisorStatus, PaperAccountAuthority, PaperAccountError, PaperCostModel,
-    PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
-    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
+    AccountRiskError, DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError,
+    JournalReadError, JournalSnapshot, JournalSnapshotSource, JsonlHistory,
+    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent, MarketDataEventSource,
+    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
+    MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus, PaperAccountAuthority,
+    PaperAccountError, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
+    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
+    ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     StrategyError, StrategyMachine, VolumeMakerMode, VolumeMakerState, VolumeMakerStrategy,
@@ -604,6 +604,7 @@ struct PlannedOperation {
     intent: OrderIntent,
     kind: PlannedKind,
     reference_price: Price,
+    admission_ticket: Option<AccountRiskAdmissionTicket>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -769,10 +770,16 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                 };
 
                 let admitted = match planned {
-                    Some(operation) if operation.kind == PlannedKind::Open => {
+                    Some(operation)
+                        if operation.kind == PlannedKind::Open
+                            && context.config.account_risk.is_some() =>
+                    {
                         match admit_open(&context, &operation, observed_at).await {
-                            Ok(true) => Some(operation),
-                            Ok(false) => {
+                            Ok(Some(ticket)) => Some(PlannedOperation {
+                                admission_ticket: Some(ticket),
+                                ..operation
+                            }),
+                            Ok(None) => {
                                 // A durable rejection consumes the standing
                                 // quote and skips this cycle without failing.
                                 stats.rejected_entries = stats.rejected_entries.saturating_add(1);
@@ -790,10 +797,26 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
 
                 let mut stop_after_operation = false;
                 if let Some(operation) = admitted {
-                    context.operation_sequence = context
-                        .operation_sequence
-                        .checked_add(1)
-                        .ok_or(VolumeMakerPaperTaskError::InvalidRequest)?;
+                    let Some(next_operation) = context.operation_sequence.checked_add(1) else {
+                        if let Err(error) = discard_planned_admission(
+                            context.config.account_risk.as_ref(),
+                            &context.config.task_id,
+                            operation.admission_ticket.as_ref(),
+                            observed_at,
+                        )
+                        .await
+                        {
+                            let failure = error.failure_bucket();
+                            return fail_owner(&mut context, failure, error).await;
+                        }
+                        return fail_owner(
+                            &mut context,
+                            VolumeMakerPaperTaskFailure::InvalidRequest,
+                            VolumeMakerPaperTaskError::InvalidRequest,
+                        )
+                        .await;
+                    };
+                    context.operation_sequence = next_operation;
                     let request = match build_request(
                         &context.config,
                         &operation,
@@ -801,6 +824,17 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                     ) {
                         Ok(request) => request,
                         Err(error) => {
+                            if let Err(cancel_error) = discard_planned_admission(
+                                context.config.account_risk.as_ref(),
+                                &context.config.task_id,
+                                operation.admission_ticket.as_ref(),
+                                observed_at,
+                            )
+                            .await
+                            {
+                                let failure = cancel_error.failure_bucket();
+                                return fail_owner(&mut context, failure, cancel_error).await;
+                            }
                             next.operation_count = context.operation_sequence;
                             context.status_sender.send_replace(next);
                             return fail_owner(
@@ -811,6 +845,7 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                             .await;
                         }
                     };
+                    let recovery_request = request.clone();
                     match run_operation(&mut context, request).await {
                         OperationOutcome::Terminal(Ok(run), stop_requested) => {
                             stop_after_operation = stop_requested;
@@ -877,19 +912,68 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                             }
                         }
                         OperationOutcome::Terminal(Err(error), _) => {
+                            let needs_recovery = match retain_cancelled_operation(
+                                context.saga.account(),
+                                context.config.account_risk.as_ref(),
+                                &context.config.task_id,
+                                operation.admission_ticket.as_ref(),
+                                &recovery_request,
+                                observed_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(&mut context, failure, retain_error).await;
+                                }
+                            };
+                            if needs_recovery {
+                                next.operation_count = context.operation_sequence;
+                                context.status_sender.send_replace(next);
+                                return fail_owner(
+                                    &mut context,
+                                    VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                    VolumeMakerPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            }
                             let (failure, error) = classify_saga_error(error);
                             next.operation_count = context.operation_sequence;
                             context.status_sender.send_replace(next);
                             return fail_owner(&mut context, failure, error).await;
                         }
                         OperationOutcome::Cancelled(request) => {
-                            retain_cancelled_operation(context.saga.account(), &request).await;
+                            let needs_recovery = match retain_cancelled_operation(
+                                context.saga.account(),
+                                context.config.account_risk.as_ref(),
+                                &context.config.task_id,
+                                operation.admission_ticket.as_ref(),
+                                &request,
+                                observed_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(&mut context, failure, retain_error).await;
+                                }
+                            };
                             next.operation_count = context.operation_sequence;
                             context.status_sender.send_replace(next);
-                            return fail_owner(
+                            if needs_recovery {
+                                return fail_owner(
+                                    &mut context,
+                                    VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                    VolumeMakerPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            }
+                            return stop_owner(
                                 &mut context,
-                                VolumeMakerPaperTaskFailure::RecoveryRequired,
-                                VolumeMakerPaperTaskError::RecoveryRequired,
+                                bucket.take(),
+                                VolumeMakerPaperTaskExit::StopRequested,
                             )
                             .await;
                         }
@@ -977,21 +1061,81 @@ async fn run_operation(
 
 async fn retain_cancelled_operation(
     account: &PaperAccountAuthority,
+    risk: Option<&AccountRiskAuthority>,
+    owner_task_id: &str,
+    admission_ticket: Option<&AccountRiskAdmissionTicket>,
     request: &PaperSingleLegRequest,
-) {
+    now: DateTime<Utc>,
+) -> Result<bool, VolumeMakerPaperTaskError> {
     let reservation_id = request.reservation().reservation_id();
-    let Ok(snapshot) = account.snapshot().await else {
-        return;
-    };
+    let snapshot = account
+        .snapshot()
+        .await
+        .map_err(VolumeMakerPaperTaskError::Account)?;
     let Some(reservation) = snapshot
         .reservations
         .iter()
         .find(|reservation| reservation.reservation_id == reservation_id)
     else {
-        return;
+        let (Some(risk), Some(ticket)) = (risk, admission_ticket) else {
+            return Ok(false);
+        };
+        if cancel_unreserved_admission(risk, owner_task_id, ticket, now)
+            .await
+            .map_err(VolumeMakerPaperTaskError::AccountRisk)?
+        {
+            return Ok(false);
+        }
+        let retry_snapshot = account
+            .snapshot()
+            .await
+            .map_err(VolumeMakerPaperTaskError::Account)?;
+        let Some(retry_reservation) = retry_snapshot
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+        else {
+            return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+        };
+        if retry_reservation.phase == PaperReservationPhase::Pending {
+            let _ = account
+                .mark_uncertain(reservation_id)
+                .await
+                .map_err(VolumeMakerPaperTaskError::Account)?;
+        }
+        return Ok(true);
     };
     if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account.mark_uncertain(reservation_id).await;
+        let _ = account
+            .mark_uncertain(reservation_id)
+            .await
+            .map_err(VolumeMakerPaperTaskError::Account)?;
+    }
+    Ok(true)
+}
+
+async fn cancel_unreserved_admission(
+    risk: &AccountRiskAuthority,
+    task_id: &str,
+    ticket: &AccountRiskAdmissionTicket,
+    now: DateTime<Utc>,
+) -> Result<bool, AccountRiskError> {
+    risk.cancel_admission(task_id, ticket, now).await
+}
+
+async fn discard_planned_admission(
+    risk: Option<&AccountRiskAuthority>,
+    task_id: &str,
+    ticket: Option<&AccountRiskAdmissionTicket>,
+    now: DateTime<Utc>,
+) -> Result<(), VolumeMakerPaperTaskError> {
+    let (Some(risk), Some(ticket)) = (risk, ticket) else {
+        return Ok(());
+    };
+    match cancel_unreserved_admission(risk, task_id, ticket, now).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(VolumeMakerPaperTaskError::RecoveryRequired),
+        Err(error) => Err(VolumeMakerPaperTaskError::AccountRisk(error)),
     }
 }
 
@@ -1082,6 +1226,7 @@ fn plan_operation(
             intent,
             kind: PlannedKind::Close,
             reference_price,
+            admission_ticket: None,
         }));
     }
     if next_cycle_at.is_some_and(|at| observed_at < at) {
@@ -1108,6 +1253,7 @@ fn plan_operation(
                         intent,
                         kind: PlannedKind::Open,
                         reference_price: standing.bid,
+                        admission_ticket: None,
                     }));
                 }
                 if snapshot.bid() >= standing.ask {
@@ -1123,6 +1269,7 @@ fn plan_operation(
                         intent,
                         kind: PlannedKind::Open,
                         reference_price: standing.ask,
+                        admission_ticket: None,
                     }));
                 }
             }
@@ -1145,6 +1292,7 @@ fn plan_operation(
                         intent,
                         kind: PlannedKind::Open,
                         reference_price,
+                        admission_ticket: None,
                     }))
                 }
                 // The legacy service waits for a book with visible depth
@@ -1184,9 +1332,9 @@ async fn admit_open(
     context: &OwnerContext,
     operation: &PlannedOperation,
     observed_at: DateTime<Utc>,
-) -> Result<bool, VolumeMakerPaperTaskError> {
+) -> Result<Option<AccountRiskAdmissionTicket>, VolumeMakerPaperTaskError> {
     let Some(risk) = context.config.account_risk.as_ref() else {
-        return Ok(true);
+        return Ok(None);
     };
     let notional = operation
         .reference_price
@@ -1205,8 +1353,8 @@ async fn admit_open(
         .await
         .map_err(VolumeMakerPaperTaskError::AccountRisk)?
     {
-        AccountRiskAdmission::Admitted { .. } => Ok(true),
-        AccountRiskAdmission::Rejected(_) => Ok(false),
+        AccountRiskAdmission::Admitted { ticket, .. } => Ok(Some(ticket)),
+        AccountRiskAdmission::Rejected(_) => Ok(None),
     }
 }
 
@@ -1862,5 +2010,89 @@ impl Error for VolumeMakerPaperTaskError {
             | Self::TaskCancelled
             | Self::PreviouslyFailed(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use chrono::{TimeZone, Utc};
+    use crypto_trading_domain::Money;
+    use crypto_trading_runtime::{
+        AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, JsonlHistory,
+    };
+    use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
+    use rust_decimal::Decimal;
+    use uuid::Uuid;
+
+    use super::cancel_unreserved_admission;
+
+    fn money(value: &str) -> Money {
+        Money::new(Decimal::from_str(value).unwrap())
+    }
+
+    fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 26, hour, minute, 0).unwrap()
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "crypto-trading-volume-admission-{label}-{}.jsonl",
+            Uuid::new_v4()
+        ))
+    }
+
+    fn risk(path: &std::path::Path) -> AccountRiskAuthority {
+        AccountRiskAuthority::new(
+            Uuid::new_v4(),
+            JsonlHistory::new(path),
+            "paper",
+            AccountRiskPolicy::new(AccountRiskLimits {
+                max_symbol_exposure: Some(money("100")),
+                max_total_exposure: Some(money("100")),
+                ..AccountRiskLimits::default()
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn candidate(task_id: &str, notional: &str) -> AccountRiskCandidate {
+        AccountRiskCandidate::new(task_id, "BTC-USDT", money(notional)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pre_reservation_failure_releases_the_pending_admission() {
+        let path = temp_path("pre-reservation-failure");
+        let risk = risk(&path);
+        let ticket = match risk
+            .admit(&candidate("owner-a", "100"), at(9, 0))
+            .await
+            .unwrap()
+        {
+            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
+            AccountRiskAdmission::Rejected(rejection) => {
+                panic!("expected admission, got {rejection:?}")
+            }
+        };
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "1"), at(9, 1))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+        ));
+
+        assert!(
+            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "100"), at(9, 3))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Admitted { .. }
+        ));
     }
 }

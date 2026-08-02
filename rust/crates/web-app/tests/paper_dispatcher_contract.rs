@@ -723,7 +723,7 @@ async fn matching_grid_profile_executes_through_paper_exchange_and_account_autho
 
     let journal = wait_for_journal(
         &fixture.history_path,
-        "\"decision\":\"paper_account_committed\"",
+        "\"decision\":\"paper_account_execution_settled\"",
     )
     .await;
     assert!(journal.contains("\"decision\":\"execution_completed\""));
@@ -773,7 +773,7 @@ async fn checked_in_grid_replay_keeps_the_owner_running_after_every_cross() {
 
     let journal = wait_for_journal(
         &fixture.history_path,
-        "\"decision\":\"paper_account_committed\"",
+        "\"decision\":\"paper_account_execution_settled\"",
     )
     .await;
     assert!(!journal.contains("\"decision\":\"task_failed\""));

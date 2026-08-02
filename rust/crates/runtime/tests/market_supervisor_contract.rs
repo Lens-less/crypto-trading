@@ -248,6 +248,7 @@ async fn binance_polling_reconnects_after_failure_without_fabricating_a_quote() 
             snapshot,
             revision: 1,
             received_at,
+            ..
         }) if snapshot.exchange() == "binance"
             && snapshot.symbol.as_str() == "LTC-BTC-SPOT"
             && snapshot.market_type == MarketType::Spot
@@ -257,6 +258,83 @@ async fn binance_polling_reconnects_after_failure_without_fabricating_a_quote() 
         source.next_event().await.unwrap().unwrap(),
         MarketDataEvent::Observation(MarketDataObservation { revision: 2, .. })
     ));
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn binance_polling_keeps_wire_sequence_separate_from_poll_continuity() {
+    let (base_url, server) = stub_server(vec![
+        http_response(
+            "200 OK",
+            r#"{
+            "symbol":"LTCBTC",
+            "bidPrice":"4.00000000",
+            "bidQty":"431.00000000",
+            "askPrice":"4.00000200",
+            "askQty":"9.00000000",
+            "u":41
+        }"#,
+        ),
+        http_response(
+            "200 OK",
+            r#"{
+            "symbol":"LTCBTC",
+            "bidPrice":"4.10000000",
+            "bidQty":"431.00000000",
+            "askPrice":"4.10000200",
+            "askQty":"9.00000000",
+            "u":47
+        }"#,
+        ),
+    ]);
+    let now = timestamp(1);
+    let clock = Arc::new(FixedClock { now });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+    let key = instrument("binance", "LTC-BTC-SPOT", MarketType::Spot);
+    let mut source = BinancePublicPollingSource::new(
+        exchange,
+        vec![BinancePollingRoute::new(key.clone(), Symbol::new("LTCBTC").unwrap()).unwrap()],
+        polling_policy(StdDuration::from_millis(1)),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+
+    let first = source.next_event().await.unwrap().unwrap();
+    let second = source.next_event().await.unwrap().unwrap();
+
+    assert!(matches!(
+        &first,
+        MarketDataEvent::Observation(MarketDataObservation {
+            snapshot,
+            revision: 1,
+            received_at,
+            timestamp_provenance,
+            source_sequence,
+        }) if snapshot.symbol.as_str() == "LTC-BTC-SPOT"
+            && *received_at == now
+            && *timestamp_provenance == crypto_trading_runtime::MarketTimestampProvenance::LocalReceipt
+            && *source_sequence == Some(41)
+    ));
+    assert!(matches!(
+        &second,
+        MarketDataEvent::Observation(MarketDataObservation {
+            revision: 2,
+            source_sequence: Some(47),
+            ..
+        })
+    ));
+
+    let mut book = MarketDataBook::new(
+        MarketUniverse::new(vec![key.clone()]).unwrap(),
+        MarketFreshnessPolicy::new(Duration::seconds(10), Duration::seconds(1)).unwrap(),
+        clock,
+    );
+    book.apply(first).unwrap();
+    book.apply(second).unwrap();
+    assert_eq!(
+        book.view().instrument(&key).unwrap().continuity,
+        MarketContinuity::Continuous
+    );
     server.join().unwrap();
 }
 

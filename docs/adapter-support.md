@@ -34,10 +34,14 @@ Status meanings:
 <!-- adapter-matrix:end -->
 
 `implemented` is not synonymous with production-ready. Binance public data is
-read-only and one-shot. Hyperliquid public data is read-only credential-free
-polling of the perpetual asset contexts (impact prices plus an hourly
-funding-rate side channel), not a realtime stream, and grants no order or
-account authority. Binance's Testnet lifecycle owner has deterministic
+read-only credential-free REST polling; optional update IDs are retained as
+source sequences, while the documented response has no venue event timestamp
+and is therefore marked with explicit local-receipt-time provenance.
+Hyperliquid public data is read-only credential-free polling of the perpetual
+asset contexts (impact prices plus an hourly funding-rate side channel), also
+without a venue event timestamp. The runtime rejects cross-venue pairs beyond
+an explicit skew bound, but neither adapter is a realtime stream or grants
+order/account authority. Binance's Testnet lifecycle owner has deterministic
 submit-query-cancel/query-first recovery coverage, and its report-first account
 gate compares signed balances, open orders, and positions to one exact
 committed Paper reservation. Real credentialed Spot/USD-M reconciliation,
@@ -45,3 +49,15 @@ open-order, partial-fill, restart, and 24-hour soak evidence remain external
 release gates. PaperExchange is process-local. Every external venue still
 reports `live: unavailable`, and the manifest validation rejects any live claim
 while `live_trading_enabled` is false.
+
+The journal-backed Paper account above the adapter now settles fully filled
+synchronous taker receipts into exact FIFO lots, immediate fees, realized PnL,
+settled equity, and reduce-only capacity. This does not widen adapter authority:
+resting-maker callbacks, funding, mark-to-market, margin/liquidation rules,
+queue/depth impact, and external account truth remain unavailable.
+
+Offline research support is separately exposed as `research.indicators` and
+`research.backtest` in the capability manifest. The current backtest is a
+deterministic single-instrument kernel; it does not yet share the production
+market-event/strategy adapter seam and is not evidence of paper/live parity or
+profitability.

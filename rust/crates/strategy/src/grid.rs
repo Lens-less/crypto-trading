@@ -1,3 +1,10 @@
+//! Deterministic grid planning derived from the frozen Python subsystem.
+//!
+//! The legacy implementation is a behavioral reference, not a byte-for-byte
+//! compatibility contract. Where a legacy index formula contradicts its own
+//! documented economic meaning, the Rust planner keeps the documented meaning
+//! and calls out that deviation at the formula and in the changelog.
+
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, OrderIntent, Price, Quantity, Side, Symbol,
 };

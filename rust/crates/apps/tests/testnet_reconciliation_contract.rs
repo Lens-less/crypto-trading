@@ -14,8 +14,9 @@ use crypto_trading_exchange::{
 };
 use crypto_trading_runtime::{
     JsonlHistory, PAPER_ACCOUNT_SCHEMA_VERSION, PaperAccountAuthority, PaperAccountConfig,
-    PaperAccountSnapshot, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, PaperReservationView, ProjectionStatus,
+    PaperAccountSnapshot, PaperCostModel, PaperExecutionLedgerKind, PaperReconciliationOutcome,
+    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, PaperReservationView,
+    ProjectionStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -64,6 +65,11 @@ fn account(symbol: &Symbol) -> PaperAccountSnapshot {
         pending_reserved: Money::default(),
         uncertain_reserved: Money::default(),
         committed_exposure: Money::new(decimal("100")),
+        ledger_kind: PaperExecutionLedgerKind::LegacyReservationOnly,
+        cumulative_fees: Money::default(),
+        realized_pnl: Money::default(),
+        settled_equity_base: Money::new(decimal("1000")),
+        open_lots: Vec::new(),
         reservations: vec![PaperReservationView {
             reservation_id,
             task_id: "grid-btc".to_owned(),
@@ -77,6 +83,8 @@ fn account(symbol: &Symbol) -> PaperAccountSnapshot {
             first_sequence: 1,
             last_sequence: 2,
             reconciliation: None,
+            ledger_kind: PaperExecutionLedgerKind::LegacyReservationOnly,
+            settlement: None,
         }],
     }
 }

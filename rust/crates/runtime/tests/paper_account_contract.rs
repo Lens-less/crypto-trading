@@ -6,13 +6,17 @@ use std::{
     },
 };
 
-use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symbol};
+use chrono::Utc;
+use crypto_trading_domain::{
+    MarketType, Money, Order, OrderIntent, OrderStatus, Price, Quantity, Side, Symbol,
+};
+use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     JsonlHistory, PAPER_COST_MODEL_VERSION, PaperAccountAuthority, PaperAccountConfig,
-    PaperAccountError, PaperCostModel, PaperReconciliationDigestAlgorithm,
-    PaperReconciliationEvidence, PaperReconciliationOutcome, PaperReconciliationProof,
-    PaperReservationAdmission, PaperReservationLeg, PaperReservationPhase, PaperReservationRequest,
-    ProjectionStatus,
+    PaperAccountError, PaperCostModel, PaperExecutionLedgerKind,
+    PaperReconciliationDigestAlgorithm, PaperReconciliationEvidence, PaperReconciliationOutcome,
+    PaperReconciliationProof, PaperReservationAdmission, PaperReservationLeg,
+    PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -55,6 +59,131 @@ fn reservation_request(
         ],
     )
     .unwrap()
+}
+
+fn priced_intent_with_quantity(
+    exchange: &str,
+    side: Side,
+    price: &str,
+    quantity: &str,
+) -> OrderIntent {
+    OrderIntent::limit(
+        exchange,
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        side,
+        Quantity::new(decimal(quantity)).unwrap(),
+        Price::new(decimal(price)).unwrap(),
+    )
+}
+
+fn single_leg_request(
+    task_id: &str,
+    idempotency_key: &str,
+    exchange: &str,
+    side: Side,
+    reserved_notional: &str,
+    intent_price: &str,
+) -> PaperReservationRequest {
+    single_leg_request_with_quantity(
+        task_id,
+        idempotency_key,
+        exchange,
+        side,
+        reserved_notional,
+        intent_price,
+        "1",
+    )
+}
+
+fn single_leg_request_with_quantity(
+    task_id: &str,
+    idempotency_key: &str,
+    exchange: &str,
+    side: Side,
+    reserved_notional: &str,
+    intent_price: &str,
+    quantity: &str,
+) -> PaperReservationRequest {
+    let intent = priced_intent_with_quantity(exchange, side, intent_price, quantity);
+    PaperReservationRequest::new(
+        Uuid::new_v4(),
+        task_id,
+        idempotency_key,
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        vec![PaperReservationLeg::from_intent(0, &intent, money(reserved_notional)).unwrap()],
+    )
+    .unwrap()
+}
+
+fn single_leg_reduce_request(
+    task_id: &str,
+    idempotency_key: &str,
+    exchange: &str,
+    side: Side,
+    reserved_notional: &str,
+    intent_price: &str,
+) -> PaperReservationRequest {
+    let mut intent = priced_intent_with_quantity(exchange, side, intent_price, "1");
+    intent.reduce_only = true;
+    PaperReservationRequest::new(
+        Uuid::new_v4(),
+        task_id,
+        idempotency_key,
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        vec![PaperReservationLeg::from_intent(0, &intent, money(reserved_notional)).unwrap()],
+    )
+    .unwrap()
+}
+
+fn filled_receipt(exchange: &str, side: Side, order_id: &str, fill_price: &str) -> TradingReceipt {
+    filled_receipt_with_quantity(exchange, side, order_id, fill_price, "1")
+}
+
+fn filled_receipt_with_quantity(
+    exchange: &str,
+    side: Side,
+    order_id: &str,
+    fill_price: &str,
+    quantity: &str,
+) -> TradingReceipt {
+    let intent = priced_intent_with_quantity(exchange, side, fill_price, quantity);
+    TradingReceipt::Submitted {
+        order: Order {
+            id: order_id.to_owned(),
+            intent: intent.clone(),
+            filled_quantity: intent.quantity,
+            average_fill_price: Some(Price::new(decimal(fill_price)).unwrap()),
+            status: OrderStatus::Filled,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        disposition: SubmissionDisposition::Filled,
+    }
+}
+
+fn filled_receipt_for_leg(
+    leg: &PaperReservationLeg,
+    order_id: &str,
+    fill_price: &str,
+) -> TradingReceipt {
+    let quantity = leg.expected_quantity().unwrap().as_decimal().to_string();
+    let mut intent = priced_intent_with_quantity(leg.exchange(), leg.side(), fill_price, &quantity);
+    intent.client_order_id = leg.client_order_id().unwrap();
+    TradingReceipt::Submitted {
+        order: Order {
+            id: order_id.to_owned(),
+            intent: intent.clone(),
+            filled_quantity: intent.quantity,
+            average_fill_price: Some(Price::new(decimal(fill_price)).unwrap()),
+            status: OrderStatus::Filled,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        disposition: SubmissionDisposition::Filled,
+    }
 }
 
 fn reconciliation_match_proof(
@@ -618,6 +747,585 @@ async fn sealed_chain_without_active_file_replays_the_reserved_balance() {
     let snapshot = fresh.snapshot().await.unwrap();
     assert_eq!(snapshot.available, money("1000"));
     assert!(snapshot.reservations.is_empty());
+}
+
+#[tokio::test]
+async fn exact_settlement_matches_hand_worked_fee_and_pnl_vector() {
+    let path = temp_path("exact-vector");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+
+    let open = single_leg_request(
+        "grid:btc/open/0001",
+        "grid-open-0001",
+        "paper-grid",
+        Side::Buy,
+        "100",
+        "100",
+    );
+    let open_receipt = filled_receipt_for_leg(&open.legs()[0], "open-1", "100");
+    let open_id = open.reservation_id();
+    authority.reserve(open).await.unwrap();
+    authority
+        .settle_execution(open_id, &[open_receipt])
+        .await
+        .unwrap();
+
+    let opened = authority.snapshot().await.unwrap();
+    assert_eq!(opened.ledger_kind, PaperExecutionLedgerKind::ExactExecution);
+    assert_eq!(opened.cumulative_fees, money("0.1"));
+    assert_eq!(opened.realized_pnl, Money::default());
+    assert_eq!(opened.settled_equity_base, money("999.9"));
+    assert_eq!(opened.available, money("899.9"));
+    assert_eq!(opened.committed_exposure, money("100"));
+    assert_eq!(opened.open_lots.len(), 1);
+    assert_eq!(
+        opened.reservations[0]
+            .settlement
+            .as_ref()
+            .unwrap()
+            .fees_paid,
+        money("0.1")
+    );
+    assert_eq!(
+        opened.reservations[0]
+            .settlement
+            .as_ref()
+            .unwrap()
+            .realized_pnl_delta,
+        Money::default()
+    );
+
+    let close = single_leg_reduce_request(
+        "grid:btc/close/0002",
+        "grid-close-0002",
+        "paper-grid",
+        Side::Sell,
+        "110",
+        "110",
+    );
+    let close_receipt = filled_receipt_for_leg(&close.legs()[0], "close-1", "110");
+    let close_id = close.reservation_id();
+    authority.reserve(close).await.unwrap();
+    authority
+        .settle_execution(close_id, &[close_receipt])
+        .await
+        .unwrap();
+
+    let settled = authority.snapshot().await.unwrap();
+    assert_eq!(settled.cumulative_fees, money("0.21"));
+    assert_eq!(settled.realized_pnl, money("9.79"));
+    assert_eq!(settled.settled_equity_base, money("1009.79"));
+    assert_eq!(settled.available, money("1009.79"));
+    assert_eq!(settled.committed_exposure, Money::default());
+    assert!(settled.open_lots.is_empty());
+    assert!(
+        settled
+            .reservations
+            .iter()
+            .all(|r| r.phase == PaperReservationPhase::Released)
+    );
+    assert_eq!(
+        settled.reservations[1]
+            .settlement
+            .as_ref()
+            .unwrap()
+            .fees_paid,
+        money("0.11")
+    );
+    assert_eq!(
+        settled.reservations[1]
+            .settlement
+            .as_ref()
+            .unwrap()
+            .realized_pnl_delta,
+        money("9.79")
+    );
+
+    let records = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        records
+            .lines()
+            .filter(|line| line.contains("\"decision\":\"paper_account_execution_settled\""))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn losing_round_trip_reduces_settled_equity() {
+    let path = temp_path("loss-roundtrip");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+
+    let open = single_leg_request(
+        "grid:btc/open-loss",
+        "grid-open-loss",
+        "paper-grid",
+        Side::Buy,
+        "100",
+        "100",
+    );
+    let open_receipt = filled_receipt_for_leg(&open.legs()[0], "loss-open-1", "100");
+    let open_id = open.reservation_id();
+    authority.reserve(open).await.unwrap();
+    authority
+        .settle_execution(open_id, &[open_receipt])
+        .await
+        .unwrap();
+
+    let close = single_leg_reduce_request(
+        "grid:btc/close-loss",
+        "grid-close-loss",
+        "paper-grid",
+        Side::Sell,
+        "90",
+        "90",
+    );
+    let close_receipt = filled_receipt_for_leg(&close.legs()[0], "loss-close-1", "90");
+    let close_id = close.reservation_id();
+    authority.reserve(close).await.unwrap();
+    authority
+        .settle_execution(close_id, &[close_receipt])
+        .await
+        .unwrap();
+
+    let snapshot = authority.snapshot().await.unwrap();
+    assert_eq!(snapshot.cumulative_fees, money("0.19"));
+    assert_eq!(snapshot.realized_pnl, money("-10.19"));
+    assert_eq!(snapshot.settled_equity_base, money("989.81"));
+    assert_eq!(snapshot.available, money("989.81"));
+}
+
+#[tokio::test]
+async fn short_loss_beyond_initial_equity_remains_projectable_and_clamps_available_to_zero() {
+    let path = temp_path("negative-short-equity");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let open = single_leg_request(
+        "grid:btc/open-short-loss",
+        "grid-open-short-loss",
+        "paper-grid",
+        Side::Sell,
+        "100",
+        "100",
+    );
+    let open_receipt = filled_receipt_for_leg(&open.legs()[0], "short-loss-open", "100");
+    let open_id = open.reservation_id();
+    authority.reserve(open).await.unwrap();
+    authority
+        .settle_execution(open_id, &[open_receipt])
+        .await
+        .unwrap();
+
+    let close = single_leg_reduce_request(
+        "grid:btc/close-short-loss",
+        "grid-close-short-loss",
+        "paper-grid",
+        Side::Buy,
+        "1200",
+        "1200",
+    );
+    let close_receipt = filled_receipt_for_leg(&close.legs()[0], "short-loss-close", "1200");
+    let close_id = close.reservation_id();
+    authority.reserve(close).await.unwrap();
+    authority
+        .settle_execution(close_id, &[close_receipt])
+        .await
+        .unwrap();
+
+    let snapshot = authority.snapshot().await.unwrap();
+    assert_eq!(snapshot.settled_equity_base, money("-101.3"));
+    assert_eq!(snapshot.realized_pnl, money("-1101.3"));
+    assert_eq!(snapshot.available, Money::default());
+    assert!(snapshot.open_lots.is_empty());
+}
+
+#[tokio::test]
+async fn exact_loss_is_visible_to_api_equity_checks_later() {
+    let path = temp_path("api-low-equity");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("100")).unwrap(),
+    )
+    .unwrap();
+
+    let open = single_leg_request(
+        "grid:btc/open-small",
+        "grid-open-small",
+        "paper-grid",
+        Side::Buy,
+        "60",
+        "60",
+    );
+    let open_receipt = filled_receipt_for_leg(&open.legs()[0], "small-open-1", "60");
+    let open_id = open.reservation_id();
+    authority.reserve(open).await.unwrap();
+    authority
+        .settle_execution(open_id, &[open_receipt])
+        .await
+        .unwrap();
+
+    let close = single_leg_reduce_request(
+        "grid:btc/close-small",
+        "grid-close-small",
+        "paper-grid",
+        Side::Sell,
+        "50",
+        "50",
+    );
+    let close_receipt = filled_receipt_for_leg(&close.legs()[0], "small-close-1", "50");
+    let close_id = close.reservation_id();
+    authority.reserve(close).await.unwrap();
+    authority
+        .settle_execution(close_id, &[close_receipt])
+        .await
+        .unwrap();
+
+    let snapshot = authority.snapshot().await.unwrap();
+    let api_visible_equity = snapshot
+        .available
+        .as_decimal()
+        .checked_add(snapshot.pending_reserved.as_decimal())
+        .and_then(|value| value.checked_add(snapshot.uncertain_reserved.as_decimal()))
+        .and_then(|value| value.checked_add(snapshot.committed_exposure.as_decimal()))
+        .unwrap();
+    assert_eq!(Money::new(api_visible_equity), money("89.89"));
+    assert!(api_visible_equity < decimal("90"));
+}
+
+#[tokio::test]
+async fn reduce_only_reservations_fail_before_append_without_matching_inventory() {
+    let path = temp_path("reduce-without-inventory");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("100")).unwrap(),
+    )
+    .unwrap();
+    let request = single_leg_reduce_request(
+        "grid:btc/close-empty",
+        "grid-close-empty",
+        "paper-grid",
+        Side::Sell,
+        "50",
+        "50",
+    );
+
+    assert!(matches!(
+        authority.reserve(request).await,
+        Err(PaperAccountError::ReduceOnlyCapacityExceeded)
+    ));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn pending_reduce_only_reservations_cannot_double_spend_one_open_lot() {
+    let path = temp_path("reduce-capacity-reserved-once");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let open = single_leg_request(
+        "grid:btc/open-capacity",
+        "grid-open-capacity",
+        "paper-grid",
+        Side::Buy,
+        "60",
+        "60",
+    );
+    let open_receipt = filled_receipt_for_leg(&open.legs()[0], "capacity-open", "60");
+    let open_id = open.reservation_id();
+    authority.reserve(open).await.unwrap();
+    authority
+        .settle_execution(open_id, &[open_receipt])
+        .await
+        .unwrap();
+
+    let first_close = single_leg_reduce_request(
+        "grid:btc/close-capacity-a",
+        "grid-close-capacity-a",
+        "paper-grid",
+        Side::Sell,
+        "50",
+        "50",
+    );
+    authority.reserve(first_close).await.unwrap();
+    let second_close = single_leg_reduce_request(
+        "grid:btc/close-capacity-b",
+        "grid-close-capacity-b",
+        "paper-grid",
+        Side::Sell,
+        "50",
+        "50",
+    );
+
+    assert!(matches!(
+        authority.reserve(second_close).await,
+        Err(PaperAccountError::ReduceOnlyCapacityExceeded)
+    ));
+    assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 3);
+}
+
+#[tokio::test]
+async fn reduce_only_settlement_rechecks_inventory_before_appending() {
+    let path = temp_path("reduce-capacity-rechecked");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let open = single_leg_request(
+        "grid:btc/open-recheck",
+        "grid-open-recheck",
+        "paper-grid",
+        Side::Buy,
+        "60",
+        "60",
+    );
+    let open_receipt = filled_receipt_for_leg(&open.legs()[0], "recheck-open", "60");
+    let open_id = open.reservation_id();
+    authority.reserve(open).await.unwrap();
+    authority
+        .settle_execution(open_id, &[open_receipt])
+        .await
+        .unwrap();
+
+    let reduce = single_leg_reduce_request(
+        "grid:btc/reduce-recheck",
+        "grid-reduce-recheck",
+        "paper-grid",
+        Side::Sell,
+        "50",
+        "50",
+    );
+    let reduce_receipt = filled_receipt_for_leg(&reduce.legs()[0], "recheck-reduce", "50");
+    let reduce_id = reduce.reservation_id();
+    authority.reserve(reduce).await.unwrap();
+
+    let consuming_sell = single_leg_request(
+        "grid:btc/non-reduce-recheck",
+        "grid-non-reduce-recheck",
+        "paper-grid",
+        Side::Sell,
+        "50",
+        "50",
+    );
+    let consuming_receipt =
+        filled_receipt_for_leg(&consuming_sell.legs()[0], "recheck-consuming", "50");
+    let consuming_id = consuming_sell.reservation_id();
+    authority.reserve(consuming_sell).await.unwrap();
+    authority
+        .settle_execution(consuming_id, &[consuming_receipt])
+        .await
+        .unwrap();
+    let before = std::fs::read_to_string(&path).unwrap().lines().count();
+
+    assert!(matches!(
+        authority
+            .settle_execution(reduce_id, &[reduce_receipt])
+            .await,
+        Err(PaperAccountError::ReduceOnlyCapacityExceeded)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().count(),
+        before
+    );
+    assert_eq!(authority.snapshot().await.unwrap().open_lots.len(), 0);
+}
+
+#[tokio::test]
+async fn wrong_id_or_oversized_fill_fails_closed_without_writing_settlement() {
+    let wrong_id_path = temp_path("wrong-id-no-write");
+    let wrong_id_authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&wrong_id_path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let wrong_id_request = single_leg_request(
+        "grid:btc/wrong-id",
+        "grid-wrong-id",
+        "paper-grid",
+        Side::Buy,
+        "100",
+        "100",
+    );
+    let wrong_id_reservation = wrong_id_request.reservation_id();
+    wrong_id_authority.reserve(wrong_id_request).await.unwrap();
+    let wrong_id_error = wrong_id_authority
+        .settle_execution(
+            wrong_id_reservation,
+            &[filled_receipt(
+                "paper-grid",
+                Side::Buy,
+                "wrong-id-order",
+                "100",
+            )],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_id_error,
+        PaperAccountError::InvalidTransition
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&wrong_id_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let oversized_path = temp_path("oversized-no-write");
+    let oversized_authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&oversized_path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let oversized_request = single_leg_request(
+        "grid:btc/oversized",
+        "grid-oversized",
+        "paper-grid",
+        Side::Buy,
+        "100",
+        "100",
+    );
+    let oversized_receipt =
+        filled_receipt_for_leg(&oversized_request.legs()[0], "oversized-order", "101");
+    let oversized_reservation = oversized_request.reservation_id();
+    oversized_authority
+        .reserve(oversized_request)
+        .await
+        .unwrap();
+    let oversized_error = oversized_authority
+        .settle_execution(oversized_reservation, &[oversized_receipt])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        oversized_error,
+        PaperAccountError::InvalidTransition
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&oversized_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn repeated_round_trip_flips_release_durable_available_balance() {
+    // Keep a bounded end-to-end sample on the real journal/fsync path. The
+    // 1,000-cycle exhaustion regression lives beside the pure ledger
+    // interpreter, where it does not turn the default suite quadratic in I/O.
+    const ROUND_TRIPS: u32 = 12;
+    let path = temp_path("repeated-flips");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+
+    let first = single_leg_request(
+        "flip/open/0000",
+        "flip-open-0000",
+        "paper-grid",
+        Side::Buy,
+        "0.1",
+        "0.1",
+    );
+    let first_receipt = filled_receipt_for_leg(&first.legs()[0], "flip-open-0", "0.1");
+    let first_id = first.reservation_id();
+    authority.reserve(first).await.unwrap();
+    authority
+        .settle_execution(first_id, &[first_receipt])
+        .await
+        .unwrap();
+
+    let mut next_side = Side::Sell;
+    for index in 0..ROUND_TRIPS {
+        let request = single_leg_request_with_quantity(
+            &format!("flip/{index:04}"),
+            &format!("flip-key-{index:04}"),
+            "paper-grid",
+            next_side,
+            "0.2",
+            "0.1",
+            "2",
+        );
+        let receipt =
+            filled_receipt_for_leg(&request.legs()[0], &format!("flip-order-{index:04}"), "0.1");
+        let reservation_id = request.reservation_id();
+        authority.reserve(request).await.unwrap();
+        authority
+            .settle_execution(reservation_id, &[receipt])
+            .await
+            .unwrap();
+        next_side = match next_side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+    }
+
+    let snapshot = authority.snapshot().await.unwrap();
+    assert_eq!(snapshot.available, money("999.8975"));
+    assert_eq!(snapshot.committed_exposure, money("0.1"));
+    assert_eq!(snapshot.cumulative_fees, money("0.0025"));
+    assert_eq!(snapshot.realized_pnl, money("-0.0024"));
+    assert_eq!(snapshot.settled_equity_base, money("999.9975"));
+    assert_eq!(snapshot.open_lots.len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_committed_journal_remains_explicitly_distinguishable() {
+    let journal_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let path = temp_path("legacy-compat");
+    std::fs::write(
+        &path,
+        include_bytes!("../../../fixtures/m4-reconciliation-failed.jsonl"),
+    )
+    .unwrap();
+
+    let authority = PaperAccountAuthority::new(
+        journal_id,
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let snapshot = authority.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.ledger_kind,
+        PaperExecutionLedgerKind::LegacyReservationOnly
+    );
+    assert_eq!(snapshot.cumulative_fees, Money::default());
+    assert_eq!(snapshot.realized_pnl, Money::default());
+    assert_eq!(snapshot.settled_equity_base, money("1000"));
+    assert!(snapshot.open_lots.is_empty());
+    assert_eq!(
+        snapshot.reservations[0].ledger_kind,
+        PaperExecutionLedgerKind::LegacyReservationOnly
+    );
+    assert!(snapshot.reservations[0].settlement.is_none());
 }
 
 fn temp_path(label: &str) -> std::path::PathBuf {

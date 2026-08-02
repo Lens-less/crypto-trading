@@ -14,6 +14,7 @@ pub mod paper_profile;
 pub mod paper_single_leg_saga;
 pub mod paper_volume_maker_task;
 pub mod scanner;
+pub mod shutdown;
 pub mod task_host;
 pub mod testnet_lifecycle;
 pub mod testnet_reconciliation;

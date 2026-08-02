@@ -14,6 +14,19 @@ the software may do exactly what it could do before.
 
 ### Fixed
 
+- Paper account execution no longer treats `available + committed exposure` as
+  immutable equity. Fully filled synchronous taker receipts now settle exact
+  fees and FIFO realized PnL, release closed-lot capacity, recheck reduce-only
+  inventory before append, and keep negative settled equity projectable. Old
+  reservation-only journals remain explicitly distinguishable and replayable.
+- Account-risk admission is now a durable ticket that is either consumed by a
+  reservation or explicitly cancelled. Grid, arbitrage, and volume-maker
+  compensation paths propagate failures instead of leaking admitted notional;
+  same-timestamp and reserve-after-read races fail closed into recovery.
+- REST market observations no longer masquerade as venue-timestamped data or
+  turn optional Binance wire update IDs into polling delivery gaps. Timestamp
+  provenance, venue sequence metadata, future tolerance, and cross-venue skew
+  are explicit and independently enforced.
 - Journal chain snapshots can no longer silently omit a segment sealed while
   the chain was being captured. The reader re-inspects the sealed chain after
   freezing the active file and retries the capture when a rotation landed in
@@ -59,6 +72,12 @@ the software may do exactly what it could do before.
 
 ### Changed
 
+- Control-plane state now projects its seven read models in one pagination
+  pass, and account-risk admission composes risk, Paper account, and pending
+  admission state in one pass over a frozen journal generation.
+- Journal segment discovery enumerates the directory once and blocking file
+  inspection runs outside async executor threads, removing the fixed 63-probe
+  append tax while preserving partial-tail and chain-gap failure semantics.
 - Account-risk day rollover is now monotonic: replaying an older observation
   cannot move the active UTC risk day backwards or reset a newer day's trade
   count.
@@ -83,6 +102,17 @@ the software may do exactly what it could do before.
 
 ### Added
 
+- Cross-platform graceful shutdown covers Ctrl-C, Unix SIGTERM, and Windows
+  console close/shutdown signals. Compose grants a 70-second stop window and CI
+  verifies a container health check followed by a clean SIGTERM exit.
+- Structured tracing now reports market polling, exchange dispatch, journal
+  append/rotation, projection replay, latency, and failure outcomes at their
+  existing I/O seams.
+- Decimal-only incremental ATR, EMA, EWMA realized volatility, rolling z-score,
+  Sharpe, Sortino, drawdown, win-rate, and profit-factor kernels, plus a
+  deterministic single-instrument event-tape backtester with fee/slippage
+  assumptions, raw trades/equity curves, and out-of-sample walk-forward
+  windows.
 - `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue and pull
   request templates, `CODEOWNERS`, and `dependabot.yml`.
 - `rust/deny.toml` supply-chain policy covering licenses, duplicate versions,

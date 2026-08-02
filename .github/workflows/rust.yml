@@ -25,6 +25,7 @@ jobs:
   verify:
     name: ${{ matrix.os }} / Rust ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +62,7 @@ jobs:
   quality:
     name: Formatting, linting, and release build
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     defaults:
       run:
         working-directory: rust
@@ -97,6 +99,7 @@ jobs:
   clean-build:
     name: Isolated MSRV quality gates
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: rust
@@ -136,6 +139,7 @@ jobs:
   audit:
     name: RustSec advisory audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       checks: write
@@ -149,6 +153,7 @@ jobs:
   supply-chain:
     name: License, ban, and source policy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
@@ -162,6 +167,7 @@ jobs:
   deployment:
     name: Container image and operator scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # The deployed artifact is the image, so a Dockerfile that no longer
@@ -173,4 +179,41 @@ jobs:
           CRYPTO_TRADING_JOURNAL_ID: 00000000-0000-4000-8000-000000000000
           CRYPTO_TRADING_WEB_TOKEN: ci-validation-token-not-a-secret-000000
         run: docker compose -f deploy/compose.yaml config --quiet
+      - name: Container serves health and exits cleanly on SIGTERM
+        shell: bash
+        run: |
+          set -euo pipefail
+          data_dir="$RUNNER_TEMP/crypto-trading-data"
+          mkdir -p "$data_dir"
+          cp rust/fixtures/m2-operator-journal.jsonl "$data_dir/operations.jsonl"
+          docker run \
+            --detach \
+            --name crypto-trading-sigterm-smoke \
+            --volume "$data_dir:/var/lib/crypto-trading" \
+            crypto-trading:ci \
+            --history-path /var/lib/crypto-trading/operations.jsonl \
+            --journal-id 44444444-4444-4444-8444-444444444444 \
+            --port 8787
+          for attempt in $(seq 1 30); do
+            if docker exec crypto-trading-sigterm-smoke \
+              curl --fail --silent --show-error http://127.0.0.1:8787/api/v1/health; then
+              break
+            fi
+            sleep 1
+            if [ "$attempt" -eq 30 ]; then
+              docker logs crypto-trading-sigterm-smoke
+              exit 1
+            fi
+          done
+          docker stop --time 5 crypto-trading-sigterm-smoke
+          exit_code="$(docker inspect -f '{{.State.ExitCode}}' crypto-trading-sigterm-smoke)"
+          if [ "$exit_code" -ne 0 ]; then
+            docker logs crypto-trading-sigterm-smoke || true
+            echo "expected graceful SIGTERM exit code 0, got $exit_code" >&2
+            exit 1
+          fi
+      - name: Remove SIGTERM smoke container
+        if: always()
+        shell: bash
+        run: docker rm -f crypto-trading-sigterm-smoke >/dev/null 2>&1 || true
       - run: shellcheck deploy/*.sh

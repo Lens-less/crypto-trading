@@ -20,7 +20,8 @@ use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     ExecutionBatch, FileJournalSnapshotSource, JournalSnapshotSource, JsonlHistory,
     OperatorReadModel, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
-    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, RuntimeError,
+    PaperExecutionLedgerKind, PaperReservationLeg, PaperReservationPhase, PaperReservationRequest,
+    RuntimeError,
 };
 use rust_decimal::Decimal;
 
@@ -163,13 +164,17 @@ async fn exact_pair_is_reserved_then_planned_before_execution_and_replay_is_idem
             "paper_account_reserved",
             "execution_planned",
             "execution_completed",
-            "paper_account_committed",
+            "paper_account_execution_settled",
         ]
     );
     let snapshot = account.snapshot().await.unwrap();
     assert_eq!(snapshot.pending_reserved, Money::default());
     assert_eq!(snapshot.committed_exposure, money("200"));
-    assert_eq!(snapshot.available, money("800"));
+    assert_eq!(snapshot.available, money("799.80"));
+    assert_eq!(
+        snapshot.ledger_kind,
+        PaperExecutionLedgerKind::ExactExecution
+    );
 
     let result = saga
         .run(request, |_| async {
@@ -283,7 +288,7 @@ async fn filled_receipts_are_correlated_by_identity_not_vector_position() {
             "paper_account_reserved",
             "execution_planned",
             "execution_completed",
-            "paper_account_committed",
+            "paper_account_execution_settled",
         ]
     );
     let snapshot = account.snapshot().await.unwrap();

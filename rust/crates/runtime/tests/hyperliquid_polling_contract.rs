@@ -154,6 +154,7 @@ async fn hyperliquid_polling_recovers_after_failure_and_publishes_funding_sideba
             snapshot,
             revision: 1,
             received_at,
+            ..
         }) if snapshot.exchange() == "hyperliquid"
             && snapshot.symbol.as_str() == "BTCUSDT"
             && snapshot.market_type == MarketType::Perpetual

@@ -50,6 +50,42 @@ fn official_book_ticker_fixture_maps_to_an_exact_spot_snapshot() {
     assert_eq!(snapshot.timestamp, received_at);
 }
 
+#[test]
+fn optional_book_ticker_sequence_aliases_are_parsed_without_claiming_a_venue_event_time() {
+    let received_at = timestamp("2026-07-14T03:04:05Z");
+
+    let canonical = BinancePublicExchange::parse_book_ticker_observation(
+        br#"{
+            "symbol":"LTCBTC",
+            "bidPrice":"4.00000000",
+            "bidQty":"431.00000000",
+            "askPrice":"4.00000200",
+            "askQty":"9.00000000",
+            "updateId":123456
+        }"#,
+        received_at,
+    )
+    .unwrap();
+    assert_eq!(canonical.snapshot.timestamp, received_at);
+    assert_eq!(canonical.event_time, None);
+    assert_eq!(canonical.source_sequence, Some(123_456));
+
+    let alias = BinancePublicExchange::parse_book_ticker_observation(
+        br#"{
+            "symbol":"LTCBTC",
+            "bidPrice":"4.00000000",
+            "bidQty":"431.00000000",
+            "askPrice":"4.00000200",
+            "askQty":"9.00000000",
+            "u":123457
+        }"#,
+        received_at,
+    )
+    .unwrap();
+    assert_eq!(alias.source_sequence, Some(123_457));
+    assert_eq!(alias.event_time, None);
+}
+
 #[tokio::test]
 async fn public_adapter_refuses_every_private_or_trading_operation() {
     let exchange = BinancePublicExchange::new().unwrap();

@@ -8,9 +8,12 @@ use crypto_trading_control_plane::{
     ControlPlaneEventsError, ReadControlPlane, ReadFailureKind,
 };
 use crypto_trading_runtime::{
-    CapabilityAccess, CapabilityEnvironment, CapabilityLevel, CursorError, ExecutionBatch,
-    ExecutionBatchState, JournalPageBoundary, JournalSnapshot, JournalSnapshotSource,
-    PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, ProjectionStatus,
+    AccountRiskReadModel, ArbitrageMonitorReadModel, CapabilityAccess, CapabilityEnvironment,
+    CapabilityLevel, CursorError, ExecutionBatch, ExecutionBatchState, JournalPageBoundary,
+    JournalSnapshot, JournalSnapshotSource, MAX_JOURNAL_PAGE_EVENTS, MemoryJournalSnapshotSource,
+    OperatorReadModel, PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
+    PaperAccountReadModel, PriceAlertReadModel, ProjectionStatus, ReadOnlyTaskReadModel,
+    VirtualGridScannerReadModel, project_control_plane_state,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -214,6 +217,95 @@ fn partial_tail_is_reported_without_emitting_an_incomplete_event() {
     ));
 }
 
+#[test]
+fn multi_page_snapshot_matches_legacy_models_with_one_shared_state_replay() {
+    let source = multi_page_control_plane_source();
+    let expected = source.snapshot().unwrap();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let projection = project_control_plane_state(&expected).unwrap();
+    let stats = projection.stats;
+    let snapshot = control_plane.snapshot().unwrap();
+
+    assert_eq!(stats.state_page_reads, 2);
+    assert_eq!(
+        snapshot.schema_version,
+        CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION
+    );
+    assert_eq!(snapshot.capabilities, *control_plane.capabilities());
+    assert_eq!(
+        snapshot.operator,
+        OperatorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.monitor,
+        ArbitrageMonitorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.alerts,
+        PriceAlertReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.tasks,
+        ReadOnlyTaskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.scanner,
+        VirtualGridScannerReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.paper_accounts,
+        PaperAccountReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.account_risk,
+        AccountRiskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+}
+
+#[test]
+fn multi_page_combined_read_keeps_events_separate_from_one_shared_state_replay() {
+    let source = multi_page_control_plane_source();
+    let expected = source.snapshot().unwrap();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let stats = project_control_plane_state(&expected).unwrap().stats;
+    let read = control_plane.snapshot_with_events_after(None).unwrap();
+
+    assert_eq!(stats.state_page_reads, 2);
+    assert_eq!(
+        read.snapshot.operator,
+        OperatorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.monitor,
+        ArbitrageMonitorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.alerts,
+        PriceAlertReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.tasks,
+        ReadOnlyTaskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.scanner,
+        VirtualGridScannerReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.paper_accounts,
+        PaperAccountReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.account_risk,
+        AccountRiskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(read.events.events.len(), MAX_JOURNAL_PAGE_EVENTS);
+    assert_eq!(read.events.events[0].sequence, 1);
+    assert_eq!(read.events.boundary, JournalPageBoundary::PageLimit);
+}
+
 #[derive(Clone)]
 struct MutableJournalSource {
     journal_id: Uuid,
@@ -303,6 +395,27 @@ fn jsonl(records: &[Value]) -> Vec<u8> {
         bytes.push(b'\n');
     }
     bytes
+}
+
+fn multi_page_control_plane_source() -> MemoryJournalSnapshotSource {
+    MemoryJournalSnapshotSource::new(multi_page_journal_id(), multi_page_control_plane_bytes())
+        .unwrap()
+}
+
+fn multi_page_control_plane_bytes() -> Vec<u8> {
+    let mut records = (0..260)
+        .map(|index| decision_record("hold", &json!({ "index": index }), "2026-07-24T00:00:00Z"))
+        .collect::<Vec<_>>();
+    records.extend(
+        include_str!("../../../fixtures/web-api/journal.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()),
+    );
+    jsonl(&records)
+}
+
+fn multi_page_journal_id() -> Uuid {
+    Uuid::parse_str("77777777-7777-4777-8777-777777777777").unwrap()
 }
 
 fn fixed_uuid(value: u8) -> Uuid {

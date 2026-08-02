@@ -18,7 +18,7 @@ use crypto_trading_domain::{MarketSnapshot, Price};
 use crypto_trading_runtime::{
     DecisionRecord, MAX_MARKET_DATA_EVENTS, MarketContinuity, MarketDataBook, MarketDataClock,
     MarketDataError, MarketDataEvent, MarketDataFreshness, MarketDataObservation, MarketDataUpdate,
-    MarketInstrument,
+    MarketDataView, MarketInstrument,
 };
 use crypto_trading_strategy::{SpreadCalculator, StrategyError};
 use rust_decimal::Decimal;
@@ -292,6 +292,32 @@ impl ReadOnlyArbitrageMonitor {
                 freshness,
                 continuity,
             },
+            Err(MarketDataError::PairSkew {
+                left,
+                right,
+                skew_millis,
+                tolerance_millis,
+            }) => {
+                let Some((instrument, continuity)) =
+                    lagging_pair_leg(&view, left.as_ref(), right.as_ref())
+                else {
+                    return Err(MarketDataError::PairSkew {
+                        left,
+                        right,
+                        skew_millis,
+                        tolerance_millis,
+                    }
+                    .into());
+                };
+                ArbitrageMonitorOutcome::Waiting {
+                    instrument,
+                    freshness: MarketDataFreshness::PairSkew {
+                        skew_millis,
+                        tolerance_millis,
+                    },
+                    continuity,
+                }
+            }
             Err(error) => return Err(error.into()),
         };
         Ok(ArbitrageMonitorEvent {
@@ -304,6 +330,22 @@ impl ReadOnlyArbitrageMonitor {
             right: self.right.clone(),
             outcome,
         })
+    }
+}
+
+fn lagging_pair_leg(
+    view: &MarketDataView,
+    left: &MarketInstrument,
+    right: &MarketInstrument,
+) -> Option<(MarketInstrument, MarketContinuity)> {
+    let left_row = view.instrument(left)?;
+    let right_row = view.instrument(right)?;
+    let left_timestamp = left_row.snapshot.as_ref()?.timestamp;
+    let right_timestamp = right_row.snapshot.as_ref()?.timestamp;
+    if left_timestamp <= right_timestamp {
+        Some((left.clone(), left_row.continuity.clone()))
+    } else {
+        Some((right.clone(), right_row.continuity.clone()))
     }
 }
 

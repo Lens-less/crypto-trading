@@ -29,6 +29,7 @@
 - 在提交模拟订单前执行产品身份、行情新鲜度、盘口深度和单批风险检查。
 - 记录稳定批次 ID、client order ID、提交计划、回执和对账摘要。
 - 开发并测试交易领域模型、策略、风险控制、交易所接口与运行时边界。
+- 用同一套 Decimal 算术运行增量指标、确定性事件带回测与仅报告样本外结果的 walk-forward 切分。
 
 它暂时不适合：
 
@@ -44,9 +45,9 @@
 | `config-check` | 完整分类检查 | 不适用 | 不适用 | 不适用 | 检查文件或目录；对 public path loaders、public from_str loaders 和 shared raw reader 统一施加 1 MiB / YAML 读入护栏；发现不支持配置、读取错误或预算耗尽时非零退出 |
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
-| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；Grid owner 会把配置启用的纯策略网格保护指令（冻结入场/剥头皮/重置/止损退出）写成 `grid_protection` journal 事实并映射为受限 paper 动作，只作用于 owner 自身的虚拟持仓；Arbitrage owner 可选历史决策模式（`history_decision`）：用 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级并标注 `funding_degraded`；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（journal-backed：单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
+| `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；完全成交的同步 taker 回执会写入精确 FIFO lot、手续费、已实现 PnL 与 settled equity，reduce-only 平仓额度在 reserve 与 settle 两处校验；Grid owner 会把配置启用的纯策略网格保护指令写成 `grid_protection` journal 事实并映射为受限 paper 动作；Arbitrage owner 可选 spread-history 自然价差门控，资金费率缺失时标注 `funding_degraded`；两个 owner 的开仓在 reservation 前都要通过 journal-backed 账户风控，拒绝会写成 `account_risk_rejected` 事实 |
 | `paper risk` | 可通过 `--paper-account-risk-config` 加载可选限额（缺省全部禁用） | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝、owner 消费 close 指令后停止 |
-| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay / `--live` 轮询） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；`--live` 可显式选用真实免凭证公开轮询双源（仅限 binance+hyperliquid 精确对：Binance 现货 bookTicker + Hyperliquid 永续 asset contexts，后者附每小时资金费率只读侧通道，轮询非实时）；自动恢复仍未开放 |
+| `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay / `--live` 轮询） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；`--live` 可显式选用真实免凭证公开轮询双源（仅限 binance+hyperliquid 精确对：Binance 现货 bookTicker + Hyperliquid 永续 asset contexts，后者附每小时资金费率只读侧通道）；两端 REST 响应均显式标记本地接收时间来源，保留可用的 venue sequence，并拒绝超出配置 skew 的跨所配对；轮询仍非实时，自动恢复仍未开放 |
 | `volume-maker` | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve/status/stop` 运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式吃盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源仍未开放 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
 | `scanner` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
@@ -74,7 +75,7 @@ Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Va
 
 - **精确领域类型**：价格、数量和金额使用 `rust_decimal`，关键算术使用受检操作，不以二进制浮点承担交易计算。
 - **纯策略内核**：固定/马丁网格、网格保护子系统（剥头皮、本金保护、止盈、价格锁定、止损，按固定优先级仲裁）、分段套利、价格提醒、做量和虚拟网格逻辑与 I/O 分离，便于确定性测试。
-- **可验证的 PaperExchange**：覆盖订单状态、盘口深度消耗、GTC/IOC/FOK 语义、spot sell inventory 与 reduce-only capacity 的进程内预留、部分成交收缩、撤单释放和 flat position 清理；但不包含 cash/margin ledger、fees/funding/slippage/queue impact、持久化 / 跨进程持仓或风险预留。
+- **可验证的 Paper 执行与账本**：`PaperExchange` 覆盖订单状态、顶层深度消耗、GTC/IOC/FOK、部分成交与撤单语义；journal-backed Paper account 对完全成交的同步 taker 回执记录 FIFO lot、即时手续费、已实现 PnL、settled equity 和 reduce-only 容量。尚不包含周期性 mark-to-market、资金费率、保证金/强平、真实排队延迟、多档冲击或 resting-maker 的持久成交回调。
 - **失败关闭的执行边界**：未授权模式、过期行情、产品身份不匹配、深度不足、风险超限和未实现适配器都在提交前拒绝。
 - **可审计执行历史**：先写入 `execution_planned`，再写入 `execution_completed`、`execution_partial` 或 `execution_incomplete`。
 - **有界资源使用**：配置、历史记录、批次、actor 队列、HTTP 响应和聚合输出都有显式上限。
@@ -415,10 +416,10 @@ cargo run --locked -- config-check config/exchanges/paradex_config.yaml
 ## 安全模型与 Paper 限制
 
 1. **Live 永远失败关闭**：风险确认短语只建立显式授权意图，不会绕过尚未完成的适配器、风控和对账门禁。
-2. **每个进程从空 paper 账本开始**：当前 one-shot 不读取真实余额、真实持仓、未成交单或其他进程的 reservation；Grid 也不做账户级 pending-order risk reservation。
+2. **Paper 真值仍不是交易所真值**：同一 journal generation 会跨重启重放 reservation、精确成交费用、FIFO lot 与 settled equity，并由共享账户风控消费；但它不读取真实余额、保证金、外部挂单或交易所仓位，也不能跨不同 journal 自动合并风险。
 3. **网格是挂单语义验证**：它根据一个显式参考价规划 resting orders，不代表真实撮合、账户风险或跨进程仓位已经验证。
 4. **套利使用显式顶层盘口**：调用方必须给出双边 bid/ask 和四侧可用数量；`strategy_key` 是配置选择器，不是腿 symbol 的别名；模型不等价于完整深度、延迟和滑点仿真。
-5. **仓位上限不是账户预算**：`max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不限制整个批次或账户的总毛名义价值；`equity` 与 `available_balance` 也尚未参与资金或保证金门禁。
+5. **Paper 账户门禁不等于保证金引擎**：账户风控使用精确 settled equity、剩余 lot 敞口和 pending admission 做余额/单币种/全局上限判断；它仍没有未实现 PnL、维持保证金、资金费率或交易所强平规则，因此不能作为实盘资金安全证明。
 6. **Paper 不计算真实交易成本**：手续费、资金费率、网络延迟、队列优先级和市场冲击不在当前结果中。
 7. **不完整执行不得直接重试**：先根据 history 中的批次、腿和对账摘要确认状态，否则可能重复提交。
 
@@ -442,7 +443,7 @@ strategy decision ──► risk + execution policy
         completed / partial / incomplete history
 ```
 
-Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依赖任何其他 crate，
+Rust workspace 包含十一个 crate。依赖方向是单向的：`domain` 不依赖任何其他 crate，
 `web` 不能构造交易权限。
 
 | Crate | 职责 |
@@ -450,12 +451,16 @@ Rust workspace 包含九个 crate。依赖方向是单向的：`domain` 不依�
 | `domain` | Symbol、MarketSnapshot、Order、Position、Price、Quantity、Money 等领域类型 |
 | `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
 | `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、风险、价格提醒、做量和虚拟网格算法 |
+| `indicators` | O(1) 增量 ATR、EMA、EWMA 实现波动率、滚动 z-score 与 Decimal 绩效指标 |
+| `backtest` | 确定性 `SimClock + EventTape + FillModel + Ledger`、逐笔/权益曲线产物与仅样本外 walk-forward 窗口 |
 | `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |
 | `runtime` | 执行模式、路由、批次、提交策略、部分结果对账、JSONL journal、operator read model 与 capability 清单 |
 | `control-plane` | journal 与各操作界面之间的最小权限读取/提交 seam |
 | `web` | HTTP API 与编译期嵌入的 React 操作台 bundle(`frontend/dist`) |
 | `web-app` | `crypto-trading-web` 二进制，只在 loopback 上提供只读控制面 |
 | `apps` | `crypto-trading` 二进制、CLI 参数、配置检查、one-shot 与 Testnet 编排 |
+
+`backtest` 当前是研究闭环的 tracer bullet：它能稳定产出逐笔成交、权益曲线和样本外窗口，但仍是单标的即时成交模型，尚未接入生产 `MarketDataEvent`／`StrategyMachine` 适配层，也不模拟队列、延迟、资金费率、部分成交或多档深度。回测全绿不能解释为 paper/live 一致，更不能解释为策略盈利。
 
 详细的兼容面与设计目标见 [`docs/internal/specs/RUST_REFACTOR_PLAN.md`](docs/internal/specs/RUST_REFACTOR_PLAN.md)。
 
@@ -491,7 +496,7 @@ crypto-trading/
 │   ├── e2e/                     # Playwright 真浏览器合约
 │   └── docs/                    # UI 契约迁移映射与 parity 清单
 ├── rust/                        # 唯一活动项目
-│   ├── crates/                  # Rust workspace 源码（九个 crate）
+│   ├── crates/                  # Rust workspace 源码（十一个 crate）
 │   ├── config/                  # 当前配置副本
 │   ├── fixtures/                # 契约测试消费的 journal fixture
 │   ├── deny.toml                # 许可证 / 依赖来源策略
@@ -569,7 +574,7 @@ CI 还会：
 - 私有交易适配器的签名向量、testnet 下单/撤单和限流验证。
 - 多腿补偿、恢复锁、durable saga 和崩溃后续作。
 - 从权威交易所元数据加载 tick size、lot size 和最小名义价值。
-- 真实手续费、资金费率、延迟、滑点与更完整的 paper 撮合模型。
+- resting-maker 手续费/返佣、资金费率、周期性 mark-to-market、延迟、队列优先级、多档滑点与更完整的 paper 撮合模型。
 - 历史轮转、跨进程日志协调、持续凭证扫描和许可证策略门禁。
 
 ## 参与贡献

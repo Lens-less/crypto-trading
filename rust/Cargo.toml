@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "crates/apps",
+    "crates/backtest",
     "crates/config",
     "crates/control-plane",
     "crates/domain",
     "crates/exchange",
+    "crates/indicators",
     "crates/runtime",
     "crates/strategy",
     "crates/web",

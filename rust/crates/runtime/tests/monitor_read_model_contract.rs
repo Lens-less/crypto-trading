@@ -123,6 +123,39 @@ fn waiting_projection_keeps_freshness_and_continuity_classifications() {
 }
 
 #[test]
+fn pair_skew_waiting_projection_remains_valid_and_operator_visible() {
+    let snapshot = snapshot(&[monitor_record(
+        "monitor_waiting",
+        8,
+        10,
+        &json!({
+            "type": "waiting",
+            "instrument": leg("left"),
+            "freshness": {
+                "status": "pair_skew",
+                "skew_millis": 2_000,
+                "tolerance_millis": 1_000,
+            },
+            "continuity": { "status": "continuous" },
+        }),
+        0,
+    )]);
+
+    let model = ArbitrageMonitorReadModel::from_legacy_snapshot(&snapshot).unwrap();
+    let latest = model.latest.unwrap();
+    assert_eq!(model.projection_status, ProjectionStatus::Complete);
+    assert_eq!(latest.state, MonitorProjectionState::Waiting);
+    assert!(matches!(
+        latest.projection,
+        ArbitrageMonitorProjection::Waiting {
+            freshness: MonitorFreshnessState::PairSkew,
+            continuity: MonitorContinuityState::Continuous,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn malformed_monitor_event_degrades_projection_and_preserves_last_valid_fact() {
     let snapshot = snapshot(&[
         monitor_record(

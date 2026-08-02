@@ -14,15 +14,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
-    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskDirective,
-    AccountRiskError, DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError,
-    JournalReadError, JournalSnapshot, JournalSnapshotSource, JsonlHistory,
-    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent, MarketDataEventSource,
-    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
-    MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus, PaperAccountAuthority,
-    PaperAccountError, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
-    ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
+    AccountRiskDirective, AccountRiskError, DecisionRecord, ExecutionBatch,
+    FileJournalSnapshotSource, HistoryError, JournalReadError, JournalSnapshot,
+    JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent,
+    MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError,
+    MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
+    PaperAccountAuthority, PaperAccountError, PaperCostModel, PaperReconciliationOutcome,
+    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
+    ReadModelError, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
+    ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     GridDirective, GridFill, GridProtectionMachine, GridProtectionObservation,
@@ -881,7 +882,15 @@ async fn run_owner(
                             .await;
                         }
                         OperationOutcome::Cancelled(request) => {
-                            retain_cancelled_operation(saga.account(), &request).await;
+                            let _ = retain_cancelled_operation(
+                                saga.account(),
+                                None,
+                                "",
+                                None,
+                                &request,
+                                Utc::now(),
+                            )
+                            .await;
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
                             return fail_owner(
@@ -913,16 +922,12 @@ async fn run_owner(
                     // Entry-side crossings pass the account-level admission
                     // before any reservation exists; a durable rejection
                     // skips the crossing and keeps the owner alive.
-                    if let Some(risk) = config.account_risk.as_ref()
+                    let observed_at = observed.map_or_else(Utc::now, |(_, at)| at);
+                    let admission_ticket = if let Some(risk) = config.account_risk.as_ref()
                         && matches!(cross.side, GridFill::Buy)
                     {
-                        let observed_at = observed.map_or_else(Utc::now, |(_, at)| at);
                         match admit_grid_entry(risk, &config, &grid, &cross, observed_at).await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                completed_cross_count += 1;
-                                continue;
-                            }
+                            Ok(ticket) => ticket,
                             Err(error) => {
                                 let failure = error.failure_bucket();
                                 next.operation_count = operation_sequence;
@@ -938,11 +943,91 @@ async fn run_owner(
                                 .await;
                             }
                         }
+                    } else {
+                        None
+                    };
+                    if config.account_risk.is_some()
+                        && matches!(cross.side, GridFill::Buy)
+                        && admission_ticket.is_none()
+                    {
+                        completed_cross_count += 1;
+                        continue;
                     }
-                    operation_sequence = operation_sequence
-                        .checked_add(1)
-                        .ok_or(GridPaperTaskError::InvalidRequest)?;
-                    let request = build_operation(&config, &grid, cross, operation_sequence)?;
+                    if let Some(risk) = config.account_risk.as_ref()
+                        && matches!(cross.side, GridFill::Buy)
+                    {
+                        let Some(next_operation) = operation_sequence.checked_add(1) else {
+                            if let Err(error) = discard_planned_admission(
+                                Some(risk),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                observed_at,
+                            )
+                            .await
+                            {
+                                let failure = error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::InvalidRequest,
+                                GridPaperTaskError::InvalidRequest,
+                            )
+                            .await;
+                        };
+                        operation_sequence = next_operation;
+                    } else {
+                        operation_sequence = operation_sequence
+                            .checked_add(1)
+                            .ok_or(GridPaperTaskError::InvalidRequest)?;
+                    }
+                    let request = match build_operation(&config, &grid, cross, operation_sequence) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            if let Err(cancel_error) = discard_planned_admission(
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                observed_at,
+                            )
+                            .await
+                            {
+                                let failure = cancel_error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    cancel_error,
+                                )
+                                .await;
+                            }
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::InvalidRequest,
+                                error,
+                            )
+                            .await;
+                        }
+                    };
+                    let recovery_request = request.clone();
                     match run_operation(
                         &saga,
                         Arc::clone(&executor),
@@ -958,6 +1043,43 @@ async fn run_owner(
                             stop_after_operation |= stop_requested;
                         }
                         OperationOutcome::Terminal(Err(error), _) => {
+                            let needs_recovery = match retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                &recovery_request,
+                                observed_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        failure,
+                                        retain_error,
+                                    )
+                                    .await;
+                                }
+                            };
+                            if needs_recovery {
+                                next.operation_count = operation_sequence;
+                                status_sender.send_replace(next);
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    GridPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            }
                             let (failure, error) = classify_saga_error(error);
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
@@ -972,16 +1094,49 @@ async fn run_owner(
                             .await;
                         }
                         OperationOutcome::Cancelled(request) => {
-                            retain_cancelled_operation(saga.account(), &request).await;
+                            let needs_recovery = match retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                &request,
+                                observed_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        failure,
+                                        retain_error,
+                                    )
+                                    .await;
+                                }
+                            };
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
-                            return fail_owner(
+                            if needs_recovery {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    GridPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            }
+                            return stop_owner(
                                 &mut source,
                                 &history,
                                 &status_sender,
                                 &mut last_recorded_at,
-                                GridPaperTaskFailure::RecoveryRequired,
-                                GridPaperTaskError::RecoveryRequired,
+                                GridPaperTaskExit::StopRequested,
                             )
                             .await;
                         }
@@ -1123,21 +1278,81 @@ async fn run_operation(
 
 async fn retain_cancelled_operation(
     account: &PaperAccountAuthority,
+    risk: Option<&AccountRiskAuthority>,
+    owner_task_id: &str,
+    admission_ticket: Option<&AccountRiskAdmissionTicket>,
     request: &PaperSingleLegRequest,
-) {
+    now: DateTime<Utc>,
+) -> Result<bool, GridPaperTaskError> {
     let reservation_id = request.reservation().reservation_id();
-    let Ok(snapshot) = account.snapshot().await else {
-        return;
-    };
+    let snapshot = account
+        .snapshot()
+        .await
+        .map_err(GridPaperTaskError::Account)?;
     let Some(reservation) = snapshot
         .reservations
         .iter()
         .find(|reservation| reservation.reservation_id == reservation_id)
     else {
-        return;
+        let (Some(risk), Some(ticket)) = (risk, admission_ticket) else {
+            return Ok(false);
+        };
+        if cancel_unreserved_admission(risk, owner_task_id, ticket, now)
+            .await
+            .map_err(GridPaperTaskError::AccountRisk)?
+        {
+            return Ok(false);
+        }
+        let retry_snapshot = account
+            .snapshot()
+            .await
+            .map_err(GridPaperTaskError::Account)?;
+        let Some(retry_reservation) = retry_snapshot
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+        else {
+            return Err(GridPaperTaskError::RecoveryRequired);
+        };
+        if retry_reservation.phase == PaperReservationPhase::Pending {
+            let _ = account
+                .mark_uncertain(reservation_id)
+                .await
+                .map_err(GridPaperTaskError::Account)?;
+        }
+        return Ok(true);
     };
     if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account.mark_uncertain(reservation_id).await;
+        let _ = account
+            .mark_uncertain(reservation_id)
+            .await
+            .map_err(GridPaperTaskError::Account)?;
+    }
+    Ok(true)
+}
+
+async fn cancel_unreserved_admission(
+    risk: &AccountRiskAuthority,
+    task_id: &str,
+    ticket: &AccountRiskAdmissionTicket,
+    now: DateTime<Utc>,
+) -> Result<bool, AccountRiskError> {
+    risk.cancel_admission(task_id, ticket, now).await
+}
+
+async fn discard_planned_admission(
+    risk: Option<&AccountRiskAuthority>,
+    task_id: &str,
+    ticket: Option<&AccountRiskAdmissionTicket>,
+    now: DateTime<Utc>,
+) -> Result<(), GridPaperTaskError> {
+    let (Some(risk), Some(ticket)) = (risk, ticket) else {
+        return Ok(());
+    };
+    match cancel_unreserved_admission(risk, task_id, ticket, now).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(GridPaperTaskError::RecoveryRequired),
+        Err(error) => Err(GridPaperTaskError::AccountRisk(error)),
     }
 }
 
@@ -1220,7 +1435,7 @@ async fn admit_grid_entry(
     grid: &VirtualGrid,
     cross: &VirtualGridCross,
     observed_at: DateTime<Utc>,
-) -> Result<bool, GridPaperTaskError> {
+) -> Result<Option<AccountRiskAdmissionTicket>, GridPaperTaskError> {
     let notional = cross
         .trigger_price
         .as_decimal()
@@ -1238,8 +1453,8 @@ async fn admit_grid_entry(
         .await
         .map_err(GridPaperTaskError::AccountRisk)?
     {
-        AccountRiskAdmission::Admitted { .. } => Ok(true),
-        AccountRiskAdmission::Rejected(_) => Ok(false),
+        AccountRiskAdmission::Admitted { ticket, .. } => Ok(Some(ticket)),
+        AccountRiskAdmission::Rejected(_) => Ok(None),
     }
 }
 
@@ -1906,5 +2121,89 @@ impl Error for GridPaperTaskError {
             | Self::TaskCancelled
             | Self::PreviouslyFailed(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use chrono::{TimeZone, Utc};
+    use crypto_trading_domain::Money;
+    use crypto_trading_runtime::{
+        AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, JsonlHistory,
+    };
+    use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
+    use rust_decimal::Decimal;
+    use uuid::Uuid;
+
+    use super::cancel_unreserved_admission;
+
+    fn money(value: &str) -> Money {
+        Money::new(Decimal::from_str(value).unwrap())
+    }
+
+    fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 26, hour, minute, 0).unwrap()
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "crypto-trading-grid-admission-{label}-{}.jsonl",
+            Uuid::new_v4()
+        ))
+    }
+
+    fn risk(path: &std::path::Path) -> AccountRiskAuthority {
+        AccountRiskAuthority::new(
+            Uuid::new_v4(),
+            JsonlHistory::new(path),
+            "paper",
+            AccountRiskPolicy::new(AccountRiskLimits {
+                max_symbol_exposure: Some(money("100")),
+                max_total_exposure: Some(money("100")),
+                ..AccountRiskLimits::default()
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn candidate(task_id: &str, notional: &str) -> AccountRiskCandidate {
+        AccountRiskCandidate::new(task_id, "BTC-USDT", money(notional)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pre_reservation_failure_releases_the_pending_admission() {
+        let path = temp_path("pre-reservation-failure");
+        let risk = risk(&path);
+        let ticket = match risk
+            .admit(&candidate("owner-a", "100"), at(9, 0))
+            .await
+            .unwrap()
+        {
+            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
+            AccountRiskAdmission::Rejected(rejection) => {
+                panic!("expected admission, got {rejection:?}")
+            }
+        };
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "1"), at(9, 1))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+        ));
+
+        assert!(
+            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            risk.admit(&candidate("owner-b", "100"), at(9, 3))
+                .await
+                .unwrap(),
+            AccountRiskAdmission::Admitted { .. }
+        ));
     }
 }

@@ -135,8 +135,9 @@ impl MarketUniverse {
 /// Freshness bounds applied at read time rather than at ingest time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketFreshnessPolicy {
-    max_age: Duration,
-    max_future_skew: Duration,
+    maximum_age: Duration,
+    future_tolerance: Duration,
+    pair_skew_bound: Duration,
 }
 
 impl MarketFreshnessPolicy {
@@ -157,17 +158,41 @@ impl MarketFreshnessPolicy {
             ));
         }
         Ok(Self {
-            max_age,
-            max_future_skew,
+            maximum_age: max_age,
+            future_tolerance: max_future_skew,
+            pair_skew_bound: max_future_skew,
         })
     }
 
+    /// Sets the independent cross-venue event-time skew bound.
+    ///
+    /// The two-argument constructor keeps backward-compatible behavior by
+    /// defaulting this bound to `max_future_skew`; callers that compare venues
+    /// should set it explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError`] when `max_pair_skew` is negative.
+    pub fn with_max_pair_skew(mut self, max_pair_skew: Duration) -> Result<Self, MarketDataError> {
+        if max_pair_skew < Duration::zero() {
+            return Err(MarketDataError::InvalidFreshnessPolicy(
+                "maximum market pair skew must not be negative",
+            ));
+        }
+        self.pair_skew_bound = max_pair_skew;
+        Ok(self)
+    }
+
     pub const fn max_age(self) -> Duration {
-        self.max_age
+        self.maximum_age
     }
 
     pub const fn max_future_skew(self) -> Duration {
-        self.max_future_skew
+        self.future_tolerance
+    }
+
+    pub const fn max_pair_skew(self) -> Duration {
+        self.pair_skew_bound
     }
 
     fn classify(self, snapshot_at: DateTime<Utc>, now: DateTime<Utc>) -> MarketDataFreshness {
@@ -175,15 +200,15 @@ impl MarketFreshnessPolicy {
             let skew = snapshot_at.signed_duration_since(now);
             return MarketDataFreshness::Future {
                 skew_millis: skew.num_milliseconds(),
-                tolerance_millis: self.max_future_skew.num_milliseconds(),
-                within_tolerance: skew <= self.max_future_skew,
+                tolerance_millis: self.future_tolerance.num_milliseconds(),
+                within_tolerance: skew <= self.future_tolerance,
             };
         }
         let age = now.signed_duration_since(snapshot_at);
-        if age > self.max_age {
+        if age > self.maximum_age {
             MarketDataFreshness::Stale {
                 age_millis: age.num_milliseconds(),
-                limit_millis: self.max_age.num_milliseconds(),
+                limit_millis: self.maximum_age.num_milliseconds(),
             }
         } else {
             MarketDataFreshness::Fresh {
@@ -226,12 +251,33 @@ pub enum MarketDataFreshness {
         tolerance_millis: i64,
         within_tolerance: bool,
     },
+    PairSkew {
+        skew_millis: i64,
+        tolerance_millis: i64,
+    },
 }
 
 impl MarketDataFreshness {
     pub const fn is_fresh(&self) -> bool {
-        matches!(self, Self::Fresh { .. })
+        matches!(
+            self,
+            Self::Fresh { .. }
+                | Self::Future {
+                    within_tolerance: true,
+                    ..
+                }
+        )
     }
+}
+
+/// Whether one snapshot timestamp came from the venue event itself or from the
+/// runtime's local receive clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketTimestampProvenance {
+    Missing,
+    VenueEventTime,
+    LocalReceipt,
 }
 
 /// Bounded, non-secret classification of a market-data source failure.
@@ -288,6 +334,8 @@ pub struct MarketDataObservation {
     pub snapshot: MarketSnapshot,
     pub revision: u64,
     pub received_at: DateTime<Utc>,
+    pub timestamp_provenance: MarketTimestampProvenance,
+    pub source_sequence: Option<u64>,
 }
 
 impl MarketDataObservation {
@@ -301,13 +349,42 @@ impl MarketDataObservation {
         revision: u64,
         received_at: DateTime<Utc>,
     ) -> Result<Self, MarketDataError> {
+        Self::with_source_metadata(
+            snapshot,
+            revision,
+            received_at,
+            MarketTimestampProvenance::VenueEventTime,
+            None,
+        )
+    }
+
+    /// Creates one ordered source observation with explicit timestamp
+    /// provenance and optional source sequence metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::InvalidRevision`] for revision zero and
+    /// [`MarketDataError::InvalidTimestampProvenance`] when callers omit the
+    /// accepted timestamp provenance.
+    pub fn with_source_metadata(
+        snapshot: MarketSnapshot,
+        revision: u64,
+        received_at: DateTime<Utc>,
+        timestamp_provenance: MarketTimestampProvenance,
+        source_sequence: Option<u64>,
+    ) -> Result<Self, MarketDataError> {
         if revision == 0 {
             return Err(MarketDataError::InvalidRevision);
+        }
+        if timestamp_provenance == MarketTimestampProvenance::Missing {
+            return Err(MarketDataError::InvalidTimestampProvenance);
         }
         Ok(Self {
             snapshot,
             revision,
             received_at,
+            timestamp_provenance,
+            source_sequence,
         })
     }
 }
@@ -504,6 +581,20 @@ impl MarketDataBook {
                     snapshot: entry.last.as_ref().map(|last| last.snapshot.clone()),
                     revision: entry.last.as_ref().map(|last| last.revision),
                     received_at: entry.last.as_ref().map(|last| last.received_at),
+                    timestamp_provenance: entry
+                        .last
+                        .as_ref()
+                        .map_or(MarketTimestampProvenance::Missing, |last| {
+                            last.timestamp_provenance
+                        }),
+                    source_latency_millis: entry.last.as_ref().and_then(|last| {
+                        (last.timestamp_provenance == MarketTimestampProvenance::VenueEventTime)
+                            .then(|| {
+                                last.received_at
+                                    .signed_duration_since(last.snapshot.timestamp)
+                                    .num_milliseconds()
+                            })
+                    }),
                     status_changed_at: entry.status_changed_at,
                     freshness,
                     continuity: entry.continuity.clone(),
@@ -514,6 +605,7 @@ impl MarketDataBook {
             schema_version: MARKET_DATA_VIEW_SCHEMA_VERSION,
             observed_at: now,
             generation: self.generation,
+            pair_skew_tolerance_millis: self.policy.max_pair_skew().num_milliseconds(),
             instruments,
         }
     }
@@ -548,11 +640,25 @@ impl MarketDataView {
     ) -> Result<ObservedMarketPair, MarketDataError> {
         let left_snapshot = ready_snapshot(self, left)?;
         let right_snapshot = ready_snapshot(self, right)?;
+        let skew_millis = left_snapshot
+            .timestamp
+            .signed_duration_since(right_snapshot.timestamp)
+            .num_milliseconds()
+            .abs();
+        if skew_millis > self.pair_skew_tolerance_millis {
+            return Err(MarketDataError::PairSkew {
+                left: Box::new(left.clone()),
+                right: Box::new(right.clone()),
+                skew_millis,
+                tolerance_millis: self.pair_skew_tolerance_millis,
+            });
+        }
         Ok(ObservedMarketPair {
             left: left_snapshot,
             right: right_snapshot,
             observed_at: self.observed_at,
             generation: self.generation,
+            pair_skew_millis: skew_millis,
         })
     }
 }
@@ -607,7 +713,13 @@ impl MarketDataBook {
                 self.generation = next_generation;
                 return Ok(MarketDataUpdate::IgnoredOutOfOrder);
             }
-            if observation.snapshot.timestamp == last.snapshot.timestamp {
+            let authoritative_timestamps = observation.timestamp_provenance
+                == MarketTimestampProvenance::VenueEventTime
+                && last.timestamp_provenance == MarketTimestampProvenance::VenueEventTime;
+            if authoritative_timestamps
+                && observation.snapshot.timestamp == last.snapshot.timestamp
+                && observation.source_sequence.is_none()
+            {
                 entry.continuity = MarketContinuity::DuplicateTimestamp {
                     timestamp: observation.snapshot.timestamp,
                 };
@@ -615,7 +727,8 @@ impl MarketDataBook {
                 self.generation = next_generation;
                 return Ok(MarketDataUpdate::IgnoredDuplicateTimestamp);
             }
-            if observation.snapshot.timestamp < last.snapshot.timestamp {
+            if authoritative_timestamps && observation.snapshot.timestamp < last.snapshot.timestamp
+            {
                 entry.continuity = MarketContinuity::OutOfOrderTimestamp {
                     last_timestamp: last.snapshot.timestamp,
                     observed_timestamp: observation.snapshot.timestamp,
@@ -693,6 +806,8 @@ pub struct MarketInstrumentView {
     pub snapshot: Option<MarketSnapshot>,
     pub revision: Option<u64>,
     pub received_at: Option<DateTime<Utc>>,
+    pub timestamp_provenance: MarketTimestampProvenance,
+    pub source_latency_millis: Option<i64>,
     pub status_changed_at: Option<DateTime<Utc>>,
     pub freshness: MarketDataFreshness,
     pub continuity: MarketContinuity,
@@ -713,6 +828,7 @@ pub struct MarketDataView {
     pub schema_version: u16,
     pub observed_at: DateTime<Utc>,
     pub generation: u64,
+    pub pair_skew_tolerance_millis: i64,
     instruments: Vec<MarketInstrumentView>,
 }
 
@@ -736,6 +852,7 @@ pub struct ObservedMarketPair {
     pub right: MarketSnapshot,
     pub observed_at: DateTime<Utc>,
     pub generation: u64,
+    pub pair_skew_millis: i64,
 }
 
 fn ready_snapshot(
@@ -863,11 +980,11 @@ impl SubscriptionMarketDataAdapter {
                 *revision = revision
                     .checked_add(1)
                     .ok_or(MarketDataError::RevisionExhausted)?;
-                Ok(MarketDataEvent::Observation(MarketDataObservation {
+                Ok(MarketDataEvent::Observation(MarketDataObservation::new(
                     snapshot,
-                    revision: *revision,
-                    received_at: self.clock.now(),
-                }))
+                    *revision,
+                    self.clock.now(),
+                )?))
             }
             Err(ExchangeError::SubscriptionLagged { skipped }) => Ok(MarketDataEvent::SourceGap {
                 exchange: self.exchange.clone(),
@@ -938,6 +1055,8 @@ pub enum MarketDataError {
     InvalidRevision,
     #[error("market-data source gap must skip at least one observation")]
     InvalidGapCount,
+    #[error("market-data timestamp provenance must be explicit for accepted observations")]
+    InvalidTimestampProvenance,
     #[error("market-data revision counter is exhausted")]
     RevisionExhausted,
     #[error("market-data view generation counter is exhausted")]
@@ -960,6 +1079,15 @@ pub enum MarketDataError {
     SourceIdentityMismatch { expected: String, actual: String },
     #[error("market-data source event time moved backwards for {exchange}")]
     SourceEventTimeRollback { exchange: String },
+    #[error(
+        "observed pair skew between {left:?} and {right:?} is {skew_millis}ms, exceeding the {tolerance_millis}ms tolerance"
+    )]
+    PairSkew {
+        left: Box<MarketInstrument>,
+        right: Box<MarketInstrument>,
+        skew_millis: i64,
+        tolerance_millis: i64,
+    },
     #[error(
         "instrument {instrument:?} is not strategy-ready: freshness={freshness:?}, continuity={continuity:?}"
     )]

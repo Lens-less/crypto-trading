@@ -70,6 +70,7 @@ pub enum MonitorFreshnessState {
     Fresh,
     Stale,
     Future,
+    PairSkew,
 }
 
 /// Bounded continuity classification retained by the monitor projection.
@@ -137,7 +138,7 @@ pub struct ArbitrageMonitorView {
     pub projection: ArbitrageMonitorProjection,
 }
 
-struct MonitorProjectionBuilder {
+pub(crate) struct MonitorProjectionBuilder {
     journal_id: Uuid,
     journal_head_sequence: Option<u64>,
     projection_status: ProjectionStatus,
@@ -146,7 +147,7 @@ struct MonitorProjectionBuilder {
 }
 
 impl MonitorProjectionBuilder {
-    const fn new(journal_id: Uuid) -> Self {
+    pub(crate) const fn new(journal_id: Uuid) -> Self {
         Self {
             journal_id,
             journal_head_sequence: None,
@@ -163,16 +164,13 @@ impl MonitorProjectionBuilder {
         let mut cursor = None;
         loop {
             let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())?;
-            if let Some(event) = page.events().last() {
-                self.journal_head_sequence = Some(event.sequence());
-            }
             for event in page.events() {
-                self.apply_event(event);
+                self.observe_event(event);
             }
             match page.boundary() {
                 JournalPageBoundary::SnapshotEnd => break,
                 JournalPageBoundary::PartialTail { .. } => {
-                    self.projection_status = ProjectionStatus::Degraded;
+                    self.mark_partial_tail();
                     break;
                 }
                 JournalPageBoundary::PageLimit => {
@@ -190,14 +188,27 @@ impl MonitorProjectionBuilder {
                 }
             }
         }
-        Ok(ArbitrageMonitorReadModel {
+        Ok(self.finish())
+    }
+
+    pub(crate) fn observe_event(&mut self, event: &OperationEventEnvelope) {
+        self.journal_head_sequence = Some(event.sequence());
+        self.apply_event(event);
+    }
+
+    pub(crate) fn mark_partial_tail(&mut self) {
+        self.projection_status = ProjectionStatus::Degraded;
+    }
+
+    pub(crate) fn finish(self) -> ArbitrageMonitorReadModel {
+        ArbitrageMonitorReadModel {
             schema_version: ARBITRAGE_MONITOR_READ_MODEL_SCHEMA_VERSION,
             journal_id: self.journal_id,
             journal_head_sequence: self.journal_head_sequence,
             projection_status: self.projection_status,
             latest: self.latest,
             invalid_event_count: self.invalid_event_count,
-        })
+        }
     }
 
     fn apply_event(&mut self, event: &OperationEventEnvelope) {
@@ -372,6 +383,7 @@ fn parse_freshness(value: &Value) -> Result<MonitorFreshnessState, ()> {
         "fresh" => Ok(MonitorFreshnessState::Fresh),
         "stale" => Ok(MonitorFreshnessState::Stale),
         "future" => Ok(MonitorFreshnessState::Future),
+        "pair_skew" => Ok(MonitorFreshnessState::PairSkew),
         _ => Err(()),
     }
 }

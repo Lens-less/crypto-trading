@@ -17,7 +17,8 @@ use crypto_trading_domain::{
 use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     ExecutionBatch, JsonlHistory, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
-    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, RuntimeError,
+    PaperExecutionLedgerKind, PaperReservationLeg, PaperReservationPhase, PaperReservationRequest,
+    RuntimeError,
 };
 use rust_decimal::Decimal;
 
@@ -112,9 +113,16 @@ async fn one_grid_leg_is_reserved_planned_and_committed_once() {
         .unwrap();
     assert!(matches!(result, PaperSingleLegRun::Completed { .. }));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let snapshot = account.snapshot().await.unwrap();
     assert_eq!(
-        account.snapshot().await.unwrap().reservations[0].phase,
+        snapshot.reservations[0].phase,
         PaperReservationPhase::Committed
+    );
+    assert_eq!(snapshot.committed_exposure, Money::new(decimal("100")));
+    assert_eq!(snapshot.available, Money::new(decimal("899.90")));
+    assert_eq!(
+        snapshot.ledger_kind,
+        PaperExecutionLedgerKind::ExactExecution
     );
 
     let replay = saga
@@ -130,7 +138,15 @@ async fn one_grid_leg_is_reserved_planned_and_committed_once() {
             ..
         }
     ));
-    assert_eq!(decisions(&path).len(), 4);
+    assert_eq!(
+        decisions(&path),
+        vec![
+            "paper_account_reserved".to_owned(),
+            "execution_planned".to_owned(),
+            "execution_completed".to_owned(),
+            "paper_account_execution_settled".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]

@@ -207,7 +207,7 @@ pub struct VirtualGridScanView {
     pub rows: Vec<VirtualGridScanRowView>,
 }
 
-struct ScannerProjectionBuilder {
+pub(crate) struct ScannerProjectionBuilder {
     journal_id: Uuid,
     journal_head_sequence: Option<u64>,
     projection_status: ProjectionStatus,
@@ -216,7 +216,7 @@ struct ScannerProjectionBuilder {
 }
 
 impl ScannerProjectionBuilder {
-    const fn new(journal_id: Uuid) -> Self {
+    pub(crate) const fn new(journal_id: Uuid) -> Self {
         Self {
             journal_id,
             journal_head_sequence: None,
@@ -233,16 +233,13 @@ impl ScannerProjectionBuilder {
         let mut cursor = None;
         loop {
             let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())?;
-            if let Some(event) = page.events().last() {
-                self.journal_head_sequence = Some(event.sequence());
-            }
             for event in page.events() {
-                self.apply_event(event);
+                self.observe_event(event);
             }
             match page.boundary() {
                 JournalPageBoundary::SnapshotEnd => break,
                 JournalPageBoundary::PartialTail { .. } => {
-                    self.projection_status = ProjectionStatus::Degraded;
+                    self.mark_partial_tail();
                     break;
                 }
                 JournalPageBoundary::PageLimit => {
@@ -260,14 +257,27 @@ impl ScannerProjectionBuilder {
                 }
             }
         }
-        Ok(VirtualGridScannerReadModel {
+        Ok(self.finish())
+    }
+
+    pub(crate) fn observe_event(&mut self, event: &OperationEventEnvelope) {
+        self.journal_head_sequence = Some(event.sequence());
+        self.apply_event(event);
+    }
+
+    pub(crate) fn mark_partial_tail(&mut self) {
+        self.projection_status = ProjectionStatus::Degraded;
+    }
+
+    pub(crate) fn finish(self) -> VirtualGridScannerReadModel {
+        VirtualGridScannerReadModel {
             schema_version: VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION,
             journal_id: self.journal_id,
             journal_head_sequence: self.journal_head_sequence,
             projection_status: self.projection_status,
             latest: self.latest,
             invalid_event_count: self.invalid_event_count,
-        })
+        }
     }
 
     fn apply_event(&mut self, event: &OperationEventEnvelope) {

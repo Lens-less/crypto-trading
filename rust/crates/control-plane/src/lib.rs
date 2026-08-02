@@ -15,6 +15,7 @@ use crypto_trading_runtime::{
     AccountRiskProjectionError, CapabilityError, CursorError, JournalPage, JournalPageBoundary,
     JournalReadError, JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope,
     PaperAccountProjectionError, ReadModelError, current_capability_manifest,
+    project_control_plane_state,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -103,24 +104,12 @@ impl ReadControlPlane {
     /// captured or its durable execution facts cannot be projected safely.
     pub fn snapshot(&self) -> Result<ControlPlaneSnapshot, ControlPlaneSnapshotError> {
         let journal = self.journal.snapshot()?;
-        let operator = OperatorReadModel::from_legacy_snapshot(&journal)?;
-        let monitor = ArbitrageMonitorReadModel::from_legacy_snapshot(&journal)?;
-        let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)?;
-        let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)?;
-        let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)?;
-        let paper_accounts = PaperAccountReadModel::from_legacy_snapshot(&journal)?;
-        let account_risk = AccountRiskReadModel::from_legacy_snapshot(&journal)?;
-        Ok(ControlPlaneSnapshot {
-            schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
-            capabilities: self.capabilities.clone(),
-            operator,
-            monitor,
-            alerts,
-            tasks,
-            scanner,
-            paper_accounts,
-            account_risk,
-        })
+        let projection =
+            project_control_plane_state(&journal).map_err(map_snapshot_projection_error)?;
+        Ok(control_plane_snapshot(
+            self.capabilities.clone(),
+            projection,
+        ))
     }
 
     /// Reads one bounded, payload-redacted event page after an opaque cursor.
@@ -177,32 +166,10 @@ impl ReadControlPlane {
                     source => ControlPlaneReadError::Journal(source),
                 }
             })?;
-        let operator = OperatorReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::Projection)?;
-        let monitor = ArbitrageMonitorReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::Projection)?;
-        let alerts = PriceAlertReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::Projection)?;
-        let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::Projection)?;
-        let scanner = VirtualGridScannerReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::Projection)?;
-        let paper_accounts = PaperAccountReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::PaperAccountProjection)?;
-        let account_risk = AccountRiskReadModel::from_legacy_snapshot(&journal)
-            .map_err(ControlPlaneReadError::AccountRiskProjection)?;
+        let projection =
+            project_control_plane_state(&journal).map_err(map_read_projection_error)?;
         Ok(ControlPlaneRead {
-            snapshot: ControlPlaneSnapshot {
-                schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
-                capabilities: self.capabilities.clone(),
-                operator,
-                monitor,
-                alerts,
-                tasks,
-                scanner,
-                paper_accounts,
-                account_risk,
-            },
+            snapshot: control_plane_snapshot(self.capabilities.clone(), projection),
             events: control_plane_events_page(&page),
         })
     }
@@ -226,6 +193,55 @@ fn control_plane_events_page(page: &JournalPage) -> ControlPlaneEventsPage {
             .collect(),
         next_cursor: page.next_cursor().map(ToString::to_string),
         boundary: page.boundary().clone(),
+    }
+}
+
+fn control_plane_snapshot(
+    capabilities: CapabilityManifest,
+    projection: crypto_trading_runtime::ControlPlaneProjection,
+) -> ControlPlaneSnapshot {
+    ControlPlaneSnapshot {
+        schema_version: CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
+        capabilities,
+        operator: projection.operator,
+        monitor: projection.monitor,
+        alerts: projection.alerts,
+        tasks: projection.tasks,
+        scanner: projection.scanner,
+        paper_accounts: projection.paper_accounts,
+        account_risk: projection.account_risk,
+    }
+}
+
+fn map_snapshot_projection_error(
+    error: crypto_trading_runtime::ControlPlaneProjectionError,
+) -> ControlPlaneSnapshotError {
+    match error {
+        crypto_trading_runtime::ControlPlaneProjectionError::Projection(source) => {
+            ControlPlaneSnapshotError::Projection(source)
+        }
+        crypto_trading_runtime::ControlPlaneProjectionError::PaperAccountProjection(source) => {
+            ControlPlaneSnapshotError::PaperAccountProjection(source)
+        }
+        crypto_trading_runtime::ControlPlaneProjectionError::AccountRiskProjection(source) => {
+            ControlPlaneSnapshotError::AccountRiskProjection(source)
+        }
+    }
+}
+
+fn map_read_projection_error(
+    error: crypto_trading_runtime::ControlPlaneProjectionError,
+) -> ControlPlaneReadError {
+    match error {
+        crypto_trading_runtime::ControlPlaneProjectionError::Projection(source) => {
+            ControlPlaneReadError::Projection(source)
+        }
+        crypto_trading_runtime::ControlPlaneProjectionError::PaperAccountProjection(source) => {
+            ControlPlaneReadError::PaperAccountProjection(source)
+        }
+        crypto_trading_runtime::ControlPlaneProjectionError::AccountRiskProjection(source) => {
+            ControlPlaneReadError::AccountRiskProjection(source)
+        }
     }
 }
 

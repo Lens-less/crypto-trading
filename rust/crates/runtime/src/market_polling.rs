@@ -9,11 +9,14 @@ use crypto_trading_domain::{MarketType, Symbol};
 use crypto_trading_exchange::{
     BinancePublicExchange, HyperliquidFundingRate, HyperliquidPublicExchange,
 };
+use tokio::time::{Instant, sleep_until};
+use tracing::{debug, warn};
 
 use crate::{
     market_data::{
         MAX_MARKET_DATA_TARGETS, MAX_MARKET_SYMBOL_BYTES, MarketDataClock, MarketDataError,
-        MarketDataEvent, MarketDataObservation, MarketInstrument, classify_exchange_failure,
+        MarketDataEvent, MarketDataObservation, MarketInstrument, MarketTimestampProvenance,
+        classify_exchange_failure,
     },
     market_supervisor::{MarketDataEventFuture, MarketDataEventSource},
 };
@@ -21,6 +24,7 @@ use crate::{
 const BINANCE_EXCHANGE: &str = "binance";
 const HYPERLIQUID_EXCHANGE: &str = "hyperliquid";
 const MAX_POLL_DELAY: Duration = Duration::from_secs(60 * 60);
+const SLOW_POLL_FLOOR: Duration = Duration::from_secs(1);
 
 /// Exact mapping from one canonical read-plane instrument to a Binance wire
 /// symbol.
@@ -147,7 +151,7 @@ struct PollingTarget {
     route: BinancePollingRoute,
     revision: u64,
     consecutive_failures: u32,
-    next_delay: Duration,
+    next_poll_at: Instant,
 }
 
 impl PollingTarget {
@@ -156,7 +160,7 @@ impl PollingTarget {
             route,
             revision: 0,
             consecutive_failures: 0,
-            next_delay: Duration::ZERO,
+            next_poll_at: Instant::now(),
         }
     }
 }
@@ -242,39 +246,85 @@ impl BinancePublicPollingSource {
 
     async fn fetch_next(&mut self) -> Result<Option<MarketDataEvent>, MarketDataError> {
         let index = self.cursor;
-        let delay = self.targets[index].next_delay;
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-
+        let poll_started_at = wait_for_poll_slot(self.targets[index].next_poll_at).await;
         let instrument = self.targets[index].route.instrument.clone();
         let wire_symbol = self.targets[index].route.wire_symbol.clone();
-        let result = self.exchange.fetch_snapshot(&wire_symbol).await;
+        let target_count = self.targets.len();
+        let result = self
+            .exchange
+            .fetch_observation(&wire_symbol, self.clock.now())
+            .await;
         let received_at = self.clock.now();
         self.advance_cursor();
 
         match result {
-            Ok(mut snapshot) => {
+            Ok(observation) => {
                 let target = &mut self.targets[index];
-                target.revision = target
+                let instrument_label = instrument.symbol.as_str().to_owned();
+                // REST book-ticker observations are complete snapshots. A
+                // venue update id orders those snapshots, but skipped ids do
+                // not prove that this polling consumer dropped a snapshot.
+                // Keep delivery continuity on the local per-route counter and
+                // carry the venue id separately as source evidence.
+                let revision = target
                     .revision
                     .checked_add(1)
                     .ok_or(MarketDataError::RevisionExhausted)?;
+                target.revision = revision;
                 target.consecutive_failures = 0;
-                target.next_delay = self.policy.poll_interval;
+                let backoff = self.policy.poll_interval;
+                target.next_poll_at = schedule_next_poll(poll_started_at, backoff);
+                let provenance = if let Some(event_time) = observation.event_time {
+                    let mut snapshot = observation.snapshot;
+                    snapshot.timestamp = event_time;
+                    (snapshot, MarketTimestampProvenance::VenueEventTime)
+                } else {
+                    let mut snapshot = observation.snapshot;
+                    snapshot.timestamp = received_at;
+                    (snapshot, MarketTimestampProvenance::LocalReceipt)
+                };
+                let (mut snapshot, timestamp_provenance) = provenance;
                 snapshot.symbol = instrument.symbol;
                 snapshot.market_type = instrument.market_type;
+                let elapsed = poll_started_at.elapsed();
+                log_poll_result(
+                    BINANCE_EXCHANGE,
+                    &instrument_label,
+                    target_count,
+                    elapsed,
+                    "success",
+                    Some(backoff),
+                    false,
+                );
                 Ok(Some(MarketDataEvent::Observation(
-                    MarketDataObservation::new(snapshot, target.revision, received_at)?,
+                    MarketDataObservation::with_source_metadata(
+                        snapshot,
+                        revision,
+                        received_at,
+                        timestamp_provenance,
+                        observation.source_sequence,
+                    )?,
                 )))
             }
             Err(error) => {
                 let target = &mut self.targets[index];
                 target.consecutive_failures = target.consecutive_failures.saturating_add(1);
-                target.next_delay = self.policy.retry_delay_after(target.consecutive_failures);
+                let backoff = self.policy.retry_delay_after(target.consecutive_failures);
+                target.next_poll_at = schedule_next_poll(poll_started_at, backoff);
+                let failure = classify_exchange_failure(&error);
+                let elapsed = poll_started_at.elapsed();
+                log_poll_result(
+                    BINANCE_EXCHANGE,
+                    instrument.symbol.as_str(),
+                    target_count,
+                    elapsed,
+                    failure_label(failure),
+                    Some(backoff),
+                    true,
+                );
                 Ok(Some(MarketDataEvent::SourceUnavailable {
                     exchange: BINANCE_EXCHANGE.to_owned(),
-                    failure: classify_exchange_failure(&error),
+                    failure,
                     observed_at: received_at,
                 }))
             }
@@ -377,7 +427,7 @@ struct HyperliquidPollingTarget {
     route: HyperliquidPollingRoute,
     revision: u64,
     consecutive_failures: u32,
-    next_delay: Duration,
+    next_poll_at: Instant,
 }
 
 impl HyperliquidPollingTarget {
@@ -386,7 +436,7 @@ impl HyperliquidPollingTarget {
             route,
             revision: 0,
             consecutive_failures: 0,
-            next_delay: Duration::ZERO,
+            next_poll_at: Instant::now(),
         }
     }
 }
@@ -488,27 +538,36 @@ impl HyperliquidPublicPollingSource {
 
     async fn fetch_next(&mut self) -> Result<Option<MarketDataEvent>, MarketDataError> {
         let index = self.cursor;
-        let delay = self.targets[index].next_delay;
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-
+        let poll_started_at = wait_for_poll_slot(self.targets[index].next_poll_at).await;
         let instrument = self.targets[index].route.instrument.clone();
         let wire_coin = self.targets[index].route.wire_coin.clone();
-        let result = self.exchange.fetch_observation(wire_coin.as_str()).await;
+        let target_count = self.targets.len();
+        let result = self
+            .exchange
+            .fetch_observation_at(wire_coin.as_str(), self.clock.now())
+            .await;
         let received_at = self.clock.now();
         self.advance_cursor();
 
         match result {
             Ok(observation) => {
                 let target = &mut self.targets[index];
-                target.revision = target
+                let revision = target
                     .revision
                     .checked_add(1)
                     .ok_or(MarketDataError::RevisionExhausted)?;
+                target.revision = revision;
                 target.consecutive_failures = 0;
-                target.next_delay = self.policy.poll_interval;
+                let backoff = self.policy.poll_interval;
+                target.next_poll_at = schedule_next_poll(poll_started_at, backoff);
                 let mut snapshot = observation.snapshot;
+                let timestamp_provenance = if let Some(event_time) = observation.event_time {
+                    snapshot.timestamp = event_time;
+                    MarketTimestampProvenance::VenueEventTime
+                } else {
+                    snapshot.timestamp = received_at;
+                    MarketTimestampProvenance::LocalReceipt
+                };
                 snapshot.symbol = instrument.symbol.clone();
                 snapshot.market_type = instrument.market_type;
                 if let Some(rate) = observation.funding {
@@ -516,22 +575,50 @@ impl HyperliquidPublicPollingSource {
                         instrument,
                         FundingRateObservation {
                             rate,
-                            revision: target.revision,
+                            revision,
                             observed_at: received_at,
                         },
                     );
                 }
+                let elapsed = poll_started_at.elapsed();
+                log_poll_result(
+                    HYPERLIQUID_EXCHANGE,
+                    wire_coin.as_str(),
+                    target_count,
+                    elapsed,
+                    "success",
+                    Some(backoff),
+                    false,
+                );
                 Ok(Some(MarketDataEvent::Observation(
-                    MarketDataObservation::new(snapshot, target.revision, received_at)?,
+                    MarketDataObservation::with_source_metadata(
+                        snapshot,
+                        revision,
+                        received_at,
+                        timestamp_provenance,
+                        None,
+                    )?,
                 )))
             }
             Err(error) => {
                 let target = &mut self.targets[index];
                 target.consecutive_failures = target.consecutive_failures.saturating_add(1);
-                target.next_delay = self.policy.retry_delay_after(target.consecutive_failures);
+                let backoff = self.policy.retry_delay_after(target.consecutive_failures);
+                target.next_poll_at = schedule_next_poll(poll_started_at, backoff);
+                let failure = classify_exchange_failure(&error);
+                let elapsed = poll_started_at.elapsed();
+                log_poll_result(
+                    HYPERLIQUID_EXCHANGE,
+                    wire_coin.as_str(),
+                    target_count,
+                    elapsed,
+                    failure_label(failure),
+                    Some(backoff),
+                    true,
+                );
                 Ok(Some(MarketDataEvent::SourceUnavailable {
                     exchange: HYPERLIQUID_EXCHANGE.to_owned(),
-                    failure: classify_exchange_failure(&error),
+                    failure,
                     observed_at: received_at,
                 }))
             }
@@ -546,5 +633,79 @@ impl MarketDataEventSource for HyperliquidPublicPollingSource {
 
     fn next_event(&mut self) -> MarketDataEventFuture<'_> {
         Box::pin(self.fetch_next())
+    }
+}
+
+async fn wait_for_poll_slot(next_poll_at: Instant) -> Instant {
+    if next_poll_at > Instant::now() {
+        sleep_until(next_poll_at).await;
+    }
+    Instant::now()
+}
+
+fn schedule_next_poll(poll_started_at: Instant, backoff: Duration) -> Instant {
+    poll_started_at + backoff
+}
+
+fn failure_label(failure: crate::MarketDataSourceFailure) -> &'static str {
+    match failure {
+        crate::MarketDataSourceFailure::Disconnected => "disconnected",
+        crate::MarketDataSourceFailure::TimedOut => "timed_out",
+        crate::MarketDataSourceFailure::Backpressure => "backpressure",
+        crate::MarketDataSourceFailure::InvalidPayload => "invalid_payload",
+        crate::MarketDataSourceFailure::Rejected => "rejected",
+        crate::MarketDataSourceFailure::Unknown => "unknown",
+    }
+}
+
+fn log_poll_result(
+    venue: &str,
+    instrument: &str,
+    target_count: usize,
+    elapsed: Duration,
+    result_class: &'static str,
+    backoff: Option<Duration>,
+    failed: bool,
+) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let backoff_ms = backoff.map_or(0, |value| {
+        u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+    });
+    if failed || elapsed >= SLOW_POLL_FLOOR {
+        warn!(
+            venue,
+            instrument, target_count, elapsed_ms, result_class, backoff_ms, "market polling cycle"
+        );
+    } else {
+        debug!(
+            venue,
+            instrument, target_count, elapsed_ms, result_class, backoff_ms, "market polling cycle"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{schedule_next_poll, wait_for_poll_slot};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn round_scheduler_waits_once_for_two_ready_targets() {
+        let round_delay = Duration::from_millis(20);
+
+        let first_started = wait_for_poll_slot(Instant::now()).await;
+        let second_started = wait_for_poll_slot(Instant::now()).await;
+        let first_next = schedule_next_poll(first_started, round_delay);
+        let second_next = schedule_next_poll(second_started, round_delay);
+
+        assert!(second_started.duration_since(first_started) < Duration::from_millis(10));
+
+        let third_started = wait_for_poll_slot(first_next).await;
+        let fourth_wait_started = Instant::now();
+        let fourth_started = wait_for_poll_slot(second_next).await;
+
+        assert!(third_started.duration_since(second_started) >= round_delay);
+        assert!(fourth_started.duration_since(fourth_wait_started) < Duration::from_millis(10));
     }
 }

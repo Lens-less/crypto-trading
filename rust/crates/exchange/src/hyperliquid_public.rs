@@ -80,6 +80,9 @@ pub struct HyperliquidPublicObservation {
     /// Perpetual snapshot with `bid`/`ask` taken from the impact prices and
     /// `last` carrying the mid price when the venue publishes one.
     pub snapshot: MarketSnapshot,
+    /// Venue event time, absent for the documented REST `metaAndAssetCtxs`
+    /// response shape.
+    pub event_time: Option<DateTime<Utc>>,
     /// Hourly funding rate, absent when the venue omits it for the coin.
     pub funding: Option<HyperliquidFundingRate>,
 }
@@ -169,6 +172,22 @@ impl HyperliquidPublicExchange {
         &self,
         coin: &str,
     ) -> Result<HyperliquidPublicObservation, ExchangeError> {
+        self.fetch_observation_at(coin, Utc::now()).await
+    }
+
+    /// Fetches one asset context using a caller-supplied local receive time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::RemoteFailure`] for transport or non-success
+    /// HTTP responses, [`ExchangeError::ResourceLimit`] for oversized bodies,
+    /// and [`ExchangeError::InvalidResponse`] for malformed, ambiguous, or
+    /// out-of-bound response data.
+    pub async fn fetch_observation_at(
+        &self,
+        coin: &str,
+        received_at: DateTime<Utc>,
+    ) -> Result<HyperliquidPublicObservation, ExchangeError> {
         let body = serde_json::to_vec(&InfoRequestWire {
             request_type: "metaAndAssetCtxs",
         })
@@ -186,7 +205,7 @@ impl HyperliquidPublicExchange {
         if !status.is_success() {
             return Err(Self::map_remote_failure(status, &payload));
         }
-        Self::parse_meta_and_asset_ctxs(&payload, coin, Utc::now())
+        Self::parse_meta_and_asset_ctxs(&payload, coin, received_at)
     }
 
     /// Parses one documented `metaAndAssetCtxs` payload for one exact coin.
@@ -293,7 +312,11 @@ impl HyperliquidPublicExchange {
                 HyperliquidFundingRate::new(rate)
             })
             .transpose()?;
-        Ok(HyperliquidPublicObservation { snapshot, funding })
+        Ok(HyperliquidPublicObservation {
+            snapshot,
+            event_time: None,
+            funding,
+        })
     }
 
     async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, ExchangeError> {

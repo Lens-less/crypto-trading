@@ -69,6 +69,7 @@ fn documented_asset_context_fixture_maps_to_an_exact_perpetual_observation() {
         observation.funding.map(HyperliquidFundingRate::as_decimal),
         Some(decimal("0.0000125"))
     );
+    assert_eq!(observation.event_time, None);
 
     let negative =
         HyperliquidPublicExchange::parse_meta_and_asset_ctxs(FIXTURE, "ETH", received_at).unwrap();

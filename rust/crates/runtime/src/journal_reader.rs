@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -35,6 +36,7 @@ const LEGACY_AGGREGATE_KIND: &str = "legacy_record";
 const CURSOR_ANCHOR_CHECKPOINT_INTERVAL_BYTES: usize = 256 * 1_024;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+const SLOW_JOURNAL_SNAPSHOT: Duration = Duration::from_millis(100);
 
 /// Immutable, bounded bytes captured from one append-only journal generation.
 #[derive(Clone, Debug)]
@@ -158,7 +160,31 @@ impl FileJournalSnapshotSource {
 
 impl JournalSnapshotSource for FileJournalSnapshotSource {
     fn snapshot(&self) -> Result<JournalSnapshot, JournalReadError> {
-        JournalSnapshot::new(self.journal_id, read_chain_bytes(&self.path)?)
+        let started = Instant::now();
+        let result = read_chain_bytes(&self.path)
+            .and_then(|bytes| JournalSnapshot::new(self.journal_id, bytes));
+        let elapsed = started.elapsed();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        match &result {
+            Ok(snapshot) if elapsed >= SLOW_JOURNAL_SNAPSHOT => tracing::warn!(
+                journal_id = %self.journal_id,
+                snapshot_bytes = snapshot.len(),
+                elapsed_ms,
+                "journal snapshot capture exceeded the latency budget"
+            ),
+            Ok(snapshot) => tracing::debug!(
+                journal_id = %self.journal_id,
+                snapshot_bytes = snapshot.len(),
+                elapsed_ms,
+                "journal snapshot captured"
+            ),
+            Err(_) => tracing::warn!(
+                journal_id = %self.journal_id,
+                elapsed_ms,
+                "journal snapshot capture failed closed"
+            ),
+        }
+        result
     }
 }
 

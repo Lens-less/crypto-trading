@@ -14,8 +14,9 @@ use tokio::{
 };
 
 use crate::{
-    ExchangeError, ExchangeHandle, ExchangeOperationKey, ExchangeStatus, MarketSubscription,
-    ReconcileReceipt, ReconcileScope, SubscriptionReceipt, TradingCommand, TradingReceipt,
+    ExchangeError, ExchangeHandle, ExchangeOperation, ExchangeOperationKey, ExchangeStatus,
+    MarketSubscription, ReconcileReceipt, ReconcileScope, SubscriptionReceipt, TradingCommand,
+    TradingReceipt,
 };
 
 /// Cloneable actor handle that caps normal work and reserves one bounded lane
@@ -485,6 +486,7 @@ async fn dispatch_execute(
         ))));
         return;
     }
+    let adapter_started = Instant::now();
     let result = match timeout_at(
         deadlines.operation_deadline,
         inner.execute_before(command, deadlines.dispatch_before),
@@ -499,6 +501,8 @@ async fn dispatch_execute(
             reason: "adapter operation timed out after local admission".to_owned(),
         }),
     };
+    let adapter_elapsed = adapter_started.elapsed();
+    log_adapter_dispatch(operation, &result, adapter_elapsed);
     let result_is_ambiguous = matches!(result, Err(ExchangeError::AmbiguousOutcome { .. }));
     if result_is_ambiguous {
         admission_state
@@ -511,6 +515,34 @@ async fn dispatch_execute(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_ambiguity(operation_key, required_scope);
+    }
+}
+
+fn log_adapter_dispatch(
+    operation: ExchangeOperation,
+    result: &Result<TradingReceipt, ExchangeError>,
+    elapsed: Duration,
+) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(ExchangeError::AmbiguousOutcome { .. }) => "ambiguous",
+        Err(_) => "error",
+    };
+    if result.is_err() || elapsed >= Duration::from_millis(100) {
+        tracing::warn!(
+            operation = %operation,
+            outcome,
+            elapsed_ms,
+            "exchange adapter dispatch completed outside the normal path"
+        );
+    } else {
+        tracing::debug!(
+            operation = %operation,
+            outcome,
+            elapsed_ms,
+            "exchange adapter dispatch completed"
+        );
     }
 }
 

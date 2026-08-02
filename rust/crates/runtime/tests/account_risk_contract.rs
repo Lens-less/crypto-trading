@@ -4,11 +4,14 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symbol};
+use crypto_trading_domain::{
+    MarketType, Money, Order, OrderIntent, OrderStatus, Price, Quantity, Side, Symbol,
+};
+use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
-    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskDirective,
-    JsonlHistory, PaperAccountAuthority, PaperAccountConfig, PaperCostModel, PaperReservationLeg,
-    PaperReservationRequest,
+    AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
+    AccountRiskDirective, JsonlHistory, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
+    PaperReservationLeg, PaperReservationRequest,
 };
 use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
 use rust_decimal::Decimal;
@@ -45,6 +48,15 @@ fn authority(
 
 fn candidate(task_id: &str, symbol: &str, notional: &str) -> AccountRiskCandidate {
     AccountRiskCandidate::new(task_id, symbol, money(notional)).unwrap()
+}
+
+fn admitted_ticket(admission: AccountRiskAdmission) -> AccountRiskAdmissionTicket {
+    match admission {
+        AccountRiskAdmission::Admitted { ticket, .. } => ticket,
+        AccountRiskAdmission::Rejected(rejection) => {
+            panic!("expected admitted ticket, got rejection: {rejection:?}")
+        }
+    }
 }
 
 async fn reserve_paper_exposure(journal_id: Uuid, path: &std::path::Path, account_id: &str) {
@@ -299,6 +311,174 @@ async fn admitted_but_unreserved_notional_counts_toward_exposure_caps() {
 }
 
 #[tokio::test]
+async fn cancelling_pending_admission_frees_capacity_and_clears_open_clock() {
+    let path = temp_path("admission-cancel");
+    let journal_id = Uuid::new_v4();
+    let limits = || AccountRiskLimits {
+        max_symbol_exposure: Some(money("100")),
+        max_total_exposure: Some(money("100")),
+        ..AccountRiskLimits::default()
+    };
+    let risk = authority(journal_id, &path, limits());
+
+    let ticket = admitted_ticket(
+        risk.admit(&candidate("owner-a", "BTC-USDT", "100"), at(9, 0))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        risk.admit(&candidate("owner-b", "BTC-USDT", "1"), at(9, 1))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+    ));
+
+    assert!(
+        risk.cancel_admission("owner-a", &ticket, at(9, 2))
+            .await
+            .unwrap()
+    );
+    let state = risk.state().await.unwrap();
+    assert!(state.open_positions.is_empty());
+
+    assert!(matches!(
+        risk.admit(&candidate("owner-b", "BTC-USDT", "100"), at(9, 3))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn wrong_ticket_cannot_cancel_another_pending_admission() {
+    let path = temp_path("admission-wrong-ticket");
+    let journal_id = Uuid::new_v4();
+    let limits = || AccountRiskLimits {
+        max_symbol_exposure: Some(money("80")),
+        max_total_exposure: Some(money("80")),
+        ..AccountRiskLimits::default()
+    };
+    let risk = authority(journal_id, &path, limits());
+
+    let first_owner_ticket = admitted_ticket(
+        risk.admit(&candidate("owner-a", "BTC-USDT", "40"), at(9, 0))
+            .await
+            .unwrap(),
+    );
+    let second_owner_ticket = admitted_ticket(
+        risk.admit(&candidate("owner-b", "BTC-USDT", "40"), at(9, 1))
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        !risk
+            .cancel_admission("owner-a", &second_owner_ticket, at(9, 2))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        risk.admit(&candidate("owner-c", "BTC-USDT", "1"), at(9, 3))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
+    ));
+
+    assert!(
+        risk.cancel_admission("owner-a", &first_owner_ticket, at(9, 4))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        risk.admit(&candidate("owner-c", "BTC-USDT", "1"), at(9, 5))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn cancelling_an_increase_keeps_the_existing_position_clock() {
+    let path = temp_path("admission-increase-cancel");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(
+        journal_id,
+        &path,
+        AccountRiskLimits {
+            max_position_duration: Some(Duration::seconds(60)),
+            ..AccountRiskLimits::default()
+        },
+    );
+
+    assert!(matches!(
+        risk.admit(&candidate("owner", "BTC-USDT", "10"), at(9, 0))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    reserve_owner_leg(journal_id, &path, "paper-main", "owner", "10").await;
+    let increase_ticket = admitted_ticket(
+        risk.admit(&candidate("owner", "BTC-USDT", "5"), at(9, 1))
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        risk.cancel_admission("owner", &increase_ticket, at(9, 2))
+            .await
+            .unwrap()
+    );
+    let state = risk.state().await.unwrap();
+    assert_eq!(state.open_positions.len(), 1);
+    assert_eq!(state.open_positions[0].task_id, "owner");
+    assert_eq!(state.open_positions[0].opened_at, at(9, 0));
+    assert_eq!(
+        risk.directives(at(9, 2)).await.unwrap(),
+        vec![AccountRiskDirective::ClosePosition {
+            task_id: "owner".to_owned(),
+            symbol: "BTC-USDT".to_owned(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn cancelling_same_timestamp_increase_does_not_clear_the_opening_clock() {
+    let path = temp_path("admission-same-timestamp-cancel");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(
+        journal_id,
+        &path,
+        AccountRiskLimits {
+            max_position_duration: Some(Duration::seconds(60)),
+            ..AccountRiskLimits::default()
+        },
+    );
+
+    let opened_at = at(9, 0);
+    assert!(matches!(
+        risk.admit(&candidate("owner", "BTC-USDT", "10"), opened_at)
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    reserve_owner_leg(journal_id, &path, "paper-main", "owner", "10").await;
+    let increase_ticket = admitted_ticket(
+        risk.admit(&candidate("owner", "BTC-USDT", "5"), opened_at)
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        risk.cancel_admission("owner", &increase_ticket, at(9, 1))
+            .await
+            .unwrap()
+    );
+    let state = risk.state().await.unwrap();
+    assert_eq!(state.open_positions.len(), 1);
+    assert_eq!(state.open_positions[0].opened_at, opened_at);
+}
+
+#[tokio::test]
 async fn exposure_caps_compose_the_paper_reservation_projection() {
     let path = temp_path("exposure-caps");
     let journal_id = Uuid::new_v4();
@@ -401,6 +581,74 @@ async fn balance_thresholds_use_total_balance_not_available() {
         AccountRiskDirective::CloseAllPositions { reason }
             if reason == "balance_below_close_threshold"
     )));
+}
+
+#[tokio::test]
+async fn exact_execution_fees_lower_the_balance_used_by_close_directives() {
+    let path = temp_path("exact-fee-balance");
+    let journal_id = Uuid::new_v4();
+    let account = PaperAccountAuthority::new(
+        journal_id,
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let intent = OrderIntent::market(
+        "paper-grid",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    let request = PaperReservationRequest::new(
+        Uuid::new_v4(),
+        "grid:btc/op/fee",
+        "grid-fee",
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 0, 0).unwrap(),
+        vec![PaperReservationLeg::from_intent(0, &intent, money("100")).unwrap()],
+    )
+    .unwrap();
+    let reservation_id = request.reservation_id();
+    account.reserve(request).await.unwrap();
+    account
+        .settle_execution(
+            reservation_id,
+            &[TradingReceipt::Submitted {
+                order: Order {
+                    id: "paper-grid:BTC-USDT:fee".to_owned(),
+                    intent,
+                    filled_quantity: Quantity::new(Decimal::ONE).unwrap(),
+                    average_fill_price: Some(Price::new(Decimal::from(100_u32)).unwrap()),
+                    status: OrderStatus::Filled,
+                    created_at: at(10, 0),
+                    updated_at: at(10, 0),
+                },
+                disposition: SubmissionDisposition::Filled,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let risk = authority(
+        journal_id,
+        &path,
+        AccountRiskLimits {
+            min_balance_close: Some(money("999.95")),
+            ..AccountRiskLimits::default()
+        },
+    );
+    assert!(
+        risk.directives(at(10, 1))
+            .await
+            .unwrap()
+            .iter()
+            .any(|directive| matches!(
+                directive,
+                AccountRiskDirective::CloseAllPositions { reason }
+                    if reason == "balance_below_close_threshold"
+            ))
+    );
 }
 
 #[tokio::test]

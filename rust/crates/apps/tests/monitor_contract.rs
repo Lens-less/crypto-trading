@@ -9,8 +9,8 @@ use crypto_trading_cli::monitor::{
 };
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_runtime::{
-    MarketContinuity, MarketDataBook, MarketDataClock, MarketDataEvent, MarketDataObservation,
-    MarketFreshnessPolicy, MarketInstrument, MarketUniverse,
+    MarketContinuity, MarketDataBook, MarketDataClock, MarketDataEvent, MarketDataFreshness,
+    MarketDataObservation, MarketFreshnessPolicy, MarketInstrument, MarketUniverse,
 };
 use rust_decimal::Decimal;
 
@@ -137,6 +137,37 @@ fn below_threshold_and_stale_market_are_distinct_read_only_outcomes() {
 }
 
 #[test]
+fn pair_skew_waits_for_the_lagging_leg_without_terminating_the_monitor() {
+    let base = timestamp(0);
+    let (mut monitor, _, _, clock) = monitor(base);
+    monitor
+        .process(observation(snapshot("left", "99", "100", base), 1, base))
+        .unwrap();
+    clock.set(base + Duration::seconds(2));
+
+    let waiting = monitor
+        .process(observation(
+            snapshot("right", "102", "103", base + Duration::seconds(2)),
+            1,
+            base + Duration::seconds(2),
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        waiting.outcome,
+        ArbitrageMonitorOutcome::Waiting {
+            ref instrument,
+            freshness: MarketDataFreshness::PairSkew {
+                skew_millis: 2_000,
+                tolerance_millis: 1_000,
+            },
+            continuity: MarketContinuity::Continuous,
+        } if instrument.exchange() == "left"
+    ));
+    assert_eq!(waiting.to_record().decision, "monitor_waiting");
+}
+
+#[test]
 fn duplicate_gap_and_recovery_are_events_not_silent_state_changes() {
     let base = timestamp(0);
     let (mut monitor, _, right, clock) = monitor(base);
@@ -162,6 +193,16 @@ fn duplicate_gap_and_recovery_are_events_not_silent_state_changes() {
             ..
         } if instrument == right
     ));
+
+    // Keep the sibling leg inside the independent pair-skew bound while this
+    // test focuses on right-source gap recovery.
+    monitor
+        .process(observation(
+            snapshot("left", "99", "100", base + Duration::seconds(1)),
+            2,
+            base + Duration::seconds(1),
+        ))
+        .unwrap();
 
     let gap = monitor
         .process(MarketDataEvent::source_gap("right", 3, base + Duration::seconds(2)).unwrap())

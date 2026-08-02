@@ -13,6 +13,8 @@ use tokio::{
     time,
 };
 
+use crate::shutdown::{ShutdownSignalError, ShutdownSignalFuture, install_shutdown_signal};
+
 pub type TaskHostStopFuture<'a, Exit, Error> =
     Pin<Box<dyn Future<Output = Result<Exit, Error>> + Send + 'a>>;
 
@@ -63,6 +65,7 @@ pub enum TaskHostServeOutcome<Status, Exit> {
 pub enum TaskHostServeError<E> {
     Io(io::Error),
     Task(E),
+    Shutdown(ShutdownSignalError),
 }
 
 impl<E> std::fmt::Display for TaskHostServeError<E>
@@ -73,6 +76,9 @@ where
         match self {
             Self::Io(source) => write!(formatter, "task host control I/O failed: {source}"),
             Self::Task(source) => write!(formatter, "task host operation failed: {source}"),
+            Self::Shutdown(source) => {
+                write!(formatter, "task host shutdown handling failed: {source}")
+            }
         }
     }
 }
@@ -85,6 +91,7 @@ where
         match self {
             Self::Io(source) => Some(source),
             Self::Task(source) => Some(source),
+            Self::Shutdown(source) => Some(source),
         }
     }
 }
@@ -126,9 +133,35 @@ where
     FStatus: Fn(&H::Status) -> String,
     FStop: Fn(&H::Status, H::Exit) -> String,
 {
+    serve_host_with_shutdown(
+        host,
+        listener,
+        poll_interval,
+        render_status,
+        render_stop,
+        install_shutdown_signal().map_err(TaskHostServeError::Shutdown),
+    )
+    .await
+}
+
+pub(crate) async fn serve_host_with_shutdown<H, FStatus, FStop>(
+    host: &mut H,
+    listener: TcpListener,
+    poll_interval: Duration,
+    render_status: FStatus,
+    render_stop: FStop,
+    shutdown: Result<ShutdownSignalFuture, TaskHostServeError<H::Error>>,
+) -> Result<TaskHostServeOutcome<H::Status, H::Exit>, TaskHostServeError<H::Error>>
+where
+    H: TaskHost,
+    FStatus: Fn(&H::Status) -> String,
+    FStop: Fn(&H::Status, H::Exit) -> String,
+{
+    let mut shutdown = shutdown?;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            result = &mut shutdown => {
+                result.map_err(TaskHostServeError::Shutdown)?;
                 let exit = host.stop().await.map_err(TaskHostServeError::Task)?;
                 return Ok(TaskHostServeOutcome::StopRequested(exit));
             }

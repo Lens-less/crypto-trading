@@ -1,5 +1,8 @@
-//! Pure grid-protection state machines ported from the frozen Python grid
-//! subsystem (`archive/python-legacy/core/services/grid/`).
+//! Pure grid-protection state machines derived from the frozen Python grid
+//! subsystem (`archive/python-legacy/core/services/grid/`). The archive is a
+//! behavioral reference rather than a byte-for-byte compatibility contract;
+//! deliberate corrections to economically inverted legacy formulas are
+//! documented at their decision points and in the changelog.
 //!
 //! Five independent policies observe one price/position/equity snapshot and
 //! emit a single [`GridDirective`]. [`GridProtectionMachine`] arbitrates them

@@ -1,11 +1,13 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    ffi::{OsStr, OsString},
     io::{self, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use chrono::{DateTime, Utc};
@@ -16,6 +18,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex as AsyncMutex,
 };
+use tracing::{debug, warn};
 
 pub const MAX_HISTORY_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_HISTORY_BATCH_BYTES: usize = 8_388_608;
@@ -215,11 +218,9 @@ impl SealedChainError {
 
 /// Maps an active journal path onto the sealed segment for `sequence`.
 pub(crate) fn sealed_segment_path(active_path: &Path, sequence: u64) -> PathBuf {
-    let file_name = active_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("history.jsonl");
-    active_path.with_file_name(format!("{file_name}.{sequence}"))
+    let mut file_name = history_file_name(active_path);
+    file_name.push(format!(".{sequence}"));
+    active_path.with_file_name(file_name)
 }
 
 /// Enumerates the sealed chain `<path>.1 ..= <path>.N` from filesystem facts.
@@ -230,49 +231,82 @@ pub(crate) fn sealed_segment_path(active_path: &Path, sequence: u64) -> PathBuf 
 pub(crate) fn inspect_sealed_segments(
     active_path: &Path,
 ) -> Result<Vec<SealedSegment>, SealedChainError> {
-    let mut segments = Vec::new();
-    for sequence in 1..=MAX_HISTORY_SEALED_SEGMENTS {
-        let path = sealed_segment_path(active_path, sequence);
-        match std::fs::metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.is_file() {
-                    return Err(SealedChainError::NotAFile { path });
-                }
-                if metadata.len() == 0 || metadata.len() > MAX_HISTORY_FILE_BYTES {
-                    return Err(SealedChainError::Bytes {
-                        path,
-                        bytes: metadata.len(),
-                    });
-                }
-                segments.push(SealedSegment {
+    let parent = active_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut segments = BTreeMap::new();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SealedChainError::Inspect {
+                path: parent.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|source| SealedChainError::Inspect {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let Some(sequence) = sealed_segment_sequence(active_path, &entry.file_name(), &path)?
+        else {
+            continue;
+        };
+        if !(1..=MAX_HISTORY_SEALED_SEGMENTS).contains(&sequence) {
+            return Err(SealedChainError::TooManySegments {
+                segments: MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1),
+            });
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|source| SealedChainError::Inspect {
+                path: path.clone(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(SealedChainError::NotAFile { path });
+        }
+        if metadata.len() == 0 || metadata.len() > MAX_HISTORY_FILE_BYTES {
+            return Err(SealedChainError::Bytes {
+                path,
+                bytes: metadata.len(),
+            });
+        }
+        if segments
+            .insert(
+                sequence,
+                SealedSegment {
                     path,
                     bytes: metadata.len(),
-                });
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                for later in
-                    sequence.saturating_add(1)..=MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1)
-                {
-                    let found = sealed_segment_path(active_path, later);
-                    if found.exists() {
-                        return Err(SealedChainError::Gap {
-                            missing: path,
-                            found,
-                        });
-                    }
-                }
-                return Ok(segments);
-            }
-            Err(source) => return Err(SealedChainError::Inspect { path, source }),
+                },
+            )
+            .is_some()
+        {
+            return Err(duplicate_sealed_sequence(&candidate_path_for_sequence(
+                active_path,
+                sequence,
+            )));
         }
     }
-    let overflow = sealed_segment_path(active_path, MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1));
-    if overflow.exists() {
-        return Err(SealedChainError::TooManySegments {
-            segments: MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1),
-        });
+
+    let mut contiguous = Vec::with_capacity(segments.len());
+    let mut expected = 1u64;
+    for (sequence, segment) in segments {
+        if sequence != expected {
+            return Err(SealedChainError::Gap {
+                missing: sealed_segment_path(active_path, expected),
+                found: segment.path,
+            });
+        }
+        contiguous.push(segment);
+        expected = expected.saturating_add(1);
     }
-    Ok(segments)
+    Ok(contiguous)
 }
 
 const fn ensure_chain_budget(
@@ -360,6 +394,12 @@ pub struct JsonlHistory {
     startup_failure: Option<CrossProcessLeaseFailure>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct AppendBatchStats {
+    batch_bytes: u64,
+    rotated: bool,
+}
+
 impl Drop for JsonlHistory {
     fn drop(&mut self) {
         if Arc::strong_count(&self.path_lock) == 1 {
@@ -426,6 +466,52 @@ impl JsonlHistory {
             return Ok(());
         }
 
+        let started_at = Instant::now();
+        let mut stats = AppendBatchStats::default();
+        let result = self.append_batch_inner(records, &mut stats).await;
+        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        match &result {
+            Ok(()) if stats.rotated => warn!(
+                batch_records = records.len(),
+                batch_bytes = stats.batch_bytes,
+                elapsed_ms,
+                category = "rotation",
+                "history append batch completed"
+            ),
+            Ok(()) => debug!(
+                batch_records = records.len(),
+                batch_bytes = stats.batch_bytes,
+                elapsed_ms,
+                category = "success",
+                "history append batch completed"
+            ),
+            Err(HistoryError::PartialTail { .. }) => warn!(
+                batch_records = records.len(),
+                batch_bytes = stats.batch_bytes,
+                elapsed_ms,
+                category = "partial_tail",
+                "history append batch failed"
+            ),
+            Err(_) => warn!(
+                batch_records = records.len(),
+                batch_bytes = stats.batch_bytes,
+                elapsed_ms,
+                category = "failure",
+                "history append batch failed"
+            ),
+        }
+
+        result
+    }
+
+    async fn append_batch_inner(
+        &self,
+        records: &[DecisionRecord],
+        stats: &mut AppendBatchStats,
+    ) -> Result<(), HistoryError> {
+        debug_assert!(!records.is_empty());
+
         let mut batch = Vec::new();
         for (index, record) in records.iter().enumerate() {
             let mut writer = ByteBudgetWriter::new(MAX_HISTORY_RECORD_BYTES);
@@ -486,6 +572,7 @@ impl JsonlHistory {
             batch.extend_from_slice(&encoded);
         }
 
+        stats.batch_bytes = u64::try_from(batch.len()).unwrap_or(u64::MAX);
         let _guard = self.path_lock.lock().await;
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
@@ -496,8 +583,9 @@ impl JsonlHistory {
         }
         let _lease = self.active_cross_process_lease()?;
 
-        let batch_bytes = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-        let mut file = self.open_active_within_chain_budget(batch_bytes).await?;
+        let mut file = self
+            .open_active_within_chain_budget(stats.batch_bytes, stats)
+            .await?;
         file.write_all(&batch).await.map_err(HistoryError::Write)?;
         file.flush().await.map_err(HistoryError::Flush)?;
         file.sync_data().await.map_err(HistoryError::Sync)
@@ -512,9 +600,9 @@ impl JsonlHistory {
     async fn open_active_within_chain_budget(
         &self,
         batch_bytes: u64,
+        stats: &mut AppendBatchStats,
     ) -> Result<tokio::fs::File, HistoryError> {
-        let sealed =
-            inspect_sealed_segments(&self.path).map_err(SealedChainError::into_history_error)?;
+        let sealed = self.inspect_sealed_segments_for_append().await?;
         let sealed_bytes = sealed
             .iter()
             .fold(0u64, |total, segment| total.saturating_add(segment.bytes));
@@ -554,6 +642,7 @@ impl JsonlHistory {
                 path: sealed_path,
                 source,
             })?;
+        stats.rotated = true;
         let file = self.open_active().await?;
         let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
         if existing_bytes.saturating_add(batch_bytes) > MAX_HISTORY_FILE_BYTES {
@@ -564,6 +653,20 @@ impl JsonlHistory {
             });
         }
         Ok(file)
+    }
+
+    async fn inspect_sealed_segments_for_append(&self) -> Result<Vec<SealedSegment>, HistoryError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            run_append_inspection_test_hook();
+            inspect_sealed_segments(&path).map_err(SealedChainError::into_history_error)
+        })
+        .await
+        .map_err(|_| {
+            HistoryError::Metadata(io::Error::other(
+                "history sealed-segment inspection task failed",
+            ))
+        })?
     }
 
     /// Refuses to append to or seal an active file whose last byte is not a
@@ -632,16 +735,144 @@ fn stable_history_path(path: &Path) -> PathBuf {
     canonicalize_existing_prefix(&absolute_key(path))
 }
 
+fn history_file_name(path: &Path) -> OsString {
+    path.file_name()
+        .map_or_else(|| OsString::from("history.jsonl"), OsStr::to_os_string)
+}
+
+fn duplicate_sealed_sequence(path: &Path) -> SealedChainError {
+    SealedChainError::Inspect {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "multiple sealed segment names resolve to the same sequence",
+        ),
+    }
+}
+
+fn noncanonical_sealed_segment(
+    active_path: &Path,
+    candidate_path: &Path,
+    sequence: u64,
+) -> SealedChainError {
+    SealedChainError::Gap {
+        missing: sealed_segment_path(active_path, sequence),
+        found: candidate_path.to_path_buf(),
+    }
+}
+
+fn candidate_path_for_sequence(active_path: &Path, sequence: u64) -> PathBuf {
+    sealed_segment_path(active_path, sequence)
+}
+
+#[cfg(unix)]
+fn sealed_segment_sequence(
+    active_path: &Path,
+    candidate: &OsStr,
+    candidate_path: &Path,
+) -> Result<Option<u64>, SealedChainError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let active_name = history_file_name(active_path);
+    let active_bytes = active_name.as_os_str().as_bytes();
+    let candidate_bytes = candidate.as_bytes();
+    if !candidate_bytes.starts_with(active_bytes) {
+        return Ok(None);
+    }
+    let Some(suffix) = candidate_bytes.get(active_bytes.len()..) else {
+        return Ok(None);
+    };
+    let Some(suffix) = suffix.strip_prefix(b".") else {
+        return Ok(None);
+    };
+    if suffix.is_empty() || !suffix.iter().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let Ok(sequence_text) = std::str::from_utf8(suffix) else {
+        return Ok(None);
+    };
+    let Ok(sequence) = sequence_text.parse::<u64>() else {
+        return Ok(None);
+    };
+    if sequence.to_string().as_bytes() != suffix {
+        return Err(noncanonical_sealed_segment(
+            active_path,
+            candidate_path,
+            sequence,
+        ));
+    }
+    Ok(Some(sequence))
+}
+
+#[cfg(not(unix))]
+fn sealed_segment_sequence(
+    active_path: &Path,
+    candidate: &OsStr,
+    candidate_path: &Path,
+) -> Result<Option<u64>, SealedChainError> {
+    let active_name = history_file_name(active_path);
+    let Some(active_name) = active_name.to_str() else {
+        return Err(SealedChainError::Inspect {
+            path: active_path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "active history file name is not valid UTF-8 on this platform",
+            ),
+        });
+    };
+    let Some(candidate) = candidate.to_str() else {
+        return Ok(None);
+    };
+    let Some(suffix) = candidate
+        .strip_prefix(active_name)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return Ok(None);
+    };
+    if suffix.is_empty() || !suffix.as_bytes().iter().all(u8::is_ascii_digit) {
+        return Ok(None);
+    }
+    let Ok(sequence) = suffix.parse::<u64>() else {
+        return Ok(None);
+    };
+    if sequence.to_string() != suffix {
+        return Err(noncanonical_sealed_segment(
+            active_path,
+            candidate_path,
+            sequence,
+        ));
+    }
+    Ok(Some(sequence))
+}
+
+#[cfg(test)]
+type AppendInspectionHook = Arc<dyn Fn() + Send + Sync + 'static>;
+#[cfg(test)]
+static APPEND_INSPECTION_HOOK: OnceLock<StdMutex<Option<AppendInspectionHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn run_append_inspection_test_hook() {
+    let hook = APPEND_INSPECTION_HOOK
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_append_inspection_test_hook() {}
+
 pub(crate) fn stable_history_path_for_read(path: &Path) -> PathBuf {
     stable_history_path(path)
 }
 
 fn history_lock_path(history_path: &Path) -> PathBuf {
-    let file_name = history_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("history.jsonl");
-    history_path.with_file_name(format!("{file_name}.{HISTORY_CROSS_PROCESS_LOCK_SUFFIX}"))
+    let mut file_name = history_file_name(history_path);
+    file_name.push(format!(".{HISTORY_CROSS_PROCESS_LOCK_SUFFIX}"));
+    history_path.with_file_name(file_name)
 }
 
 fn prime_cross_process_lease(
@@ -916,6 +1147,14 @@ pub enum HistoryError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
     use uuid::Uuid;
 
     const STABLE_CWD_TEST_NAME: &str =
@@ -1000,6 +1239,127 @@ mod tests {
     }
 
     #[test]
+    fn inspect_sealed_segments_accepts_empty_chain_and_ignores_unrelated_files() {
+        let root = temp_root("history-inspect-empty");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        std::fs::write(root.join("decisions.jsonl.tmp"), b"tmp").unwrap();
+        std::fs::write(root.join("decisions.jsonl.abc"), b"abc").unwrap();
+        std::fs::write(root.join("other.jsonl.1"), b"other").unwrap();
+
+        let segments = inspect_sealed_segments(&path).unwrap();
+
+        assert!(segments.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_sealed_segments_treats_a_missing_parent_directory_as_an_empty_chain() {
+        let root = temp_root("history-inspect-missing-parent");
+        let path = root.join("missing").join("decisions.jsonl");
+
+        let segments = inspect_sealed_segments(&path).unwrap();
+
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn inspect_sealed_segments_rejects_gaps() {
+        let root = temp_root("history-inspect-gap");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        std::fs::write(sealed_segment_path(&path, 2), b"segment\n").unwrap();
+
+        let error = inspect_sealed_segments(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SealedChainError::Gap { missing, found }
+                if missing == sealed_segment_path(&path, 1)
+                    && found == sealed_segment_path(&path, 2)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_sealed_segments_supports_non_utf8_history_file_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_root("history-inspect-nonutf8");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(OsString::from_vec(vec![
+            b'd', b'e', b'c', b'i', b's', b'i', b'o', b'n', b's', b'.', b'\xFF',
+        ]));
+        let sealed = sealed_segment_path(&path, 1);
+        std::fs::write(&sealed, b"segment\n").unwrap();
+
+        let segments = inspect_sealed_segments(&path).unwrap();
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].path, sealed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_sealed_segments_rejects_non_canonical_numeric_suffixes() {
+        let root = temp_root("history-inspect-noncanonical");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        std::fs::write(path.with_file_name("decisions.jsonl.01"), b"segment\n").unwrap();
+
+        let error = inspect_sealed_segments(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SealedChainError::Gap { missing, found }
+                if missing == sealed_segment_path(&path, 1)
+                    && found == path.with_file_name("decisions.jsonl.01")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_sealed_segments_rejects_duplicate_numeric_sequences() {
+        let root = temp_root("history-inspect-duplicate");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        std::fs::write(sealed_segment_path(&path, 1), b"segment\n").unwrap();
+        std::fs::write(path.with_file_name("decisions.jsonl.01"), b"segment\n").unwrap();
+
+        let error = inspect_sealed_segments(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SealedChainError::Gap { missing, found }
+                if missing == sealed_segment_path(&path, 1)
+                    && found == path.with_file_name("decisions.jsonl.01")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_sealed_segments_rejects_out_of_range_segments() {
+        let root = temp_root("history-inspect-overflow");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        std::fs::write(
+            sealed_segment_path(&path, MAX_HISTORY_SEALED_SEGMENTS + 1),
+            b"segment\n",
+        )
+        .unwrap();
+
+        let error = inspect_sealed_segments(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SealedChainError::TooManySegments { segments }
+                if segments == MAX_HISTORY_SEALED_SEGMENTS + 1
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn byte_budget_writer_stops_after_one_over_limit_byte() {
         let mut writer = ByteBudgetWriter::new(4);
 
@@ -1027,6 +1387,52 @@ mod tests {
             .unwrap();
 
         assert!(status.success(), "child test failed: {status}");
+    }
+
+    #[test]
+    fn append_inspection_runs_off_the_current_thread_runtime() {
+        let root = temp_root("history-inspect-runtime");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        let history = JsonlHistory::new(&path);
+        let record = DecisionRecord {
+            timestamp: Utc::timestamp_opt(&Utc, 1_700_000_000, 0).unwrap(),
+            strategy: "spawn-blocking".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "hold".to_owned(),
+            details: Value::Null,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (timer_tx, timer_rx) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_release = Arc::clone(&release);
+        let _hook = TestInspectHook::install(move || {
+            started_tx.send(()).unwrap();
+            while !hook_release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+
+        let join = std::thread::spawn(move || {
+            runtime().block_on(async move {
+                let append = tokio::spawn({
+                    let history = history.clone();
+                    let record = record.clone();
+                    async move { history.append(&record).await }
+                });
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    timer_tx.send(()).unwrap();
+                });
+                append.await.unwrap()
+            })
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        timer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.store(true, Ordering::Release);
+        join.join().unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1385,5 +1791,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.original);
         }
+    }
+
+    struct TestInspectHook;
+
+    impl TestInspectHook {
+        fn install<F>(hook: F) -> TestInspectHookGuard
+        where
+            F: Fn() + Send + Sync + 'static,
+        {
+            let mut slot = APPEND_INSPECTION_HOOK
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(slot.is_none(), "append inspection hook already installed");
+            *slot = Some(Arc::new(hook));
+            TestInspectHookGuard
+        }
+    }
+
+    struct TestInspectHookGuard;
+
+    impl Drop for TestInspectHookGuard {
+        fn drop(&mut self) {
+            let mut slot = APPEND_INSPECTION_HOOK
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = None;
+        }
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 }
