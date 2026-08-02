@@ -506,6 +506,40 @@ async fn definite_invalid_utf8_at_the_active_tail_still_fails_closed() {
 }
 
 #[tokio::test]
+async fn invalid_utf8_inside_a_complete_active_record_still_fails_closed() {
+    let root = temp_root("history-rotation-invalid-utf8-middle");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted_record = record("placeholder", 0);
+    corrupted_record.decision = "执行中断🚀".to_owned();
+    let mut corrupted = encoded(&corrupted_record);
+    assert_eq!(corrupted.pop(), Some(b'\n'));
+    let emoji = "🚀".as_bytes();
+    let emoji_start = corrupted
+        .windows(emoji.len())
+        .rposition(|window| window == emoji)
+        .unwrap();
+    corrupted[emoji_start] = 0xff;
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.valid_up_to(), emoji_start);
+    assert_eq!(utf8_error.error_len(), Some(1));
+    assert!(emoji_start + 1 < corrupted.len());
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn complete_active_record_without_a_terminator_is_preserved_before_append() {
     let root = temp_root("history-rotation-complete-unterminated");
     std::fs::create_dir_all(&root).unwrap();
