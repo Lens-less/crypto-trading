@@ -316,6 +316,46 @@ fn idle_arbitrage_replay() -> String {
         + "\n"
 }
 
+fn globally_ordered_arbitrage_replay() -> String {
+    [
+        json!({
+            "exchange": "paper-left",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "99",
+            "ask": "100",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:00Z",
+        }),
+        json!({
+            "exchange": "paper-right",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "100.05",
+            "ask": "100.10",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:01Z",
+        }),
+        json!({
+            "exchange": "paper-left",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "99.5",
+            "ask": "100.5",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:02Z",
+        }),
+    ]
+    .into_iter()
+    .map(|line| serde_json::to_string(&line).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n"
+}
+
 fn catalog_from_replays(
     label: &str,
     grid_replay_body: &str,
@@ -746,6 +786,66 @@ async fn matching_grid_profile_executes_through_paper_exchange_and_account_autho
     .await;
     assert_eq!(stopped["status"], "applied");
     wait_for_task(&fixture.router, "paper-grid-owner", "stopped").await;
+
+    drop(fixture.listener);
+}
+
+#[tokio::test]
+async fn arbitrage_profile_consumes_both_sources_in_global_replay_order() {
+    let grid = idle_grid_replay();
+    let arbitrage = globally_ordered_arbitrage_replay();
+    let fixture = application(
+        "ordered-arbitrage-replay",
+        catalog_from_replays("ordered-arbitrage-replay", &grid, Some(&arbitrage)),
+        None,
+    )
+    .await;
+    let started = submit(
+        &fixture.router,
+        &arbitrage_start(
+            Uuid::new_v4(),
+            "ordered-arbitrage-start",
+            "paper-arbitrage-owner",
+            "arb.v1",
+        ),
+    )
+    .await;
+    assert_eq!(started["status"], "applied");
+
+    let journal = wait_for_journal(
+        &fixture.history_path,
+        "\"processed_event_count\":3,\"schema_version\":1",
+    )
+    .await;
+    let decisions = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["strategy"] == "arbitrage_monitor")
+        .map(|record| record["decision"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decisions,
+        [
+            "monitor_waiting",
+            "monitor_no_opportunity",
+            "monitor_no_opportunity",
+        ],
+        "R1 must complete the first pair before L2 is consumed"
+    );
+    assert!(!journal.contains("\"decision\":\"execution_completed\""));
+
+    let stopped = submit(
+        &fixture.router,
+        &mutation(
+            Uuid::new_v4(),
+            "ordered-arbitrage-stop",
+            "paper-arbitrage-owner",
+            SubmitCommand::StopTask,
+        ),
+    )
+    .await;
+    assert_eq!(stopped["status"], "applied");
+    wait_for_task(&fixture.router, "paper-arbitrage-owner", "stopped").await;
 
     drop(fixture.listener);
 }

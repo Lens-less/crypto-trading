@@ -897,6 +897,54 @@ async fn exact_settlement_matches_hand_worked_fee_and_pnl_vector() {
 }
 
 #[tokio::test]
+async fn exact_execution_inventory_cannot_be_released_by_exchange_reconciliation() {
+    let path = temp_path("exact-reconcile-release-guard");
+    let authority = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let request = single_leg_request(
+        "grid:btc/open-exact",
+        "grid-open-exact",
+        "paper-grid",
+        Side::Buy,
+        "100",
+        "100",
+    );
+    let reservation_id = request.reservation_id();
+    let batch_id = request.batch_id();
+    let receipt = filled_receipt_for_leg(&request.legs()[0], "exact-open", "100");
+    authority.reserve(request).await.unwrap();
+    authority
+        .settle_execution(reservation_id, &[receipt])
+        .await
+        .unwrap();
+    let before = authority.snapshot().await.unwrap();
+    let journal_before = std::fs::read(&path).unwrap();
+
+    let error = authority
+        .reconcile_release(reconciliation_match_proof(
+            "paper-main",
+            reservation_id,
+            batch_id,
+            "paper-grid/account-2026-08-03T00:00:00Z",
+            1,
+            "0123456789abcdef",
+            money("999.9"),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, PaperAccountError::InvalidTransition));
+    assert_eq!(authority.snapshot().await.unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), journal_before);
+    assert_eq!(before.committed_exposure, money("100"));
+    assert_eq!(before.open_lots.len(), 1);
+}
+
+#[tokio::test]
 async fn losing_round_trip_reduces_settled_equity() {
     let path = temp_path("loss-roundtrip");
     let authority = PaperAccountAuthority::new(

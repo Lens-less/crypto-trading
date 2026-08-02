@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use crypto_trading_cli::{
-    ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperTask,
-    ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
+    ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperMarketEventFuture,
+    ArbitragePaperTask, ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
     ArbitragePaperTaskFailure, ArbitragePaperTaskPhase,
     monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock},
 };
@@ -231,6 +231,10 @@ impl GatedFillExecutor {
 }
 
 impl ArbitragePaperExecutor for GatedFillExecutor {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let permits = Arc::clone(&self.permits);
@@ -263,6 +267,10 @@ struct PendingExecutor {
 }
 
 impl ArbitragePaperExecutor for PendingExecutor {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, _batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(pending())
@@ -270,6 +278,10 @@ impl ArbitragePaperExecutor for PendingExecutor {
 }
 
 impl ArbitragePaperExecutor for FillExecutor {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {

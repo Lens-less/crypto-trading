@@ -81,9 +81,21 @@ const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type ArbitragePaperExecutionFuture =
     Pin<Box<dyn Future<Output = Result<Vec<TradingReceipt>, RuntimeError>> + Send + 'static>>;
+/// Boxed hook that applies one owner-consumed market event to an execution
+/// adapter before the owner evaluates the exact pair against it.
+pub type ArbitragePaperMarketEventFuture =
+    Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'static>>;
 
 /// Minimal object-safe two-leg execution seam owned by the task process.
 pub trait ArbitragePaperExecutor: Send + Sync + 'static {
+    /// Applies one complete market event at consumer time.
+    ///
+    /// Live executors implement an explicit no-op. Replay executors use this
+    /// hook to prevent a fast source from advancing their paper books beyond
+    /// the event the owner is currently processing. Keeping the method
+    /// required makes every executor choose its clock semantics deliberately.
+    fn observe_market_event(&self, event: MarketDataEvent) -> ArbitragePaperMarketEventFuture;
+
     fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture;
 }
 
@@ -802,6 +814,38 @@ async fn run_owner(
             Selected::Left(Ok(Some(event))) | Selected::Right(Ok(Some(event))) => {
                 if *stop.borrow() || *cancel.borrow() {
                     continue;
+                }
+                if let Err(error) = executor.observe_market_event(event.clone()).await {
+                    if let Err(abort_error) = abort_inflight(
+                        &mut in_flight,
+                        saga.account(),
+                        config.account_risk.as_ref(),
+                        &config.task_id,
+                    )
+                    .await
+                    {
+                        let failure = abort_error.failure_bucket();
+                        return fail_owner(
+                            &mut left,
+                            &mut right,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            failure,
+                            abort_error,
+                        )
+                        .await;
+                    }
+                    return fail_owner(
+                        &mut left,
+                        &mut right,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        ArbitragePaperTaskFailure::ExecutionFailed,
+                        ArbitragePaperTaskError::Runtime(error),
+                    )
+                    .await;
                 }
                 let monitor_event = match monitor.process(event) {
                     Ok(event) => event,
@@ -2593,146 +2637,5 @@ impl Error for ArbitragePaperTaskError {
             | Self::TaskCancelled
             | Self::PreviouslyFailed(_) => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use chrono::{TimeZone, Utc};
-    use crypto_trading_domain::Money;
-    use crypto_trading_runtime::{
-        AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, JsonlHistory,
-    };
-    use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
-    use rust_decimal::Decimal;
-    use uuid::Uuid;
-
-    use super::discard_planned_admission;
-    use crate::paper_admission::cancel_unreserved_admission;
-
-    fn money(value: &str) -> Money {
-        Money::new(Decimal::from_str(value).unwrap())
-    }
-
-    fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 7, 26, hour, minute, 0).unwrap()
-    }
-
-    fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "crypto-trading-arbitrage-admission-{label}-{}.jsonl",
-            Uuid::new_v4()
-        ))
-    }
-
-    fn risk(path: &std::path::Path) -> AccountRiskAuthority {
-        AccountRiskAuthority::new(
-            Uuid::new_v4(),
-            JsonlHistory::new(path),
-            "paper",
-            AccountRiskPolicy::new(AccountRiskLimits {
-                max_symbol_exposure: Some(money("100")),
-                max_total_exposure: Some(money("100")),
-                ..AccountRiskLimits::default()
-            })
-            .unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn candidate(task_id: &str, notional: &str) -> AccountRiskCandidate {
-        AccountRiskCandidate::new(task_id, "BTC-USDT", money(notional)).unwrap()
-    }
-
-    #[tokio::test]
-    async fn pre_reservation_failure_releases_the_pending_admission() {
-        let path = temp_path("pre-reservation-failure");
-        let risk = risk(&path);
-        let ticket = match risk
-            .admit(&candidate("owner-a", "100"), at(9, 0))
-            .await
-            .unwrap()
-        {
-            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
-            AccountRiskAdmission::Rejected(rejection) => {
-                panic!("expected admission, got {rejection:?}")
-            }
-        };
-        assert!(matches!(
-            risk.admit(&candidate("owner-b", "1"), at(9, 1))
-                .await
-                .unwrap(),
-            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
-        ));
-
-        assert!(
-            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2))
-                .await
-                .is_ok()
-        );
-        assert!(matches!(
-            risk.admit(&candidate("owner-b", "100"), at(9, 3))
-                .await
-                .unwrap(),
-            AccountRiskAdmission::Admitted { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn discarded_planned_operation_releases_pending_admission() {
-        let path = temp_path("discarded-planned-operation");
-        let risk = risk(&path);
-        let ticket = match risk
-            .admit(&candidate("owner-a", "100"), at(9, 0))
-            .await
-            .unwrap()
-        {
-            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
-            AccountRiskAdmission::Rejected(rejection) => {
-                panic!("expected admission, got {rejection:?}")
-            }
-        };
-        assert!(matches!(
-            risk.admit(&candidate("owner-b", "1"), at(9, 1))
-                .await
-                .unwrap(),
-            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
-        ));
-
-        discard_planned_admission(Some(&risk), "owner-a", Some(&ticket), at(9, 2))
-            .await
-            .unwrap();
-        assert!(matches!(
-            risk.admit(&candidate("owner-b", "100"), at(9, 3))
-                .await
-                .unwrap(),
-            AccountRiskAdmission::Admitted { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn missing_pending_admission_surfaces_recovery_required() {
-        let path = temp_path("missing-pending-admission");
-        let risk = risk(&path);
-        let ticket = match risk
-            .admit(&candidate("owner-a", "100"), at(9, 0))
-            .await
-            .unwrap()
-        {
-            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
-            AccountRiskAdmission::Rejected(rejection) => {
-                panic!("expected admission, got {rejection:?}")
-            }
-        };
-
-        cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 1))
-            .await
-            .unwrap();
-        assert!(matches!(
-            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2)).await,
-            Ok(false)
-        ));
     }
 }

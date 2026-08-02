@@ -69,12 +69,12 @@ pub type GridPaperObservationFuture =
 pub trait GridPaperExecutor: Send + Sync + 'static {
     /// Applies one observation at consumer time.
     ///
-    /// Live executors can keep the default no-op. Replay executors use this
+    /// Live executors implement an explicit no-op. Replay executors use this
     /// hook to prevent a fast source from advancing their paper book beyond
-    /// the event the owner is currently processing.
-    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
-        Box::pin(async { Ok(()) })
-    }
+    /// the event the owner is currently processing. Keeping the method
+    /// required makes a newly added replay executor choose its clock semantics
+    /// deliberately instead of silently inheriting live behavior.
+    fn observe_market(&self, observation: MarketDataObservation) -> GridPaperObservationFuture;
 
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture;
 }
@@ -2139,89 +2139,5 @@ impl Error for GridPaperTaskError {
             | Self::TaskCancelled
             | Self::PreviouslyFailed(_) => None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use chrono::{TimeZone, Utc};
-    use crypto_trading_domain::Money;
-    use crypto_trading_runtime::{
-        AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, JsonlHistory,
-    };
-    use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
-    use rust_decimal::Decimal;
-    use uuid::Uuid;
-
-    use crate::paper_admission::cancel_unreserved_admission;
-
-    fn money(value: &str) -> Money {
-        Money::new(Decimal::from_str(value).unwrap())
-    }
-
-    fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 7, 26, hour, minute, 0).unwrap()
-    }
-
-    fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "crypto-trading-grid-admission-{label}-{}.jsonl",
-            Uuid::new_v4()
-        ))
-    }
-
-    fn risk(path: &std::path::Path) -> AccountRiskAuthority {
-        AccountRiskAuthority::new(
-            Uuid::new_v4(),
-            JsonlHistory::new(path),
-            "paper",
-            AccountRiskPolicy::new(AccountRiskLimits {
-                max_symbol_exposure: Some(money("100")),
-                max_total_exposure: Some(money("100")),
-                ..AccountRiskLimits::default()
-            })
-            .unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn candidate(task_id: &str, notional: &str) -> AccountRiskCandidate {
-        AccountRiskCandidate::new(task_id, "BTC-USDT", money(notional)).unwrap()
-    }
-
-    #[tokio::test]
-    async fn pre_reservation_failure_releases_the_pending_admission() {
-        let path = temp_path("pre-reservation-failure");
-        let risk = risk(&path);
-        let ticket = match risk
-            .admit(&candidate("owner-a", "100"), at(9, 0))
-            .await
-            .unwrap()
-        {
-            AccountRiskAdmission::Admitted { ticket, .. } => ticket,
-            AccountRiskAdmission::Rejected(rejection) => {
-                panic!("expected admission, got {rejection:?}")
-            }
-        };
-        assert!(matches!(
-            risk.admit(&candidate("owner-b", "1"), at(9, 1))
-                .await
-                .unwrap(),
-            AccountRiskAdmission::Rejected(AccountRiskRejection::SymbolExposureExceeded { .. })
-        ));
-
-        assert!(
-            cancel_unreserved_admission(&risk, "owner-a", &ticket, at(9, 2))
-                .await
-                .is_ok()
-        );
-        assert!(matches!(
-            risk.admit(&candidate("owner-b", "100"), at(9, 3))
-                .await
-                .unwrap(),
-            AccountRiskAdmission::Admitted { .. }
-        ));
     }
 }

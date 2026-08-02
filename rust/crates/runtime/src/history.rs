@@ -465,12 +465,14 @@ impl JsonlHistory {
         &self.path
     }
 
-    /// Quarantines and truncates a crash-left partial active tail when a valid
-    /// complete-record prefix anchors the repair.
+    /// Repairs a crash-left active tail without discarding complete facts.
     ///
     /// Authority refreshes call this before replay so a normal process restart
-    /// can recover without first attempting a write. An unanchored fragment or
-    /// malformed complete prefix remains fail-closed.
+    /// can recover without first attempting a write. A JSON prefix cut off by
+    /// EOF is quarantined and truncated, including when it is the first record
+    /// in a fresh active file. A complete record missing only its terminator is
+    /// preserved by writing and syncing that terminator. Complete malformed
+    /// records remain fail-closed.
     pub(crate) async fn repair_recoverable_tail(&self) -> Result<(), HistoryError> {
         let _guard = self.path_lock.lock().await;
         let _lease = self.active_cross_process_lease()?;
@@ -553,12 +555,12 @@ impl JsonlHistory {
     ///
     /// This prevents another task in the process from interleaving bytes inside
     /// the group. It is deliberately not described as a transaction: an OS
-    /// write failure can still leave a partial tail. Later appends
-    /// automatically truncate only the crash-left suffix after the last
-    /// complete, valid record. A tail without a complete-record anchor, or any
-    /// complete malformed record in that retained prefix, still fails closed so
-    /// the writer never launders deeper corruption into the middle of the
-    /// journal.
+    /// write failure can still leave a partial tail. Later appends quarantine
+    /// and truncate only the JSON prefix cut off by EOF after the last complete,
+    /// valid record. This also applies when rotation left no complete record in
+    /// the fresh active file. A complete record missing only its terminator is
+    /// preserved, while any complete malformed record still fails closed so the
+    /// writer never launders deeper corruption into the journal.
     ///
     /// If the batch would push the active file past [`MAX_HISTORY_FILE_BYTES`],
     /// the active file is sealed as the next read-only chain segment before the
@@ -852,11 +854,11 @@ impl JsonlHistory {
     /// while it stays at the end of the chain: appending would glue the
     /// fragment and the next record into one malformed line in the middle of
     /// the journal, and sealing would freeze it into a segment every future
-    /// chain read rejects. When there is an anchored complete prefix, the
-    /// caller truncates only the trailing fragment and syncs that repair
-    /// before continuing. Without such an anchor, or when the anchored prefix
-    /// already contains a complete malformed record, the writer still fails
-    /// closed.
+    /// chain read rejects. A suffix cut off by EOF is quarantined before the
+    /// caller truncates and syncs it; without a newline anchor the entire
+    /// active file is that suffix. A complete record missing only its newline
+    /// is instead terminated and synced in place. Any complete malformed
+    /// record still fails closed.
     async fn ensure_active_tail_is_complete(
         &self,
         file: &mut tokio::fs::File,
@@ -877,26 +879,94 @@ impl JsonlHistory {
         }
 
         let bytes = self.read_active_bytes(file, existing_bytes).await?;
-        let Some(complete_prefix_len) = bytes
+        let complete_prefix_len = bytes
             .iter()
             .rposition(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-        else {
-            return Err(HistoryError::PartialTail {
-                path: self.path.clone(),
-            });
-        };
-        self.validate_complete_prefix(&bytes[..complete_prefix_len])?;
-        let quarantined = self
-            .quarantine_partial_tail(&bytes[complete_prefix_len..])
-            .await?;
-        warn!(
-            retained_bytes = complete_prefix_len,
-            quarantine_path = %quarantined.display(),
-            "history partial tail quarantined before append"
-        );
+            .map_or(0, |index| index + 1);
+        self.recover_unterminated_active_tail(file, &bytes, complete_prefix_len, existing_bytes)
+            .await
+    }
 
-        Ok(u64::try_from(complete_prefix_len).unwrap_or(u64::MAX))
+    async fn recover_unterminated_active_tail(
+        &self,
+        file: &mut tokio::fs::File,
+        bytes: &[u8],
+        complete_prefix_len: usize,
+        existing_bytes: u64,
+    ) -> Result<u64, HistoryError> {
+        self.validate_complete_prefix(&bytes[..complete_prefix_len])?;
+        let suffix = &bytes[complete_prefix_len..];
+        let line = bytes[..complete_prefix_len]
+            .split(|byte| *byte == b'\n')
+            .count();
+        match serde_json::from_slice::<Value>(suffix) {
+            Err(source) if is_recoverable_partial_json_tail(suffix, &source) => {
+                let quarantined = self.quarantine_partial_tail(suffix).await?;
+                warn!(
+                    retained_bytes = complete_prefix_len,
+                    quarantine_path = %quarantined.display(),
+                    "history partial tail quarantined during recovery"
+                );
+                Ok(u64::try_from(complete_prefix_len).unwrap_or(u64::MAX))
+            }
+            Err(source) => Err(HistoryError::MalformedActiveRecord {
+                path: self.path.clone(),
+                line,
+                source,
+            }),
+            Ok(_) => match serde_json::from_slice::<DecisionRecord>(suffix) {
+                Ok(_) => {
+                    self.restore_active_record_terminator(file, suffix.len(), existing_bytes)
+                        .await
+                }
+                Err(source) => Err(HistoryError::MalformedActiveRecord {
+                    path: self.path.clone(),
+                    line,
+                    source,
+                }),
+            },
+        }
+    }
+
+    async fn restore_active_record_terminator(
+        &self,
+        file: &mut tokio::fs::File,
+        record_body_bytes: usize,
+        existing_bytes: u64,
+    ) -> Result<u64, HistoryError> {
+        let record_bytes =
+            record_body_bytes
+                .checked_add(1)
+                .ok_or(HistoryError::RecordTooLarge {
+                    index: 0,
+                    bytes: usize::MAX,
+                    limit: MAX_HISTORY_RECORD_BYTES,
+                })?;
+        if record_bytes > MAX_HISTORY_RECORD_BYTES {
+            return Err(HistoryError::RecordTooLarge {
+                index: 0,
+                bytes: record_bytes,
+                limit: MAX_HISTORY_RECORD_BYTES,
+            });
+        }
+        let repaired_bytes = existing_bytes.saturating_add(1);
+        if repaired_bytes > MAX_HISTORY_FILE_BYTES {
+            return Err(HistoryError::FileTooLarge {
+                existing_bytes,
+                batch_bytes: 1,
+                limit: MAX_HISTORY_FILE_BYTES,
+            });
+        }
+        file.write_all(b"\n")
+            .await
+            .map_err(HistoryError::TailRepair)?;
+        file.flush().await.map_err(HistoryError::TailRepair)?;
+        file.sync_data().await.map_err(HistoryError::Sync)?;
+        warn!(
+            retained_bytes = repaired_bytes,
+            "history complete active record terminator restored during recovery"
+        );
+        Ok(repaired_bytes)
     }
 
     async fn open_active(&self) -> Result<tokio::fs::File, HistoryError> {
@@ -1005,6 +1075,13 @@ impl JsonlHistory {
                 path: quarantine_fallback,
                 source: io::Error::other("history partial-tail quarantine task failed"),
             })?
+    }
+}
+
+fn is_recoverable_partial_json_tail(suffix: &[u8], source: &serde_json::Error) -> bool {
+    match std::str::from_utf8(suffix) {
+        Ok(_) => source.is_eof(),
+        Err(source) => source.error_len().is_none(),
     }
 }
 
@@ -1818,30 +1895,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_still_fails_closed_when_a_partial_tail_has_no_complete_record_anchor() {
-        let path = std::env::temp_dir().join(format!("history-partial-tail-{}", Uuid::new_v4()));
-        let history = JsonlHistory::new(&path);
-        // A crash mid-write leaves the last record without its terminator.
-        let fragment: &[u8] = b"{\"decision\":\"trunc";
-        std::fs::write(&path, fragment).unwrap();
-        let record = DecisionRecord {
-            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
-            strategy: "partial-tail".to_owned(),
-            symbol: "BTC".to_owned(),
-            decision: "hold".to_owned(),
-            details: Value::Null,
-        };
-
-        let error = history.append(&record).await.unwrap_err();
-
-        assert!(matches!(error, HistoryError::PartialTail { .. }));
-        // The fragment stays at the end of the chain, where readers can still
-        // detect and quarantine it.
-        assert_eq!(std::fs::read(&path).unwrap(), fragment);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
     async fn append_truncates_only_the_tail_after_the_last_complete_record() {
         let path = std::env::temp_dir().join(format!("history-tail-recover-{}", Uuid::new_v4()));
         let history = JsonlHistory::new(&path);
@@ -1876,12 +1929,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_refuses_to_seal_a_partial_tail_without_a_complete_record_anchor() {
+    async fn rotation_refuses_to_seal_an_unanchored_malformed_active_file() {
         let path = std::env::temp_dir().join(format!("history-partial-seal-{}", Uuid::new_v4()));
         let history = JsonlHistory::new(&path);
-        // An active file at the limit whose tail is a partial record: the
-        // crossing append must fail closed instead of sealing a segment that
-        // every future chain read would reject.
+        // Zero-filled bytes are not a truncated JSON prefix. The crossing
+        // append must fail closed instead of laundering the malformed active
+        // file into a sealed segment.
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_HISTORY_FILE_BYTES).unwrap();
         drop(file);
@@ -1895,7 +1948,10 @@ mod tests {
 
         let error = history.append(&record).await.unwrap_err();
 
-        assert!(matches!(error, HistoryError::PartialTail { .. }));
+        assert!(matches!(
+            error,
+            HistoryError::MalformedActiveRecord { line: 1, .. }
+        ));
         assert!(!sealed_segment_path(history.path(), 1).exists());
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),

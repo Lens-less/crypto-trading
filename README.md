@@ -9,7 +9,7 @@
 当前主线位于 [`rust/`](rust/README.md)。原 Python 项目已冻结到 [`archive/python-legacy/`](archive/python-legacy/)，只用于审计、行为对照和迁移参考。
 
 > [!WARNING]
-> **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、真实交易所账户风控真相（equity/margin/持仓）和多腿故障补偿尚未达到开放门槛；账户级风控权威目前仅覆盖 Paper 模拟账本。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 结果不包含真实手续费、资金费率、滑点、撮合队列优先级或跨进程持仓。
+> **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、真实交易所账户风控真相（equity/margin/持仓）和多腿故障补偿尚未达到开放门槛；账户级风控权威目前仅覆盖 Paper 模拟账本。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 只计配置的同步 taker 手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。
 > 唯一具备下单权限的路径是 Binance **Testnet**（模拟资金的真实外部环境），且需要精确确认短语。
 > 本项目按原样提供，不含任何担保，也不构成投资建议；使用后果由使用者自行承担。
 >
@@ -420,7 +420,7 @@ cargo run --locked -- config-check config/exchanges/paradex_config.yaml
 3. **网格是挂单语义验证**：它根据一个显式参考价规划 resting orders，不代表真实撮合、账户风险或跨进程仓位已经验证。
 4. **套利使用显式顶层盘口**：调用方必须给出双边 bid/ask 和四侧可用数量；`strategy_key` 是配置选择器，不是腿 symbol 的别名；模型不等价于完整深度、延迟和滑点仿真。
 5. **Paper 账户门禁不等于保证金引擎**：账户风控使用精确 settled equity、剩余 lot 敞口和 pending admission 做余额/单币种/全局上限判断；它仍没有未实现 PnL、维持保证金、资金费率或交易所强平规则，因此不能作为实盘资金安全证明。
-6. **Paper 不计算真实交易成本**：手续费、资金费率、网络延迟、队列优先级和市场冲击不在当前结果中。
+6. **Paper 交易成本模型仍有限**：精确账本会计入完全成交同步 taker 回执的配置手续费；resting-maker 手续费/返佣、资金费率、网络延迟、队列优先级和多档市场冲击仍不在当前结果中。
 7. **不完整执行不得直接重试**：先根据 history 中的批次、腿和对账摘要确认状态，否则可能重复提交。
 
 更完整的门禁与剩余风险见 [`docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md`](docs/internal/audits/RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md)。

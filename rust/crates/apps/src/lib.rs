@@ -29,9 +29,9 @@ pub use paper_arbitrage_saga::{
 };
 pub use paper_arbitrage_task::{
     ARBITRAGE_PAPER_TASK_STATUS_SCHEMA_VERSION, ArbitragePaperExecutionFuture,
-    ArbitragePaperExecutor, ArbitragePaperTask, ArbitragePaperTaskConfig, ArbitragePaperTaskError,
-    ArbitragePaperTaskExit, ArbitragePaperTaskFailure, ArbitragePaperTaskPhase,
-    ArbitragePaperTaskStatus,
+    ArbitragePaperExecutor, ArbitragePaperMarketEventFuture, ArbitragePaperTask,
+    ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
+    ArbitragePaperTaskFailure, ArbitragePaperTaskPhase, ArbitragePaperTaskStatus,
 };
 pub use paper_grid_task::{
     GRID_PAPER_TASK_STATUS_SCHEMA_VERSION, GridPaperExecutionFuture, GridPaperExecutor,

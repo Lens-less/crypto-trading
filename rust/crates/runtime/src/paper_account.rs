@@ -1357,8 +1357,10 @@ impl PaperAccountAuthority {
         self.reloaded_reservation(reservation_id).await
     }
 
-    /// Releases committed exposure only when caller presents durable,
+    /// Releases opaque committed exposure only when caller presents durable,
     /// replayable reconciliation proof bound to this account and batch.
+    /// Exact execution inventory is released exclusively by local fill
+    /// settlement so its exposure cannot diverge from its FIFO open lots.
     ///
     /// # Errors
     ///
@@ -1393,6 +1395,9 @@ impl PaperAccountAuthority {
             };
         }
         if reservation.phase != PaperReservationPhase::Committed {
+            return Err(PaperAccountError::InvalidTransition);
+        }
+        if reservation.ledger_kind != PaperExecutionLedgerKind::LegacyReservationOnly {
             return Err(PaperAccountError::InvalidTransition);
         }
         validate_reconciliation_evidence(
@@ -1519,33 +1524,28 @@ impl PaperAccountAuthority {
         &self,
         reservation_id: Uuid,
     ) -> Result<PaperReservationView, PaperAccountError> {
-        let updated = self
-            .load_account_snapshot_with_terminal_retention(true)
-            .await?;
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)?;
+        let updated = projection
+            .paper_snapshot(self.config.account_id(), self.config.initial_available)
+            .map_err(map_authority_state_error_to_paper)?;
         require_writable(&updated)?;
-        find_reservation(&updated, reservation_id).cloned()
+        projection
+            .historical_reservation_by_id(self.config.account_id(), reservation_id)?
+            .ok_or(PaperAccountError::UnknownReservation)
     }
 
     async fn load_account_snapshot(&self) -> Result<PaperAccountSnapshot, PaperAccountError> {
-        self.load_account_snapshot_with_terminal_retention(false)
-            .await
-    }
-
-    async fn load_account_snapshot_with_terminal_retention(
-        &self,
-        retain_terminal_reservations: bool,
-    ) -> Result<PaperAccountSnapshot, PaperAccountError> {
         let projection = self
             .state_cache
             .refresh(&self.history)
             .await
             .map_err(map_authority_state_error_to_paper)?;
         projection
-            .paper_snapshot(
-                self.config.account_id(),
-                self.config.initial_available,
-                retain_terminal_reservations,
-            )
+            .paper_snapshot(self.config.account_id(), self.config.initial_available)
             .map_err(map_authority_state_error_to_paper)
     }
 
@@ -1579,7 +1579,7 @@ impl PaperAccountAuthority {
             .await
             .map_err(map_authority_state_error_to_paper)?;
         projection
-            .historical_reservation_by_id(self.config.account_id(), reservation_id)
+            .historical_reservation_by_id(self.config.account_id(), reservation_id)?
             .ok_or(PaperAccountError::UnknownReservation)
     }
 }
@@ -2381,7 +2381,9 @@ fn apply_projected_release(
             bounded_reason(reason).map_err(|_| ())?;
         }
         (None, Some(proof)) => {
-            if reservation.phase != PaperReservationPhase::Committed {
+            if reservation.phase != PaperReservationPhase::Committed
+                || reservation.ledger_kind != PaperExecutionLedgerKind::LegacyReservationOnly
+            {
                 return Err(());
             }
             validate_projected_reconciliation_proof(
@@ -2912,17 +2914,6 @@ fn gross_close_delta(
         Side::Buy => checked_sub_money_allow_negative(exit_notional, entry_notional).ok_or(()),
         Side::Sell => checked_sub_money_allow_negative(entry_notional, exit_notional).ok_or(()),
     }
-}
-
-fn find_reservation(
-    snapshot: &PaperAccountSnapshot,
-    reservation_id: Uuid,
-) -> Result<&PaperReservationView, PaperAccountError> {
-    snapshot
-        .reservations
-        .iter()
-        .find(|reservation| reservation.reservation_id == reservation_id)
-        .ok_or(PaperAccountError::UnknownReservation)
 }
 
 fn active_reservation_count(reservations: &[PaperReservationView]) -> usize {

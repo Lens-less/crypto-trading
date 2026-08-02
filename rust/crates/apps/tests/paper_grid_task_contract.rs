@@ -11,8 +11,9 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use crypto_trading_cli::{
-    GridPaperExecutionFuture, GridPaperExecutor, GridPaperTask, GridPaperTaskConfig,
-    GridPaperTaskError, GridPaperTaskExit, GridPaperTaskFailure, GridPaperTaskPhase,
+    GridPaperExecutionFuture, GridPaperExecutor, GridPaperObservationFuture, GridPaperTask,
+    GridPaperTaskConfig, GridPaperTaskError, GridPaperTaskExit, GridPaperTaskFailure,
+    GridPaperTaskPhase,
 };
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, Order, OrderStatus, Price, Quantity, Side, Symbol,
@@ -147,6 +148,10 @@ struct FillExecutor {
 }
 
 impl GridPaperExecutor for FillExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
@@ -171,6 +176,10 @@ impl GridPaperExecutor for FillExecutor {
 struct TimeoutExecutor;
 
 impl GridPaperExecutor for TimeoutExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, _batch: ExecutionBatch) -> GridPaperExecutionFuture {
         Box::pin(async {
             Err(RuntimeError::InvalidExecutionPolicy(
@@ -186,6 +195,10 @@ struct PendingExecutor {
 }
 
 impl GridPaperExecutor for PendingExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, _batch: ExecutionBatch) -> GridPaperExecutionFuture {
         self.started.store(true, Ordering::SeqCst);
         Box::pin(pending())
@@ -214,6 +227,10 @@ impl GatedFillExecutor {
 }
 
 impl GridPaperExecutor for GatedFillExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         self.started.store(true, Ordering::SeqCst);
         let permit = self.release.clone();
@@ -717,6 +734,10 @@ struct RecordingExecutor {
 }
 
 impl GridPaperExecutor for RecordingExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         let intent = batch.intents()[0].clone();
         self.intents

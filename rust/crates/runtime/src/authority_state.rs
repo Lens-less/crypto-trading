@@ -31,7 +31,6 @@ struct AuthorityStateKey {
 #[derive(Debug, Default)]
 struct AuthorityStateCell {
     cached: Option<Arc<AuthorityProjection>>,
-    replay_count: usize,
 }
 
 static AUTHORITY_STATE_CELLS: OnceLock<
@@ -46,9 +45,66 @@ pub(crate) struct AuthorityStateCache {
 
 #[derive(Clone, Debug)]
 pub(crate) struct HistoricalReservationIndex {
-    by_task_key: HashMap<(String, String, String), PaperReservationView>,
-    reservation_ids: HashMap<(String, Uuid), PaperReservationView>,
-    batch_ids: HashMap<(String, Uuid), PaperReservationView>,
+    // Paper and risk authorities serialize every cache access on the shared
+    // journal lock. Sharing this append-only identity table therefore keeps a
+    // delta O(active state + changed reservations) without exposing a mutable
+    // public snapshot or cloning all terminal history.
+    maps: Arc<StdMutex<HistoricalReservationMaps>>,
+}
+
+#[derive(Debug, Default)]
+struct HistoricalReservationMaps {
+    by_task_key: HashMap<(String, String, String), Arc<PaperReservationView>>,
+    reservation_ids: HashMap<(String, Uuid), Arc<PaperReservationView>>,
+    batch_ids: HashMap<(String, Uuid), Arc<PaperReservationView>>,
+}
+
+impl HistoricalReservationIndex {
+    fn empty() -> Self {
+        Self {
+            maps: Arc::new(StdMutex::new(HistoricalReservationMaps::default())),
+        }
+    }
+
+    fn apply_model_updates(
+        &self,
+        model: &PaperAccountReadModel,
+        previous_last_sequence: u64,
+    ) -> Result<(), AuthorityStateError> {
+        let updates = model.accounts.iter().flat_map(|account| {
+            account
+                .reservations
+                .iter()
+                .filter(move |reservation| reservation.last_sequence > previous_last_sequence)
+                .map(|reservation| (account.account_id.clone(), Arc::new(reservation.clone())))
+        });
+        let mut maps = self
+            .maps
+            .lock()
+            .map_err(|_| AuthorityStateError::Degraded)?;
+        for (account_id, reservation) in updates {
+            maps.by_task_key.insert(
+                (
+                    account_id.clone(),
+                    reservation.task_id.clone(),
+                    reservation.idempotency_key.clone(),
+                ),
+                Arc::clone(&reservation),
+            );
+            maps.reservation_ids.insert(
+                (account_id.clone(), reservation.reservation_id),
+                Arc::clone(&reservation),
+            );
+            maps.batch_ids
+                .insert((account_id, reservation.batch_id), reservation);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn storage_identity(&self) -> *const () {
+        Arc::as_ptr(&self.maps).cast()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,7 +112,6 @@ pub(crate) struct AuthorityProjection {
     pub(crate) head: HistoryChainHead,
     pub(crate) last_sequence: u64,
     pub(crate) paper_live: PaperAccountReadModel,
-    pub(crate) paper_all: PaperAccountReadModel,
     pub(crate) risk: AccountRiskReadModel,
     open_admissions: Vec<OpenAdmission>,
     historical_reservations: HistoricalReservationIndex,
@@ -170,17 +225,8 @@ impl AuthorityStateCache {
             .cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cell.replay_count = cell.replay_count.saturating_add(1);
         cell.cached = Some(rebuilt.clone());
         Ok(rebuilt)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replay_count(&self) -> usize {
-        self.cell
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replay_count
     }
 }
 
@@ -189,13 +235,8 @@ impl AuthorityProjection {
         &self,
         account_id: &str,
         initial_available: Money,
-        retain_terminal_reservations: bool,
     ) -> Result<PaperAccountSnapshot, AuthorityStateError> {
-        let model = if retain_terminal_reservations {
-            &self.paper_all
-        } else {
-            &self.paper_live
-        };
+        let model = &self.paper_live;
         if let Some(account) = model
             .accounts
             .iter()
@@ -255,23 +296,26 @@ impl AuthorityProjection {
         account_id: &str,
         request: &PaperReservationRequest,
     ) -> Result<Option<PaperReservationView>, crate::PaperAccountError> {
-        if let Some(existing) = self.historical_reservations.by_task_key.get(&(
+        let maps = self
+            .historical_reservations
+            .maps
+            .lock()
+            .map_err(|_| crate::PaperAccountError::DurableStateDegraded)?;
+        if let Some(existing) = maps.by_task_key.get(&(
             account_id.to_owned(),
             request.task_id().to_owned(),
             request.idempotency_key().to_owned(),
         )) {
             return if existing.matches(request) {
-                Ok(Some(existing.clone()))
+                Ok(Some(existing.as_ref().clone()))
             } else {
                 Err(crate::PaperAccountError::IdempotencyConflict)
             };
         }
-        if self
-            .historical_reservations
+        if maps
             .reservation_ids
             .contains_key(&(account_id.to_owned(), request.reservation_id()))
-            || self
-                .historical_reservations
+            || maps
                 .batch_ids
                 .contains_key(&(account_id.to_owned(), request.batch_id()))
         {
@@ -284,11 +328,16 @@ impl AuthorityProjection {
         &self,
         account_id: &str,
         reservation_id: Uuid,
-    ) -> Option<PaperReservationView> {
-        self.historical_reservations
+    ) -> Result<Option<PaperReservationView>, crate::PaperAccountError> {
+        let maps = self
+            .historical_reservations
+            .maps
+            .lock()
+            .map_err(|_| crate::PaperAccountError::DurableStateDegraded)?;
+        Ok(maps
             .reservation_ids
             .get(&(account_id.to_owned(), reservation_id))
-            .cloned()
+            .map(|reservation| reservation.as_ref().clone()))
     }
 }
 
@@ -407,14 +456,17 @@ fn project_snapshot(
             }
         }
     }
-    finish_projection(
+    let risk = risk.finish();
+    let paper_live = paper_live.finish()?;
+    let paper_all = paper_all.finish()?;
+    Ok(AuthorityProjection {
         head,
         last_sequence,
-        Ok(risk.finish()),
-        paper_live.finish(),
-        paper_all.finish(),
+        historical_reservations: build_historical_reservation_index(&paper_all)?,
+        paper_live,
+        risk,
         open_admissions,
-    )
+    })
 }
 
 fn apply_delta(
@@ -449,8 +501,8 @@ fn apply_delta(
     let mut risk = account_risk::ProjectionBuilder::from_model(cached.risk.clone());
     let mut paper_live =
         paper_account::ProjectionBuilder::from_model(cached.paper_live.clone(), false);
-    let mut paper_all =
-        paper_account::ProjectionBuilder::from_model(cached.paper_all.clone(), true);
+    let mut paper_updates =
+        paper_account::ProjectionBuilder::from_model(cached.paper_live.clone(), true);
     let mut open_admissions = cached.open_admissions.clone();
     let mut sequence = cached.last_sequence;
     for record in delta.records {
@@ -460,18 +512,24 @@ fn apply_delta(
         let event = event_from_decision_record(cached.paper_live.journal_id, sequence, &record)?;
         risk.observe_event(&event)?;
         paper_live.observe_event(&event);
-        paper_all.observe_event(&event);
+        paper_updates.observe_event(&event);
         account_risk::apply_open_admission_event(&mut open_admissions, event.payload())
             .map_err(|_| AuthorityStateError::Degraded)?;
     }
-    finish_projection(
-        delta.head_after,
-        sequence,
-        Ok(risk.finish()),
-        paper_live.finish(),
-        paper_all.finish(),
+    let risk = risk.finish();
+    let paper_live = paper_live.finish()?;
+    let paper_updates = paper_updates.finish()?;
+    cached
+        .historical_reservations
+        .apply_model_updates(&paper_updates, cached.last_sequence)?;
+    Ok(AuthorityProjection {
+        head: delta.head_after,
+        last_sequence: sequence,
+        paper_live,
+        risk,
         open_admissions,
-    )
+        historical_reservations: cached.historical_reservations.clone(),
+    })
 }
 
 fn history_head_bytes(head: &HistoryChainHead) -> Option<u64> {
@@ -480,362 +538,23 @@ fn history_head_bytes(head: &HistoryChainHead) -> Option<u64> {
         .try_fold(head.active_bytes, |total, bytes| total.checked_add(*bytes))
 }
 
-fn finish_projection(
-    head: HistoryChainHead,
-    last_sequence: u64,
-    risk: Result<AccountRiskReadModel, AccountRiskProjectionError>,
-    paper_live: Result<PaperAccountReadModel, PaperAccountProjectionError>,
-    paper_all: Result<PaperAccountReadModel, PaperAccountProjectionError>,
-    open_admissions: Vec<OpenAdmission>,
-) -> Result<AuthorityProjection, AuthorityStateError> {
-    let risk = risk?;
-    let paper_live = paper_live?;
-    let paper_all = paper_all?;
-    Ok(AuthorityProjection {
-        head,
-        last_sequence,
-        historical_reservations: build_historical_reservation_index(&paper_all),
-        paper_live,
-        paper_all,
-        risk,
-        open_admissions,
-    })
-}
-
-fn build_historical_reservation_index(model: &PaperAccountReadModel) -> HistoricalReservationIndex {
-    let mut by_task_key = HashMap::new();
-    let mut reservation_ids = HashMap::new();
-    let mut batch_ids = HashMap::new();
-    for account in &model.accounts {
-        for reservation in &account.reservations {
-            by_task_key.insert(
-                (
-                    account.account_id.clone(),
-                    reservation.task_id.clone(),
-                    reservation.idempotency_key.clone(),
-                ),
-                reservation.clone(),
-            );
-            reservation_ids.insert(
-                (account.account_id.clone(), reservation.reservation_id),
-                reservation.clone(),
-            );
-            batch_ids.insert(
-                (account.account_id.clone(), reservation.batch_id),
-                reservation.clone(),
-            );
-        }
-    }
-    HistoricalReservationIndex {
-        by_task_key,
-        reservation_ids,
-        batch_ids,
-    }
+fn build_historical_reservation_index(
+    model: &PaperAccountReadModel,
+) -> Result<HistoricalReservationIndex, AuthorityStateError> {
+    let index = HistoricalReservationIndex::empty();
+    index.apply_model_updates(model, 0)?;
+    Ok(index)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, JsonlHistory,
-        PaperAccountAuthority, PaperAccountConfig, PaperCostModel, PaperReservationAdmission,
-        PaperReservationLeg, PaperReservationRequest,
-    };
-    use chrono::{TimeZone, Utc};
-    use crypto_trading_domain::{MarketType, Quantity, Side, Symbol};
-    use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
-    use rust_decimal::Decimal;
+    use super::HistoricalReservationIndex;
 
-    fn money(value: &str) -> Money {
-        Money::new(Decimal::from_str_exact(value).unwrap())
-    }
+    #[test]
+    fn historical_index_clones_share_the_cold_history_storage() {
+        let index = HistoricalReservationIndex::empty();
+        let cloned = index.clone();
 
-    fn temp_case(label: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("authority-state-{label}-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("decisions.jsonl");
-        (root, path)
-    }
-
-    fn paper_authority(journal_id: Uuid, path: &Path) -> PaperAccountAuthority {
-        PaperAccountAuthority::new(
-            journal_id,
-            JsonlHistory::new(path),
-            PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn risk_authority(journal_id: Uuid, path: &Path) -> AccountRiskAuthority {
-        AccountRiskAuthority::new(
-            journal_id,
-            JsonlHistory::new(path),
-            "paper",
-            AccountRiskPolicy::new(AccountRiskLimits::default()).unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn request(
-        task_id: &str,
-        idempotency: &str,
-        reservation_id: Uuid,
-        batch_id: Uuid,
-    ) -> PaperReservationRequest {
-        let intent = crypto_trading_domain::OrderIntent::market(
-            "paper-grid",
-            Symbol::new("BTC-USDT").unwrap(),
-            MarketType::Spot,
-            Side::Buy,
-            Quantity::new(Decimal::ONE).unwrap(),
-        );
-        PaperReservationRequest::new(
-            reservation_id,
-            task_id,
-            idempotency,
-            batch_id,
-            PaperCostModel::v1(10, 0, 0).unwrap(),
-            vec![PaperReservationLeg::from_intent(0, &intent, money("10")).unwrap()],
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn many_mutations_share_one_cold_replay_and_incremental_refresh() {
-        let (root, path) = temp_case("incremental");
-        let journal_id = Uuid::new_v4();
-        let authority = paper_authority(journal_id, &path);
-        let cache = AuthorityStateCache::new(journal_id, &JsonlHistory::new(&path));
-
-        assert_eq!(authority.snapshot().await.unwrap().reservations.len(), 0);
-        assert_eq!(cache.replay_count(), 1);
-
-        for index in 0..8_u128 {
-            let reserved = authority
-                .reserve(request(
-                    &format!("task/{index}"),
-                    &format!("idem/{index}"),
-                    Uuid::from_u128(index + 1),
-                    Uuid::from_u128(index + 101),
-                ))
-                .await
-                .unwrap();
-            let reservation = match reserved {
-                PaperReservationAdmission::Reserved(reservation) => reservation,
-                PaperReservationAdmission::Existing(_) => panic!("expected fresh reservation"),
-            };
-            authority
-                .release(reservation.reservation_id, "cycle_done")
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(cache.replay_count(), 1);
-        assert!(authority.snapshot().await.unwrap().reservations.is_empty());
-        drop(cache);
-        drop(authority);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn same_process_other_handle_append_is_observed_incrementally() {
-        let (root, path) = temp_case("other-handle");
-        let journal_id = Uuid::new_v4();
-        let first = paper_authority(journal_id, &path);
-        let second = paper_authority(journal_id, &path);
-        let cache = AuthorityStateCache::new(journal_id, &JsonlHistory::new(&path));
-
-        first.snapshot().await.unwrap();
-        let admission = second
-            .reserve(request(
-                "task/a",
-                "idem/a",
-                Uuid::from_u128(1),
-                Uuid::from_u128(2),
-            ))
-            .await
-            .unwrap();
-        match admission {
-            PaperReservationAdmission::Reserved(_) => {}
-            PaperReservationAdmission::Existing(_) => panic!("expected fresh reservation"),
-        }
-
-        let snapshot = first.snapshot().await.unwrap();
-        assert_eq!(snapshot.reservations.len(), 1);
-        assert_eq!(cache.replay_count(), 1);
-        drop(cache);
-        drop(first);
-        drop(second);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn restart_recovers_by_cold_replaying_again() {
-        let (root, path) = temp_case("restart");
-        let journal_id = Uuid::new_v4();
-        {
-            let authority = paper_authority(journal_id, &path);
-            authority.snapshot().await.unwrap();
-            authority
-                .reserve(request(
-                    "task/a",
-                    "idem/a",
-                    Uuid::from_u128(1),
-                    Uuid::from_u128(2),
-                ))
-                .await
-                .unwrap();
-            let cache = AuthorityStateCache::new(journal_id, &JsonlHistory::new(&path));
-            assert_eq!(cache.replay_count(), 1);
-        }
-
-        let restarted = paper_authority(journal_id, &path);
-        let cache = AuthorityStateCache::new(journal_id, &JsonlHistory::new(&path));
-        let snapshot = restarted.snapshot().await.unwrap();
-        assert_eq!(snapshot.reservations.len(), 1);
-        assert_eq!(cache.replay_count(), 1);
-        drop(cache);
-        drop(restarted);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn tampered_head_regression_fails_closed() {
-        let (root, path) = temp_case("tamper");
-        let journal_id = Uuid::new_v4();
-        let authority = paper_authority(journal_id, &path);
-        authority
-            .reserve(request(
-                "task/a",
-                "idem/a",
-                Uuid::from_u128(1),
-                Uuid::from_u128(2),
-            ))
-            .await
-            .unwrap();
-        authority.snapshot().await.unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
-
-        let error = authority.snapshot().await.unwrap_err();
-        assert!(matches!(
-            error,
-            crate::PaperAccountError::DurableStateDegraded
-        ));
-        drop(authority);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn risk_incremental_state_matches_cold_replay() {
-        let (root, path) = temp_case("risk");
-        let journal_id = Uuid::new_v4();
-        let first = risk_authority(journal_id, &path);
-        let second = risk_authority(journal_id, &path);
-        let now = Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap();
-        let admission = second
-            .admit(
-                &AccountRiskCandidate::new("owner/a", "BTC-USDT", money("10")).unwrap(),
-                now,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(admission, AccountRiskAdmission::Admitted { .. }));
-
-        let warm = first.state().await.unwrap();
-        drop(first);
-        drop(second);
-
-        let restarted = risk_authority(journal_id, &path);
-        let cold = restarted.state().await.unwrap();
-        assert_eq!(warm, cold);
-        drop(restarted);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn historical_idempotency_is_scoped_to_one_paper_account() {
-        let (root, path) = temp_case("account-scope");
-        let journal_id = Uuid::new_v4();
-        let first = paper_authority(journal_id, &path);
-        let second = PaperAccountAuthority::new(
-            journal_id,
-            JsonlHistory::new(&path),
-            PaperAccountConfig::new("paper-secondary", money("1000")).unwrap(),
-        )
-        .unwrap();
-        let first_request = request(
-            "shared-task",
-            "shared-idempotency",
-            Uuid::from_u128(1),
-            Uuid::from_u128(2),
-        );
-        let first_reservation = match first.reserve(first_request).await.unwrap() {
-            PaperReservationAdmission::Reserved(reservation) => reservation,
-            PaperReservationAdmission::Existing(_) => panic!("expected first reservation"),
-        };
-        first
-            .release(first_reservation.reservation_id, "account_scope_complete")
-            .await
-            .unwrap();
-
-        let second_admission = second
-            .reserve(request(
-                "shared-task",
-                "shared-idempotency",
-                Uuid::from_u128(3),
-                Uuid::from_u128(4),
-            ))
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            second_admission,
-            PaperReservationAdmission::Reserved(_)
-        ));
-        drop(first);
-        drop(second);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn restart_quarantines_an_anchored_partial_tail_before_replay() {
-        let (root, path) = temp_case("partial-restart");
-        let journal_id = Uuid::new_v4();
-        {
-            let authority = paper_authority(journal_id, &path);
-            authority
-                .reserve(request(
-                    "task/a",
-                    "idem/a",
-                    Uuid::from_u128(1),
-                    Uuid::from_u128(2),
-                ))
-                .await
-                .unwrap();
-        }
-        let partial = br#"{"timestamp":"2026-08-03T00:00:00Z","strategy":"crash""#;
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.extend_from_slice(partial);
-        std::fs::write(&path, bytes).unwrap();
-
-        let restarted = paper_authority(journal_id, &path);
-        let snapshot = restarted.snapshot().await.unwrap();
-        assert_eq!(snapshot.reservations.len(), 1);
-        assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
-        let quarantines = std::fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|candidate| {
-                candidate
-                    .extension()
-                    .is_some_and(|extension| extension == "quarantine")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(quarantines.len(), 1);
-        assert_eq!(std::fs::read(&quarantines[0]).unwrap(), partial);
-
-        drop(restarted);
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(index.storage_identity(), cloned.storage_identity());
     }
 }

@@ -31,11 +31,11 @@ the software may do exactly what it could do before.
   the chain was being captured. The reader re-inspects the sealed chain after
   freezing the active file and retries the capture when a rotation landed in
   between, so read models never project a chain with a hole in the middle.
-- The journal writer refuses to append to — or seal — an active file whose last
-  byte is not a record terminator (`HistoryError::PartialTail`). A crash-left
-  partial record previously merged with the next append into one malformed
-  mid-chain line (or was frozen into a sealed segment readers reject), turning
-  a detectable, recoverable tail into permanent corruption.
+- The journal writer now repairs only recoverable active-file crash tails before
+  append or rotation: a JSON suffix cut off by EOF is quarantined and truncated,
+  while a complete `DecisionRecord` missing only its newline has that terminator
+  restored and synchronized. Complete malformed records and every sealed-segment
+  inconsistency still fail closed, so recovery cannot launder durable corruption.
 - The paper exchange fills resting limit orders at their own limit price when a
   later snapshot trades through the level. Resting orders previously executed
   at the new touch (bid/ask), granting maker orders taker-style price
