@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use crate::{IndicatorError, math::checked_sqrt};
 
 const VARIANCE_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 18);
+const MAX_ROLLING_WINDOW: usize = 1_000_000;
 
 /// Rolling z-score over a fixed-size window using population variance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,15 +21,21 @@ impl RollingZScore {
     ///
     /// # Errors
     ///
-    /// Returns [`IndicatorError::InvalidWindow`] when `window < 2`.
+    /// Returns [`IndicatorError::InvalidWindow`] when `window` is outside the
+    /// supported `2..=1_000_000` range or its bounded sample buffer cannot be
+    /// reserved.
     pub fn new(window: usize) -> Result<Self, IndicatorError> {
-        if window < 2 {
+        if !(2..=MAX_ROLLING_WINDOW).contains(&window) {
             return Err(IndicatorError::InvalidWindow);
         }
+        let mut samples = VecDeque::new();
+        samples
+            .try_reserve(window)
+            .map_err(|_| IndicatorError::InvalidWindow)?;
 
         Ok(Self {
             window,
-            samples: VecDeque::with_capacity(window),
+            samples,
             sum: Decimal::ZERO,
             sum_of_squares: Decimal::ZERO,
         })

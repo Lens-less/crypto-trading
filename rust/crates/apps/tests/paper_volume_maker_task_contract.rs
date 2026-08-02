@@ -76,11 +76,18 @@ fn config(task_id: &str, mode: VolumeMakerMode, grace: StdDuration) -> VolumeMak
 }
 
 fn account(label: &str) -> (PaperAccountAuthority, JsonlHistory, PathBuf) {
+    account_with_available(label, "10000")
+}
+
+fn account_with_available(
+    label: &str,
+    initial_available: &str,
+) -> (PaperAccountAuthority, JsonlHistory, PathBuf) {
     let path = temp_path(label, "jsonl");
     let history = JsonlHistory::new(&path);
     let account = PaperAccountAuthority::planned(
         history.clone(),
-        PaperAccountConfig::new(EXCHANGE, Money::new(decimal("10000"))).unwrap(),
+        PaperAccountConfig::new(EXCHANGE, Money::new(decimal(initial_available))).unwrap(),
     )
     .unwrap();
     (account, history, path)
@@ -523,6 +530,92 @@ async fn account_risk_rejections_skip_cycles_without_reservations() {
     assert!(body.contains("\"decision\":\"account_risk_rejected\""));
     assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
     assert!(body.contains("\"rejected_entries\":1"), "{body}");
+}
+
+#[tokio::test]
+async fn reservation_failures_cancel_admitted_cycles_without_leaking_owner_risk() {
+    let (account, history, path) = account_with_available("reserve-after-admit", "50");
+    let risk = account_risk(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(FillExecutor::default());
+    let first_source = VecSource::new(vec![observation(
+        "100",
+        "101",
+        1,
+        base_time() + Duration::seconds(10),
+    )]);
+    let mut first = VolumeMakerPaperTask::start(
+        config(
+            "volume:reserve-fail:first",
+            VolumeMakerMode::MarketImbalance,
+            StdDuration::from_secs(1),
+        )
+        .with_account_risk(risk.clone()),
+        first_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let first_error = first.wait().await.unwrap_err();
+    assert!(matches!(first_error, VolumeMakerPaperTaskError::Saga(_)));
+    assert_eq!(first.status().phase, VolumeMakerPaperTaskPhase::Failed);
+    assert_eq!(
+        first.status().failure,
+        Some(VolumeMakerPaperTaskFailure::AccountContract)
+    );
+
+    let second_source = VecSource::new(vec![observation(
+        "100",
+        "101",
+        2,
+        base_time() + Duration::seconds(20),
+    )]);
+    let mut second = VolumeMakerPaperTask::start(
+        config(
+            "volume:reserve-fail:second",
+            VolumeMakerMode::MarketImbalance,
+            StdDuration::from_secs(1),
+        )
+        .with_account_risk(risk.clone()),
+        second_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let second_error = second.wait().await.unwrap_err();
+    assert!(matches!(second_error, VolumeMakerPaperTaskError::Saga(_)));
+    assert_eq!(second.status().phase, VolumeMakerPaperTaskPhase::Failed);
+    assert_eq!(
+        second.status().failure,
+        Some(VolumeMakerPaperTaskFailure::AccountContract)
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+
+    let state = risk.state().await.unwrap();
+    assert!(state.open_positions.is_empty());
+    assert_eq!(state.admitted_count, 2);
+    assert_eq!(state.rejected_count, 0);
+
+    let body = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admitted\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admission_cancelled\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
 }
 
 #[tokio::test]

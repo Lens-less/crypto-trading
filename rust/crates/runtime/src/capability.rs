@@ -760,7 +760,7 @@ fn research_capabilities() -> Vec<Capability> {
             CapabilityArea::Research,
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic single-instrument SimClock/EventTape backtests with explicit maker/taker fees, slippage, FIFO-style ledger outputs, equity curves, metrics, and out-of-sample-only walk-forward windows.",
+            "Deterministic single-instrument SimClock/EventTape backtests with explicit maker/taker fees, slippage, weighted-average-cost ledger outputs, equity curves, metrics, and out-of-sample-only walk-forward windows.",
             &[
                 "This is a bounded research kernel, not a profitability claim: production MarketDataEvent/strategy adapters, multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
             ],

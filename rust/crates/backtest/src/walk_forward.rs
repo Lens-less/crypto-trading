@@ -5,9 +5,9 @@ use crate::BacktestError;
 /// Walk-forward sizing parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalkForwardConfig {
-    pub train_size: usize,
-    pub test_size: usize,
-    pub step_size: usize,
+    train: usize,
+    test: usize,
+    step: usize,
 }
 
 impl WalkForwardConfig {
@@ -27,10 +27,28 @@ impl WalkForwardConfig {
         }
 
         Ok(Self {
-            train_size,
-            test_size,
-            step_size,
+            train: train_size,
+            test: test_size,
+            step: step_size,
         })
+    }
+
+    /// Returns the number of observations in each training window.
+    #[must_use]
+    pub const fn train_size(self) -> usize {
+        self.train
+    }
+
+    /// Returns the number of observations in each out-of-sample window.
+    #[must_use]
+    pub const fn test_size(self) -> usize {
+        self.test
+    }
+
+    /// Returns the number of observations advanced between windows.
+    #[must_use]
+    pub const fn step_size(self) -> usize {
+        self.step
     }
 }
 
@@ -61,19 +79,28 @@ impl WalkForwardSplitter {
         let mut train_start = 0_usize;
         let mut window_index = 0_usize;
 
-        while train_start
-            .checked_add(self.config.train_size)
-            .and_then(|value| value.checked_add(self.config.test_size))
-            .is_some_and(|end| end <= total_len)
-        {
-            let test_start = train_start + self.config.train_size;
-            let test_end = test_start + self.config.test_size;
+        loop {
+            let Some(test_start) = train_start.checked_add(self.config.train) else {
+                break;
+            };
+            let Some(test_end) = test_start
+                .checked_add(self.config.test)
+                .filter(|end| *end <= total_len)
+            else {
+                break;
+            };
             windows.push(OutOfSampleWindow {
                 window_index,
                 range: test_start..test_end,
             });
-            train_start += self.config.step_size;
-            window_index += 1;
+            let Some(next_train_start) = train_start.checked_add(self.config.step) else {
+                break;
+            };
+            let Some(next_window_index) = window_index.checked_add(1) else {
+                break;
+            };
+            train_start = next_train_start;
+            window_index = next_window_index;
         }
 
         windows

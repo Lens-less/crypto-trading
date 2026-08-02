@@ -415,7 +415,7 @@ async fn crash_inside_the_final_utf8_code_point_is_quarantined_before_append() {
     std::fs::write(sealed(&path, 1), encoded(&sealed_record)).unwrap();
 
     let mut interrupted = record("placeholder", 1);
-    interrupted.decision = "执行中断🚀".to_owned();
+    interrupted.decision = "路径\\\"执行\u{0001}中断🚀".to_owned();
     let interrupted = encoded(&interrupted);
     let emoji = "🚀".as_bytes();
     let emoji_start = interrupted
@@ -534,6 +534,58 @@ async fn invalid_utf8_inside_a_complete_active_record_still_fails_closed() {
         HistoryError::MalformedActiveRecord { line: 1, .. }
     ));
     assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn malformed_valid_utf8_prefix_plus_truncated_codepoint_still_fails_closed() {
+    let root = temp_root("history-rotation-malformed-prefix-truncated-utf8");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted = b"{bad json}".to_vec();
+    corrupted.push(0xf0);
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.error_len(), None);
+    assert_eq!(&corrupted[..utf8_error.valid_up_to()], b"{bad json}");
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 0)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    assert_eq!(partial_tail_quarantines(&root).len(), 0);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn truncated_codepoint_outside_json_string_still_fails_closed() {
+    let root = temp_root("history-rotation-truncated-utf8-outside-string");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted = b"{".to_vec();
+    corrupted.push(0xf0);
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.valid_up_to(), 1);
+    assert_eq!(utf8_error.error_len(), None);
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 0)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    assert_eq!(partial_tail_quarantines(&root).len(), 0);
 
     drop(history);
     std::fs::remove_dir_all(root).unwrap();
@@ -766,6 +818,22 @@ fn encoded(record: &DecisionRecord) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(record).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+fn partial_tail_quarantines(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("decisions.jsonl.partial-tail.")
+                        && name.ends_with(".quarantine")
+                })
+        })
+        .collect()
 }
 
 /// Grows `path` to `len` bytes ending in a record terminator, so size fixtures

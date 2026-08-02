@@ -91,12 +91,23 @@ pub trait ArbitragePaperExecutor: Send + Sync + 'static {
     /// Applies one complete market event at consumer time.
     ///
     /// Live executors implement an explicit no-op. Replay executors use this
-    /// hook to prevent a fast source from advancing their paper books beyond
-    /// the event the owner is currently processing. Keeping the method
-    /// required makes every executor choose its clock semantics deliberately.
+    /// hook to validate global tape order and advance only the monitor clock;
+    /// execution books advance later from the frozen pair passed to
+    /// [`Self::execute`]. Keeping the method required makes every executor
+    /// choose its clock semantics deliberately.
     fn observe_market_event(&self, event: MarketDataEvent) -> ArbitragePaperMarketEventFuture;
 
-    fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture;
+    /// Executes against the exact market pair that produced `batch`.
+    ///
+    /// The owner keeps consuming and coalescing later market events while a
+    /// durable saga reserves capital. Carrying the pair through the plan
+    /// prevents those later events from changing this operation's execution
+    /// context.
+    fn execute(
+        &self,
+        batch: ExecutionBatch,
+        pair: ObservedMarketPair,
+    ) -> ArbitragePaperExecutionFuture;
 }
 
 /// Validated execution, risk, lifecycle, and reservation policy.
@@ -613,6 +624,7 @@ impl Drop for InFlightOperation {
 struct PlannedOperation {
     request: PaperArbitrageRequest,
     decision: ArbitrageDecision,
+    pair: ObservedMarketPair,
     admission_ticket: Option<AccountRiskAdmissionTicket>,
 }
 
@@ -704,7 +716,23 @@ async fn run_owner(
                 let operation = in_flight
                     .take()
                     .ok_or(ArbitragePaperTaskError::TaskCancelled)?;
-                if let Err(error) = complete_operation(result, &operation.decision, &mut state) {
+                if let Err(operation_error) =
+                    complete_operation(result, &operation.decision, &mut state)
+                {
+                    let error = match retain_cancelled_operation(
+                        saga.account(),
+                        config.account_risk.as_ref(),
+                        &config.task_id,
+                        operation.admission_ticket.as_ref(),
+                        &operation.request,
+                        Utc::now(),
+                    )
+                    .await
+                    {
+                        Ok(false) => operation_error,
+                        Ok(true) => ArbitragePaperTaskError::RecoveryRequired,
+                        Err(error) => error,
+                    };
                     let (failure, error) = classify_operation_error(error);
                     return fail_owner(
                         &mut left,
@@ -1392,6 +1420,7 @@ async fn plan_latest_operation(
     Ok(Some(PlannedOperation {
         request,
         decision,
+        pair,
         admission_ticket,
     }))
 }
@@ -1733,12 +1762,13 @@ fn start_operation(
     let admission_ticket = planned.admission_ticket.clone();
     let saga = saga.clone();
     let request_for_task = planned.request;
+    let pair = planned.pair;
     let execution_started = Arc::new(AtomicBool::new(false));
     let task_execution_started = Arc::clone(&execution_started);
     let join = tokio::spawn(async move {
         saga.run(request_for_task, move |batch| {
             task_execution_started.store(true, Ordering::Release);
-            executor.execute(batch)
+            executor.execute(batch, pair)
         })
         .await
     });

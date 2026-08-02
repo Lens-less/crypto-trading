@@ -32,7 +32,11 @@ pub(crate) fn checked_sqrt(value: Decimal) -> Result<Decimal, IndicatorError> {
             .ok_or(IndicatorError::ArithmeticOverflow)?
             .checked_div(two)
             .ok_or(IndicatorError::ArithmeticOverflow)?;
-        if (next - guess).abs() <= SQRT_TOLERANCE {
+        let delta = next
+            .checked_sub(guess)
+            .map(|difference| difference.abs())
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        if delta <= SQRT_TOLERANCE {
             return Ok(next.round_dp(SQRT_ROUND_DP));
         }
         guess = next;

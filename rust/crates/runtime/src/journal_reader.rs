@@ -853,12 +853,16 @@ pub enum JournalReadError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::sealed_segment_path;
 
     fn temp_journal_root(prefix: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn test_sealed_segment_path(active_path: &Path, sequence: u64) -> PathBuf {
+        let file_name = active_path.file_name().unwrap().to_string_lossy();
+        active_path.with_file_name(format!("{file_name}.{sequence}"))
     }
 
     #[test]
@@ -872,7 +876,7 @@ mod tests {
         // active file continues the journal.
         let stale = inspect_sealed_segments(&path).unwrap();
         assert!(stale.is_empty());
-        std::fs::rename(&path, sealed_segment_path(&path, 1)).unwrap();
+        std::fs::rename(&path, test_sealed_segment_path(&path, 1)).unwrap();
         std::fs::write(&path, b"{\"active\":2}\n").unwrap();
 
         // The stale capture reads the new active file and silently misses the
@@ -906,7 +910,7 @@ mod tests {
         // exist yet.
         let stale = inspect_sealed_segments(&path).unwrap();
         assert!(stale.is_empty());
-        std::fs::rename(&path, sealed_segment_path(&path, 1)).unwrap();
+        std::fs::rename(&path, test_sealed_segment_path(&path, 1)).unwrap();
 
         // Against the stale inspection this is indistinguishable from an
         // absent journal; the re-inspection exposes the rotation.

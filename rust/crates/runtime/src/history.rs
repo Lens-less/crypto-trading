@@ -472,7 +472,8 @@ impl JsonlHistory {
     /// EOF is quarantined and truncated, including when it is the first record
     /// in a fresh active file. A complete record missing only its terminator is
     /// preserved by writing and syncing that terminator. Complete malformed
-    /// records remain fail-closed.
+    /// records remain fail-closed. An incomplete UTF-8 code point is
+    /// recoverable only inside an otherwise EOF-incomplete record string.
     pub(crate) async fn repair_recoverable_tail(&self) -> Result<(), HistoryError> {
         let _guard = self.path_lock.lock().await;
         let _lease = self.active_cross_process_lease()?;
@@ -1079,10 +1080,51 @@ impl JsonlHistory {
 }
 
 fn is_recoverable_partial_json_tail(suffix: &[u8], source: &serde_json::Error) -> bool {
+    // The serializer emits raw multi-byte UTF-8 only inside JSON strings. A
+    // truncated code point therefore is not enough by itself: its valid prefix
+    // must also be an EOF-incomplete record at a position accepting a raw
+    // string byte. This prevents the UTF-8 suffix from hiding earlier syntax
+    // corruption or an impossible write position.
     match std::str::from_utf8(suffix) {
         Ok(_) => source.is_eof(),
-        Err(source) => source.error_len().is_none(),
+        Err(source) if source.error_len().is_none() => {
+            let valid_prefix = &suffix[..source.valid_up_to()];
+            valid_prefix.starts_with(b"{")
+                && json_prefix_accepts_raw_string_byte(valid_prefix)
+                && matches!(
+                    serde_json::from_slice::<DecisionRecord>(valid_prefix),
+                    Err(source) if source.is_eof()
+                )
+        }
+        Err(_) => false,
     }
+}
+
+fn json_prefix_accepts_raw_string_byte(prefix: &[u8]) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut unicode_escape_digits = 0u8;
+    for byte in prefix {
+        if !in_string {
+            if *byte == b'"' {
+                in_string = true;
+            }
+        } else if unicode_escape_digits > 0 {
+            unicode_escape_digits -= 1;
+        } else if escaped {
+            escaped = false;
+            if *byte == b'u' {
+                unicode_escape_digits = 4;
+            }
+        } else {
+            match *byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        }
+    }
+    in_string && !escaped && unicode_escape_digits == 0
 }
 
 fn stable_history_path(path: &Path) -> PathBuf {

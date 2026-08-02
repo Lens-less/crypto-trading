@@ -356,6 +356,56 @@ fn globally_ordered_arbitrage_replay() -> String {
         + "\n"
 }
 
+fn lookahead_arbitrage_replay() -> String {
+    [
+        json!({
+            "exchange": "paper-left",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "99",
+            "ask": "100",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:00Z",
+        }),
+        json!({
+            "exchange": "paper-right",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "102",
+            "ask": "103",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:01Z",
+        }),
+        json!({
+            "exchange": "paper-left",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "100.8",
+            "ask": "101",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:02Z",
+        }),
+        json!({
+            "exchange": "paper-right",
+            "symbol": "ETH-USDC-PERP",
+            "market_type": "perpetual",
+            "bid": "100.8",
+            "ask": "101",
+            "bid_quantity": "20",
+            "ask_quantity": "20",
+            "timestamp": "2026-07-25T00:00:03Z",
+        }),
+    ]
+    .into_iter()
+    .map(|line| serde_json::to_string(&line).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n"
+}
+
 fn catalog_from_replays(
     label: &str,
     grid_replay_body: &str,
@@ -790,6 +840,21 @@ async fn matching_grid_profile_executes_through_paper_exchange_and_account_autho
     drop(fixture.listener);
 }
 
+async fn wait_for_journal_count(path: &PathBuf, expected: &str, count: usize) -> String {
+    let deadline = tokio::time::Instant::now() + PROJECTION_DEADLINE;
+    loop {
+        let last_journal = std::fs::read_to_string(path).unwrap();
+        if last_journal.matches(expected).count() >= count {
+            return last_journal;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "journal never contained {count} occurrences of {expected:?}; last journal: {last_journal}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn arbitrage_profile_consumes_both_sources_in_global_replay_order() {
     let grid = idle_grid_replay();
@@ -839,6 +904,93 @@ async fn arbitrage_profile_consumes_both_sources_in_global_replay_order() {
         &mutation(
             Uuid::new_v4(),
             "ordered-arbitrage-stop",
+            "paper-arbitrage-owner",
+            SubmitCommand::StopTask,
+        ),
+    )
+    .await;
+    assert_eq!(stopped["status"], "applied");
+    wait_for_task(&fixture.router, "paper-arbitrage-owner", "stopped").await;
+
+    drop(fixture.listener);
+}
+
+#[tokio::test]
+async fn arbitrage_profile_executes_against_the_pair_that_triggered_the_operation() {
+    let grid = idle_grid_replay();
+    let arbitrage = lookahead_arbitrage_replay();
+    let fixture = application(
+        "frozen-arbitrage-pair",
+        catalog_from_replays("frozen-arbitrage-pair", &grid, Some(&arbitrage)),
+        None,
+    )
+    .await;
+    let started = submit(
+        &fixture.router,
+        &arbitrage_start(
+            Uuid::new_v4(),
+            "frozen-arbitrage-start",
+            "paper-arbitrage-owner",
+            "arb.v1",
+        ),
+    )
+    .await;
+    assert_eq!(started["status"], "applied");
+
+    wait_for_journal(
+        &fixture.history_path,
+        "\"processed_event_count\":4,\"schema_version\":1",
+    )
+    .await;
+    let journal = wait_for_journal_count(
+        &fixture.history_path,
+        "\"decision\":\"paper_account_execution_settled\"",
+        2,
+    )
+    .await;
+    let settlements = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["decision"] == "paper_account_execution_settled")
+        .collect::<Vec<_>>();
+    assert_eq!(settlements.len(), 2);
+    let opening_fills = settlements[0]["details"]["fills"]
+        .as_array()
+        .expect("exact paper settlement must retain typed fills");
+    assert_eq!(opening_fills.len(), 2);
+    let opening_left = opening_fills
+        .iter()
+        .find(|fill| fill["exchange"] == "paper-left")
+        .expect("opening settlement must include the left venue");
+    let opening_right = opening_fills
+        .iter()
+        .find(|fill| fill["exchange"] == "paper-right")
+        .expect("opening settlement must include the right venue");
+    assert_eq!(opening_left["average_fill_price"], "100");
+    assert_eq!(opening_right["average_fill_price"], "102");
+    let closing_fills = settlements[1]["details"]["fills"]
+        .as_array()
+        .expect("the later pair must close through the persistent paper positions");
+    assert_eq!(closing_fills.len(), 2);
+    let closing_left = closing_fills
+        .iter()
+        .find(|fill| fill["exchange"] == "paper-left")
+        .expect("closing settlement must include the left venue");
+    let closing_right = closing_fills
+        .iter()
+        .find(|fill| fill["exchange"] == "paper-right")
+        .expect("closing settlement must include the right venue");
+    assert_eq!(closing_left["average_fill_price"], "100.8");
+    assert_eq!(closing_left["reduce_only"], true);
+    assert_eq!(closing_right["average_fill_price"], "101");
+    assert_eq!(closing_right["reduce_only"], true);
+    assert!(!journal.contains("\"decision\":\"task_failed\""));
+
+    let stopped = submit(
+        &fixture.router,
+        &mutation(
+            Uuid::new_v4(),
+            "frozen-arbitrage-stop",
             "paper-arbitrage-owner",
             SubmitCommand::StopTask,
         ),

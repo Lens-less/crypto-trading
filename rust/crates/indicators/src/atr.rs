@@ -57,8 +57,14 @@ impl Atr {
         let true_range = match self.previous_close {
             None => range,
             Some(previous_close) => {
-                let high_gap = (high - previous_close).abs();
-                let low_gap = (low - previous_close).abs();
+                let high_gap = high
+                    .checked_sub(previous_close)
+                    .map(|gap| gap.abs())
+                    .ok_or(IndicatorError::ArithmeticOverflow)?;
+                let low_gap = low
+                    .checked_sub(previous_close)
+                    .map(|gap| gap.abs())
+                    .ok_or(IndicatorError::ArithmeticOverflow)?;
                 range.max(high_gap).max(low_gap)
             }
         };

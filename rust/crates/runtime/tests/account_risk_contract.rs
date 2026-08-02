@@ -37,10 +37,19 @@ fn authority(
     path: &std::path::Path,
     limits: AccountRiskLimits,
 ) -> AccountRiskAuthority {
+    authority_for_scope(journal_id, path, "paper", limits)
+}
+
+fn authority_for_scope(
+    journal_id: Uuid,
+    path: &std::path::Path,
+    scope_id: &str,
+    limits: AccountRiskLimits,
+) -> AccountRiskAuthority {
     AccountRiskAuthority::new(
         journal_id,
         JsonlHistory::new(path),
-        "paper",
+        scope_id,
         AccountRiskPolicy::new(limits).unwrap(),
     )
     .unwrap()
@@ -308,6 +317,47 @@ async fn admitted_but_unreserved_notional_counts_toward_exposure_caps() {
             .unwrap(),
         AccountRiskAdmission::Admitted { .. }
     ));
+}
+
+#[tokio::test]
+async fn reservation_consumption_and_cancellation_preserve_risk_scope_isolation() {
+    let path = temp_path("scope-isolation");
+    let journal_id = Uuid::new_v4();
+    let risk_a = authority_for_scope(journal_id, &path, "scope-a", AccountRiskLimits::default());
+    let risk_b = authority_for_scope(journal_id, &path, "scope-b", AccountRiskLimits::default());
+    let owner = candidate("owner/a", "BTC-USDT", "10");
+    let ticket_a = admitted_ticket(risk_a.admit(&owner, at(9, 0)).await.unwrap());
+    let ticket_b = admitted_ticket(risk_b.admit(&owner, at(9, 1)).await.unwrap());
+
+    assert!(
+        risk_a
+            .cancel_admission("owner/a", &ticket_a, at(9, 2))
+            .await
+            .unwrap()
+    );
+    assert!(risk_a.state().await.unwrap().open_positions.is_empty());
+    assert_eq!(risk_b.state().await.unwrap().open_positions.len(), 1);
+    assert!(
+        !risk_b
+            .cancel_admission("owner/a", &ticket_a, at(9, 3))
+            .await
+            .unwrap()
+    );
+
+    risk_a
+        .record_position_closed("owner/a", at(9, 4))
+        .await
+        .unwrap();
+    assert_eq!(risk_b.state().await.unwrap().open_positions.len(), 1);
+
+    reserve_owner_leg(journal_id, &path, "paper-main", "owner/a", "10").await;
+    assert!(
+        !risk_b
+            .cancel_admission("owner/a", &ticket_b, at(9, 5))
+            .await
+            .unwrap(),
+        "the matching paper reservation must consume only scope-b's remaining ticket"
+    );
 }
 
 #[tokio::test]

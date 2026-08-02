@@ -26,7 +26,7 @@ use thiserror::Error;
 pub enum IndicatorError {
     #[error("indicator period must be positive")]
     InvalidPeriod,
-    #[error("window size must be at least two")]
+    #[error("window size must be within the supported bounded range")]
     InvalidWindow,
     #[error("price inputs must be strictly positive")]
     NonPositivePrice,

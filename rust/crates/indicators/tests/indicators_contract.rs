@@ -109,6 +109,14 @@ fn rolling_zscore_update_is_atomic_when_decimal_arithmetic_overflows() {
 }
 
 #[test]
+fn rolling_zscore_rejects_capacity_overflow_as_a_typed_window_error() {
+    assert_eq!(
+        RollingZScore::new(usize::MAX),
+        Err(crypto_trading_indicators::IndicatorError::InvalidWindow)
+    );
+}
+
+#[test]
 fn performance_metrics_match_golden_vectors() {
     let equity_curve = [decimal("100"), decimal("120"), decimal("90"), decimal("95")];
     let trade_pnls = [decimal("10"), decimal("-5"), Decimal::ZERO, decimal("15")];

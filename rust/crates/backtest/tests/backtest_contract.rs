@@ -234,3 +234,27 @@ fn walk_forward_reports_only_out_of_sample_windows() {
     assert_eq!(windows[0].range, 3..5);
     assert_eq!(windows[1].range, 5..7);
 }
+
+#[test]
+fn walk_forward_rejects_every_zero_sized_component() {
+    for config in [
+        WalkForwardConfig::new(0, 1, 1),
+        WalkForwardConfig::new(1, 0, 1),
+        WalkForwardConfig::new(1, 1, 0),
+    ] {
+        assert_eq!(config, Err(BacktestError::InvalidWalkForwardConfig));
+    }
+}
+
+#[test]
+fn walk_forward_stops_cleanly_when_the_next_step_would_overflow() {
+    let splitter = WalkForwardSplitter::new(
+        WalkForwardConfig::new(1, 1, usize::MAX.checked_sub(2).unwrap()).unwrap(),
+    );
+
+    let windows = splitter.out_of_sample_windows(usize::MAX);
+
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].range, 1..2);
+    assert_eq!(windows[1].range, usize::MAX - 1..usize::MAX);
+}

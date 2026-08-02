@@ -75,11 +75,18 @@ fn config(task_id: &str, grace: StdDuration) -> GridPaperTaskConfig {
 }
 
 fn account(label: &str) -> (PaperAccountAuthority, JsonlHistory, std::path::PathBuf) {
+    account_with_available(label, "10000")
+}
+
+fn account_with_available(
+    label: &str,
+    initial_available: &str,
+) -> (PaperAccountAuthority, JsonlHistory, std::path::PathBuf) {
     let path = temp_path(label);
     let history = JsonlHistory::new(&path);
     let account = PaperAccountAuthority::planned(
         history.clone(),
-        PaperAccountConfig::new("paper-grid", Money::new(decimal("10000"))).unwrap(),
+        PaperAccountConfig::new("paper-grid", Money::new(decimal(initial_available))).unwrap(),
     )
     .unwrap();
     (account, history, path)
@@ -363,6 +370,84 @@ async fn account_risk_rejections_skip_entry_crossings_without_reservations() {
     assert_eq!(state.last_rejection.as_deref(), Some("symbol_disabled"));
     let body = std::fs::read_to_string(path).unwrap();
     assert!(body.contains("\"decision\":\"account_risk_rejected\""));
+    assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
+}
+
+#[tokio::test]
+async fn reservation_failures_cancel_admitted_grid_entries_without_leaking_owner_risk() {
+    let (account, history, path) = account_with_available("reserve-after-admit", "50");
+    let risk = account_risk(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(FillExecutor::default());
+    let first_source = VecSource::new(vec![observation(
+        "99",
+        1,
+        base_time() + Duration::seconds(10),
+    )]);
+    let mut first = GridPaperTask::start(
+        config("grid:reserve-fail:first", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        grid(),
+        first_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let first_error = first.wait().await.unwrap_err();
+    assert!(matches!(first_error, GridPaperTaskError::Saga(_)));
+    assert_eq!(first.status().phase, GridPaperTaskPhase::Failed);
+    assert_eq!(
+        first.status().failure,
+        Some(GridPaperTaskFailure::AccountContract)
+    );
+
+    let second_source = VecSource::new(vec![observation(
+        "99",
+        2,
+        base_time() + Duration::seconds(20),
+    )]);
+    let mut second = GridPaperTask::start(
+        config("grid:reserve-fail:second", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        grid(),
+        second_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let second_error = second.wait().await.unwrap_err();
+    assert!(matches!(second_error, GridPaperTaskError::Saga(_)));
+    assert_eq!(second.status().phase, GridPaperTaskPhase::Failed);
+    assert_eq!(
+        second.status().failure,
+        Some(GridPaperTaskFailure::AccountContract)
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+
+    let state = risk.state().await.unwrap();
+    assert!(state.open_positions.is_empty());
+    assert_eq!(state.admitted_count, 2);
+    assert_eq!(state.rejected_count, 0);
+
+    let body = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admitted\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admission_cancelled\"")
+            .count(),
+        2,
+        "{body}"
+    );
     assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
 }
 

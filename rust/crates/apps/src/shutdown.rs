@@ -30,7 +30,7 @@ pub struct ShutdownSignalError {
 }
 
 impl ShutdownSignalError {
-    fn register(signal: &'static str, source: io::Error) -> Self {
+    pub(crate) fn register(signal: &'static str, source: io::Error) -> Self {
         Self {
             signal,
             stage: ShutdownSignalStage::Register,
@@ -38,7 +38,7 @@ impl ShutdownSignalError {
         }
     }
 
-    fn receive(signal: &'static str, source: io::Error) -> Self {
+    pub(crate) fn receive(signal: &'static str, source: io::Error) -> Self {
         Self {
             signal,
             stage: ShutdownSignalStage::Receive,
@@ -46,17 +46,16 @@ impl ShutdownSignalError {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn synthetic(
-        signal: &'static str,
-        stage: ShutdownSignalStage,
-        message: &'static str,
-    ) -> Self {
-        let source = io::Error::other(message);
-        match stage {
-            ShutdownSignalStage::Register => Self::register(signal, source),
-            ShutdownSignalStage::Receive => Self::receive(signal, source),
-        }
+    /// Returns the operating-system signal whose handling failed.
+    #[must_use]
+    pub const fn signal(&self) -> &'static str {
+        self.signal
+    }
+
+    /// Returns whether handler registration or signal receipt failed.
+    #[must_use]
+    pub const fn stage(&self) -> ShutdownSignalStage {
+        self.stage
     }
 }
 
@@ -152,18 +151,17 @@ fn platform_shutdown_signal() -> Result<ShutdownSignalFuture, ShutdownSignalErro
 #[cfg(test)]
 mod tests {
     use super::{ShutdownSignalError, ShutdownSignalStage};
+    use std::io;
 
     #[test]
-    fn synthetic_signal_error_preserves_the_failed_stage() {
-        let error = ShutdownSignalError::synthetic(
+    fn signal_error_exposes_typed_identity_and_stage() {
+        let error = ShutdownSignalError::register(
             "SIGTERM",
-            ShutdownSignalStage::Register,
-            "synthetic failure",
+            io::Error::from(io::ErrorKind::PermissionDenied),
         );
 
-        assert_eq!(
-            error.to_string(),
-            "shutdown signal registration failed for SIGTERM: synthetic failure"
-        );
+        assert_eq!(error.signal(), "SIGTERM");
+        assert_eq!(error.stage(), ShutdownSignalStage::Register);
+        assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
     }
 }
