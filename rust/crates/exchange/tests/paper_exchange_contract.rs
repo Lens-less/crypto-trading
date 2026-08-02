@@ -276,11 +276,54 @@ async fn resting_limit_fills_from_a_later_snapshot_and_subscription_observes_it(
     let orders = paper.orders().await;
     assert_eq!(orders.len(), 1);
     assert_eq!(orders[0].status, OrderStatus::Filled);
+    // A resting maker order executes at its own limit price when the book
+    // trades through the level; the new touch (ask 99.5) is a taker-only
+    // price a maker can never receive.
     assert_eq!(
         orders[0].average_fill_price.unwrap().as_decimal(),
-        decimal("99.5")
+        decimal("100")
     );
     assert_eq!(orders[0].updated_at, timestamp("2026-07-14T01:01:00Z"));
+}
+
+#[tokio::test]
+async fn resting_sell_limit_fills_at_its_limit_price_when_the_book_gaps_up() {
+    let paper = paper_at("2026-07-14T01:01:00Z");
+    let symbol = Symbol::new("BTC-USDT").unwrap();
+    paper
+        .publish_snapshot(snapshot("99", "101", "2026-07-14T01:00:00Z"))
+        .await
+        .unwrap();
+
+    let mut intent = OrderIntent::limit(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(decimal("1")).unwrap(),
+        Price::new(decimal("102")).unwrap(),
+    );
+    intent.client_order_id = Uuid::parse_str("67e55044-10b1-426f-9247-bb680e5fe0c9").unwrap();
+    let placed = paper.execute(TradingCommand::Submit(intent)).await.unwrap();
+    assert_eq!(
+        placed.submission_disposition(),
+        Some(SubmissionDisposition::Open)
+    );
+
+    paper
+        .publish_snapshot(snapshot("110", "110.5", "2026-07-14T01:01:00Z"))
+        .await
+        .unwrap();
+
+    let orders = paper.orders().await;
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].status, OrderStatus::Filled);
+    // The maker's fill sticks to its limit (102), not the gapped bid (110):
+    // touch-price improvement on a gap is only available to takers.
+    assert_eq!(
+        orders[0].average_fill_price.unwrap().as_decimal(),
+        decimal("102")
+    );
 }
 
 #[tokio::test]
