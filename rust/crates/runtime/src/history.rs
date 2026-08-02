@@ -12,7 +12,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Mutex as AsyncMutex,
+};
 
 pub const MAX_HISTORY_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_HISTORY_BATCH_BYTES: usize = 8_388_608;
@@ -399,8 +402,11 @@ impl JsonlHistory {
     ///
     /// This prevents another task in the process from interleaving bytes inside
     /// the group. It is deliberately not described as a transaction: an OS
-    /// write failure can still leave a partial tail that recovery code must
-    /// detect and quarantine.
+    /// write failure can still leave a partial tail. Later appends fail closed
+    /// on such a tail ([`HistoryError::PartialTail`]) instead of merging it
+    /// into the next record or sealing it into a read-only segment, so the
+    /// damage stays detectable at the end of the chain until it is
+    /// quarantined.
     ///
     /// If the batch would push the active file past [`MAX_HISTORY_FILE_BYTES`],
     /// the active file is sealed as the next read-only chain segment before the
@@ -513,7 +519,7 @@ impl JsonlHistory {
             .iter()
             .fold(0u64, |total, segment| total.saturating_add(segment.bytes));
 
-        let file = self.open_active().await?;
+        let mut file = self.open_active().await?;
         let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
         if existing_bytes > MAX_HISTORY_FILE_BYTES || batch_bytes > MAX_HISTORY_FILE_BYTES {
             // An oversized active file was not produced by this writer; sealing
@@ -524,6 +530,8 @@ impl JsonlHistory {
                 limit: MAX_HISTORY_FILE_BYTES,
             });
         }
+        self.ensure_active_tail_is_complete(&mut file, existing_bytes)
+            .await?;
         ensure_chain_budget(sealed_bytes, existing_bytes, batch_bytes)?;
         if existing_bytes.saturating_add(batch_bytes) <= MAX_HISTORY_FILE_BYTES {
             return Ok(file);
@@ -556,6 +564,39 @@ impl JsonlHistory {
             });
         }
         Ok(file)
+    }
+
+    /// Refuses to append to or seal an active file whose last byte is not a
+    /// record terminator.
+    ///
+    /// A crash or failed write can leave a partial record at the tail. Readers
+    /// tolerate that state as a recoverable partial-tail boundary, but only
+    /// while it stays at the end of the chain: appending would glue the
+    /// fragment and the next record into one malformed line in the middle of
+    /// the journal, and sealing would freeze it into a segment every future
+    /// chain read rejects. Both destroy the ability to detect and quarantine
+    /// the tail, so the writer fails closed instead.
+    async fn ensure_active_tail_is_complete(
+        &self,
+        file: &mut tokio::fs::File,
+        existing_bytes: u64,
+    ) -> Result<(), HistoryError> {
+        if existing_bytes == 0 {
+            return Ok(());
+        }
+        let mut tail = [0u8; 1];
+        file.seek(io::SeekFrom::End(-1))
+            .await
+            .map_err(HistoryError::TailInspect)?;
+        file.read_exact(&mut tail)
+            .await
+            .map_err(HistoryError::TailInspect)?;
+        if tail != [b'\n'] {
+            return Err(HistoryError::PartialTail {
+                path: self.path.clone(),
+            });
+        }
+        Ok(())
     }
 
     async fn open_active(&self) -> Result<tokio::fs::File, HistoryError> {
@@ -835,6 +876,12 @@ pub enum HistoryError {
         resource: &'static str,
         bytes: usize,
     },
+    #[error("failed to read the history file tail: {0}")]
+    TailInspect(std::io::Error),
+    #[error(
+        "history file {path} ends in a partial record; quarantine the crash-left tail before appending"
+    )]
+    PartialTail { path: PathBuf },
     #[error("failed to create history directory: {0}")]
     CreateDirectory(std::io::Error),
     #[error("failed to serialize decision record: {0}")]
@@ -994,9 +1041,7 @@ mod tests {
             details: Value::Null,
         };
         let record_bytes = serde_json::to_vec(&record).unwrap().len() as u64 + 1;
-        let file = std::fs::File::create(&path).unwrap();
-        file.set_len(MAX_HISTORY_FILE_BYTES - record_bytes).unwrap();
-        drop(file);
+        newline_terminated_fill(&path, MAX_HISTORY_FILE_BYTES - record_bytes);
 
         history.append(&record).await.unwrap();
         assert_eq!(
@@ -1015,6 +1060,59 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(sealed).unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_fails_closed_on_a_crash_left_partial_tail() {
+        let path = std::env::temp_dir().join(format!("history-partial-tail-{}", Uuid::new_v4()));
+        let history = JsonlHistory::new(&path);
+        // A crash mid-write leaves the last record without its terminator.
+        let fragment: &[u8] = b"{\"decision\":\"trunc";
+        std::fs::write(&path, fragment).unwrap();
+        let record = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            strategy: "partial-tail".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "hold".to_owned(),
+            details: Value::Null,
+        };
+
+        let error = history.append(&record).await.unwrap_err();
+
+        assert!(matches!(error, HistoryError::PartialTail { .. }));
+        // The fragment stays at the end of the chain, where readers can still
+        // detect and quarantine it.
+        assert_eq!(std::fs::read(&path).unwrap(), fragment);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_to_seal_a_partial_tail_into_a_segment() {
+        let path = std::env::temp_dir().join(format!("history-partial-seal-{}", Uuid::new_v4()));
+        let history = JsonlHistory::new(&path);
+        // An active file at the limit whose tail is a partial record: the
+        // crossing append must fail closed instead of sealing a segment that
+        // every future chain read would reject.
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_HISTORY_FILE_BYTES).unwrap();
+        drop(file);
+        let record = DecisionRecord {
+            timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            strategy: "partial-seal".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "hold".to_owned(),
+            details: Value::Null,
+        };
+
+        let error = history.append(&record).await.unwrap_err();
+
+        assert!(matches!(error, HistoryError::PartialTail { .. }));
+        assert!(!sealed_segment_path(history.path(), 1).exists());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_HISTORY_FILE_BYTES
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1142,6 +1240,16 @@ mod tests {
             .keys()
             .filter(|path| path.to_string_lossy().to_lowercase().contains(&tag))
             .count()
+    }
+
+    /// Grows `path` to `len` bytes ending in a record terminator, so size
+    /// fixtures pass the writer's partial-tail check.
+    fn newline_terminated_fill(path: &Path, len: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(len - 1).unwrap();
+        drop(file);
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"\n").unwrap();
     }
 
     fn minimum_history_record_bytes() -> usize {

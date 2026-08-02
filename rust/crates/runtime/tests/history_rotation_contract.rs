@@ -38,9 +38,7 @@ async fn appends_across_the_file_limit_seal_a_segment_and_continue() {
     let history = JsonlHistory::new(&path);
     let record = record("rotation_fill", 0);
     let record_bytes = u64::try_from(encoded(&record).len()).unwrap();
-    let file = std::fs::File::create(&path).unwrap();
-    file.set_len(MAX_HISTORY_FILE_BYTES - record_bytes).unwrap();
-    drop(file);
+    newline_terminated_fill(&path, MAX_HISTORY_FILE_BYTES - record_bytes);
 
     history.append(&record).await.unwrap();
     assert_eq!(file_len(&path), MAX_HISTORY_FILE_BYTES);
@@ -258,10 +256,7 @@ async fn segment_and_chain_budgets_fail_closed_without_writing() {
     }
     let overflow = record("rotation_overflow", 1);
     let overflow_bytes = u64::try_from(encoded(&overflow).len()).unwrap();
-    let file = std::fs::File::create(&path).unwrap();
-    file.set_len(MAX_HISTORY_FILE_BYTES - overflow_bytes + 1)
-        .unwrap();
-    drop(file);
+    newline_terminated_fill(&path, MAX_HISTORY_FILE_BYTES - overflow_bytes + 1);
     let before = file_len(&path);
 
     // A crossing append on a full chain fails closed instead of sealing.
@@ -314,6 +309,47 @@ async fn segment_and_chain_budgets_fail_closed_without_writing() {
     std::fs::remove_dir_all(oversized_root).unwrap();
 }
 
+#[tokio::test]
+async fn crash_left_partial_tail_blocks_appends_until_quarantined() {
+    let root = temp_root("history-rotation-partial-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    history
+        .append(&record("execution_planned", 0))
+        .await
+        .unwrap();
+
+    // Crash mid-write: the last record loses its terminating newline.
+    let mut truncated = std::fs::read(&path).unwrap();
+    truncated.pop();
+    std::fs::write(&path, &truncated).unwrap();
+
+    // Readers still see a detectable, recoverable partial-tail boundary...
+    let source = FileJournalSnapshotSource::new(Uuid::from_bytes([13; 16]), &path).unwrap();
+    let page = LegacyJsonlJournalReader::read_page(&source.snapshot().unwrap(), None).unwrap();
+    assert!(matches!(
+        page.boundary(),
+        JournalPageBoundary::PartialTail { .. }
+    ));
+
+    // ...because the writer refuses to glue new records onto the fragment or
+    // seal it into a read-only segment.
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+    assert!(matches!(error, HistoryError::PartialTail { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), truncated);
+
+    // Quarantining the fragment (here: dropping the sole partial record)
+    // restores appends.
+    std::fs::write(&path, b"").unwrap();
+    let resumed = record("execution_completed", 2);
+    history.append(&resumed).await.unwrap();
+    assert_eq!(read_journal_chain(&path).unwrap(), encoded(&resumed));
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn cross_process_writers_stay_excluded_across_rotation() {
     let root = temp_root("history-rotation-lease");
@@ -348,11 +384,7 @@ fn cross_process_writers_stay_excluded_across_rotation() {
     let recovered = JsonlHistory::new(&history_path);
     let padding = record("rotation_fill", 2);
     let padding_bytes = u64::try_from(encoded(&padding).len()).unwrap();
-    let active = std::fs::File::create(&history_path).unwrap();
-    active
-        .set_len(MAX_HISTORY_FILE_BYTES - padding_bytes)
-        .unwrap();
-    drop(active);
+    newline_terminated_fill(&history_path, MAX_HISTORY_FILE_BYTES - padding_bytes);
     runtime().block_on(recovered.append(&padding)).unwrap();
     runtime().block_on(recovered.append(&padding)).unwrap();
     assert_eq!(file_len(&sealed(&history_path, 2)), MAX_HISTORY_FILE_BYTES);
@@ -427,6 +459,16 @@ fn encoded(record: &DecisionRecord) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(record).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+/// Grows `path` to `len` bytes ending in a record terminator, so size fixtures
+/// pass the writer's partial-tail check.
+fn newline_terminated_fill(path: &Path, len: u64) {
+    let file = std::fs::File::create(path).unwrap();
+    file.set_len(len - 1).unwrap();
+    drop(file);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut file, b"\n").unwrap();
 }
 
 fn sealed(path: &Path, sequence: u64) -> PathBuf {

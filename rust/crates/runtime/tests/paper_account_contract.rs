@@ -560,6 +560,66 @@ async fn journal_generation_mismatch_degrades_and_closes_writes() {
     assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
 }
 
+#[tokio::test]
+async fn sealed_chain_without_active_file_replays_the_reserved_balance() {
+    let path = temp_path("sealed-chain");
+    let journal_id = Uuid::new_v4();
+    let config = PaperAccountConfig::new("paper-main", money("1000")).unwrap();
+    let authority =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config.clone()).unwrap();
+    let admission = authority
+        .reserve(reservation_request(
+            "arb:btc",
+            "open:0001",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ))
+        .await
+        .unwrap();
+    let PaperReservationAdmission::Reserved(reservation) = admission else {
+        panic!("the reservation must be admitted against the fresh journal");
+    };
+
+    // Crash point between sealing the active file and recreating it: the
+    // sealed chain `<path>.1` alone is the complete durable record and must
+    // replay every reservation fact, not silently reset the balance to
+    // `initial_available`.
+    let sealed = {
+        let mut sealed = path.clone().into_os_string();
+        sealed.push(".1");
+        std::path::PathBuf::from(sealed)
+    };
+    std::fs::rename(&path, &sealed).unwrap();
+
+    let restarted =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config.clone()).unwrap();
+    let snapshot = restarted.snapshot().await.unwrap();
+    assert_eq!(snapshot.projection_status, ProjectionStatus::Complete);
+    assert_eq!(snapshot.available, money("799.40"));
+    assert_eq!(snapshot.pending_reserved, money("200.60"));
+    assert_eq!(snapshot.reservations.len(), 1);
+
+    // Transitions on the pre-crash reservation keep working: the append
+    // recreates the active file behind the sealed segment.
+    let uncertain = restarted
+        .mark_uncertain(reservation.reservation_id)
+        .await
+        .unwrap();
+    assert_eq!(uncertain.phase, PaperReservationPhase::Uncertain);
+
+    // A journal with neither an active file nor sealed segments still loads
+    // as a fresh empty account.
+    let fresh = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(temp_path("sealed-chain-fresh")),
+        config,
+    )
+    .unwrap();
+    let snapshot = fresh.snapshot().await.unwrap();
+    assert_eq!(snapshot.available, money("1000"));
+    assert!(snapshot.reservations.is_empty());
+}
+
 fn temp_path(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "crypto-trading-paper-account-{label}-{}.jsonl",

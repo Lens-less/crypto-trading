@@ -41,7 +41,7 @@ const MAX_RECONCILIATION_MISMATCHES: usize = 16;
 const MAX_RECONCILIATION_EVIDENCE_BYTES: usize = 32 * 1_024;
 const MAX_COST_BPS: u32 = 10_000;
 const PAPER_ACCOUNT_STRATEGY: &str = "paper_account";
-const PAPER_ACCOUNT_RESERVED: &str = "paper_account_reserved";
+pub(crate) const PAPER_ACCOUNT_RESERVED: &str = "paper_account_reserved";
 const PAPER_ACCOUNT_UNCERTAIN: &str = "paper_account_uncertain";
 const PAPER_ACCOUNT_COMMITTED: &str = "paper_account_committed";
 const PAPER_ACCOUNT_RELEASED: &str = "paper_account_released";
@@ -1347,14 +1347,18 @@ impl PaperAccountAuthority {
 
     async fn load_account_snapshot(&self) -> Result<PaperAccountSnapshot, PaperAccountError> {
         let source = FileJournalSnapshotSource::new(self.journal_id, self.history.path())?;
-        let source_path = source.path().to_owned();
         let journal_id = self.journal_id;
-        let journal = tokio::task::spawn_blocking(move || match std::fs::metadata(&source_path) {
-            Ok(_) => source.snapshot(),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+        let journal = tokio::task::spawn_blocking(move || match source.snapshot() {
+            // A fresh journal is the only state read as empty: the chain reader
+            // surfaces a missing active file as `Open(NotFound)` solely when no
+            // sealed segment exists. A missing active file behind sealed
+            // segments (the legal crash point between sealing and recreating
+            // it) replays the sealed chain inside `snapshot()` and must never
+            // reset the account balance to `initial_available`.
+            Err(JournalReadError::Open(error)) if error.kind() == ErrorKind::NotFound => {
                 JournalSnapshot::new(journal_id, Vec::new())
             }
-            Err(error) => Err(JournalReadError::Metadata(error)),
+            result => result,
         })
         .await
         .map_err(|_| PaperAccountError::SnapshotTaskFailed)??;
