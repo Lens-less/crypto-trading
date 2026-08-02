@@ -305,10 +305,14 @@ impl GridPlanner {
                 GridDirection::Short => upper.checked_sub(level_offset),
             }
             .ok_or(StrategyError::InvalidFinancialValue("grid level price"))?;
-            let increment_count = match self.config.direction {
-                GridDirection::Long => count - index,
-                GridDirection::Short => index - 1,
-            };
+            // Index 1 is the deepest adverse excursion in both directions
+            // (lowest price for long, highest price for short), so martingale
+            // sizing is largest there. The legacy short formula
+            // (`grid_config.py:565-569`, `order_amount + (grid_index - 1) *
+            // increment`) contradicts its own documented intent ("价格越高，
+            // 数量越多") because legacy Grid 1 is the highest short price; we
+            // deliberately deviate to deliver the documented intent.
+            let increment_count = count - index;
             let quantity_increment = self
                 .config
                 .martingale_increment

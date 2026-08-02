@@ -121,13 +121,16 @@ fn martingale_long_matches_the_legacy_ten_level_quantity_ladder() {
     assert!(levels.iter().all(|level| level.side == Side::Buy));
 }
 
-// Golden vector extracted from the frozen Python engine
-// (`archive/python-legacy/core/services/grid/models/grid_config.py:565-569`):
-// short martingale quantity per level is
-// `order_amount + (grid_index - 1) * martingale_increment`, with Grid 1 at
-// the upper bound (`grid_config.py:311-314`) selling the least.
+// Golden vector for the legacy engine's DOCUMENTED short-martingale intent
+// (`archive/python-legacy/core/services/grid/models/grid_config.py:565-569`:
+// "价格越高（grid_index 越大），数量越多" — higher price sells more). The
+// legacy formula `order_amount + (grid_index - 1) * martingale_increment`
+// delivered the opposite because Grid 1 is the highest short price
+// (`grid_config.py:311-314`); this port deliberately deviates from that
+// buggy behavior so the largest quantity sits at the most adverse price,
+// mirroring the long ladder.
 #[test]
-fn martingale_short_matches_the_legacy_ten_level_quantity_ladder() {
+fn martingale_short_sizes_largest_at_the_most_adverse_price() {
     let planner = GridPlanner::new(GridPlanConfig {
         exchange: "paper".to_owned(),
         symbol: Symbol::new("BTC").unwrap(),
@@ -145,16 +148,16 @@ fn martingale_short_matches_the_legacy_ten_level_quantity_ladder() {
 
     let levels = planner.fixed_levels().unwrap();
     let expected: Vec<(Decimal, Decimal)> = [
-        ("110", "0.50"),
-        ("109", "0.55"),
-        ("108", "0.60"),
-        ("107", "0.65"),
-        ("106", "0.70"),
-        ("105", "0.75"),
-        ("104", "0.80"),
-        ("103", "0.85"),
-        ("102", "0.90"),
-        ("101", "0.95"),
+        ("110", "0.95"),
+        ("109", "0.90"),
+        ("108", "0.85"),
+        ("107", "0.80"),
+        ("106", "0.75"),
+        ("105", "0.70"),
+        ("104", "0.65"),
+        ("103", "0.60"),
+        ("102", "0.55"),
+        ("101", "0.50"),
     ]
     .iter()
     .map(|(price, quantity)| (decimal(price), decimal(quantity)))

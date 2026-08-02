@@ -26,6 +26,7 @@ use crypto_trading_runtime::{
     JsonlHistory, MarketDataClock, MarketDataEvent, MarketDataObservation, MarketFreshnessPolicy,
     PriceAlertReadModel,
 };
+use crypto_trading_strategy::AlertKind;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -226,6 +227,45 @@ async fn ready_samples_persist_occurrences_and_cooldown_suppresses_duplicates() 
         decision_count(&records, "price_alert_delivery_succeeded"),
         2
     );
+    remove_file(&path);
+}
+
+#[tokio::test]
+async fn volatility_alert_fires_without_a_sample_exactly_on_the_window_boundary() {
+    // Regression: the runtime prunes strategy history to exactly the
+    // volatility window before every evaluation, so with real millisecond
+    // timestamps no retained sample ever sits at or before the boundary and
+    // volatility alerts could never fire end-to-end. Every timestamp here
+    // carries a millisecond offset so nothing lands on the boundary.
+    let path = temp_path("alert-volatility-off-boundary");
+    let clock = Arc::new(TestClock::new(timestamp_ms(500)));
+    let mut runtime = journal_only_runtime(&volatility_config(0), Arc::clone(&clock), &path);
+
+    for (revision, offset_ms) in [(1_u64, 500_i64), (2, 30_700)] {
+        clock.set(timestamp_ms(offset_ms));
+        let report = runtime
+            .process(observation(revision, timestamp_ms(offset_ms), "100"))
+            .await
+            .unwrap();
+        assert!(report.occurrences.is_empty());
+    }
+
+    // At 61.3s the 60s window starts at 1.3s: the 0.5s sample is pruned and
+    // the 30.7s sample is strictly inside the window and must anchor the move.
+    clock.set(timestamp_ms(61_300));
+    let triggered = runtime
+        .process(observation(3, timestamp_ms(61_300), "105"))
+        .await
+        .unwrap();
+    assert_eq!(triggered.occurrences.len(), 1);
+    assert_eq!(triggered.occurrences[0].kind, AlertKind::VolatilityUp);
+    assert_eq!(
+        triggered.occurrences[0].change_percent,
+        Some(Decimal::from(5))
+    );
+
+    runtime.stop().await;
+    assert_eq!(decision_count(&records(&path), "price_alert_occurred"), 1);
     remove_file(&path);
 }
 
@@ -921,6 +961,11 @@ fn price(value: &str) -> Price {
 
 fn timestamp(offset_seconds: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).single().unwrap() + Duration::seconds(offset_seconds)
+}
+
+fn timestamp_ms(offset_milliseconds: i64) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).single().unwrap()
+        + Duration::milliseconds(offset_milliseconds)
 }
 
 fn temp_path(label: &str) -> std::path::PathBuf {
