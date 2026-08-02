@@ -14,6 +14,22 @@ the software may do exactly what it could do before.
 
 ### Fixed
 
+- Journal chain snapshots can no longer silently omit a segment sealed while
+  the chain was being captured. The reader re-inspects the sealed chain after
+  freezing the active file and retries the capture when a rotation landed in
+  between, so read models never project a chain with a hole in the middle.
+- The journal writer refuses to append to — or seal — an active file whose last
+  byte is not a record terminator (`HistoryError::PartialTail`). A crash-left
+  partial record previously merged with the next append into one malformed
+  mid-chain line (or was frozen into a sealed segment readers reject), turning
+  a detectable, recoverable tail into permanent corruption.
+- The paper exchange fills resting limit orders at their own limit price when a
+  later snapshot trades through the level. Resting orders previously executed
+  at the new touch (bid/ask), granting maker orders taker-style price
+  improvement on every inter-snapshot gap and systematically overstating paper
+  PnL for maker-style strategies. Submit-time crossings still fill at the
+  touch, which is correct taker semantics.
+
 - Signed exchange requests no longer follow HTTP redirects. `reqwest` preserves
   custom headers across redirects, so a `3xx` from the venue would have
   replayed the `X-MBX-APIKEY` header and the signed query string to whatever
@@ -43,6 +59,19 @@ the software may do exactly what it could do before.
 
 ### Changed
 
+- Account-risk day rollover is now monotonic: replaying an older observation
+  cannot move the active UTC risk day backwards or reset a newer day's trade
+  count.
+- Account-risk admission now conservatively includes admitted notional until a
+  matching paper reservation consumes it, closing the gap in which concurrent
+  owners could all pass the same exposure limit before their reservations were
+  durable.
+- Martingale sizing treats the deepest adverse grid level as the largest order
+  for both long and short grids. This intentionally follows the documented
+  strategy meaning instead of the legacy Python short-grid index formula.
+- Short-grid scalping places reduce-only take-profit orders beyond breakeven on
+  the profitable side. This intentionally corrects the legacy Python formula,
+  which subtracted the short offset and could place the exit on the loss side.
 - CI triggers on a denylist rather than an allowlist of paths. Test fixtures,
   the `Dockerfile`, and everything under `deploy/` were previously excluded, so
   a change to any of them could ship with a green check and no gate having run.
