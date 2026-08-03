@@ -111,6 +111,62 @@ fn replay_rejects_multi_exchange_configs_instead_of_silently_truncating_scope() 
     assert!(!history.exists());
 }
 
+#[test]
+fn configured_pair_skew_changes_replay_monitor_outcome() {
+    let replay = temp_path("monitor-pair-skew-replay", "jsonl");
+    std::fs::write(
+        &replay,
+        concat!(
+            r#"{"exchange":"paper-left","symbol":"ETH-USDC-PERP","market_type":"perpetual","bid":"99","ask":"100","timestamp":"2026-07-24T00:00:00.000Z"}"#,
+            "\n",
+            r#"{"exchange":"paper-right","symbol":"ETH-USDC-PERP","market_type":"perpetual","bid":"102","ask":"103","timestamp":"2026-07-24T00:00:00.300Z"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    for (tolerance_ms, expected_decision) in [
+        (250_u64, "monitor_waiting"),
+        (500_u64, "monitor_opportunity"),
+    ] {
+        let config = temp_path(&format!("monitor-pair-skew-{tolerance_ms}"), "yaml");
+        let history = temp_path(
+            &format!("monitor-pair-skew-{tolerance_ms}-history"),
+            "jsonl",
+        );
+        std::fs::write(
+            &config,
+            format!(
+                "exchanges: [paper-left, paper-right]\nsymbols: [ETH-USDC-PERP]\nthresholds:\n  min_spread_pct: 0\nhealth_check:\n  data_timeout: 30\n  max_pair_skew_ms: {tolerance_ms}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = Command::new(binary())
+            .current_dir(repo_root())
+            .args([
+                "monitor",
+                "--config",
+                config.to_str().unwrap(),
+                "--replay",
+                replay.to_str().unwrap(),
+                "--history-path",
+                history.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let journal = std::fs::read_to_string(&history).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+        assert_eq!(last["decision"], expected_decision, "{journal}");
+
+        std::fs::remove_file(config).unwrap();
+        std::fs::remove_file(history).unwrap();
+    }
+    std::fs::remove_file(replay).unwrap();
+}
+
 fn temp_path(label: &str, extension: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

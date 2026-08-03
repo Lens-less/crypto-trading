@@ -8,12 +8,13 @@
 //! bounded notices and then refetch the operator snapshot; transports do not
 //! choose their own payload-redaction policy.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
 use crypto_trading_runtime::{
-    AccountRiskProjectionError, CapabilityError, CursorError, JournalPage, JournalPageBoundary,
-    JournalReadError, JournalSnapshotSource, LegacyJsonlJournalReader, OperationEventEnvelope,
+    AccountRiskProjectionError, CapabilityError, CursorError, JournalCursor, JournalPage,
+    JournalPageBoundary, JournalReadError, JournalSnapshot, JournalSnapshotSource,
+    LegacyJsonlJournalReader, MAX_CURSOR_ANCHOR_SCAN_BYTES, OperationEventEnvelope,
     PaperAccountProjectionError, ReadModelError, current_capability_manifest,
     project_control_plane_state,
 };
@@ -68,6 +69,7 @@ pub type SharedJournalSnapshotSource = dyn JournalSnapshotSource + Send + Sync;
 pub struct ReadControlPlane {
     journal: Arc<SharedJournalSnapshotSource>,
     capabilities: CapabilityManifest,
+    projection_cache: Arc<RwLock<ProjectionCache>>,
 }
 
 impl ReadControlPlane {
@@ -86,6 +88,7 @@ impl ReadControlPlane {
         Ok(Self {
             journal,
             capabilities,
+            projection_cache: Arc::new(RwLock::new(ProjectionCache::default())),
         })
     }
 
@@ -93,6 +96,16 @@ impl ReadControlPlane {
     #[must_use]
     pub const fn capabilities(&self) -> &CapabilityManifest {
         &self.capabilities
+    }
+
+    /// Returns resident projection-cache counters for operational tests.
+    ///
+    #[must_use]
+    pub fn projection_cache_stats(&self) -> ControlPlaneProjectionCacheStats {
+        self.projection_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stats
     }
 
     /// Captures one immutable journal generation and projects its operator
@@ -104,12 +117,7 @@ impl ReadControlPlane {
     /// captured or its durable execution facts cannot be projected safely.
     pub fn snapshot(&self) -> Result<ControlPlaneSnapshot, ControlPlaneSnapshotError> {
         let journal = self.journal.snapshot()?;
-        let projection =
-            project_control_plane_state(&journal).map_err(map_snapshot_projection_error)?;
-        Ok(control_plane_snapshot(
-            self.capabilities.clone(),
-            projection,
-        ))
+        self.cached_snapshot_or_reproject(&journal, map_snapshot_projection_error)
     }
 
     /// Reads one bounded, payload-redacted event page after an opaque cursor.
@@ -166,12 +174,134 @@ impl ReadControlPlane {
                     source => ControlPlaneReadError::Journal(source),
                 }
             })?;
-        let projection =
-            project_control_plane_state(&journal).map_err(map_read_projection_error)?;
         Ok(ControlPlaneRead {
-            snapshot: control_plane_snapshot(self.capabilities.clone(), projection),
+            snapshot: self.cached_snapshot_or_reproject(&journal, map_read_projection_error)?,
             events: control_plane_events_page(&page),
         })
+    }
+
+    fn cached_snapshot_or_reproject<E>(
+        &self,
+        journal: &JournalSnapshot,
+        map_error: fn(crypto_trading_runtime::ControlPlaneProjectionError) -> E,
+    ) -> Result<ControlPlaneSnapshot, E> {
+        if let Some(snapshot) = self.try_cached_snapshot(journal) {
+            self.record_cache_hit();
+            return Ok(snapshot);
+        }
+
+        let projection = project_control_plane_state(journal).map_err(map_error)?;
+        let snapshot = control_plane_snapshot(self.capabilities.clone(), projection);
+        let entry = ProjectionCacheEntry::capture(journal, snapshot.clone());
+        self.record_cache_miss(entry);
+        Ok(snapshot)
+    }
+
+    fn try_cached_snapshot(&self, journal: &JournalSnapshot) -> Option<ControlPlaneSnapshot> {
+        if journal.len() > MAX_CURSOR_ANCHOR_SCAN_BYTES {
+            return None;
+        }
+
+        let entry = self
+            .projection_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry
+            .clone()?;
+        if entry.journal_id != journal.journal_id() || entry.snapshot_len != journal.len() {
+            return None;
+        }
+
+        let validation =
+            LegacyJsonlJournalReader::read_page(journal, Some(&entry.terminal_cursor)).ok()?;
+        if validation.events().is_empty()
+            && matches!(
+                validation.boundary(),
+                JournalPageBoundary::SnapshotEnd | JournalPageBoundary::PartialTail { .. }
+            )
+        {
+            return Some(entry.snapshot);
+        }
+        None
+    }
+
+    fn record_cache_hit(&self) {
+        let mut cache = self
+            .projection_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.stats.hits = cache.stats.hits.saturating_add(1);
+    }
+
+    fn record_cache_miss(&self, entry: Option<ProjectionCacheEntry>) {
+        let mut cache = self
+            .projection_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.stats.misses = cache.stats.misses.saturating_add(1);
+        cache.entry = entry;
+        if cache.entry.is_some() {
+            cache.stats.stores = cache.stats.stores.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneProjectionCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub stores: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProjectionCache {
+    entry: Option<ProjectionCacheEntry>,
+    stats: ControlPlaneProjectionCacheStats,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectionCacheEntry {
+    journal_id: Uuid,
+    snapshot_len: usize,
+    terminal_cursor: JournalCursor,
+    snapshot: ControlPlaneSnapshot,
+}
+
+impl ProjectionCacheEntry {
+    fn capture(journal: &JournalSnapshot, snapshot: ControlPlaneSnapshot) -> Option<Self> {
+        if journal.len() > MAX_CURSOR_ANCHOR_SCAN_BYTES {
+            return None;
+        }
+
+        Some(Self {
+            journal_id: journal.journal_id(),
+            snapshot_len: journal.len(),
+            terminal_cursor: snapshot_terminal_cursor(journal)?,
+            snapshot,
+        })
+    }
+}
+
+fn snapshot_terminal_cursor(snapshot: &JournalSnapshot) -> Option<JournalCursor> {
+    let mut cursor = None;
+
+    loop {
+        let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref()).ok()?;
+        match page.boundary() {
+            JournalPageBoundary::SnapshotEnd | JournalPageBoundary::PartialTail { .. } => {
+                return page.next_cursor().cloned();
+            }
+            JournalPageBoundary::PageLimit => {
+                let next = page.next_cursor().cloned()?;
+                if cursor.as_ref().is_some_and(|previous| {
+                    previous.next_offset() == next.next_offset()
+                        && previous.after_sequence() == next.after_sequence()
+                }) {
+                    return None;
+                }
+                cursor = Some(next);
+            }
+        }
     }
 }
 
@@ -349,9 +479,10 @@ impl ControlPlaneSnapshotError {
                 PaperAccountProjectionError::NonAdvancingPage
                 | PaperAccountProjectionError::ArithmeticOverflow,
             )
-            | Self::AccountRiskProjection(AccountRiskProjectionError::NonAdvancingPage) => {
-                ReadFailureKind::InvalidJournal
-            }
+            | Self::AccountRiskProjection(
+                AccountRiskProjectionError::NonAdvancingPage
+                | AccountRiskProjectionError::InvalidAdmissionTicket,
+            ) => ReadFailureKind::InvalidJournal,
         }
     }
 }
@@ -413,9 +544,10 @@ impl ControlPlaneReadError {
                 PaperAccountProjectionError::NonAdvancingPage
                 | PaperAccountProjectionError::ArithmeticOverflow,
             )
-            | Self::AccountRiskProjection(AccountRiskProjectionError::NonAdvancingPage) => {
-                ReadFailureKind::InvalidJournal
-            }
+            | Self::AccountRiskProjection(
+                AccountRiskProjectionError::NonAdvancingPage
+                | AccountRiskProjectionError::InvalidAdmissionTicket,
+            ) => ReadFailureKind::InvalidJournal,
         }
     }
 }

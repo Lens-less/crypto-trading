@@ -15,7 +15,7 @@ use crate::market_data::{
 };
 
 /// Version of the stable, non-secret supervisor status view.
-pub const MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION: u16 = 1;
+pub const MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION: u16 = 2;
 /// Maximum events retained between a supervised source and its consumer.
 ///
 /// One complete polling round fits without loss because sources cannot own
@@ -94,6 +94,9 @@ pub struct MarketSupervisorStatus {
     pub phase: MarketSupervisorPhase,
     pub health: MarketSupervisorHealth,
     pub event_sequence: u64,
+    /// Events that this consumer could not observe because the bounded
+    /// broadcast retention window was overwritten.
+    pub dropped_event_count: u64,
     pub consecutive_source_failures: u32,
     pub last_event_at: Option<DateTime<Utc>>,
     pub exit: Option<MarketSupervisorExit>,
@@ -108,6 +111,7 @@ impl MarketSupervisorStatus {
             phase: MarketSupervisorPhase::Starting,
             health: MarketSupervisorHealth::Unknown,
             event_sequence: 0,
+            dropped_event_count: 0,
             consecutive_source_failures: 0,
             last_event_at: None,
             exit: None,
@@ -115,7 +119,11 @@ impl MarketSupervisorStatus {
     }
 
     fn observe(&mut self, event: &MarketDataEvent) {
-        self.last_event_at = Some(event.observed_at());
+        let observed_at = event.observed_at();
+        self.last_event_at = Some(
+            self.last_event_at
+                .map_or(observed_at, |last_event_at| last_event_at.max(observed_at)),
+        );
         match event {
             MarketDataEvent::Observation(_) => {
                 self.health = MarketSupervisorHealth::Healthy;
@@ -184,7 +192,7 @@ type SupervisorTaskResult = Result<MarketSupervisorExit, MarketSupervisorError>;
 ///
 /// Event retention has a fixed upper bound. One complete polling round is
 /// retained exactly; a consumer that falls farther behind first receives an
-/// explicit source gap and then the latest retained event. Dropping the
+/// explicit source gap and then every retained event in source order. Dropping the
 /// supervisor requests cancellation; [`Self::stop`] additionally waits for
 /// graceful completion.
 #[derive(Debug)]
@@ -197,6 +205,7 @@ pub struct MarketSupervisor {
     events: broadcast::Receiver<SequencedMarketEvent>,
     join: Option<JoinHandle<SupervisorTaskResult>>,
     last_event_sequence: u64,
+    dropped_event_count: u64,
     pending_event: Option<MarketDataEvent>,
     completion: Option<SupervisorTaskResult>,
 }
@@ -313,6 +322,7 @@ impl MarketSupervisor {
             events,
             join: Some(join),
             last_event_sequence: 0,
+            dropped_event_count: 0,
             pending_event: None,
             completion: None,
         })
@@ -320,13 +330,16 @@ impl MarketSupervisor {
 
     /// Returns the latest stable task status without waiting.
     pub fn status(&self) -> MarketSupervisorStatus {
-        self.status.borrow().clone()
+        let mut status = self.status.borrow().clone();
+        status.dropped_event_count = status.dropped_event_count.max(self.dropped_event_count);
+        status
     }
 
     /// Waits for the next source event.
     ///
-    /// A slow caller receives a source-gap event before the latest retained
-    /// source event. `None` means the source ended normally.
+    /// A slow caller receives a source-gap event before the oldest retained
+    /// source event, followed by the remainder of the retained window in
+    /// source order. `None` means the source ended normally.
     ///
     /// # Errors
     ///
@@ -339,27 +352,9 @@ impl MarketSupervisor {
         loop {
             let envelope = match self.events.recv().await {
                 Ok(envelope) => envelope,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let mut latest = loop {
-                        match self.events.recv().await {
-                            Ok(envelope) => break envelope,
-                            Err(broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(broadcast::error::RecvError::Closed) => {
-                                return self.settle_closed_source().await;
-                            }
-                        }
-                    };
-                    loop {
-                        match self.events.try_recv() {
-                            Ok(envelope) => latest = envelope,
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                            Err(
-                                broadcast::error::TryRecvError::Empty
-                                | broadcast::error::TryRecvError::Closed,
-                            ) => break,
-                        }
-                    }
-                    latest
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    self.dropped_event_count = self.dropped_event_count.saturating_add(skipped);
+                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     return self.settle_closed_source().await;

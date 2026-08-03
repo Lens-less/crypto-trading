@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
 use axum::{Router, middleware};
+use tokio::sync::watch;
 
 use crate::{
     ReadControlPlane, SettingsResponse, WebAccessPolicy, WebRequestRateLimiter,
-    api::{add_security_headers, api_routes_with_settings, not_found},
+    api::{
+        add_security_headers, api_routes_with_settings, api_routes_with_settings_and_shutdown,
+        not_found,
+    },
     ui::ui_router,
 };
 
@@ -31,6 +35,31 @@ pub fn app_router_with_settings(
         .nest(
             "/api/v1",
             api_routes_with_settings(control_plane, access, settings, rate_limiter),
+        )
+        .fallback(not_found)
+        .layer(middleware::from_fn(add_security_headers))
+}
+
+/// Builds the full application with deployment metadata and a lifecycle signal.
+/// Event streams close promptly when `shutdown` changes to `true`.
+pub fn app_router_with_settings_and_shutdown(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    settings: SettingsResponse,
+    rate_limiter: WebRequestRateLimiter,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
+    Router::new()
+        .merge(ui_router())
+        .nest(
+            "/api/v1",
+            api_routes_with_settings_and_shutdown(
+                control_plane,
+                access,
+                settings,
+                rate_limiter,
+                shutdown,
+            ),
         )
         .fallback(not_found)
         .layer(middleware::from_fn(add_security_headers))

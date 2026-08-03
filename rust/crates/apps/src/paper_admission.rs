@@ -40,7 +40,7 @@ pub(crate) async fn retain_cancelled_reservation(
     now: DateTime<Utc>,
 ) -> Result<bool, PaperAdmissionCompensationError> {
     let snapshot = account
-        .snapshot()
+        .decision_snapshot()
         .await
         .map_err(PaperAdmissionCompensationError::Account)?;
     if let Some(reservation) = snapshot
@@ -64,7 +64,7 @@ pub(crate) async fn retain_cancelled_reservation(
     // between the first snapshot and the cancel. Re-read while the caller's
     // owner is stopping and retain the raced reservation as uncertain.
     let retry_snapshot = account
-        .snapshot()
+        .decision_snapshot()
         .await
         .map_err(PaperAdmissionCompensationError::Account)?;
     let retry_reservation = retry_snapshot
@@ -105,4 +105,58 @@ async fn retain_pending(
             .map_err(PaperAdmissionCompensationError::Account)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use crypto_trading_domain::Money;
+    use crypto_trading_runtime::{
+        DecisionRecord, JsonlHistory, PaperAccountConfig, PaperAccountError,
+    };
+    use rust_decimal::Decimal;
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn compensation_refuses_to_decide_from_a_degraded_diagnostic_snapshot() {
+        let path =
+            std::env::temp_dir().join(format!("paper-admission-degraded-{}.jsonl", Uuid::new_v4()));
+        let journal_id = Uuid::new_v4();
+        let history = JsonlHistory::new(&path);
+        history
+            .append(&DecisionRecord {
+                timestamp: Utc::now(),
+                strategy: "paper_account".to_owned(),
+                symbol: "paper-main".to_owned(),
+                decision: "paper_account_reserved".to_owned(),
+                details: json!({"schema_version": 1}),
+            })
+            .await
+            .unwrap();
+        let account = PaperAccountAuthority::new(
+            journal_id,
+            history,
+            PaperAccountConfig::new("paper-main", Money::new(Decimal::from_str("1000").unwrap()))
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            retain_cancelled_reservation(
+                &account,
+                None,
+                "owner/a",
+                None,
+                Uuid::new_v4(),
+                Utc::now(),
+            )
+            .await,
+            Err(PaperAdmissionCompensationError::Account(
+                PaperAccountError::DurableStateDegraded
+            ))
+        ));
+    }
 }

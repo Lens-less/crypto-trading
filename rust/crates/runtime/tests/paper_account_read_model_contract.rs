@@ -138,6 +138,10 @@ async fn invalid_paper_fact_degrades_without_overwriting_last_valid_reservation(
     assert_eq!(degraded.projection_status, ProjectionStatus::Degraded);
     assert_eq!(degraded.invalid_event_count, 1);
     assert_eq!(degraded.reservations, vec![committed]);
+    assert!(matches!(
+        authority.decision_snapshot().await,
+        Err(PaperAccountError::DurableStateDegraded)
+    ));
 
     let error = authority
         .record_reconciliation_failure(
@@ -193,7 +197,11 @@ async fn partial_tail_is_visible_then_quarantined_before_the_next_account_write(
     assert_eq!(recovered.projection_status, ProjectionStatus::Complete);
     assert_eq!(recovered.reservations.len(), 2);
     assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
-    let quarantines = std::fs::read_dir(path.parent().unwrap())
+    let quarantine_dir = path.parent().unwrap().join(format!(
+        "{}.quarantine",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let quarantines = std::fs::read_dir(&quarantine_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|candidate| {
@@ -201,8 +209,7 @@ async fn partial_tail_is_visible_then_quarantined_before_the_next_account_write(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    name.starts_with(path.file_name().unwrap().to_str().unwrap())
-                        && name.ends_with(".quarantine")
+                    name.starts_with("partial-tail.") && name.ends_with(".quarantine")
                 })
         })
         .collect::<Vec<_>>();

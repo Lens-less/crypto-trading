@@ -339,7 +339,7 @@ async fn binance_polling_keeps_wire_sequence_separate_from_poll_continuity() {
 }
 
 #[tokio::test]
-async fn binance_due_targets_are_fetched_concurrently_and_emitted_in_route_order() {
+async fn binance_due_targets_are_fetched_concurrently_without_dropping_results() {
     let request_count = 3;
     let response_delay = StdDuration::from_millis(250);
     let (base_url, server) = delayed_binance_stub_server(request_count, response_delay);
@@ -367,6 +367,7 @@ async fn binance_due_targets_are_fetched_concurrently_and_emitted_in_route_order
     }
     let elapsed = started.elapsed();
 
+    symbols.sort();
     assert_eq!(symbols, ["AAA-USDT", "BBB-USDT", "CCC-USDT"]);
     assert!(
         elapsed < StdDuration::from_millis(650),
@@ -374,6 +375,83 @@ async fn binance_due_targets_are_fetched_concurrently_and_emitted_in_route_order
         response_delay * u32::try_from(request_count).unwrap()
     );
     server.join().unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_binance_routes_emit_in_completion_order() {
+    let (base_url, server) = completion_order_binance_stub_server();
+    let clock = Arc::new(FixedClock { now: timestamp(1) });
+    let aaa = instrument("binance", "AAA-USDT", MarketType::Spot);
+    let bbb = instrument("binance", "BBB-USDT", MarketType::Spot);
+    let mut source = BinancePublicPollingSource::new(
+        BinancePublicExchange::with_base_url(&base_url).unwrap(),
+        vec![route("AAA-USDT", "AAAUSDT"), route("BBB-USDT", "BBBUSDT")],
+        polling_policy(StdDuration::from_millis(1)),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+
+    let first = source.next_event().await.unwrap().unwrap();
+    let second = source.next_event().await.unwrap().unwrap();
+
+    assert!(matches!(
+        &first,
+        MarketDataEvent::SourceUnavailable {
+            failure: MarketDataSourceFailure::Backpressure,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &second,
+        MarketDataEvent::Observation(observation)
+            if observation.snapshot.symbol.as_str() == "AAA-USDT"
+    ));
+
+    let mut book = MarketDataBook::new(
+        MarketUniverse::new(vec![aaa, bbb]).unwrap(),
+        MarketFreshnessPolicy::new(Duration::seconds(10), Duration::seconds(1)).unwrap(),
+        clock,
+    );
+    book.apply(first).unwrap();
+    book.apply(second).unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn binance_poll_interval_starts_after_request_completion() {
+    let response_delay = StdDuration::from_millis(180);
+    let poll_interval = StdDuration::from_millis(120);
+    let (base_url, server) = cooldown_binance_stub_server(response_delay);
+    let clock = Arc::new(FixedClock { now: timestamp(1) });
+    let mut source = BinancePublicPollingSource::new(
+        BinancePublicExchange::with_base_url(&base_url).unwrap(),
+        vec![
+            BinancePollingRoute::new(
+                instrument("binance", "LTC-BTC-SPOT", MarketType::Spot),
+                Symbol::new("LTCBTC").unwrap(),
+            )
+            .unwrap(),
+        ],
+        MarketPollingPolicy::new(poll_interval, poll_interval, poll_interval).unwrap(),
+        clock,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(_)
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(_)
+    ));
+
+    let (first_response_completed, second_request_accepted) = server.join().unwrap();
+    assert!(
+        second_request_accepted.duration_since(first_response_completed)
+            >= StdDuration::from_millis(100),
+        "next request started before the post-completion cooldown elapsed"
+    );
 }
 
 #[tokio::test]
@@ -421,6 +499,7 @@ async fn supervisor_retains_one_concurrent_poll_round_without_synthetic_gaps() {
         symbols.push(observation.snapshot.symbol.as_str().to_owned());
     }
 
+    symbols.sort();
     assert_eq!(symbols, ["AAA-USDT", "BBB-USDT", "CCC-USDT"]);
     assert_eq!(
         supervisor.stop().await.unwrap(),
@@ -430,7 +509,7 @@ async fn supervisor_retains_one_concurrent_poll_round_without_synthetic_gaps() {
 }
 
 #[tokio::test]
-async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memory() {
+async fn supervisor_lag_preserves_retained_window_and_counts_overwrites() {
     let base = timestamp(0);
     let event_count = u64::try_from(MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS).unwrap() + 3;
     let source = ScriptedSource::new(
@@ -463,13 +542,15 @@ async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memor
             exchange,
             skipped,
             observed_at,
-        } if exchange == "binance" && skipped == event_count - 1 && observed_at == base
+        } if exchange == "binance" && skipped == 3 && observed_at == base
     ));
-    assert!(matches!(
-        supervisor.next_event().await.unwrap().unwrap(),
-        MarketDataEvent::Observation(MarketDataObservation { revision, .. })
-            if revision == event_count
-    ));
+    for expected_revision in 4..=event_count {
+        assert!(matches!(
+            supervisor.next_event().await.unwrap().unwrap(),
+            MarketDataEvent::Observation(MarketDataObservation { revision, .. })
+                if revision == expected_revision
+        ));
+    }
     assert!(supervisor.next_event().await.unwrap().is_none());
 
     let status = supervisor.status();
@@ -480,7 +561,40 @@ async fn supervisor_slow_consumer_gets_gap_then_latest_event_with_constant_memor
     assert_eq!(status.task_id, Uuid::from_u128(41));
     assert_eq!(status.phase, MarketSupervisorPhase::Stopped);
     assert_eq!(status.health, MarketSupervisorHealth::Healthy);
+    assert_eq!(status.dropped_event_count, 3);
     assert_eq!(status.exit, Some(MarketSupervisorExit::SourceEnded));
+}
+
+#[tokio::test]
+async fn supervisor_last_event_time_is_a_non_regressing_projection_high_water() {
+    let base = timestamp(0);
+    let source = ScriptedSource::new(
+        "binance",
+        vec![
+            observation("binance", "BTCUSDT", 1, base + Duration::seconds(2)),
+            MarketDataEvent::source_unavailable(
+                "binance",
+                MarketDataSourceFailure::Disconnected,
+                base + Duration::seconds(1),
+            )
+            .unwrap(),
+        ],
+    );
+    let mut supervisor = MarketSupervisor::start(
+        Uuid::from_u128(47),
+        source,
+        supervisor_config(StdDuration::from_millis(100)),
+    )
+    .unwrap();
+
+    assert!(supervisor.next_event().await.unwrap().is_some());
+    assert!(supervisor.next_event().await.unwrap().is_some());
+    assert!(supervisor.next_event().await.unwrap().is_none());
+
+    assert_eq!(
+        supervisor.status().last_event_at,
+        Some(base + Duration::seconds(2))
+    );
 }
 
 #[tokio::test]
@@ -576,8 +690,9 @@ async fn supervisor_cancels_a_long_polling_backoff_without_waiting_for_the_timer
 #[tokio::test]
 async fn external_failure_degrades_the_book_and_recovery_restores_a_fresh_quote() {
     let responses = vec![
-        http_response(
+        http_response_with_headers(
             "429 Too Many Requests",
+            &["Retry-After: 1"],
             r#"{"code":-1003,"msg":"too many requests"}"#,
         ),
         http_response(
@@ -615,13 +730,15 @@ async fn external_failure_degrades_the_book_and_recovery_restores_a_fresh_quote(
     assert_eq!(
         degraded_row.continuity,
         MarketContinuity::Unavailable {
-            failure: MarketDataSourceFailure::Disconnected
+            failure: MarketDataSourceFailure::Backpressure
         }
     );
     assert_eq!(degraded_row.freshness, MarketDataFreshness::Missing);
 
+    let retry_started = StdInstant::now();
     book.apply(supervisor.next_event().await.unwrap().unwrap())
         .unwrap();
+    assert!(retry_started.elapsed() >= StdDuration::from_millis(900));
     let recovered = book.view();
     let recovered_row = recovered.instrument(&key).unwrap();
     assert_eq!(recovered_row.continuity, MarketContinuity::Continuous);
@@ -755,9 +872,107 @@ fn delayed_binance_stub_server(
     (base_url, server)
 }
 
+fn completion_order_binance_stub_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut handlers = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            handlers.push(thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1_024];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let symbol = request
+                    .split("symbol=")
+                    .nth(1)
+                    .and_then(|suffix| suffix.split_whitespace().next())
+                    .expect("request must carry an exact wire symbol");
+                let response = if symbol == "AAAUSDT" {
+                    thread::sleep(StdDuration::from_millis(250));
+                    let body =
+                        r#"{"symbol":"AAAUSDT","bidPrice":"99","bidQty":"1","askPrice":"101","askQty":"1","u":1}"#;
+                    http_response("200 OK", body)
+                } else {
+                    thread::sleep(StdDuration::from_millis(20));
+                    http_response(
+                        "429 Too Many Requests",
+                        r#"{"code":-1003,"msg":"too many requests"}"#,
+                    )
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+    (base_url, server)
+}
+
+fn cooldown_binance_stub_server(
+    first_response_delay: StdDuration,
+) -> (String, thread::JoinHandle<(StdInstant, StdInstant)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let body = include_str!("../../exchange/tests/fixtures/binance_book_ticker.json");
+        let mut first = listener.accept().unwrap().0;
+        read_http_headers(&mut first);
+        thread::sleep(first_response_delay);
+        first
+            .write_all(http_response("200 OK", body).as_bytes())
+            .unwrap();
+        let first_response_completed = StdInstant::now();
+
+        let mut second = listener.accept().unwrap().0;
+        let second_request_accepted = StdInstant::now();
+        read_http_headers(&mut second);
+        second
+            .write_all(http_response("200 OK", body).as_bytes())
+            .unwrap();
+        (first_response_completed, second_request_accepted)
+    });
+    (base_url, server)
+}
+
+fn read_http_headers(stream: &mut std::net::TcpStream) {
+    stream
+        .set_read_timeout(Some(StdDuration::from_secs(5)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1_024];
+    loop {
+        let read = stream.read(&mut buffer).unwrap();
+        request.extend_from_slice(&buffer[..read]);
+        if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+}
+
 fn http_response(status: &str, body: &str) -> String {
+    http_response_with_headers(status, &[], body)
+}
+
+fn http_response_with_headers(status: &str, headers: &[&str], body: &str) -> String {
+    let headers = if headers.is_empty() {
+        String::new()
+    } else {
+        format!("{}\r\n", headers.join("\r\n"))
+    };
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }

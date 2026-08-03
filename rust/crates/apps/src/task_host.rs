@@ -157,12 +157,52 @@ where
     FStatus: Fn(&H::Status) -> String,
     FStop: Fn(&H::Status, H::Exit) -> String,
 {
-    let mut shutdown = shutdown?;
+    let mut shutdown = match shutdown {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            tracing::error!(
+                event = "task_host_signal_registration_failed",
+                "task host cannot guarantee graceful termination"
+            );
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        event = "task_host_ready",
+        "task host is accepting loopback control requests"
+    );
     loop {
         tokio::select! {
             result = &mut shutdown => {
-                result.map_err(TaskHostServeError::Shutdown)?;
-                let exit = host.stop().await.map_err(TaskHostServeError::Task)?;
+                let signal = match result {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        tracing::error!(
+                            event = "task_host_signal_receive_failed",
+                            "task host lost its graceful-shutdown signal stream"
+                        );
+                        return Err(TaskHostServeError::Shutdown(error));
+                    }
+                };
+                tracing::info!(
+                    event = "task_host_shutdown_requested",
+                    signal = ?signal,
+                    "task host received an operating-system shutdown signal"
+                );
+                let exit = match host.stop().await {
+                    Ok(exit) => exit,
+                    Err(error) => {
+                        tracing::error!(
+                            event = "task_host_shutdown_failed",
+                            "task host failed to reach its bounded stop outcome"
+                        );
+                        return Err(TaskHostServeError::Task(error));
+                    }
+                };
+                tracing::info!(
+                    event = "task_host_shutdown_completed",
+                    "task host reached its graceful stop outcome"
+                );
                 return Ok(TaskHostServeOutcome::StopRequested(exit));
             }
             accepted = listener.accept() => {
@@ -176,6 +216,10 @@ where
             () = time::sleep(poll_interval) => {
                 let status = host.status();
                 if status.is_terminal() {
+                    tracing::info!(
+                        event = "task_host_terminal",
+                        "task host observed a terminal owner status"
+                    );
                     return Ok(TaskHostServeOutcome::Terminal(status));
                 }
             }
@@ -213,11 +257,31 @@ where
             Ok(None)
         }
         Ok(TaskHostControlCommand::Stop) => {
-            let exit = host.stop().await.map_err(TaskHostServeError::Task)?;
+            tracing::info!(
+                event = "task_host_stop_requested",
+                source = "loopback_control",
+                "task host received a local stop command"
+            );
+            let exit = match host.stop().await {
+                Ok(exit) => exit,
+                Err(error) => {
+                    tracing::error!(
+                        event = "task_host_shutdown_failed",
+                        source = "loopback_control",
+                        "task host failed to reach its bounded stop outcome"
+                    );
+                    return Err(TaskHostServeError::Task(error));
+                }
+            };
             let status = host.status();
             write_response(&mut stream, &render_stop(&status, exit))
                 .await
                 .map_err(TaskHostServeError::Io)?;
+            tracing::info!(
+                event = "task_host_shutdown_completed",
+                source = "loopback_control",
+                "task host reached its graceful stop outcome"
+            );
             Ok(Some(exit))
         }
         Err(message) => {

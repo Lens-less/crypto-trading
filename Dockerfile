@@ -34,6 +34,9 @@ RUN cargo build \
 
 FROM debian:bookworm-slim AS runtime
 
+ENV RUST_LOG="warn,crypto_trading_web_app=info,crypto_trading_web=info,crypto_trading_cli=info,crypto_trading_control_plane=info,crypto_trading_runtime=info,crypto_trading_exchange=info" \
+    RUST_BACKTRACE="1"
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

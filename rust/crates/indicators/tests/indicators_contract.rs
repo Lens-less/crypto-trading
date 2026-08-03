@@ -23,18 +23,15 @@ fn assert_close(actual: Decimal, expected: &str) {
 fn ema_matches_incremental_golden_vector() {
     let mut ema = Ema::new(3).unwrap();
 
-    assert_eq!(ema.update(decimal("10")).unwrap(), decimal("10"));
-    assert_eq!(ema.update(decimal("12")).unwrap(), decimal("11"));
-    assert_eq!(ema.update(decimal("11")).unwrap(), decimal("11"));
-    assert_eq!(ema.update(decimal("13")).unwrap(), decimal("12"));
+    assert_eq!(ema.update(decimal("10")).unwrap(), None);
+    assert_eq!(ema.update(decimal("12")).unwrap(), None);
+    assert_eq!(ema.update(decimal("11")).unwrap(), Some(decimal("11")));
+    assert_eq!(ema.update(decimal("13")).unwrap(), Some(decimal("12")));
 }
 
 #[test]
-fn ema_rejects_a_period_that_cannot_form_its_smoothing_denominator() {
-    assert_eq!(
-        Ema::new(u32::MAX),
-        Err(crypto_trading_indicators::IndicatorError::ArithmeticOverflow)
-    );
+fn ema_accepts_the_maximum_period_when_its_decimal_denominator_is_representable() {
+    assert!(Ema::new(u32::MAX).is_ok());
 }
 
 #[test]
@@ -44,17 +41,23 @@ fn atr_matches_wilder_golden_vector() {
     assert_eq!(
         atr.update(decimal("10"), decimal("8"), decimal("9"))
             .unwrap(),
-        decimal("2")
+        None
     );
-    assert_close(
+    assert_eq!(
         atr.update(decimal("11"), decimal("8"), decimal("10"))
             .unwrap(),
-        "2.333333333333333333",
+        None,
     );
-    assert_close(
+    assert_eq!(
         atr.update(decimal("13"), decimal("9"), decimal("12"))
             .unwrap(),
-        "2.888888888888888889",
+        Some(decimal("3")),
+    );
+    assert_close(
+        atr.update(decimal("14"), decimal("12"), decimal("13"))
+            .unwrap()
+            .unwrap(),
+        "2.666666666666666667",
     );
 }
 
@@ -99,10 +102,11 @@ fn rolling_zscore_matches_full_window_golden_vector() {
 #[test]
 fn rolling_zscore_update_is_atomic_when_decimal_arithmetic_overflows() {
     let mut zscore = RollingZScore::new(2).unwrap();
+    assert_eq!(zscore.update(Decimal::MAX), Ok(None));
     let before = zscore.clone();
 
     assert_eq!(
-        zscore.update(Decimal::MAX),
+        zscore.update(Decimal::MIN),
         Err(crypto_trading_indicators::IndicatorError::ArithmeticOverflow)
     );
     assert_eq!(zscore, before);
@@ -123,11 +127,11 @@ fn performance_metrics_match_golden_vectors() {
     let returns = [decimal("1"), decimal("1"), decimal("-1")];
     let ratios = RatioConfig::default();
 
-    let drawdown = max_drawdown(&equity_curve).unwrap();
+    let drawdown = max_drawdown(&equity_curve).unwrap().unwrap();
     assert_eq!(drawdown.amount, decimal("30"));
     assert_eq!(drawdown.ratio, decimal("0.25"));
-    assert_eq!(win_rate(&trade_pnls).unwrap(), decimal("0.5"));
-    assert_eq!(profit_factor(&trade_pnls).unwrap(), decimal("5"));
+    assert_eq!(win_rate(&trade_pnls).unwrap().unwrap(), decimal("0.5"));
+    assert_eq!(profit_factor(&trade_pnls).unwrap().unwrap(), decimal("5"));
     assert_eq!(
         sharpe_ratio(&[decimal("1"), decimal("2"), decimal("3")], ratios)
             .unwrap()
@@ -144,6 +148,39 @@ fn performance_metrics_match_golden_vectors() {
 }
 
 #[test]
-fn max_drawdown_returns_none_instead_of_panicking_on_unrepresentable_distance() {
-    assert_eq!(max_drawdown(&[Decimal::MAX, Decimal::MIN]), None);
+fn max_drawdown_reports_unrepresentable_distance_as_arithmetic_error() {
+    assert_eq!(
+        max_drawdown(&[Decimal::MAX, Decimal::MIN]),
+        Err(crypto_trading_indicators::IndicatorError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn empty_metric_inputs_are_unavailable_without_becoming_errors() {
+    assert_eq!(max_drawdown(&[]).unwrap(), None);
+    assert_eq!(win_rate(&[]).unwrap(), None);
+    assert_eq!(profit_factor(&[]).unwrap(), None);
+}
+
+#[test]
+fn profit_factor_reports_unrepresentable_loss_magnitude_as_arithmetic_error() {
+    assert_eq!(
+        profit_factor(&[Decimal::MIN, Decimal::MIN]),
+        Err(crypto_trading_indicators::IndicatorError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn sharpe_uses_stable_online_moments_for_large_tightly_clustered_returns() {
+    let high = decimal("30000000000000000000000000000");
+    let returns = [
+        high.checked_sub(decimal("2")).unwrap(),
+        high.checked_add(decimal("2")).unwrap(),
+        high,
+    ];
+
+    assert_eq!(
+        sharpe_ratio(&returns, RatioConfig::default()).unwrap(),
+        Some(high.checked_div(decimal("2")).unwrap())
+    );
 }

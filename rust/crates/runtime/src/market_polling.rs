@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use crypto_trading_domain::{MarketType, Symbol};
 use crypto_trading_exchange::{
     BinancePublicExchange, BinancePublicObservation, ExchangeError, HyperliquidFundingRate,
-    HyperliquidPublicExchange, HyperliquidPublicObservation,
+    HyperliquidPublicExchange, HyperliquidPublicObservation, MAX_HYPERLIQUID_PUBLIC_CATALOG_COINS,
+    RemoteRetryAfter,
 };
 use tokio::{
     task::JoinSet,
@@ -186,7 +187,7 @@ impl PollingTarget {
 /// Long-lived, credential-free Binance Spot polling adapter.
 ///
 /// The adapter accepts explicit canonical-to-wire routes, fetches a bounded
-/// batch of due targets concurrently, emits the results in deterministic route
+/// batch of due targets concurrently, emits the results in monotonic completion
 /// order, and converts recoverable venue failures into source-unavailable
 /// events. It exposes no order, account, or reconciliation authority.
 #[derive(Debug)]
@@ -295,7 +296,7 @@ impl BinancePublicPollingSource {
         while let Some(outcome) = requests.join_next().await {
             outcomes.push(outcome.map_err(|_| MarketDataError::PollingTaskFailed)?);
         }
-        outcomes.sort_by_key(|(index, _, _, _)| *index);
+        outcomes.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
 
         for outcome in outcomes {
             let event = self.event_from_outcome(round_started_at, outcome)?;
@@ -328,7 +329,7 @@ impl BinancePublicPollingSource {
                 target.revision = revision;
                 target.consecutive_failures = 0;
                 let backoff = self.policy.poll_interval;
-                target.next_poll_at = schedule_next_poll(round_started_at, backoff);
+                target.next_poll_at = schedule_after_completion(completed_at, backoff)?;
                 let provenance = if let Some(event_time) = observation.event_time {
                     let mut snapshot = observation.snapshot;
                     snapshot.timestamp = event_time;
@@ -362,8 +363,9 @@ impl BinancePublicPollingSource {
             Err(error) => {
                 let target = &mut self.targets[index];
                 target.consecutive_failures = target.consecutive_failures.saturating_add(1);
-                let backoff = self.policy.retry_delay_after(target.consecutive_failures);
-                target.next_poll_at = schedule_next_poll(round_started_at, backoff);
+                let policy_backoff = self.policy.retry_delay_after(target.consecutive_failures);
+                let backoff = retry_delay_for(&error, received_at, policy_backoff);
+                target.next_poll_at = schedule_after_completion(completed_at, backoff)?;
                 let failure = classify_exchange_failure(&error);
                 let elapsed = completed_at.saturating_duration_since(round_started_at);
                 log_poll_result(
@@ -497,10 +499,11 @@ impl HyperliquidPollingTarget {
 
 /// Long-lived, credential-free Hyperliquid perpetual polling adapter.
 ///
-/// The adapter accepts explicit canonical-to-coin routes, fetches a bounded
-/// batch of due targets concurrently, emits the results in deterministic route
-/// order, and converts recoverable venue failures into source-unavailable
-/// events. Successful observations also publish the venue's hourly funding
+/// The adapter accepts explicit canonical-to-coin routes, fetches every due
+/// target from one bounded venue-wide response, emits the fan-out in stable
+/// route order, and converts recoverable venue failures into one
+/// source-unavailable event per failed request. Successful observations also
+/// publish the venue's hourly funding
 /// rate into a bounded side feed. It exposes no order, account, or
 /// reconciliation authority.
 #[derive(Debug)]
@@ -534,10 +537,10 @@ impl HyperliquidPublicPollingSource {
         if routes.is_empty() {
             return Err(MarketDataError::EmptyUniverse);
         }
-        if routes.len() > MAX_MARKET_DATA_TARGETS {
+        if routes.len() > MAX_HYPERLIQUID_PUBLIC_CATALOG_COINS {
             return Err(MarketDataError::UniverseTooLarge {
                 count: routes.len(),
-                limit: MAX_MARKET_DATA_TARGETS,
+                limit: MAX_HYPERLIQUID_PUBLIC_CATALOG_COINS,
             });
         }
         routes.sort_by(|left, right| left.instrument.cmp(&right.instrument));
@@ -606,31 +609,42 @@ impl HyperliquidPublicPollingSource {
             .filter_map(|(index, target)| {
                 (target.next_poll_at <= round_started_at).then_some(index)
             })
-            .take(MAX_CONCURRENT_POLL_REQUESTS)
             .collect::<Vec<_>>();
 
-        let mut requests = JoinSet::new();
-        for index in due_indices {
-            let exchange = self.exchange.clone();
-            let wire_coin = self.targets[index].route.wire_coin.clone();
-            let clock = Arc::clone(&self.clock);
-            requests.spawn(async move {
-                let result = exchange
-                    .fetch_observation_at(wire_coin.as_str(), clock.now())
-                    .await;
-                (index, Instant::now(), clock.now(), result)
-            });
-        }
+        let wire_coins = due_indices
+            .iter()
+            .map(|index| self.targets[*index].route.wire_coin.clone())
+            .collect::<Vec<_>>();
+        let result = self
+            .exchange
+            .fetch_observations_at(&wire_coins, self.clock.now())
+            .await;
+        let completed_at = Instant::now();
+        let received_at = self.clock.now();
 
-        let mut outcomes = Vec::with_capacity(requests.len());
-        while let Some(outcome) = requests.join_next().await {
-            outcomes.push(outcome.map_err(|_| MarketDataError::PollingTaskFailed)?);
-        }
-        outcomes.sort_by_key(|(index, _, _, _)| *index);
-
-        for outcome in outcomes {
-            let event = self.event_from_outcome(round_started_at, outcome)?;
-            self.pending_events.push_back(event);
+        match result {
+            Ok(observations) => {
+                if observations.len() != due_indices.len() {
+                    return Err(MarketDataError::PollingTaskFailed);
+                }
+                for (index, observation) in due_indices.into_iter().zip(observations) {
+                    let event = self.event_from_outcome(
+                        round_started_at,
+                        (index, completed_at, received_at, Ok(observation)),
+                    )?;
+                    self.pending_events.push_back(event);
+                }
+            }
+            Err(error) => {
+                let event = self.event_from_batch_failure(
+                    round_started_at,
+                    &due_indices,
+                    completed_at,
+                    received_at,
+                    &error,
+                )?;
+                self.pending_events.push_back(event);
+            }
         }
 
         Ok(self.pending_events.pop_front())
@@ -654,7 +668,7 @@ impl HyperliquidPublicPollingSource {
                 target.revision = revision;
                 target.consecutive_failures = 0;
                 let backoff = self.policy.poll_interval;
-                target.next_poll_at = schedule_next_poll(round_started_at, backoff);
+                target.next_poll_at = schedule_after_completion(completed_at, backoff)?;
                 let mut snapshot = observation.snapshot;
                 let timestamp_provenance = if let Some(event_time) = observation.event_time {
                     snapshot.timestamp = event_time;
@@ -696,8 +710,9 @@ impl HyperliquidPublicPollingSource {
             Err(error) => {
                 let target = &mut self.targets[index];
                 target.consecutive_failures = target.consecutive_failures.saturating_add(1);
-                let backoff = self.policy.retry_delay_after(target.consecutive_failures);
-                target.next_poll_at = schedule_next_poll(round_started_at, backoff);
+                let policy_backoff = self.policy.retry_delay_after(target.consecutive_failures);
+                let backoff = retry_delay_for(&error, received_at, policy_backoff);
+                target.next_poll_at = schedule_after_completion(completed_at, backoff)?;
                 let failure = classify_exchange_failure(&error);
                 let elapsed = completed_at.saturating_duration_since(round_started_at);
                 log_poll_result(
@@ -718,6 +733,41 @@ impl HyperliquidPublicPollingSource {
         };
         Ok(event)
     }
+
+    fn event_from_batch_failure(
+        &mut self,
+        round_started_at: Instant,
+        due_indices: &[usize],
+        completed_at: Instant,
+        received_at: DateTime<Utc>,
+        error: &ExchangeError,
+    ) -> Result<MarketDataEvent, MarketDataError> {
+        let mut applied_backoff = Duration::ZERO;
+        for index in due_indices {
+            let target = &mut self.targets[*index];
+            target.consecutive_failures = target.consecutive_failures.saturating_add(1);
+            let policy_backoff = self.policy.retry_delay_after(target.consecutive_failures);
+            let backoff = retry_delay_for(error, received_at, policy_backoff);
+            target.next_poll_at = schedule_after_completion(completed_at, backoff)?;
+            applied_backoff = applied_backoff.max(backoff);
+        }
+        let failure = classify_exchange_failure(error);
+        let elapsed = completed_at.saturating_duration_since(round_started_at);
+        log_poll_result(
+            HYPERLIQUID_EXCHANGE,
+            "metaAndAssetCtxs",
+            self.targets.len(),
+            elapsed,
+            failure_label(failure),
+            Some(applied_backoff),
+            true,
+        );
+        Ok(MarketDataEvent::SourceUnavailable {
+            exchange: HYPERLIQUID_EXCHANGE.to_owned(),
+            failure,
+            observed_at: received_at,
+        })
+    }
 }
 
 impl MarketDataEventSource for HyperliquidPublicPollingSource {
@@ -737,8 +787,31 @@ async fn wait_for_poll_slot(next_poll_at: Instant) -> Instant {
     Instant::now()
 }
 
-fn schedule_next_poll(poll_started_at: Instant, backoff: Duration) -> Instant {
-    poll_started_at + backoff
+fn schedule_after_completion(
+    completed_at: Instant,
+    backoff: Duration,
+) -> Result<Instant, MarketDataError> {
+    completed_at
+        .checked_add(backoff)
+        .ok_or(MarketDataError::PollingDelayOutOfRange)
+}
+
+fn retry_delay_for(
+    error: &ExchangeError,
+    received_at: DateTime<Utc>,
+    policy_backoff: Duration,
+) -> Duration {
+    let server_backoff = error
+        .remote_failure_metadata()
+        .and_then(|metadata| metadata.retry_after.as_ref())
+        .and_then(|retry_after| match retry_after {
+            RemoteRetryAfter::Seconds(seconds) => Some(Duration::from_secs(*seconds)),
+            RemoteRetryAfter::At(deadline) => {
+                deadline.signed_duration_since(received_at).to_std().ok()
+            }
+        })
+        .unwrap_or(Duration::ZERO);
+    policy_backoff.max(server_backoff)
 }
 
 fn failure_label(failure: crate::MarketDataSourceFailure) -> &'static str {
@@ -780,7 +853,9 @@ fn log_poll_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{schedule_next_poll, wait_for_poll_slot};
+    use super::{retry_delay_for, schedule_after_completion, wait_for_poll_slot};
+    use chrono::{TimeZone, Utc};
+    use crypto_trading_exchange::{ExchangeError, RemoteFailureMetadata, RemoteRetryAfter};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -790,8 +865,8 @@ mod tests {
 
         let first_started = wait_for_poll_slot(Instant::now()).await;
         let second_started = wait_for_poll_slot(Instant::now()).await;
-        let first_next = schedule_next_poll(first_started, round_delay);
-        let second_next = schedule_next_poll(second_started, round_delay);
+        let first_next = schedule_after_completion(first_started, round_delay).unwrap();
+        let second_next = schedule_after_completion(second_started, round_delay).unwrap();
 
         assert!(second_started.duration_since(first_started) < Duration::from_millis(10));
 
@@ -801,5 +876,31 @@ mod tests {
 
         assert!(third_started.duration_since(second_started) >= round_delay);
         assert!(fourth_started.duration_since(fourth_wait_started) < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn server_retry_after_is_not_truncated_to_the_local_policy_limit() {
+        let retry_after = Duration::from_secs(2 * 60 * 60);
+        let error = ExchangeError::RemoteFailure {
+            exchange: "binance".to_owned(),
+            status: Some(429),
+            reason: "rate limited".to_owned(),
+            metadata: RemoteFailureMetadata {
+                exchange_code: None,
+                retry_after: Some(RemoteRetryAfter::Seconds(retry_after.as_secs())),
+                server_time: None,
+            },
+        };
+        let received_at = Utc.with_ymd_and_hms(2026, 8, 3, 0, 0, 0).unwrap();
+
+        assert_eq!(
+            retry_delay_for(&error, received_at, Duration::from_secs(1)),
+            retry_after
+        );
+    }
+
+    #[test]
+    fn unrepresentable_remote_retry_delay_fails_closed() {
+        assert!(schedule_after_completion(Instant::now(), Duration::MAX).is_err());
     }
 }

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Quantity, Symbol};
 use serde::Deserialize;
 
+use crate::remote::metadata_from_reqwest_headers;
 use crate::{
     ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeOperation,
     ExchangeStatus, MarketSubscription, ReconcileReceipt, ReconcileScope, SubscriptionReceipt,
@@ -134,10 +135,13 @@ impl BinancePublicExchange {
             .await
             .map_err(|error| ExchangeError::remote_failure(EXCHANGE, None, error.to_string()))?;
         let status = response.status();
+        let failure_metadata = metadata_from_reqwest_headers(response.headers());
         let payload = Self::read_response_body(response).await?;
 
         if !status.is_success() {
-            return Err(Self::map_remote_failure(status, &payload));
+            return Err(
+                Self::map_remote_failure(status, &payload).with_remote_metadata(failure_metadata)
+            );
         }
         let observation = Self::parse_book_ticker_observation(&payload, received_at)?;
         if observation.snapshot.symbol != *symbol {
@@ -197,7 +201,8 @@ impl BinancePublicExchange {
                 Some(&error.msg),
                 false,
             );
-            return ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), reason);
+            return ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), reason)
+                .with_exchange_code(error.code.to_string());
         }
 
         let status_reason = status.canonical_reason().unwrap_or("HTTP request failed");

@@ -31,6 +31,34 @@ const READY_PATH_ENV: &str = "JSONL_ROTATION_LOCK_READY_PATH";
 const RELEASE_PATH_ENV: &str = "JSONL_ROTATION_LOCK_RELEASE_PATH";
 
 #[tokio::test]
+async fn unrelated_numeric_neighbors_do_not_block_journal_appends() {
+    let root = temp_root("history-rotation-numeric-neighbors");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    std::fs::write(path.with_file_name("decisions.jsonl.0"), b"unrelated\n").unwrap();
+    std::fs::write(path.with_file_name("decisions.jsonl.01"), b"unrelated\n").unwrap();
+    std::fs::write(
+        path.with_file_name("decisions.jsonl.999999"),
+        b"unrelated\n",
+    )
+    .unwrap();
+    let expected = record("numeric_neighbors_ignored", 0);
+
+    JsonlHistory::new(&path).append(&expected).await.unwrap();
+
+    let journal_id = Uuid::from_bytes([6; 16]);
+    let source = FileJournalSnapshotSource::new(journal_id, &path).unwrap();
+    let page = LegacyJsonlJournalReader::read_page(&source.snapshot().unwrap(), None).unwrap();
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(
+        page.events()[0].payload()["decision"],
+        "numeric_neighbors_ignored"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn appends_across_the_file_limit_seal_a_segment_and_continue() {
     let root = temp_root("history-rotation-seal");
     std::fs::create_dir_all(&root).unwrap();
@@ -339,24 +367,95 @@ async fn crash_left_partial_tail_is_truncated_at_the_last_complete_record_before
     let mut expected = encoded(&first);
     expected.extend_from_slice(&encoded(&resumed));
     assert_eq!(read_journal_chain(&path).unwrap(), expected);
-    let quarantines = std::fs::read_dir(&root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("decisions.jsonl.partial-tail.")
-                        && name.ends_with(".quarantine")
-                })
-        })
-        .collect::<Vec<_>>();
+    let quarantines = partial_tail_quarantines(&root);
     assert_eq!(quarantines.len(), 1);
     assert_eq!(
         std::fs::read(&quarantines[0]).unwrap(),
         partial[..partial.len() - 2]
     );
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn partial_tail_quarantine_retains_only_the_latest_sixteen_artifacts() {
+    let root = temp_root("history-quarantine-retention");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    history.append(&record("seed", 0)).await.unwrap();
+    let mut latest_fragment = Vec::new();
+
+    for index in 1..=20 {
+        let interrupted = encoded(&record("interrupted", index));
+        let fragment = interrupted[..interrupted.len() - 2].to_vec();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            &fragment,
+        )
+        .unwrap();
+        history
+            .append(&record("resumed", 100 + index))
+            .await
+            .unwrap();
+        latest_fragment = fragment;
+    }
+
+    let quarantines = partial_tail_quarantines(&root);
+    assert_eq!(quarantines.len(), 16);
+    assert!(quarantines.iter().all(|path| {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+    }));
+    assert!(
+        quarantines
+            .iter()
+            .any(|path| std::fs::read(path).unwrap() == latest_fragment)
+    );
+
+    let journal_id = Uuid::from_bytes([14; 16]);
+    let source = FileJournalSnapshotSource::new(journal_id, &path).unwrap();
+    let page = LegacyJsonlJournalReader::read_page(&source.snapshot().unwrap(), None).unwrap();
+    assert_eq!(page.events().len(), 21);
+    assert_eq!(page.boundary(), &JournalPageBoundary::SnapshotEnd);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn unmanaged_quarantine_entries_fail_closed_before_active_tail_truncation() {
+    let root = temp_root("history-quarantine-unmanaged-entry");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    let first = record("seed", 0);
+    history.append(&first).await.unwrap();
+    let fragment = br#"{"decision":"interrupted""#;
+    let mut active_bytes = std::fs::read(&path).unwrap();
+    active_bytes.extend_from_slice(fragment);
+    std::fs::write(&path, &active_bytes).unwrap();
+    let quarantine_directory = root.join("decisions.jsonl.quarantine");
+    std::fs::create_dir(&quarantine_directory).unwrap();
+    std::fs::write(
+        quarantine_directory.join("operator-note.txt"),
+        b"preserve me",
+    )
+    .unwrap();
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(error, HistoryError::TailQuarantine { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), active_bytes);
+    assert_eq!(
+        std::fs::read(quarantine_directory.join("operator-note.txt")).unwrap(),
+        b"preserve me"
+    );
+    assert!(partial_tail_quarantines(&root).is_empty());
 
     drop(history);
     std::fs::remove_dir_all(root).unwrap();
@@ -386,19 +485,7 @@ async fn crash_left_first_active_record_after_rotation_is_quarantined_before_app
     expected.extend_from_slice(&encoded(&resumed));
     assert_eq!(read_journal_chain(&path).unwrap(), expected);
 
-    let quarantines = std::fs::read_dir(&root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("decisions.jsonl.partial-tail.")
-                        && name.ends_with(".quarantine")
-                })
-        })
-        .collect::<Vec<_>>();
+    let quarantines = partial_tail_quarantines(&root);
     assert_eq!(quarantines.len(), 1);
     assert_eq!(std::fs::read(&quarantines[0]).unwrap(), fragment);
 
@@ -439,19 +526,7 @@ async fn crash_inside_the_final_utf8_code_point_is_quarantined_before_append() {
     let mut expected = encoded(&sealed_record);
     expected.extend_from_slice(&encoded(&resumed));
     assert_eq!(read_journal_chain(&path).unwrap(), expected);
-    let quarantines = std::fs::read_dir(&root)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("decisions.jsonl.partial-tail.")
-                        && name.ends_with(".quarantine")
-                })
-        })
-        .collect::<Vec<_>>();
+    let quarantines = partial_tail_quarantines(&root);
     assert_eq!(quarantines.len(), 1);
     assert_eq!(std::fs::read(&quarantines[0]).unwrap(), fragment);
 
@@ -487,19 +562,7 @@ async fn definite_invalid_utf8_at_the_active_tail_still_fails_closed() {
         HistoryError::MalformedActiveRecord { line: 1, .. }
     ));
     assert_eq!(std::fs::read(&path).unwrap(), corrupted);
-    assert_eq!(
-        std::fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|candidate| {
-                candidate
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".partial-tail."))
-            })
-            .count(),
-        0
-    );
+    assert!(partial_tail_quarantines(&root).is_empty());
 
     drop(history);
     std::fs::remove_dir_all(root).unwrap();
@@ -612,19 +675,7 @@ async fn complete_active_record_without_a_terminator_is_preserved_before_append(
     expected.extend_from_slice(&encoded(&resumed));
     assert_eq!(read_journal_chain(&path).unwrap(), expected);
     assert_eq!(std::fs::read(&path).unwrap(), expected);
-    assert_eq!(
-        std::fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|candidate| {
-                candidate
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".partial-tail."))
-            })
-            .count(),
-        0
-    );
+    assert!(partial_tail_quarantines(&root).is_empty());
 
     drop(history);
     std::fs::remove_dir_all(root).unwrap();
@@ -670,19 +721,7 @@ async fn complete_malformed_unterminated_active_record_still_fails_closed() {
         HistoryError::MalformedActiveRecord { line: 1, .. }
     ));
     assert_eq!(std::fs::read(&path).unwrap(), malformed);
-    assert_eq!(
-        std::fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|candidate| {
-                candidate
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".partial-tail."))
-            })
-            .count(),
-        0
-    );
+    assert!(partial_tail_quarantines(&root).is_empty());
 
     drop(history);
     std::fs::remove_dir_all(root).unwrap();
@@ -821,19 +860,28 @@ fn encoded(record: &DecisionRecord) -> Vec<u8> {
 }
 
 fn partial_tail_quarantines(root: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(root)
-        .unwrap()
+    let directory = root.join("decisions.jsonl.quarantine");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(source) => panic!(
+            "failed to read quarantine directory {}: {source}",
+            directory.display()
+        ),
+    };
+    let mut quarantines = entries
         .map(|entry| entry.unwrap().path())
         .filter(|candidate| {
             candidate
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    name.starts_with("decisions.jsonl.partial-tail.")
-                        && name.ends_with(".quarantine")
+                    name.starts_with("partial-tail.") && name.ends_with(".quarantine")
                 })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    quarantines.sort();
+    quarantines
 }
 
 /// Grows `path` to `len` bytes ending in a record terminator, so size fixtures

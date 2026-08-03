@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use crypto_trading_domain::{MarketType, OrderIntent, Quantity, Side, Symbol};
 use crypto_trading_exchange::{
     BinancePublicExchange, ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode,
-    ExchangeOperation, MarketSubscription, ReconcileScope, TradingCommand,
+    ExchangeOperation, MarketSubscription, ReconcileScope, RemoteRetryAfter, TradingCommand,
 };
 use rust_decimal::Decimal;
 
@@ -233,6 +233,34 @@ async fn non_success_binance_json_errors_preserve_http_status_and_exchange_code(
         );
         server.join().unwrap();
     }
+}
+
+#[tokio::test]
+async fn binance_rate_limit_preserves_retry_after_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let body = r#"{"code":-1003,"msg":"too many requests"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    let metadata = error.remote_failure_metadata().unwrap();
+    assert_eq!(metadata.exchange_code.as_deref(), Some("-1003"));
+    assert_eq!(metadata.retry_after, Some(RemoteRetryAfter::Seconds(7)));
+    server.join().unwrap();
 }
 
 #[tokio::test]

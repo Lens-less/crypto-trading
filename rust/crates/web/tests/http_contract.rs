@@ -13,7 +13,9 @@ use axum::{
 };
 use crypto_trading_control_plane::ReadControlPlane;
 use crypto_trading_runtime::MemoryJournalSnapshotSource;
-use crypto_trading_web::{WebAccessPolicy, WebServerConfig, WebServerConfigError, api_router};
+use crypto_trading_web::{
+    WebAccessPolicy, WebServerConfig, WebServerConfigError, api_router, api_router_with_shutdown,
+};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::time::{Duration, timeout};
@@ -50,6 +52,21 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
             .as_str()
             .is_some_and(|text| text.contains("mainnet authority are not exposed"))
     }));
+    for capability_id in ["research.backtest", "research.indicators"] {
+        let capability = capabilities["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == capability_id)
+            .unwrap_or_else(|| panic!("missing capability {capability_id}"));
+        assert_eq!(capability["level"], "unavailable", "{capability_id}");
+        assert!(
+            capability["blockers"]
+                .as_array()
+                .is_some_and(|blockers| !blockers.is_empty()),
+            "{capability_id} must explain its library-only boundary"
+        );
+    }
 
     let system = app.oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(system.status(), StatusCode::OK);
@@ -696,6 +713,34 @@ async fn sse_emits_atomic_pages_and_resumes_from_last_event_id_without_payloads(
     let resumed_page = sse_json_data(&first_sse_event(resumed).await);
     assert_eq!(resumed_page["events"], json!([]));
     assert_eq!(resumed_page["boundary"]["kind"], "snapshot_end");
+}
+
+#[tokio::test]
+async fn sse_terminates_when_application_shutdown_begins() {
+    let source = MemoryJournalSnapshotSource::new(fixed_uuid(1), Vec::new()).unwrap();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let app = api_router_with_shutdown(
+        Arc::new(control_plane),
+        WebAccessPolicy::loopback_open(),
+        shutdown_receiver,
+    );
+
+    let response = app.oneshot(get("/api/v1/events")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let first = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("initial SSE event timed out")
+        .expect("SSE stream ended before its initial page")
+        .expect("initial SSE body failed");
+    assert!(String::from_utf8_lossy(&first).contains("event: operation_page"));
+
+    shutdown_sender.send_replace(true);
+    let next = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("SSE stream ignored application shutdown");
+    assert!(next.is_none(), "SSE body remained open after shutdown");
 }
 
 #[tokio::test]

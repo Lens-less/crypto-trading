@@ -203,10 +203,10 @@ async fn absent_venue_funding_stays_absent_instead_of_being_fabricated() {
 }
 
 #[tokio::test]
-async fn hyperliquid_due_targets_are_fetched_concurrently_and_emitted_in_route_order() {
+async fn hyperliquid_due_targets_share_one_request_and_fan_out_in_route_order() {
     let request_count = 3;
     let response_delay = StdDuration::from_millis(250);
-    let (base_url, server) = delayed_stub_server(request_count, response_delay);
+    let (base_url, server) = delayed_stub_server(1, response_delay);
     let clock = Arc::new(FixedClock {
         now: Utc::now() + Duration::seconds(1),
     });
@@ -236,10 +236,45 @@ async fn hyperliquid_due_targets_are_fetched_concurrently_and_emitted_in_route_o
 
     assert_eq!(symbols, ["BTCUSDT", "ETHUSDT", "THINUSDT"]);
     assert!(
-        elapsed < StdDuration::from_millis(650),
-        "one due-target round took {elapsed:?}; serial polling would take at least {:?}",
-        response_delay * u32::try_from(request_count).unwrap()
+        elapsed < StdDuration::from_millis(500),
+        "one venue-wide due-target request took {elapsed:?}"
     );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn hyperliquid_batch_fans_out_beyond_the_http_concurrency_limit() {
+    let coins = (0..9).map(|index| format!("C{index}")).collect::<Vec<_>>();
+    let body = synthetic_hyperliquid_fixture(&coins);
+    let (base_url, server) = stub_server(vec![http_response("200 OK", &body)]);
+    let clock = Arc::new(FixedClock {
+        now: Utc::now() + Duration::seconds(1),
+    });
+    let endpoint = HyperliquidPublicEndpoint::loopback(&base_url).unwrap();
+    let routes = coins
+        .iter()
+        .map(|coin| route(&format!("{coin}USDT"), coin))
+        .collect();
+    let mut source = HyperliquidPublicPollingSource::new(
+        HyperliquidPublicExchange::with_endpoint(&endpoint).unwrap(),
+        routes,
+        polling_policy(StdDuration::from_millis(1)),
+        clock,
+    )
+    .unwrap();
+
+    let mut observed = Vec::new();
+    for _ in &coins {
+        let event = source.next_event().await.unwrap().unwrap();
+        let MarketDataEvent::Observation(observation) = event else {
+            panic!("one successful batch must fan out observations for every due coin");
+        };
+        observed.push(observation.snapshot.symbol.as_str().to_owned());
+    }
+
+    assert_eq!(observed.len(), 9);
+    assert_eq!(observed.first().map(String::as_str), Some("C0USDT"));
+    assert_eq!(observed.last().map(String::as_str), Some("C8USDT"));
     server.join().unwrap();
 }
 
@@ -429,4 +464,18 @@ fn http_response(status: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+fn synthetic_hyperliquid_fixture(coins: &[String]) -> String {
+    let universe = coins
+        .iter()
+        .map(|coin| format!(r#"{{"name":"{coin}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let contexts = coins
+        .iter()
+        .map(|_| r#"{"impactPxs":["1","2"]}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"[{{"universe":[{universe}]}},[{contexts}]]"#)
 }

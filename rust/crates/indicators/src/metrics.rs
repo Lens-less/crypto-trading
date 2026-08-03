@@ -75,9 +75,18 @@ pub struct PerformanceMetrics {
 }
 
 /// Computes the maximum drawdown of an equity curve.
-#[must_use]
-pub fn max_drawdown(equity_curve: &[Decimal]) -> Option<Drawdown> {
-    let (&first, rest) = equity_curve.split_first()?;
+///
+/// An empty curve is a valid unavailable metric (`Ok(None)`). Arithmetic
+/// failure is reported separately and is never presented as missing data.
+///
+/// # Errors
+///
+/// Returns [`IndicatorError::ArithmeticOverflow`] when a drawdown amount or
+/// ratio cannot be represented by [`Decimal`].
+pub fn max_drawdown(equity_curve: &[Decimal]) -> Result<Option<Drawdown>, IndicatorError> {
+    let Some((&first, rest)) = equity_curve.split_first() else {
+        return Ok(None);
+    };
     let mut peak = first;
     let mut best = Drawdown {
         peak,
@@ -92,11 +101,15 @@ pub fn max_drawdown(equity_curve: &[Decimal]) -> Option<Drawdown> {
             continue;
         }
 
-        let amount = peak.checked_sub(equity)?;
+        let amount = peak
+            .checked_sub(equity)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
         let ratio = if peak.is_zero() {
             Decimal::ZERO
         } else {
-            amount.checked_div(peak)?
+            amount
+                .checked_div(peak)
+                .ok_or(IndicatorError::ArithmeticOverflow)?
         };
 
         if amount > best.amount {
@@ -109,44 +122,71 @@ pub fn max_drawdown(equity_curve: &[Decimal]) -> Option<Drawdown> {
         }
     }
 
-    Some(best)
+    Ok(Some(best))
 }
 
 /// Computes winning trades divided by total trades.
-#[must_use]
-pub fn win_rate(trade_pnls: &[Decimal]) -> Option<Decimal> {
+///
+/// An empty sample is a valid unavailable metric (`Ok(None)`). Arithmetic
+/// failure is reported separately.
+///
+/// # Errors
+///
+/// Returns [`IndicatorError::ArithmeticOverflow`] when the sample counts or
+/// ratio cannot be represented by [`Decimal`].
+pub fn win_rate(trade_pnls: &[Decimal]) -> Result<Option<Decimal>, IndicatorError> {
     if trade_pnls.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let wins = trade_pnls
         .iter()
         .filter(|value| **value > Decimal::ZERO)
         .count();
-    Decimal::from(u64::try_from(wins).ok()?)
-        .checked_div(Decimal::from(u64::try_from(trade_pnls.len()).ok()?))
+    let wins = u64::try_from(wins).map_err(|_| IndicatorError::ArithmeticOverflow)?;
+    let observations =
+        u64::try_from(trade_pnls.len()).map_err(|_| IndicatorError::ArithmeticOverflow)?;
+    Decimal::from(wins)
+        .checked_div(Decimal::from(observations))
+        .ok_or(IndicatorError::ArithmeticOverflow)
+        .map(Some)
 }
 
 /// Computes profit factor from trade `PnL` samples.
-#[must_use]
-pub fn profit_factor(trade_pnls: &[Decimal]) -> Option<Decimal> {
+///
+/// An empty sample or a sample without any loss has no finite profit factor
+/// and returns `Ok(None)`. Arithmetic failure is reported separately.
+///
+/// # Errors
+///
+/// Returns [`IndicatorError::ArithmeticOverflow`] when an aggregate or ratio
+/// cannot be represented by [`Decimal`].
+pub fn profit_factor(trade_pnls: &[Decimal]) -> Result<Option<Decimal>, IndicatorError> {
+    if trade_pnls.is_empty() {
+        return Ok(None);
+    }
     let gross_profit = trade_pnls
         .iter()
         .copied()
         .filter(|value| *value > Decimal::ZERO)
-        .try_fold(Decimal::ZERO, Decimal::checked_add)?;
+        .try_fold(Decimal::ZERO, Decimal::checked_add)
+        .ok_or(IndicatorError::ArithmeticOverflow)?;
     let gross_loss = trade_pnls
         .iter()
         .copied()
         .filter(|value| *value < Decimal::ZERO)
         .map(|value| value.abs())
-        .try_fold(Decimal::ZERO, Decimal::checked_add)?;
+        .try_fold(Decimal::ZERO, Decimal::checked_add)
+        .ok_or(IndicatorError::ArithmeticOverflow)?;
 
     if gross_loss.is_zero() {
-        return None;
+        return Ok(None);
     }
 
-    gross_profit.checked_div(gross_loss)
+    gross_profit
+        .checked_div(gross_loss)
+        .ok_or(IndicatorError::ArithmeticOverflow)
+        .map(Some)
 }
 
 /// Computes the annualized Sharpe ratio for periodic returns.
@@ -254,9 +294,9 @@ pub fn summarize_performance(
     ratio_config: RatioConfig,
 ) -> Result<PerformanceMetrics, IndicatorError> {
     Ok(PerformanceMetrics {
-        max_drawdown: max_drawdown(equity_curve),
-        win_rate: win_rate(trade_pnls),
-        profit_factor: profit_factor(trade_pnls),
+        max_drawdown: max_drawdown(equity_curve)?,
+        win_rate: win_rate(trade_pnls)?,
+        profit_factor: profit_factor(trade_pnls)?,
         sharpe_ratio: sharpe_ratio(returns, ratio_config)?,
         sortino_ratio: sortino_ratio(returns, ratio_config)?,
     })
@@ -278,11 +318,12 @@ fn excess_returns(
 }
 
 fn arithmetic_mean(values: &[Decimal]) -> Option<Decimal> {
-    let total = values
-        .iter()
-        .copied()
-        .try_fold(Decimal::ZERO, Decimal::checked_add)?;
-    total.checked_div(Decimal::from(u64::try_from(values.len()).ok()?))
+    let mut mean = Decimal::ZERO;
+    for (index, value) in values.iter().enumerate() {
+        let count = Decimal::from(u64::try_from(index.checked_add(1)?).ok()?);
+        mean = mean.checked_add(value.checked_sub(mean)?.checked_div(count)?)?;
+    }
+    Some(mean)
 }
 
 fn sample_variance(values: &[Decimal]) -> Result<Option<Decimal>, IndicatorError> {
@@ -290,19 +331,41 @@ fn sample_variance(values: &[Decimal]) -> Result<Option<Decimal>, IndicatorError
         return Ok(None);
     }
 
-    let mean = arithmetic_mean(values).ok_or(IndicatorError::ArithmeticOverflow)?;
-    let squared_distance_sum = values.iter().try_fold(Decimal::ZERO, |acc, value| {
+    let mut mean = Decimal::ZERO;
+    let mut squared_distance_sum = Decimal::ZERO;
+    for (index, value) in values.iter().enumerate() {
+        let count = Decimal::from(
+            u64::try_from(
+                index
+                    .checked_add(1)
+                    .ok_or(IndicatorError::ArithmeticOverflow)?,
+            )
+            .map_err(|_| IndicatorError::ArithmeticOverflow)?,
+        );
         let delta = value
             .checked_sub(mean)
             .ok_or(IndicatorError::ArithmeticOverflow)?;
-        let squared = delta
-            .checked_mul(delta)
+        mean = mean
+            .checked_add(
+                delta
+                    .checked_div(count)
+                    .ok_or(IndicatorError::ArithmeticOverflow)?,
+            )
             .ok_or(IndicatorError::ArithmeticOverflow)?;
-        acc.checked_add(squared)
-            .ok_or(IndicatorError::ArithmeticOverflow)
-    })?;
+        let adjusted_delta = value
+            .checked_sub(mean)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        squared_distance_sum = squared_distance_sum
+            .checked_add(
+                delta
+                    .checked_mul(adjusted_delta)
+                    .ok_or(IndicatorError::ArithmeticOverflow)?,
+            )
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+    }
     let denominator = Decimal::from(
-        u64::try_from(values.len() - 1).map_err(|_| IndicatorError::ArithmeticOverflow)?,
+        u64::try_from(values.len().saturating_sub(1))
+            .map_err(|_| IndicatorError::ArithmeticOverflow)?,
     );
 
     squared_distance_sum

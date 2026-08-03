@@ -22,7 +22,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use crypto_trading_domain::Money;
 use crypto_trading_strategy::{
     AccountRiskDecision, AccountRiskInput, AccountRiskOpenPosition, AccountRiskPolicy,
@@ -43,16 +43,31 @@ use crate::{
     },
 };
 
-/// Stable version of every durable account-risk fact and view.
+/// Stable version of the public account-risk read model.
+///
+/// Durable facts have their own version because adding ticket leases must not
+/// silently change the control-plane response schema.
 pub const ACCOUNT_RISK_SCHEMA_VERSION: u16 = 1;
+const LEGACY_ACCOUNT_RISK_SCHEMA_VERSION: u16 = 1;
+const ACCOUNT_RISK_FACT_SCHEMA_VERSION: u16 = 2;
 /// Hard bound for distinct risk scopes reconstructed from one journal.
 pub const MAX_ACCOUNT_RISK_SCOPES: usize = 16;
 /// Hard bound for concurrently open owner-level position clocks per scope.
 pub const MAX_ACCOUNT_RISK_SCOPE_POSITIONS: usize = 64;
+/// Wall-clock lease granted to an admitted-but-not-yet-reserved ticket.
+///
+/// The market observation time supplied to [`AccountRiskAuthority::admit`]
+/// may be historical during replay, so it must never drive this lease.
+pub const ACCOUNT_RISK_ADMISSION_LEASE_SECONDS: i64 = 300;
+/// Defensive replay bound. This is deliberately larger than the live
+/// admission limit so a journal written by an older buggy process remains
+/// loadable long enough for durable compensation to repair it.
+const MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS: usize = 4_096;
 
 const ACCOUNT_RISK_STRATEGY: &str = "account_risk";
 const ACCOUNT_RISK_ADMITTED: &str = "account_risk_admitted";
 const ACCOUNT_RISK_ADMISSION_CANCELLED: &str = "account_risk_admission_cancelled";
+const ACCOUNT_RISK_ADMISSION_EXPIRED: &str = "account_risk_admission_expired";
 const ACCOUNT_RISK_REJECTED: &str = "account_risk_rejected";
 const ACCOUNT_RISK_POSITION_CLOSED: &str = "account_risk_position_closed";
 const ACCOUNT_RISK_PAUSED: &str = "account_risk_paused";
@@ -126,6 +141,22 @@ impl AccountRiskAdmissionTicket {
         Self(Uuid::new_v4().to_string())
     }
 
+    /// Reconstructs a validated durable ticket identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountRiskError::InvalidRequest`] for a malformed or nil
+    /// UUID.
+    pub fn parse(value: impl Into<String>) -> Result<Self, AccountRiskError> {
+        let value = value.into();
+        if !valid_ticket(&value) {
+            return Err(AccountRiskError::InvalidRequest(
+                "account risk admission ticket must be a non-nil UUID",
+            ));
+        }
+        Ok(Self(value))
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -178,10 +209,20 @@ pub struct AccountRiskStateView {
     pub open_positions: Vec<AccountRiskOpenPositionView>,
     #[serde(skip)]
     open_position_tickets: Vec<Option<String>>,
+    #[serde(skip)]
+    admission_clocks: Vec<AccountRiskAdmissionClock>,
     pub admitted_count: u64,
     pub rejected_count: u64,
     pub last_rejection: Option<String>,
     pub last_recorded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountRiskAdmissionClock {
+    task_id: String,
+    symbol: String,
+    ticket_id: String,
+    recorded_at: DateTime<Utc>,
 }
 
 impl AccountRiskStateView {
@@ -197,6 +238,7 @@ impl AccountRiskStateView {
             daily_trade_count: 0,
             open_positions: Vec::new(),
             open_position_tickets: Vec::new(),
+            admission_clocks: Vec::new(),
             admitted_count: 0,
             rejected_count: 0,
             last_rejection: None,
@@ -273,38 +315,20 @@ impl AccountRiskReadModel {
         self.scopes.iter().find(|scope| scope.scope_id == scope_id)
     }
 
-    fn apply_event(&mut self, payload: &Value) -> Result<(), AccountRiskProjectionError> {
-        let Some(decision) = payload.get("decision").and_then(Value::as_str) else {
-            return Ok(());
+    fn apply_event(
+        &mut self,
+        event: &crate::OperationEventEnvelope,
+    ) -> Result<(), AccountRiskProjectionError> {
+        let fact = match validated_account_risk_fact(event, self.journal_id) {
+            Ok(Some(fact)) => fact,
+            Ok(None) => return Ok(()),
+            Err(()) => {
+                self.invalid_event_count = self.invalid_event_count.saturating_add(1);
+                self.projection_status = ProjectionStatus::Degraded;
+                return Ok(());
+            }
         };
-        if !matches!(
-            decision,
-            ACCOUNT_RISK_ADMITTED
-                | ACCOUNT_RISK_ADMISSION_CANCELLED
-                | ACCOUNT_RISK_REJECTED
-                | ACCOUNT_RISK_POSITION_CLOSED
-                | ACCOUNT_RISK_PAUSED
-                | ACCOUNT_RISK_RESUMED
-                | ACCOUNT_RISK_KILL_SWITCH
-        ) {
-            return Ok(());
-        }
-        let fact = payload
-            .get("details")
-            .cloned()
-            .map(serde_json::from_value::<AccountRiskFact>);
-        let Some(Ok(fact)) = fact else {
-            self.invalid_event_count = self.invalid_event_count.saturating_add(1);
-            self.projection_status = ProjectionStatus::Degraded;
-            return Ok(());
-        };
-        if fact.schema_version() != ACCOUNT_RISK_SCHEMA_VERSION
-            || fact.matches_decision(decision).is_none()
-        {
-            self.invalid_event_count = self.invalid_event_count.saturating_add(1);
-            self.projection_status = ProjectionStatus::Degraded;
-            return Ok(());
-        }
+        let fact = fact.fact;
         let scope = self.scope_mut(fact.scope_id())?;
         scope.last_recorded_at = Some(match scope.last_recorded_at {
             Some(previous) => previous.max(fact.recorded_at()),
@@ -349,6 +373,9 @@ fn apply_fact_to_scope(
             recorded_at,
             ..
         } => {
+            let ticket = ticket_id
+                .clone()
+                .ok_or(AccountRiskProjectionError::InvalidAdmissionTicket)?;
             // Reset only on a forward UTC-date roll: a fact dated before the
             // latched day keeps counting instead of zeroing the daily cap.
             if scope.trade_date_utc.as_deref() < Some(utc_date.as_str()) {
@@ -357,14 +384,25 @@ fn apply_fact_to_scope(
             }
             scope.daily_trade_count = scope.daily_trade_count.saturating_add(1);
             scope.admitted_count = scope.admitted_count.saturating_add(1);
+            if scope.admission_clocks.len() >= MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS {
+                return Err(AccountRiskProjectionError::OpenPositionLimitExceeded {
+                    limit: MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS,
+                });
+            }
+            scope.admission_clocks.push(AccountRiskAdmissionClock {
+                task_id: task_id.clone(),
+                symbol: symbol.clone(),
+                ticket_id: ticket,
+                recorded_at,
+            });
             if !scope
                 .open_positions
                 .iter()
                 .any(|position| position.task_id == task_id)
             {
-                if scope.open_positions.len() >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS {
+                if scope.open_positions.len() >= MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS {
                     return Err(AccountRiskProjectionError::OpenPositionLimitExceeded {
-                        limit: MAX_ACCOUNT_RISK_SCOPE_POSITIONS,
+                        limit: MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS,
                     });
                 }
                 scope.open_positions.push(AccountRiskOpenPositionView {
@@ -377,20 +415,23 @@ fn apply_fact_to_scope(
         }
         AccountRiskFact::AdmissionCancelled {
             task_id, ticket_id, ..
+        }
+        | AccountRiskFact::AdmissionExpired {
+            task_id, ticket_id, ..
         } => {
             if let Some(index) = scope
-                .open_positions
+                .admission_clocks
                 .iter()
-                .zip(scope.open_position_tickets.iter())
-                .position(|(position, opener_ticket)| {
-                    position.task_id == task_id
-                        && opener_ticket.as_deref() == Some(ticket_id.as_str())
-                })
+                .position(|clock| clock.task_id == task_id && clock.ticket_id == ticket_id)
             {
-                remove_open_position(scope, index);
+                scope.admission_clocks.remove(index);
+                reconcile_open_position_clock(scope, &task_id)?;
             }
         }
         AccountRiskFact::PositionClosed { task_id, .. } => {
+            scope
+                .admission_clocks
+                .retain(|clock| clock.task_id != task_id);
             if let Some(index) = scope
                 .open_positions
                 .iter()
@@ -424,6 +465,44 @@ fn remove_open_position(scope: &mut AccountRiskStateView, index: usize) {
     scope.open_position_tickets.remove(index);
 }
 
+fn reconcile_open_position_clock(
+    scope: &mut AccountRiskStateView,
+    task_id: &str,
+) -> Result<(), AccountRiskProjectionError> {
+    let position_index = scope
+        .open_positions
+        .iter()
+        .position(|position| position.task_id == task_id);
+    let next_clock = scope
+        .admission_clocks
+        .iter()
+        .find(|clock| clock.task_id == task_id)
+        .cloned();
+    match (position_index, next_clock) {
+        (Some(index), Some(clock)) => {
+            scope.open_positions[index].symbol = clock.symbol;
+            scope.open_positions[index].opened_at = clock.recorded_at;
+            scope.open_position_tickets[index] = Some(clock.ticket_id);
+        }
+        (Some(index), None) => remove_open_position(scope, index),
+        (None, Some(clock)) => {
+            if scope.open_positions.len() >= MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS {
+                return Err(AccountRiskProjectionError::OpenPositionLimitExceeded {
+                    limit: MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS,
+                });
+            }
+            scope.open_positions.push(AccountRiskOpenPositionView {
+                task_id: clock.task_id,
+                symbol: clock.symbol,
+                opened_at: clock.recorded_at,
+            });
+            scope.open_position_tickets.push(Some(clock.ticket_id));
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
 /// Incremental account-risk interpreter shared by standalone and composite
 /// journal projections. Keeping the state machine here prevents control-plane
 /// fan-out optimization from growing a second interpretation of money facts.
@@ -452,7 +531,7 @@ impl ProjectionBuilder {
         &mut self,
         event: &crate::OperationEventEnvelope,
     ) -> Result<(), AccountRiskProjectionError> {
-        self.model.apply_event(event.payload())
+        self.model.apply_event(event)
     }
 
     pub(crate) fn mark_partial_tail(&mut self) {
@@ -536,6 +615,26 @@ impl AccountRiskAuthority {
         self.history.path()
     }
 
+    /// Cold-replays the current frozen journal head and verifies that it is
+    /// equivalent to the process-local authority projection.
+    ///
+    /// A detected mismatch permanently degrades every in-process authority
+    /// sharing this journal generation. Repeated calls are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountRiskError::DegradedState`] when a cached projection
+    /// cannot be proven equivalent, including malformed durable bytes, or
+    /// after that failure has been latched. Initial projection loading can
+    /// still return its corresponding journal or projection error.
+    pub async fn verify_durable_state(&self) -> Result<(), AccountRiskError> {
+        let _guard = self.authority_lock.lock().await;
+        self.state_cache
+            .verify_durable_state(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_risk)
+    }
+
     /// Returns the reconstructed durable state for this scope.
     ///
     /// # Errors
@@ -563,7 +662,21 @@ impl AccountRiskAuthority {
         now: DateTime<Utc>,
     ) -> Result<AccountRiskAdmission, AccountRiskError> {
         let _guard = self.authority_lock.lock().await;
+        let authority_now = Utc::now();
+        self.recover_expired_admissions_locked(authority_now)
+            .await?;
         let (state, accounts, open_admissions) = self.load().await?;
+        if open_admissions.len() >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS
+            || (state.open_positions.len() >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS
+                && !state
+                    .open_positions
+                    .iter()
+                    .any(|position| position.task_id == candidate.task_id()))
+        {
+            return Err(AccountRiskError::AdmissionCapacityExceeded {
+                limit: MAX_ACCOUNT_RISK_SCOPE_POSITIONS,
+            });
+        }
         let (mut symbol_exposure, mut total_exposure, total_balance) =
             exposures(&accounts, candidate.symbol())?;
         // Owners hold the shared lock for admission only, not for the later
@@ -594,15 +707,19 @@ impl AccountRiskAuthority {
         match self.policy.evaluate(&input) {
             AccountRiskDecision::Admitted { warnings } => {
                 let ticket = AccountRiskAdmissionTicket::new();
+                let lease_expires_at = authority_now
+                    .checked_add_signed(Duration::seconds(ACCOUNT_RISK_ADMISSION_LEASE_SECONDS))
+                    .ok_or(AccountRiskError::ArithmeticOverflow)?;
                 let labels = warnings
                     .iter()
                     .map(|warning| warning.label().to_owned())
                     .take(MAX_RISK_WARNINGS)
                     .collect();
-                self.append_fact(
+                self.append_fact_at(
+                    authority_now,
                     ACCOUNT_RISK_ADMITTED,
                     &AccountRiskFact::Admitted {
-                        schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                        schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                         journal_id: self.journal_id,
                         scope_id: self.scope_id.clone(),
                         task_id: candidate.task_id().to_owned(),
@@ -611,6 +728,7 @@ impl AccountRiskAuthority {
                         notional: candidate.notional(),
                         utc_date: utc_date(now),
                         recorded_at: now,
+                        lease_expires_at: Some(lease_expires_at),
                         warnings: labels,
                     },
                 )
@@ -621,7 +739,7 @@ impl AccountRiskAuthority {
                 self.append_fact(
                     ACCOUNT_RISK_REJECTED,
                     &AccountRiskFact::Rejected {
-                        schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                        schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                         journal_id: self.journal_id,
                         scope_id: self.scope_id.clone(),
                         task_id: candidate.task_id().to_owned(),
@@ -634,6 +752,25 @@ impl AccountRiskAuthority {
                 Ok(AccountRiskAdmission::Rejected(rejection))
             }
         }
+    }
+
+    /// Durably expires every still-pending admission whose authority
+    /// wall-clock lease has elapsed.
+    ///
+    /// Replaying an expiry removes the exact ticket only. Calling this method
+    /// again, including after restart, therefore appends no duplicate
+    /// compensation facts. [`Self::admit`] performs the same recovery before
+    /// evaluating a new candidate.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on degraded durable state, serialization, or journal I/O.
+    pub async fn recover_expired_admissions(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize, AccountRiskError> {
+        let _guard = self.authority_lock.lock().await;
+        self.recover_expired_admissions_locked(now).await
     }
 
     /// Durably cancels one still-pending admission ticket.
@@ -665,7 +802,7 @@ impl AccountRiskAuthority {
         self.append_fact(
             ACCOUNT_RISK_ADMISSION_CANCELLED,
             &AccountRiskFact::AdmissionCancelled {
-                schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                 journal_id: self.journal_id,
                 scope_id: self.scope_id.clone(),
                 task_id,
@@ -702,7 +839,7 @@ impl AccountRiskAuthority {
         self.append_fact(
             ACCOUNT_RISK_POSITION_CLOSED,
             &AccountRiskFact::PositionClosed {
-                schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                 journal_id: self.journal_id,
                 scope_id: self.scope_id.clone(),
                 task_id,
@@ -732,7 +869,7 @@ impl AccountRiskAuthority {
         self.append_fact(
             ACCOUNT_RISK_PAUSED,
             &AccountRiskFact::Paused {
-                schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                 journal_id: self.journal_id,
                 scope_id: self.scope_id.clone(),
                 reason: Some(reason),
@@ -761,7 +898,7 @@ impl AccountRiskAuthority {
         self.append_fact(
             ACCOUNT_RISK_RESUMED,
             &AccountRiskFact::Resumed {
-                schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                 journal_id: self.journal_id,
                 scope_id: self.scope_id.clone(),
                 recorded_at: now,
@@ -792,7 +929,7 @@ impl AccountRiskAuthority {
         self.append_fact(
             ACCOUNT_RISK_KILL_SWITCH,
             &AccountRiskFact::KillSwitchEngaged {
-                schema_version: ACCOUNT_RISK_SCHEMA_VERSION,
+                schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
                 journal_id: self.journal_id,
                 scope_id: self.scope_id.clone(),
                 reason: Some(reason),
@@ -879,22 +1016,82 @@ impl AccountRiskAuthority {
         ))
     }
 
+    async fn recover_expired_admissions_locked(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<usize, AccountRiskError> {
+        let (_, _, open_admissions) = self.load().await?;
+        let expired = open_admissions
+            .into_iter()
+            .filter(|admission| admission.lease_expires_at <= now)
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let mut records = Vec::with_capacity(expired.len());
+        for admission in &expired {
+            let ticket_id = admission
+                .ticket_id
+                .as_deref()
+                .ok_or(AccountRiskError::DegradedState)?;
+            records.push(self.fact_record(
+                now,
+                ACCOUNT_RISK_ADMISSION_EXPIRED,
+                &AccountRiskFact::AdmissionExpired {
+                    schema_version: ACCOUNT_RISK_FACT_SCHEMA_VERSION,
+                    journal_id: self.journal_id,
+                    scope_id: self.scope_id.clone(),
+                    task_id: admission.task_id.clone(),
+                    ticket_id: ticket_id.to_owned(),
+                    admitted_at: admission.recorded_at,
+                    lease_expires_at: admission.lease_expires_at,
+                    expired_at: now,
+                },
+            )?);
+        }
+        self.history
+            .append_batch(&records)
+            .await
+            .map_err(AccountRiskError::JournalWrite)?;
+        Ok(expired.len())
+    }
+
     async fn append_fact(
         &self,
         decision: &'static str,
         fact: &AccountRiskFact,
     ) -> Result<(), AccountRiskError> {
-        let details = serde_json::to_value(fact).map_err(AccountRiskError::Serialize)?;
+        self.append_fact_at(Utc::now(), decision, fact).await
+    }
+
+    async fn append_fact_at(
+        &self,
+        timestamp: DateTime<Utc>,
+        decision: &'static str,
+        fact: &AccountRiskFact,
+    ) -> Result<(), AccountRiskError> {
+        let record = self.fact_record(timestamp, decision, fact)?;
         self.history
-            .append(&DecisionRecord {
-                timestamp: Utc::now(),
-                strategy: ACCOUNT_RISK_STRATEGY.to_owned(),
-                symbol: self.scope_id.clone(),
-                decision: decision.to_owned(),
-                details,
-            })
+            .append(&record)
             .await
             .map_err(AccountRiskError::JournalWrite)
+    }
+
+    fn fact_record(
+        &self,
+        timestamp: DateTime<Utc>,
+        decision: &'static str,
+        fact: &AccountRiskFact,
+    ) -> Result<DecisionRecord, AccountRiskError> {
+        let details = serde_json::to_value(fact).map_err(AccountRiskError::Serialize)?;
+        Ok(DecisionRecord {
+            timestamp,
+            strategy: ACCOUNT_RISK_STRATEGY.to_owned(),
+            symbol: self.scope_id.clone(),
+            decision: decision.to_owned(),
+            details,
+        })
     }
 }
 
@@ -917,134 +1114,153 @@ pub(crate) struct OpenAdmission {
     pub(crate) symbol: String,
     pub(crate) ticket_id: Option<String>,
     pub(crate) recorded_at: DateTime<Utc>,
+    pub(crate) lease_expires_at: DateTime<Utc>,
     pub(crate) notional: Money,
 }
 
 pub(crate) fn apply_open_admission_event(
     pending: &mut Vec<OpenAdmission>,
-    payload: &Value,
+    event: &crate::OperationEventEnvelope,
 ) -> Result<(), AccountRiskError> {
+    let payload = event.payload();
     let Some(decision) = payload.get("decision").and_then(Value::as_str) else {
         return Ok(());
     };
     match decision {
-        ACCOUNT_RISK_ADMITTED | ACCOUNT_RISK_ADMISSION_CANCELLED | ACCOUNT_RISK_POSITION_CLOSED => {
-            // Malformed facts are skipped here rather than counted: the main
-            // projection already degrades on them, failing admission closed.
-            let fact = payload
-                .get("details")
-                .cloned()
-                .map(serde_json::from_value::<AccountRiskFact>);
-            let Some(Ok(fact)) = fact else {
-                return Ok(());
-            };
-            if fact.schema_version() != ACCOUNT_RISK_SCHEMA_VERSION
-                || fact.matches_decision(decision).is_none()
-            {
-                return Ok(());
-            }
-            match fact {
-                AccountRiskFact::Admitted {
-                    scope_id,
-                    task_id,
-                    symbol,
-                    ticket_id,
-                    recorded_at,
-                    notional,
-                    ..
-                } => record_open_admission(
-                    pending,
-                    scope_id,
-                    task_id,
-                    symbol,
-                    ticket_id,
-                    recorded_at,
-                    notional,
-                )?,
-                AccountRiskFact::AdmissionCancelled {
-                    scope_id,
-                    ticket_id,
-                    ..
-                } => {
-                    pending.retain(|entry| {
-                        entry.scope_id != scope_id
-                            || entry.ticket_id.as_deref() != Some(ticket_id.as_str())
-                    });
-                }
-                AccountRiskFact::PositionClosed {
-                    scope_id, task_id, ..
-                } => {
-                    pending.retain(|entry| entry.scope_id != scope_id || entry.task_id != task_id);
-                }
-                _ => {}
-            }
-        }
-        PAPER_ACCOUNT_RESERVED => {
-            let request = payload
-                .get("details")
-                .and_then(|details| details.get("request"))
-                .cloned()
-                .map(serde_json::from_value::<PaperReservationRequest>);
-            let Some(Ok(request)) = request else {
-                return Ok(());
-            };
-            for leg in request.legs() {
-                let mut matching_scopes = Vec::new();
-                for admission in pending.iter().filter(|admission| {
-                    admission_matches_reservation(
-                        admission,
-                        request.task_id(),
-                        leg.symbol().as_str(),
-                    )
-                }) {
-                    if !matching_scopes.contains(&admission.scope_id) {
-                        matching_scopes.push(admission.scope_id.clone());
-                    }
-                }
-                for scope_id in matching_scopes {
-                    settle_open_admission(
-                        pending,
-                        &scope_id,
-                        request.task_id(),
-                        leg.symbol().as_str(),
-                        leg.reserved_notional(),
-                    )?;
-                }
-            }
-        }
+        ACCOUNT_RISK_ADMITTED
+        | ACCOUNT_RISK_ADMISSION_CANCELLED
+        | ACCOUNT_RISK_ADMISSION_EXPIRED
+        | ACCOUNT_RISK_POSITION_CLOSED => apply_account_risk_open_event(pending, event)?,
+        PAPER_ACCOUNT_RESERVED => apply_paper_reservation_open_event(pending, event)?,
         _ => {}
+    }
+    Ok(())
+}
+
+fn apply_account_risk_open_event(
+    pending: &mut Vec<OpenAdmission>,
+    event: &crate::OperationEventEnvelope,
+) -> Result<(), AccountRiskError> {
+    // Malformed facts are skipped here rather than counted: the main
+    // projection already degrades on them, failing admission closed.
+    let Ok(Some(validated)) = validated_account_risk_fact(event, event.journal_id()) else {
+        return Ok(());
+    };
+    match validated.fact {
+        AccountRiskFact::Admitted {
+            scope_id,
+            task_id,
+            symbol,
+            ticket_id,
+            recorded_at,
+            notional,
+            ..
+        } => record_open_admission(
+            pending,
+            OpenAdmission {
+                scope_id,
+                task_id,
+                symbol,
+                ticket_id,
+                recorded_at,
+                lease_expires_at: validated
+                    .admitted_lease_expires_at
+                    .ok_or(AccountRiskError::DegradedState)?,
+                notional,
+            },
+        )?,
+        AccountRiskFact::AdmissionCancelled {
+            scope_id,
+            ticket_id,
+            ..
+        }
+        | AccountRiskFact::AdmissionExpired {
+            scope_id,
+            ticket_id,
+            ..
+        } => pending.retain(|entry| {
+            entry.scope_id != scope_id || entry.ticket_id.as_deref() != Some(ticket_id.as_str())
+        }),
+        AccountRiskFact::PositionClosed {
+            scope_id, task_id, ..
+        } => pending.retain(|entry| entry.scope_id != scope_id || entry.task_id != task_id),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_paper_reservation_open_event(
+    pending: &mut Vec<OpenAdmission>,
+    event: &crate::OperationEventEnvelope,
+) -> Result<(), AccountRiskError> {
+    let request = event
+        .payload()
+        .get("details")
+        .and_then(|details| details.get("request"))
+        .cloned()
+        .map(serde_json::from_value::<PaperReservationRequest>);
+    let Some(Ok(request)) = request else {
+        return Ok(());
+    };
+    if let Some((scope_id, ticket_id)) = request.risk_admission_binding() {
+        let Some(index) = pending.iter().position(|admission| {
+            admission.scope_id == scope_id && admission.ticket_id.as_deref() == Some(ticket_id)
+        }) else {
+            return Err(AccountRiskError::DegradedState);
+        };
+        if event.recorded_at() >= pending[index].lease_expires_at
+            || !bound_admission_matches_reservation(&pending[index], &request)?
+        {
+            return Err(AccountRiskError::DegradedState);
+        }
+        pending.remove(index);
+        return Ok(());
+    }
+    settle_legacy_reservation_admissions(pending, &request)
+}
+
+fn settle_legacy_reservation_admissions(
+    pending: &mut Vec<OpenAdmission>,
+    request: &PaperReservationRequest,
+) -> Result<(), AccountRiskError> {
+    for leg in request.legs() {
+        let mut matching_scopes = Vec::new();
+        for admission in pending.iter().filter(|admission| {
+            admission_matches_reservation(admission, request.task_id(), leg.symbol().as_str())
+        }) {
+            if !matching_scopes.contains(&admission.scope_id) {
+                matching_scopes.push(admission.scope_id.clone());
+            }
+        }
+        for scope_id in matching_scopes {
+            settle_open_admission(
+                pending,
+                &scope_id,
+                request.task_id(),
+                leg.symbol().as_str(),
+                leg.reserved_notional(),
+            )?;
+        }
     }
     Ok(())
 }
 
 fn record_open_admission(
     pending: &mut Vec<OpenAdmission>,
-    scope_id: String,
-    task_id: String,
-    symbol: String,
-    ticket_id: Option<String>,
-    recorded_at: DateTime<Utc>,
-    notional: Money,
+    admission: OpenAdmission,
 ) -> Result<(), AccountRiskError> {
     if pending
         .iter()
-        .filter(|entry| entry.scope_id == scope_id)
+        .filter(|entry| entry.scope_id == admission.scope_id)
         .count()
-        >= MAX_ACCOUNT_RISK_SCOPE_POSITIONS
+        >= MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS
     {
         return Err(AccountRiskProjectionError::OpenAdmissionLimitExceeded {
-            limit: MAX_ACCOUNT_RISK_SCOPE_POSITIONS,
+            limit: MAX_ACCOUNT_RISK_RECOVERY_SCOPE_POSITIONS,
         }
         .into());
     }
-    pending.push(OpenAdmission {
-        scope_id,
-        task_id,
-        symbol,
-        ticket_id,
-        recorded_at,
-        notional,
-    });
+    pending.push(admission);
     Ok(())
 }
 
@@ -1083,10 +1299,40 @@ fn admission_matches_reservation(
     symbol: &str,
 ) -> bool {
     (admission.task_id == reservation_task_id
-        || reservation_task_id
-            .strip_prefix(admission.task_id.as_str())
-            .is_some_and(|rest| rest.starts_with("/op/")))
+        || numeric_operation_suffix(&admission.task_id, reservation_task_id))
         && admission.symbol.eq_ignore_ascii_case(symbol)
+}
+
+fn numeric_operation_suffix(owner_task_id: &str, reservation_task_id: &str) -> bool {
+    reservation_task_id
+        .strip_prefix(owner_task_id)
+        .and_then(|suffix| suffix.strip_prefix("/op/"))
+        .is_some_and(|operation| {
+            !operation.is_empty() && operation.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+pub(crate) fn bound_admission_matches_reservation(
+    admission: &OpenAdmission,
+    request: &PaperReservationRequest,
+) -> Result<bool, AccountRiskError> {
+    if !admission_matches_reservation(admission, request.task_id(), &admission.symbol) {
+        return Ok(false);
+    }
+    let mut opening_notional = Money::default();
+    let mut opening_legs = 0_usize;
+    for leg in request.legs().iter().filter(|leg| !leg.reduce_only()) {
+        if !leg
+            .symbol()
+            .as_str()
+            .eq_ignore_ascii_case(&admission.symbol)
+        {
+            return Ok(false);
+        }
+        opening_notional = checked_add(opening_notional, leg.reserved_notional())?;
+        opening_legs = opening_legs.saturating_add(1);
+    }
+    Ok(opening_legs > 0 && opening_notional <= admission.notional)
 }
 
 /// Symbol, global, and total-balance observations derived from the active
@@ -1100,22 +1346,14 @@ fn exposures(
     let mut total_exposure = Money::default();
     let mut total_balance = Money::default();
     for account in &accounts.accounts {
-        let mut account_exposure = Money::default();
         for value in [
             account.pending_reserved,
             account.uncertain_reserved,
             account.committed_exposure,
         ] {
             total_exposure = checked_add(total_exposure, value)?;
-            account_exposure = checked_add(account_exposure, value)?;
         }
-        let account_balance = match account.ledger_kind {
-            PaperExecutionLedgerKind::LegacyReservationOnly => {
-                checked_add(account.available, account_exposure)?
-            }
-            PaperExecutionLedgerKind::ExactExecution => account.settled_equity_base,
-        };
-        total_balance = checked_add(total_balance, account_balance)?;
+        total_balance = checked_add(total_balance, account.settled_equity_base)?;
         for reservation in &account.reservations {
             if reservation.phase == PaperReservationPhase::Released
                 || reservation.ledger_kind == PaperExecutionLedgerKind::ExactExecution
@@ -1182,6 +1420,8 @@ enum AccountRiskFact {
         notional: Money,
         utc_date: String,
         recorded_at: DateTime<Utc>,
+        #[serde(default)]
+        lease_expires_at: Option<DateTime<Utc>>,
         warnings: Vec<String>,
     },
     AdmissionCancelled {
@@ -1192,6 +1432,16 @@ enum AccountRiskFact {
         ticket_id: String,
         admitted_at: DateTime<Utc>,
         recorded_at: DateTime<Utc>,
+    },
+    AdmissionExpired {
+        schema_version: u16,
+        journal_id: Uuid,
+        scope_id: String,
+        task_id: String,
+        ticket_id: String,
+        admitted_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+        expired_at: DateTime<Utc>,
     },
     Rejected {
         schema_version: u16,
@@ -1231,11 +1481,70 @@ enum AccountRiskFact {
     },
 }
 
+struct ValidatedAccountRiskFact {
+    fact: AccountRiskFact,
+    admitted_lease_expires_at: Option<DateTime<Utc>>,
+}
+
+fn validated_account_risk_fact(
+    event: &crate::OperationEventEnvelope,
+    expected_journal_id: Uuid,
+) -> Result<Option<ValidatedAccountRiskFact>, ()> {
+    let payload = event.payload();
+    let Some(decision) = payload.get("decision").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !matches!(
+        decision,
+        ACCOUNT_RISK_ADMITTED
+            | ACCOUNT_RISK_ADMISSION_CANCELLED
+            | ACCOUNT_RISK_ADMISSION_EXPIRED
+            | ACCOUNT_RISK_REJECTED
+            | ACCOUNT_RISK_POSITION_CLOSED
+            | ACCOUNT_RISK_PAUSED
+            | ACCOUNT_RISK_RESUMED
+            | ACCOUNT_RISK_KILL_SWITCH
+    ) {
+        return Ok(None);
+    }
+
+    let object = payload.as_object().ok_or(())?;
+    if object.len() != 4
+        || !["decision", "strategy", "symbol", "details"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+        || event.journal_id() != expected_journal_id
+        || payload.get("strategy").and_then(Value::as_str) != Some(ACCOUNT_RISK_STRATEGY)
+    {
+        return Err(());
+    }
+    let outer_scope = payload.get("symbol").and_then(Value::as_str).ok_or(())?;
+    let mut fact =
+        serde_json::from_value::<AccountRiskFact>(payload.get("details").cloned().ok_or(())?)
+            .map_err(|_| ())?;
+    if !fact.has_supported_schema()
+        || fact.journal_id() != expected_journal_id
+        || fact.scope_id() != outer_scope
+        || fact.matches_decision(decision).is_none()
+        || !valid_identity(fact.scope_id(), "scope id")
+    {
+        return Err(());
+    }
+
+    let admitted_lease_expires_at = fact.validate_fields(event)?;
+    fact.normalize_legacy_admission(event, admitted_lease_expires_at)?;
+    Ok(Some(ValidatedAccountRiskFact {
+        fact,
+        admitted_lease_expires_at,
+    }))
+}
+
 impl AccountRiskFact {
     const fn schema_version(&self) -> u16 {
         match self {
             Self::Admitted { schema_version, .. }
             | Self::AdmissionCancelled { schema_version, .. }
+            | Self::AdmissionExpired { schema_version, .. }
             | Self::Rejected { schema_version, .. }
             | Self::PositionClosed { schema_version, .. }
             | Self::Paused { schema_version, .. }
@@ -1244,10 +1553,36 @@ impl AccountRiskFact {
         }
     }
 
+    const fn journal_id(&self) -> Uuid {
+        match self {
+            Self::Admitted { journal_id, .. }
+            | Self::AdmissionCancelled { journal_id, .. }
+            | Self::AdmissionExpired { journal_id, .. }
+            | Self::Rejected { journal_id, .. }
+            | Self::PositionClosed { journal_id, .. }
+            | Self::Paused { journal_id, .. }
+            | Self::Resumed { journal_id, .. }
+            | Self::KillSwitchEngaged { journal_id, .. } => *journal_id,
+        }
+    }
+
+    const fn has_supported_schema(&self) -> bool {
+        match self {
+            Self::AdmissionExpired { schema_version, .. } => {
+                *schema_version == ACCOUNT_RISK_FACT_SCHEMA_VERSION
+            }
+            _ => matches!(
+                self.schema_version(),
+                LEGACY_ACCOUNT_RISK_SCHEMA_VERSION | ACCOUNT_RISK_FACT_SCHEMA_VERSION
+            ),
+        }
+    }
+
     fn scope_id(&self) -> &str {
         match self {
             Self::Admitted { scope_id, .. }
             | Self::AdmissionCancelled { scope_id, .. }
+            | Self::AdmissionExpired { scope_id, .. }
             | Self::Rejected { scope_id, .. }
             | Self::PositionClosed { scope_id, .. }
             | Self::Paused { scope_id, .. }
@@ -1265,6 +1600,7 @@ impl AccountRiskFact {
             | Self::Paused { recorded_at, .. }
             | Self::Resumed { recorded_at, .. }
             | Self::KillSwitchEngaged { recorded_at, .. } => *recorded_at,
+            Self::AdmissionExpired { expired_at, .. } => *expired_at,
         }
     }
 
@@ -1272,6 +1608,7 @@ impl AccountRiskFact {
         let expected: &str = match self {
             Self::Admitted { .. } => ACCOUNT_RISK_ADMITTED,
             Self::AdmissionCancelled { .. } => ACCOUNT_RISK_ADMISSION_CANCELLED,
+            Self::AdmissionExpired { .. } => ACCOUNT_RISK_ADMISSION_EXPIRED,
             Self::Rejected { .. } => ACCOUNT_RISK_REJECTED,
             Self::PositionClosed { .. } => ACCOUNT_RISK_POSITION_CLOSED,
             Self::Paused { .. } => ACCOUNT_RISK_PAUSED,
@@ -1280,6 +1617,175 @@ impl AccountRiskFact {
         };
         (expected == decision).then_some(())
     }
+
+    fn validate_fields(
+        &self,
+        event: &crate::OperationEventEnvelope,
+    ) -> Result<Option<DateTime<Utc>>, ()> {
+        match self {
+            Self::Admitted { .. } => self.validate_admitted_fields(event),
+            Self::AdmissionCancelled {
+                task_id, ticket_id, ..
+            } => {
+                if !valid_identity(task_id, "task id") || !valid_ticket(ticket_id) {
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Self::AdmissionExpired {
+                task_id,
+                ticket_id,
+                lease_expires_at,
+                expired_at,
+                ..
+            } => {
+                if !valid_identity(task_id, "task id")
+                    || !valid_ticket(ticket_id)
+                    || expired_at < lease_expires_at
+                    || *expired_at != event.recorded_at()
+                {
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Self::Rejected {
+                schema_version,
+                task_id,
+                symbol,
+                rejection,
+                ..
+            } => {
+                let valid_rejection = if *schema_version == LEGACY_ACCOUNT_RISK_SCHEMA_VERSION {
+                    valid_reason(rejection)
+                } else {
+                    matches!(
+                        rejection.as_str(),
+                        "kill_switch_engaged"
+                            | "paused"
+                            | "symbol_disabled"
+                            | "balance_below_close_threshold"
+                            | "daily_trade_limit_reached"
+                            | "symbol_exposure_exceeded"
+                            | "total_exposure_exceeded"
+                            | "invalid_candidate"
+                            | "arithmetic_overflow"
+                    )
+                };
+                if !valid_identity(task_id, "task id") || !valid_symbol(symbol) || !valid_rejection
+                {
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Self::PositionClosed { task_id, .. } => {
+                if !valid_identity(task_id, "task id") {
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Self::Paused { reason, .. } | Self::KillSwitchEngaged { reason, .. } => {
+                if reason
+                    .as_deref()
+                    .is_some_and(|reason| !valid_reason(reason))
+                {
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Self::Resumed { .. } => Ok(None),
+        }
+    }
+
+    fn normalize_legacy_admission(
+        &mut self,
+        event: &crate::OperationEventEnvelope,
+        admitted_lease_expires_at: Option<DateTime<Utc>>,
+    ) -> Result<(), ()> {
+        let Self::Admitted {
+            schema_version,
+            ticket_id,
+            lease_expires_at,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        if *schema_version == LEGACY_ACCOUNT_RISK_SCHEMA_VERSION {
+            ticket_id.get_or_insert_with(|| event.event_id().to_string());
+            *lease_expires_at = admitted_lease_expires_at;
+        }
+        if ticket_id.is_none() || lease_expires_at.is_none() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn validate_admitted_fields(
+        &self,
+        event: &crate::OperationEventEnvelope,
+    ) -> Result<Option<DateTime<Utc>>, ()> {
+        let Self::Admitted {
+            schema_version,
+            task_id,
+            symbol,
+            ticket_id,
+            notional,
+            utc_date: fact_utc_date,
+            recorded_at,
+            lease_expires_at,
+            warnings,
+            ..
+        } = self
+        else {
+            return Err(());
+        };
+        if !valid_identity(task_id, "task id")
+            || !valid_symbol(symbol)
+            || ticket_id
+                .as_deref()
+                .is_some_and(|ticket| !valid_ticket(ticket))
+            || (*schema_version == ACCOUNT_RISK_FACT_SCHEMA_VERSION && ticket_id.is_none())
+            || *notional <= Money::default()
+            || fact_utc_date != &utc_date(*recorded_at)
+            || warnings.len() > MAX_RISK_WARNINGS
+            || warnings.iter().any(|warning| {
+                if *schema_version == LEGACY_ACCOUNT_RISK_SCHEMA_VERSION {
+                    !valid_reason(warning)
+                } else {
+                    !matches!(warning.as_str(), "low_balance" | "high_risk_symbol")
+                }
+            })
+        {
+            return Err(());
+        }
+        let expected_lease = event
+            .recorded_at()
+            .checked_add_signed(Duration::seconds(ACCOUNT_RISK_ADMISSION_LEASE_SECONDS))
+            .ok_or(())?;
+        if lease_expires_at.is_some_and(|lease| lease != expected_lease) {
+            return Err(());
+        }
+        if *schema_version == ACCOUNT_RISK_FACT_SCHEMA_VERSION && lease_expires_at.is_none() {
+            return Err(());
+        }
+        Ok(Some(lease_expires_at.unwrap_or(expected_lease)))
+    }
+}
+
+fn valid_identity(value: &str, field: &'static str) -> bool {
+    bounded_identity(value, field).is_ok_and(|normalized| normalized == value)
+}
+
+fn valid_symbol(value: &str) -> bool {
+    valid_identity(value, "symbol") && value == value.to_ascii_uppercase()
+}
+
+pub(crate) fn valid_ticket(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|ticket| !ticket.is_nil())
+}
+
+fn valid_reason(value: &str) -> bool {
+    bounded_reason(value).is_ok_and(|normalized| normalized == value)
 }
 
 #[derive(Debug, Error)]
@@ -1288,6 +1794,8 @@ pub enum AccountRiskProjectionError {
     Journal(#[from] JournalReadError),
     #[error("account risk projection could not advance past a page boundary")]
     NonAdvancingPage,
+    #[error("account risk admitted fact is missing its exact ticket")]
+    InvalidAdmissionTicket,
     #[error("account risk projection exceeds the {limit}-scope bound")]
     ScopeLimitExceeded { limit: usize },
     #[error("account risk projection exceeds the {limit}-open-position bound")]
@@ -1304,6 +1812,8 @@ pub enum AccountRiskError {
     InvalidRequest(&'static str),
     #[error("account risk durable state is degraded; recovery is required")]
     DegradedState,
+    #[error("account risk live admission capacity exceeds the {limit}-admission bound")]
+    AdmissionCapacityExceeded { limit: usize },
     #[error("account risk fact serialization failed: {0}")]
     Serialize(serde_json::Error),
     #[error(transparent)]

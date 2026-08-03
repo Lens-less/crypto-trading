@@ -309,6 +309,10 @@ pub struct PaperReservationRequest {
     batch_id: Uuid,
     cost_model: PaperCostModel,
     legs: Vec<PaperReservationLeg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    risk_scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    risk_admission_ticket_id: Option<String>,
 }
 
 impl PaperReservationRequest {
@@ -362,6 +366,8 @@ impl PaperReservationRequest {
             batch_id,
             cost_model,
             legs,
+            risk_scope_id: None,
+            risk_admission_ticket_id: None,
         };
         request.validate()?;
         Ok(request)
@@ -397,6 +403,35 @@ impl PaperReservationRequest {
         &self.legs
     }
 
+    /// Binds this reservation to one exact live account-risk admission.
+    ///
+    /// The paper authority checks the ticket while holding the same journal
+    /// serialization lock used by the risk authority. Consequently either a
+    /// reservation consumes the ticket or expiry does; neither path can race
+    /// past the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PaperAccountError::InvalidRequest`] for an unsafe scope.
+    pub fn with_account_risk_admission(
+        mut self,
+        scope_id: impl Into<String>,
+        ticket: &crate::AccountRiskAdmissionTicket,
+    ) -> Result<Self, PaperAccountError> {
+        let scope_id = bounded_identity(&scope_id.into(), "scope id")
+            .map_err(PaperAccountError::InvalidRequest)?;
+        self.risk_scope_id = Some(scope_id);
+        self.risk_admission_ticket_id = Some(ticket.as_str().to_owned());
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) fn risk_admission_binding(&self) -> Option<(&str, &str)> {
+        self.risk_scope_id
+            .as_deref()
+            .zip(self.risk_admission_ticket_id.as_deref())
+    }
+
     /// Returns gross reserved leg notional before the versioned paper cost
     /// buffers are applied.
     ///
@@ -420,6 +455,26 @@ impl PaperReservationRequest {
         bounded_identity(&self.task_id, "task id").map_err(PaperAccountError::InvalidRequest)?;
         bounded_identity(&self.idempotency_key, "idempotency key")
             .map_err(PaperAccountError::InvalidRequest)?;
+        match (
+            self.risk_scope_id.as_deref(),
+            self.risk_admission_ticket_id.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(scope_id), Some(ticket_id)) => {
+                bounded_identity(scope_id, "scope id")
+                    .map_err(PaperAccountError::InvalidRequest)?;
+                if !super::account_risk::valid_ticket(ticket_id) {
+                    return Err(PaperAccountError::InvalidRequest(
+                        "paper risk admission ticket must be a non-nil UUID",
+                    ));
+                }
+            }
+            _ => {
+                return Err(PaperAccountError::InvalidRequest(
+                    "paper risk admission binding must include scope and ticket",
+                ));
+            }
+        }
         if self.legs.is_empty() || self.legs.len() > MAX_RESERVATION_LEGS {
             return Err(PaperAccountError::InvalidRequest(
                 "paper reservation leg count is outside the supported bound",
@@ -1111,6 +1166,26 @@ impl PaperAccountAuthority {
         self.history.path()
     }
 
+    /// Cold-replays the current frozen journal head and verifies that it is
+    /// equivalent to the process-local authority projection.
+    ///
+    /// A detected mismatch permanently degrades every in-process authority
+    /// sharing this journal generation. Repeated calls are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PaperAccountError::DurableStateDegraded`] when a cached
+    /// projection cannot be proven equivalent, including malformed durable
+    /// bytes, or after that failure has been latched. Initial projection
+    /// loading can still return its corresponding journal or projection error.
+    pub async fn verify_durable_state(&self) -> Result<(), PaperAccountError> {
+        let _guard = self.authority_lock.lock().await;
+        self.state_cache
+            .verify_durable_state(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)
+    }
+
     #[must_use]
     pub const fn config(&self) -> &PaperAccountConfig {
         &self.config
@@ -1127,6 +1202,24 @@ impl PaperAccountAuthority {
         self.load_account_snapshot().await
     }
 
+    /// Returns a projection that is safe to use for a control decision.
+    ///
+    /// [`Self::snapshot`] intentionally remains diagnostic and can expose the
+    /// last valid state together with a degraded status. Callers deciding
+    /// whether to reserve, compensate, or release capacity must use this
+    /// method so degraded input fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PaperAccountError::DurableStateDegraded`] when replay found a
+    /// partial or invalid fact, in addition to snapshot/journal errors.
+    pub async fn decision_snapshot(&self) -> Result<PaperAccountSnapshot, PaperAccountError> {
+        let _guard = self.authority_lock.lock().await;
+        let snapshot = self.load_account_snapshot().await?;
+        require_writable(&snapshot)?;
+        Ok(snapshot)
+    }
+
     /// Durably reserves account capacity before any execution plan or adapter
     /// side effect is allowed.
     ///
@@ -1140,6 +1233,7 @@ impl PaperAccountAuthority {
     ) -> Result<PaperReservationAdmission, PaperAccountError> {
         request.validate()?;
         let _guard = self.authority_lock.lock().await;
+        let authority_now = Utc::now();
         let snapshot = self.load_account_snapshot().await?;
         require_writable(&snapshot)?;
 
@@ -1173,6 +1267,8 @@ impl PaperAccountAuthority {
         if let Some(existing) = self.find_historical_reservation(&request).await? {
             return Ok(PaperReservationAdmission::Existing(existing));
         }
+        self.validate_bound_risk_admission(&request, authority_now)
+            .await?;
         let reserved_exposure = reserved_exposure(&request)?;
         let required =
             additional_reservation_exposure(&snapshot.open_lots, &snapshot.reservations, &request)?;
@@ -1183,7 +1279,9 @@ impl PaperAccountAuthority {
             });
         }
 
-        self.append_fact(
+        let reservation_id = request.reservation_id;
+        self.append_fact_at(
+            authority_now,
             PAPER_ACCOUNT_RESERVED,
             &ReservedFact {
                 schema_version: PAPER_ACCOUNT_SCHEMA_VERSION,
@@ -1199,7 +1297,8 @@ impl PaperAccountAuthority {
         require_writable(&updated)?;
         let reservation = updated
             .reservations
-            .last()
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
             .cloned()
             .ok_or(PaperAccountError::DurableStateConflict)?;
         Ok(PaperReservationAdmission::Reserved(reservation))
@@ -1507,10 +1606,19 @@ impl PaperAccountAuthority {
         decision: &'static str,
         fact: &T,
     ) -> Result<(), PaperAccountError> {
+        self.append_fact_at(Utc::now(), decision, fact).await
+    }
+
+    async fn append_fact_at<T: Serialize>(
+        &self,
+        timestamp: chrono::DateTime<Utc>,
+        decision: &'static str,
+        fact: &T,
+    ) -> Result<(), PaperAccountError> {
         let details = serde_json::to_value(fact).map_err(PaperAccountError::Serialize)?;
         self.history
             .append(&DecisionRecord {
-                timestamp: Utc::now(),
+                timestamp,
                 strategy: PAPER_ACCOUNT_STRATEGY.to_owned(),
                 symbol: self.config.account_id.clone(),
                 decision: decision.to_owned(),
@@ -1533,6 +1641,13 @@ impl PaperAccountAuthority {
             .paper_snapshot(self.config.account_id(), self.config.initial_available)
             .map_err(map_authority_state_error_to_paper)?;
         require_writable(&updated)?;
+        if let Some(reservation) = updated
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+        {
+            return Ok(reservation.clone());
+        }
         projection
             .historical_reservation_by_id(self.config.account_id(), reservation_id)?
             .ok_or(PaperAccountError::UnknownReservation)
@@ -1559,6 +1674,34 @@ impl PaperAccountAuthority {
             .await
             .map_err(map_authority_state_error_to_paper)?;
         projection.historical_reservation(self.config.account_id(), request)
+    }
+
+    async fn validate_bound_risk_admission(
+        &self,
+        request: &PaperReservationRequest,
+        authority_now: chrono::DateTime<Utc>,
+    ) -> Result<(), PaperAccountError> {
+        let Some((scope_id, ticket_id)) = request.risk_admission_binding() else {
+            return Ok(());
+        };
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)?;
+        let admission = projection
+            .bound_open_admission(scope_id, ticket_id)
+            .map_err(map_authority_state_error_to_paper)?
+            .ok_or(PaperAccountError::RiskAdmissionUnavailable)?;
+        if admission.lease_expires_at <= authority_now {
+            return Err(PaperAccountError::RiskAdmissionExpired);
+        }
+        if !crate::account_risk::bound_admission_matches_reservation(&admission, request)
+            .map_err(|_| PaperAccountError::ArithmeticOverflow)?
+        {
+            return Err(PaperAccountError::RiskAdmissionMismatch);
+        }
+        Ok(())
     }
 
     async fn find_transition_reservation(
@@ -1635,7 +1778,11 @@ pub(crate) struct ProjectionBuilder {
     projection_status: ProjectionStatus,
     invalid_event_count: u64,
     accounts: Vec<AccountAccumulator>,
-    retain_terminal_reservations: bool,
+}
+
+pub(crate) struct TerminalReservationUpdate {
+    pub(crate) account_id: String,
+    pub(crate) reservation: PaperReservationView,
 }
 
 impl ProjectionBuilder {
@@ -1645,22 +1792,10 @@ impl ProjectionBuilder {
             projection_status: ProjectionStatus::Complete,
             invalid_event_count: 0,
             accounts: Vec::new(),
-            retain_terminal_reservations: false,
         }
     }
 
-    pub(crate) const fn retain_terminal_reservations(
-        mut self,
-        retain_terminal_reservations: bool,
-    ) -> Self {
-        self.retain_terminal_reservations = retain_terminal_reservations;
-        self
-    }
-
-    pub(crate) fn from_model(
-        model: PaperAccountReadModel,
-        retain_terminal_reservations: bool,
-    ) -> Self {
+    pub(crate) fn from_model(model: PaperAccountReadModel) -> Self {
         Self {
             journal_id: model.journal_id,
             projection_status: model.projection_status,
@@ -1668,11 +1803,8 @@ impl ProjectionBuilder {
             accounts: model
                 .accounts
                 .into_iter()
-                .map(|snapshot| {
-                    AccountAccumulator::from_snapshot(snapshot, retain_terminal_reservations)
-                })
+                .map(AccountAccumulator::from_snapshot)
                 .collect(),
-            retain_terminal_reservations,
         }
     }
 
@@ -1706,7 +1838,14 @@ impl ProjectionBuilder {
     }
 
     pub(crate) fn observe_event(&mut self, event: &OperationEventEnvelope) {
-        self.apply_event(event.sequence(), event.payload());
+        let _ = self.observe_event_with_terminal_updates(event);
+    }
+
+    pub(crate) fn observe_event_with_terminal_updates(
+        &mut self,
+        event: &OperationEventEnvelope,
+    ) -> Vec<TerminalReservationUpdate> {
+        self.apply_event(event.sequence(), event.payload())
     }
 
     pub(crate) fn mark_partial_tail(&mut self) {
@@ -1735,9 +1874,9 @@ impl ProjectionBuilder {
         })
     }
 
-    fn apply_event(&mut self, sequence: u64, payload: &Value) {
+    fn apply_event(&mut self, sequence: u64, payload: &Value) -> Vec<TerminalReservationUpdate> {
         let Some(decision) = payload.get("decision").and_then(Value::as_str) else {
-            return;
+            return Vec::new();
         };
         if !matches!(
             decision,
@@ -1748,11 +1887,14 @@ impl ProjectionBuilder {
                 | PAPER_ACCOUNT_RECONCILE_FAILED
                 | PAPER_ACCOUNT_EXECUTION_SETTLED
         ) {
-            return;
+            return Vec::new();
         }
-        if self.try_apply_event(sequence, decision, payload).is_err() {
+        if let Ok(updates) = self.try_apply_event(sequence, decision, payload) {
+            updates
+        } else {
             self.invalid_event_count = self.invalid_event_count.saturating_add(1);
             self.projection_status = ProjectionStatus::Degraded;
+            Vec::new()
         }
     }
 
@@ -1761,7 +1903,7 @@ impl ProjectionBuilder {
         sequence: u64,
         decision: &str,
         payload: &Value,
-    ) -> Result<(), ()> {
+    ) -> Result<Vec<TerminalReservationUpdate>, ()> {
         let payload = exact_object(payload, &["decision", "details", "strategy", "symbol"])?;
         if text(payload.get("decision"))? != decision
             || text(payload.get("strategy"))? != PAPER_ACCOUNT_STRATEGY
@@ -1788,11 +1930,11 @@ impl ProjectionBuilder {
                     self.accounts.push(AccountAccumulator::new(
                         fact.account_id.clone(),
                         fact.initial_available,
-                        self.retain_terminal_reservations,
                     ));
                     self.accounts.len().saturating_sub(1)
                 };
-                self.accounts[account_index].reserve(sequence, fact)
+                self.accounts[account_index].reserve(sequence, fact)?;
+                Ok(Vec::new())
             }
             PAPER_ACCOUNT_UNCERTAIN | PAPER_ACCOUNT_COMMITTED | PAPER_ACCOUNT_RELEASED => {
                 require_money_strings_for_transition(&details)?;
@@ -1803,7 +1945,10 @@ impl ProjectionBuilder {
                     .iter_mut()
                     .find(|account| account.account_id == fact.account_id)
                     .ok_or(())?;
-                account.transition(sequence, decision, &fact)
+                let account_id = fact.account_id.clone();
+                account
+                    .transition(sequence, decision, &fact)
+                    .map(|reservations| terminal_updates(&account_id, reservations))
             }
             PAPER_ACCOUNT_EXECUTION_SETTLED => {
                 require_money_strings_for_execution_settled(&details)?;
@@ -1814,7 +1959,10 @@ impl ProjectionBuilder {
                     .iter_mut()
                     .find(|account| account.account_id == fact.account_id)
                     .ok_or(())?;
-                account.settle_execution(sequence, fact)
+                let account_id = fact.account_id.clone();
+                account
+                    .settle_execution(sequence, fact)
+                    .map(|reservations| terminal_updates(&account_id, reservations))
             }
             PAPER_ACCOUNT_RECONCILE_FAILED => {
                 require_money_strings_for_transition(&details)?;
@@ -1825,11 +1973,27 @@ impl ProjectionBuilder {
                     .iter_mut()
                     .find(|account| account.account_id == fact.account_id)
                     .ok_or(())?;
-                account.transition(sequence, decision, &fact)
+                let account_id = fact.account_id.clone();
+                account
+                    .transition(sequence, decision, &fact)
+                    .map(|reservations| terminal_updates(&account_id, reservations))
             }
             _ => Err(()),
         }
     }
+}
+
+fn terminal_updates(
+    account_id: &str,
+    reservations: Vec<PaperReservationView>,
+) -> Vec<TerminalReservationUpdate> {
+    reservations
+        .into_iter()
+        .map(|reservation| TerminalReservationUpdate {
+            account_id: account_id.to_owned(),
+            reservation,
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1842,7 +2006,6 @@ struct AccountAccumulator {
     settled_equity_base: Money,
     open_lots: Vec<PaperOpenLotView>,
     reservations: Vec<PaperReservationView>,
-    retain_terminal_reservations: bool,
 }
 
 #[derive(Default)]
@@ -1938,11 +2101,7 @@ fn fill_matches_leg((fill, leg): (&PaperExecutedFill, &PaperReservationLeg)) -> 
 }
 
 impl AccountAccumulator {
-    fn new(
-        account_id: String,
-        initial_available: Money,
-        retain_terminal_reservations: bool,
-    ) -> Self {
+    fn new(account_id: String, initial_available: Money) -> Self {
         Self {
             account_id,
             initial_available,
@@ -1952,14 +2111,10 @@ impl AccountAccumulator {
             settled_equity_base: initial_available,
             open_lots: Vec::new(),
             reservations: Vec::new(),
-            retain_terminal_reservations,
         }
     }
 
-    pub(crate) fn from_snapshot(
-        snapshot: PaperAccountSnapshot,
-        retain_terminal_reservations: bool,
-    ) -> Self {
+    pub(crate) fn from_snapshot(snapshot: PaperAccountSnapshot) -> Self {
         Self {
             account_id: snapshot.account_id,
             initial_available: snapshot.initial_available,
@@ -1969,7 +2124,6 @@ impl AccountAccumulator {
             settled_equity_base: snapshot.settled_equity_base,
             open_lots: snapshot.open_lots,
             reservations: snapshot.reservations,
-            retain_terminal_reservations,
         }
     }
 
@@ -2019,7 +2173,7 @@ impl AccountAccumulator {
         sequence: u64,
         decision: &str,
         fact: &TransitionFact,
-    ) -> Result<(), ()> {
+    ) -> Result<Vec<PaperReservationView>, ()> {
         let reservation_index = self
             .reservations
             .iter()
@@ -2084,22 +2238,25 @@ impl AccountAccumulator {
             _ => return Err(()),
         }
         reservation.last_sequence = sequence;
-        self.prune_terminal_reservations();
-        Ok(())
+        Ok(self.prune_terminal_reservations())
     }
 
-    fn settle_execution(&mut self, sequence: u64, fact: ExecutionSettledFact) -> Result<(), ()> {
+    fn settle_execution(
+        &mut self,
+        sequence: u64,
+        fact: ExecutionSettledFact,
+    ) -> Result<Vec<PaperReservationView>, ()> {
         let mut candidate = self.clone();
-        candidate.apply_execution_settlement(sequence, fact)?;
+        let terminal = candidate.apply_execution_settlement(sequence, fact)?;
         *self = candidate;
-        Ok(())
+        Ok(terminal)
     }
 
     fn apply_execution_settlement(
         &mut self,
         sequence: u64,
         fact: ExecutionSettledFact,
-    ) -> Result<(), ()> {
+    ) -> Result<Vec<PaperReservationView>, ()> {
         let (reservation_index, maximum_held) = self.validate_settlement_reservation(&fact)?;
 
         self.ledger_kind = PaperExecutionLedgerKind::ExactExecution;
@@ -2139,8 +2296,7 @@ impl AccountAccumulator {
         reservation.settlement = Some(settlement);
 
         self.sync_exact_reservation_holds(sequence, &touched_reservations)?;
-        self.prune_terminal_reservations();
-        Ok(())
+        Ok(self.prune_terminal_reservations())
     }
 
     fn validate_settlement_reservation(
@@ -2289,12 +2445,17 @@ impl AccountAccumulator {
         Ok(())
     }
 
-    fn prune_terminal_reservations(&mut self) {
-        if self.retain_terminal_reservations {
-            return;
-        }
-        self.reservations
-            .retain(|reservation| reservation.phase != PaperReservationPhase::Released);
+    fn prune_terminal_reservations(&mut self) -> Vec<PaperReservationView> {
+        let mut terminal = Vec::new();
+        self.reservations.retain(|reservation| {
+            if reservation.phase == PaperReservationPhase::Released {
+                terminal.push(reservation.clone());
+                false
+            } else {
+                true
+            }
+        });
+        terminal
     }
 
     fn finish(
@@ -3172,7 +3333,7 @@ mod tests {
     #[test]
     fn one_thousand_round_trip_flips_do_not_exhaust_projected_balance() {
         let journal_id = Uuid::from_u128(1);
-        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"), false);
+        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"));
         let mut sequence = 1_u64;
 
         apply_fill_pair(&mut account, journal_id, sequence, 1, Side::Buy, "1", "0.1");
@@ -3210,7 +3371,7 @@ mod tests {
     #[test]
     fn released_reservations_do_not_consume_active_capacity_slots() {
         let journal_id = Uuid::from_u128(9);
-        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"), false);
+        let mut account = AccountAccumulator::new("paper-main".to_owned(), money("1000"));
         let mut sequence = 1_u64;
 
         for identity in 0..(MAX_PAPER_ACCOUNT_RESERVATIONS as u128 + 8) {
@@ -3402,6 +3563,12 @@ pub enum PaperAccountError {
     ReservationIdentityConflict,
     #[error("paper task already has an active reservation")]
     ActiveTaskReservation,
+    #[error("paper reservation's bound account-risk admission is unavailable")]
+    RiskAdmissionUnavailable,
+    #[error("paper reservation's bound account-risk admission lease has expired")]
+    RiskAdmissionExpired,
+    #[error("paper reservation does not match its bound account-risk admission")]
+    RiskAdmissionMismatch,
     #[error("paper account has only {available} available but reservation needs {required}")]
     InsufficientAvailable { required: Money, available: Money },
     #[error("paper reduce-only reservation exceeds exact open-lot capacity")]

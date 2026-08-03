@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crypto_trading_runtime::{
     AdapterFacet, AdapterSupportLevel, CapabilityAccess, CapabilityArea, CapabilityEnvironment,
@@ -390,34 +390,53 @@ fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() 
 }
 
 #[test]
-fn research_kernels_are_visible_without_overstating_execution_parity() {
+fn research_kernels_are_visible_but_fail_closed_as_library_only() {
     let manifest = current_capability_manifest();
     let backtest = manifest.capability("research.backtest").unwrap();
     assert_eq!(backtest.area, CapabilityArea::Research);
-    assert_eq!(backtest.level, CapabilityLevel::Available);
+    assert_eq!(backtest.level, CapabilityLevel::Unavailable);
     assert_eq!(
         backtest.scope.environments,
         vec![CapabilityEnvironment::Offline]
     );
     assert_eq!(backtest.scope.access, CapabilityAccess::Local);
-    assert!(backtest.summary.contains("out-of-sample-only"));
+    assert!(backtest.summary.contains("library-only"));
     assert!(
         backtest
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("not a profitability claim")
-                && blocker.contains("production MarketDataEvent/strategy adapters"))
+            .any(|blocker| blocker.contains("no shipped binary")
+                && blocker.contains("no supported CLI or HTTP entry point"))
+    );
+    assert!(
+        backtest
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not a profitability claim"))
     );
 
     let indicators = manifest.capability("research.indicators").unwrap();
     assert_eq!(indicators.area, CapabilityArea::Research);
-    assert_eq!(indicators.level, CapabilityLevel::Available);
+    assert_eq!(indicators.level, CapabilityLevel::Unavailable);
+    assert_eq!(
+        indicators.scope.environments,
+        vec![CapabilityEnvironment::Offline]
+    );
+    assert_eq!(indicators.scope.access, CapabilityAccess::Local);
+    assert!(indicators.summary.contains("library-only"));
     assert!(indicators.summary.contains("EWMA realized volatility"));
     assert!(
         indicators
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("microprice") && blocker.contains("not yet wired"))
+            .any(|blocker| blocker.contains("no shipped binary")
+                && blocker.contains("no supported CLI or HTTP entry point"))
+    );
+    assert!(
+        indicators
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("microprice"))
     );
 }
 
@@ -806,6 +825,65 @@ fn every_adapter_cell_has_checked_in_evidence_and_incomplete_cells_explain_the_g
                 );
             }
         }
+    }
+}
+
+#[test]
+fn every_capability_has_checked_in_file_evidence() {
+    let manifest = current_capability_manifest();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .canonicalize()
+        .unwrap();
+
+    for capability in &manifest.capabilities {
+        assert!(
+            !capability.evidence.is_empty(),
+            "{} lacks evidence",
+            capability.id
+        );
+        for evidence in &capability.evidence {
+            let relative = Path::new(evidence);
+            assert!(
+                !relative.is_absolute()
+                    && relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                "{} evidence must be a normalized repository-relative path: {evidence}",
+                capability.id
+            );
+            assert!(
+                repository.join(relative).is_file(),
+                "{} evidence is not a checked-in file: {evidence}",
+                capability.id
+            );
+        }
+    }
+}
+
+#[test]
+fn every_available_capability_names_a_shipped_application_boundary() {
+    const SHIPPED_APPLICATION_BOUNDARIES: [&str; 3] = [
+        "rust/crates/apps/src/",
+        "rust/crates/web-app/src/",
+        "rust/crates/web/src/",
+    ];
+
+    let manifest = current_capability_manifest();
+    for capability in manifest
+        .capabilities
+        .iter()
+        .filter(|capability| capability.level == CapabilityLevel::Available)
+    {
+        assert!(
+            capability.evidence.iter().any(|evidence| {
+                SHIPPED_APPLICATION_BOUNDARIES
+                    .iter()
+                    .any(|boundary| evidence.starts_with(boundary))
+            }),
+            "{} is available but names no shipped CLI/Web implementation boundary",
+            capability.id
+        );
     }
 }
 

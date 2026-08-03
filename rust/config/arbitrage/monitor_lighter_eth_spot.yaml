@@ -17,6 +17,10 @@ symbols:
   - ETH-USDC-SPOT
 
 # 以下历史 UI 字段未接入 Rust runtime
+health_check:
+  data_timeout: 30
+  max_pair_skew_ms: 1000
+
 performance:
   ui_refresh_interval_ms: 1000  # UI刷新间隔（毫秒）
 

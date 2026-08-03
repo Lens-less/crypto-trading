@@ -12,8 +12,8 @@ const MAX_ROLLING_WINDOW: usize = 1_000_000;
 pub struct RollingZScore {
     window: usize,
     samples: VecDeque<Decimal>,
-    sum: Decimal,
-    sum_of_squares: Decimal,
+    mean: Decimal,
+    squared_deviation_sum: Decimal,
 }
 
 impl RollingZScore {
@@ -36,8 +36,8 @@ impl RollingZScore {
         Ok(Self {
             window,
             samples,
-            sum: Decimal::ZERO,
-            sum_of_squares: Decimal::ZERO,
+            mean: Decimal::ZERO,
+            squared_deviation_sum: Decimal::ZERO,
         })
     }
 
@@ -60,57 +60,68 @@ impl RollingZScore {
         } else {
             None
         };
-        let retained_sum = match removed {
-            Some(value) => self
-                .sum
-                .checked_sub(value)
-                .ok_or(IndicatorError::ArithmeticOverflow)?,
-            None => self.sum,
-        };
-        let retained_sum_of_squares = match removed {
-            Some(value) => self
-                .sum_of_squares
+        let mut retained_len = self.samples.len();
+        let mut retained_mean = self.mean;
+        let mut retained_squared_deviation_sum = self.squared_deviation_sum;
+        if let Some(value) = removed {
+            let retained_count = retained_len
+                .checked_sub(1)
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            let count = decimal_count(retained_len)?;
+            let retained_count_decimal = decimal_count(retained_count)?;
+            retained_mean = self
+                .mean
+                .checked_mul(count)
+                .and_then(|weighted| weighted.checked_sub(value))
+                .and_then(|weighted| weighted.checked_div(retained_count_decimal))
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            let removed_from_old_mean = value
+                .checked_sub(self.mean)
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            let removed_from_retained_mean = value
+                .checked_sub(retained_mean)
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            retained_squared_deviation_sum = self
+                .squared_deviation_sum
                 .checked_sub(
-                    value
-                        .checked_mul(value)
+                    removed_from_old_mean
+                        .checked_mul(removed_from_retained_mean)
                         .ok_or(IndicatorError::ArithmeticOverflow)?,
                 )
-                .ok_or(IndicatorError::ArithmeticOverflow)?,
-            None => self.sum_of_squares,
-        };
-        let next_sum = retained_sum
-            .checked_add(sample)
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            retained_len = retained_count;
+        }
+
+        let next_len = retained_len
+            .checked_add(1)
             .ok_or(IndicatorError::ArithmeticOverflow)?;
-        let next_sum_of_squares = retained_sum_of_squares
+        let next_count = decimal_count(next_len)?;
+        let delta = sample
+            .checked_sub(retained_mean)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        let next_mean = retained_mean
             .checked_add(
-                sample
-                    .checked_mul(sample)
+                delta
+                    .checked_div(next_count)
+                    .ok_or(IndicatorError::ArithmeticOverflow)?,
+            )
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        let delta_from_next_mean = sample
+            .checked_sub(next_mean)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        let next_squared_deviation_sum = retained_squared_deviation_sum
+            .checked_add(
+                delta
+                    .checked_mul(delta_from_next_mean)
                     .ok_or(IndicatorError::ArithmeticOverflow)?,
             )
             .ok_or(IndicatorError::ArithmeticOverflow)?;
 
-        let next_len = if removed.is_some() {
-            self.window
-        } else {
-            self.samples.len() + 1
-        };
         let result = if next_len < self.window {
             None
         } else {
-            let count = Decimal::from(
-                u64::try_from(self.window).map_err(|_| IndicatorError::ArithmeticOverflow)?,
-            );
-            let mean = next_sum
-                .checked_div(count)
-                .ok_or(IndicatorError::ArithmeticOverflow)?;
-            let mean_square = mean
-                .checked_mul(mean)
-                .ok_or(IndicatorError::ArithmeticOverflow)?;
-            let average_square = next_sum_of_squares
-                .checked_div(count)
-                .ok_or(IndicatorError::ArithmeticOverflow)?;
-            let variance = average_square
-                .checked_sub(mean_square)
+            let variance = next_squared_deviation_sum
+                .checked_div(next_count)
                 .ok_or(IndicatorError::ArithmeticOverflow)?;
             if variance.is_zero()
                 || (variance < Decimal::ZERO && variance.abs() <= VARIANCE_TOLERANCE)
@@ -126,7 +137,7 @@ impl RollingZScore {
                 } else {
                     Some(
                         sample
-                            .checked_sub(mean)
+                            .checked_sub(next_mean)
                             .ok_or(IndicatorError::ArithmeticOverflow)?
                             .checked_div(standard_deviation)
                             .ok_or(IndicatorError::ArithmeticOverflow)?,
@@ -139,8 +150,14 @@ impl RollingZScore {
             let _ = self.samples.pop_front();
         }
         self.samples.push_back(sample);
-        self.sum = next_sum;
-        self.sum_of_squares = next_sum_of_squares;
+        self.mean = next_mean;
+        self.squared_deviation_sum = next_squared_deviation_sum;
         Ok(result)
     }
+}
+
+fn decimal_count(count: usize) -> Result<Decimal, IndicatorError> {
+    u64::try_from(count)
+        .map(Decimal::from)
+        .map_err(|_| IndicatorError::ArithmeticOverflow)
 }

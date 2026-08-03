@@ -92,15 +92,15 @@ pub fn install_shutdown_signal() -> Result<ShutdownSignalFuture, ShutdownSignalE
 fn platform_shutdown_signal() -> Result<ShutdownSignalFuture, ShutdownSignalError> {
     use tokio::signal::unix::{SignalKind, signal};
 
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|source| ShutdownSignalError::register("SIGINT", source))?;
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|source| ShutdownSignalError::register("SIGTERM", source))?;
     Ok(Box::pin(async move {
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result
-                    .map(|()| ShutdownSignal::CtrlC)
-                    .map_err(|source| ShutdownSignalError::receive("Ctrl-C", source))
-            }
+            result = sigint.recv() => result
+                .map(|()| ShutdownSignal::CtrlC)
+                .ok_or_else(|| ShutdownSignalError::receive("SIGINT", io::Error::other("signal stream ended unexpectedly"))),
             result = sigterm.recv() => result
                 .map(|()| ShutdownSignal::Sigterm)
                 .ok_or_else(|| ShutdownSignalError::receive("SIGTERM", io::Error::other("signal stream ended unexpectedly"))),

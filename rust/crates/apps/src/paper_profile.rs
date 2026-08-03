@@ -21,8 +21,8 @@ use crypto_trading_runtime::{
     AccountRiskAuthority, ExchangeRouter, ExecutionBatch, ExecutionClock, ExecutionMode,
     ExecutionPolicy, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataClock,
     MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketDataObservation,
-    MarketFreshnessPolicy, MarketInstrument, MarketUniverse, ObservedMarketPair,
-    PaperAccountAuthority, PaperAccountConfig, PaperCostModel, RuntimeError,
+    MarketInstrument, MarketUniverse, ObservedMarketPair, PaperAccountAuthority,
+    PaperAccountConfig, PaperCostModel, RuntimeError,
 };
 use crypto_trading_strategy::{
     AccountRiskLimits, AccountRiskPolicy, CapitalProtectionPolicyConfig, GridDirection,
@@ -40,7 +40,10 @@ use crate::{
     ArbitragePaperTask, ArbitragePaperTaskConfig, ArbitragePaperTaskError,
     GridPaperExecutionFuture, GridPaperExecutor, GridPaperObservationFuture, GridPaperTask,
     GridPaperTaskConfig, GridPaperTaskError,
-    monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock, load_market_snapshot_replay},
+    monitor::{
+        ReadOnlyArbitrageMonitor, ReplayMarketDataClock, freshness_policy_from_monitor_config,
+        load_market_snapshot_replay,
+    },
 };
 
 const DEFAULT_COST_FEE_BPS: u32 = 10;
@@ -1153,10 +1156,7 @@ fn build_monitor(
     let left = MarketInstrument::new(left_exchange, symbol.clone(), market_type)?;
     let right = MarketInstrument::new(right_exchange, symbol, market_type)?;
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()])?;
-    let freshness = MarketFreshnessPolicy::new(
-        Duration::seconds(i64::try_from(monitor.data_timeout_seconds).unwrap_or(i64::MAX)),
-        Duration::seconds(1),
-    )?;
+    let freshness = freshness_policy_from_monitor_config(monitor)?;
     let book = MarketDataBook::new(universe, freshness, clock);
     ReadOnlyArbitrageMonitor::new(book, left, right, monitor.min_spread_pct)
 }

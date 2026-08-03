@@ -21,6 +21,7 @@ use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::remote::metadata_from_reqwest_headers;
 use crate::{
     ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeOperation,
     ExchangeStatus, ExchangeSymbol, ExchangeSymbolCatalog, HyperliquidPublicEndpoint,
@@ -188,6 +189,43 @@ impl HyperliquidPublicExchange {
         coin: &str,
         received_at: DateTime<Utc>,
     ) -> Result<HyperliquidPublicObservation, ExchangeError> {
+        let payload = self.fetch_meta_and_asset_ctxs_payload().await?;
+        Self::parse_meta_and_asset_ctxs(&payload, coin, received_at)
+    }
+
+    /// Fetches one coherent `metaAndAssetCtxs` response and fans it out to an
+    /// exact, bounded list of requested coins in caller order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError`] when the request fails or any requested coin
+    /// cannot be selected safely from the shared response.
+    pub async fn fetch_observations_at(
+        &self,
+        coins: &[Symbol],
+        received_at: DateTime<Utc>,
+    ) -> Result<Vec<HyperliquidPublicObservation>, ExchangeError> {
+        if coins.is_empty() {
+            return Err(ExchangeError::invalid(
+                "Hyperliquid public batch requires at least one coin",
+            ));
+        }
+        if coins.len() > MAX_HYPERLIQUID_PUBLIC_CATALOG_COINS {
+            return Err(ExchangeError::resource_limit(
+                "Hyperliquid public batch coins",
+                MAX_HYPERLIQUID_PUBLIC_CATALOG_COINS,
+                coins.len(),
+            ));
+        }
+        let payload = self.fetch_meta_and_asset_ctxs_payload().await?;
+        let (meta, contexts) = Self::parse_meta_and_asset_ctxs_document(&payload)?;
+        coins
+            .iter()
+            .map(|coin| Self::select_asset_context(&meta, &contexts, coin.as_str(), received_at))
+            .collect()
+    }
+
+    async fn fetch_meta_and_asset_ctxs_payload(&self) -> Result<Vec<u8>, ExchangeError> {
         let body = serde_json::to_vec(&InfoRequestWire {
             request_type: "metaAndAssetCtxs",
         })
@@ -201,11 +239,14 @@ impl HyperliquidPublicExchange {
             .await
             .map_err(|error| ExchangeError::remote_failure(EXCHANGE, None, error.to_string()))?;
         let status = response.status();
+        let failure_metadata = metadata_from_reqwest_headers(response.headers());
         let payload = Self::read_response_body(response).await?;
         if !status.is_success() {
-            return Err(Self::map_remote_failure(status, &payload));
+            return Err(
+                Self::map_remote_failure(status, &payload).with_remote_metadata(failure_metadata)
+            );
         }
-        Self::parse_meta_and_asset_ctxs(&payload, coin, received_at)
+        Ok(payload)
     }
 
     /// Parses one documented `metaAndAssetCtxs` payload for one exact coin.
@@ -224,6 +265,13 @@ impl HyperliquidPublicExchange {
         coin: &str,
         received_at: DateTime<Utc>,
     ) -> Result<HyperliquidPublicObservation, ExchangeError> {
+        let (meta, contexts) = Self::parse_meta_and_asset_ctxs_document(payload)?;
+        Self::select_asset_context(&meta, &contexts, coin, received_at)
+    }
+
+    fn parse_meta_and_asset_ctxs_document(
+        payload: &[u8],
+    ) -> Result<(MetaWire, Vec<AssetCtxWire>), ExchangeError> {
         let (meta, contexts): (MetaWire, Vec<AssetCtxWire>) = serde_json::from_slice(payload)
             .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
         if meta.universe.len() > MAX_ASSET_CONTEXTS {
@@ -243,8 +291,17 @@ impl HyperliquidPublicExchange {
                 ),
             ));
         }
+        Ok((meta, contexts))
+    }
+
+    fn select_asset_context(
+        meta: &MetaWire,
+        contexts: &[AssetCtxWire],
+        coin: &str,
+        received_at: DateTime<Utc>,
+    ) -> Result<HyperliquidPublicObservation, ExchangeError> {
         let mut selected: Option<(&UniverseEntryWire, &AssetCtxWire)> = None;
-        for (entry, context) in meta.universe.iter().zip(&contexts) {
+        for (entry, context) in meta.universe.iter().zip(contexts) {
             if entry.name != coin {
                 continue;
             }

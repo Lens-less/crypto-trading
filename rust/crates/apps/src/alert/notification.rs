@@ -433,23 +433,12 @@ fn start_worker(
                 .await;
                 break;
             };
-            let (decision, failure) = match outcome {
-                AdapterAttemptOutcome::Succeeded => {
-                    update_status(&status, |status| {
-                        status.delivered = status.delivered.saturating_add(1);
-                    });
-                    ("price_alert_delivery_succeeded", None)
-                }
+            let (decision, failure) = match &outcome {
+                AdapterAttemptOutcome::Succeeded => ("price_alert_delivery_succeeded", None),
                 AdapterAttemptOutcome::Failed(error) => {
-                    update_status(&status, |status| {
-                        status.failed = status.failed.saturating_add(1);
-                    });
                     ("price_alert_delivery_failed", Some(error.as_str()))
                 }
                 AdapterAttemptOutcome::TimedOut => {
-                    update_status(&status, |status| {
-                        status.timed_out = status.timed_out.saturating_add(1);
-                    });
                     ("price_alert_delivery_timed_out", Some("timeout"))
                 }
             };
@@ -465,6 +454,8 @@ fn start_worker(
                     status.status_persistence_failures =
                         status.status_persistence_failures.saturating_add(1);
                 });
+            } else {
+                record_durable_outcome(&status, &outcome);
             }
         }
     });
@@ -484,7 +475,6 @@ async fn retire_failed_worker(
     adapter_id: &str,
 ) {
     update_status(status, |status| {
-        status.failed = status.failed.saturating_add(1);
         status.worker_failures = status.worker_failures.saturating_add(1);
     });
     receiver.close();
@@ -505,19 +495,36 @@ async fn retire_failed_worker(
         ));
         drained = drained.saturating_add(1);
     }
-    if drained > 0 {
-        update_status(status, |status| {
-            status.dropped = status.dropped.saturating_add(drained);
-            status.adapter_closed = status.adapter_closed.saturating_add(drained);
-        });
-    }
     if history.append_batch(&records).await.is_err() {
         let failures = u64::try_from(records.len()).unwrap_or(u64::MAX);
         update_status(status, |status| {
             status.status_persistence_failures =
                 status.status_persistence_failures.saturating_add(failures);
         });
+    } else {
+        update_status(status, |status| {
+            status.failed = status.failed.saturating_add(1);
+            status.dropped = status.dropped.saturating_add(drained);
+            status.adapter_closed = status.adapter_closed.saturating_add(drained);
+        });
     }
+}
+
+fn record_durable_outcome(
+    status: &Arc<Mutex<NotificationDispatcherStatus>>,
+    outcome: &AdapterAttemptOutcome,
+) {
+    update_status(status, |status| match outcome {
+        AdapterAttemptOutcome::Succeeded => {
+            status.delivered = status.delivered.saturating_add(1);
+        }
+        AdapterAttemptOutcome::Failed(_) => {
+            status.failed = status.failed.saturating_add(1);
+        }
+        AdapterAttemptOutcome::TimedOut => {
+            status.timed_out = status.timed_out.saturating_add(1);
+        }
+    });
 }
 
 fn update_status(

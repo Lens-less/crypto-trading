@@ -6,3 +6,4 @@ symbols:
   - ETH-USDC-PERP
 health_check:
   data_timeout: 30
+  max_pair_skew_ms: 1000

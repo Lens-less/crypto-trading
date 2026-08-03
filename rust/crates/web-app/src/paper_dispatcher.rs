@@ -1,4 +1,12 @@
-use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use chrono::Utc;
 use crypto_trading_cli::{
@@ -9,7 +17,10 @@ use crypto_trading_control_plane::{
     SubmitCommand, SubmitDispatchFuture, SubmitDispatchOutcome, SubmitDispatcher, SubmitEnvelope,
 };
 use crypto_trading_runtime::{AccountRiskAuthority, AccountRiskError, JsonlHistory};
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, Notify, RwLock, watch},
+    task::JoinSet,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -19,31 +30,43 @@ pub struct TrustedPaperSubmitDispatcher {
     catalog: Arc<PaperProfileCatalog>,
     registry: Arc<PaperTaskRegistry>,
     account_risk: Option<Arc<AccountRiskAuthority>>,
+    degraded_logged: Arc<AtomicBool>,
 }
 
 impl TrustedPaperSubmitDispatcher {
     #[must_use]
     pub fn new(journal_id: Uuid, history_path: PathBuf, catalog: PaperProfileCatalog) -> Self {
         let registry = PaperTaskRegistry::new(catalog.task_ids());
-        let account_risk = AccountRiskAuthority::new(
+        let degraded_logged = Arc::new(AtomicBool::new(false));
+        let account_risk = if let Ok(authority) = AccountRiskAuthority::new(
             journal_id,
             JsonlHistory::new(&history_path),
             PaperProfileCatalog::account_risk_scope(),
             catalog.account_risk_policy().clone(),
-        )
-        .ok()
-        .map(Arc::new);
+        ) {
+            Some(Arc::new(authority))
+        } else {
+            degraded_logged.store(true, Ordering::Release);
+            tracing::error!(
+                event = "account_risk_authority_unavailable",
+                "paper account-risk authority failed closed during startup"
+            );
+            None
+        };
         Self {
             journal_id,
             history_path: Arc::new(history_path),
             catalog: Arc::new(catalog),
             registry: Arc::new(registry),
             account_risk,
+            degraded_logged,
         }
     }
 
     async fn dispatch_command(&self, envelope: SubmitEnvelope) -> SubmitDispatchOutcome {
-        match envelope.command() {
+        let command = command_kind(envelope.command());
+        let task_id = envelope.target_task_id().to_owned();
+        let outcome = match envelope.command() {
             SubmitCommand::StartPaperGrid { .. } | SubmitCommand::StartPaperArbitrage { .. } => {
                 self.dispatch_start(envelope).await
             }
@@ -82,7 +105,15 @@ impl TrustedPaperSubmitDispatcher {
             }
             SubmitCommand::ReconcileRelease { .. }
             | SubmitCommand::RecordReconcileFailure { .. } => SubmitDispatchOutcome::Rejected,
-        }
+        };
+        tracing::info!(
+            event = "paper_command_completed",
+            command,
+            task_id,
+            outcome = dispatch_outcome_name(outcome),
+            "trusted paper command reached a bounded outcome"
+        );
+        outcome
     }
 
     async fn dispatch_account_risk<F, Fut>(&self, action: F) -> SubmitDispatchOutcome
@@ -91,16 +122,32 @@ impl TrustedPaperSubmitDispatcher {
         Fut: Future<Output = Result<(), AccountRiskError>>,
     {
         let Some(authority) = self.account_risk.clone() else {
+            self.log_degraded_once("account_risk_authority_unavailable");
             return SubmitDispatchOutcome::Rejected;
         };
         match action(authority).await {
             Ok(()) => SubmitDispatchOutcome::Applied,
-            Err(
-                AccountRiskError::InvalidConfig(_)
-                | AccountRiskError::InvalidRequest(_)
-                | AccountRiskError::DegradedState,
-            ) => SubmitDispatchOutcome::Rejected,
-            Err(_) => SubmitDispatchOutcome::OutcomeUnknown,
+            Err(AccountRiskError::DegradedState) => {
+                self.log_degraded_once("account_risk_degraded");
+                SubmitDispatchOutcome::Rejected
+            }
+            Err(AccountRiskError::InvalidConfig(_) | AccountRiskError::InvalidRequest(_)) => {
+                SubmitDispatchOutcome::Rejected
+            }
+            Err(_) => {
+                self.log_degraded_once("account_risk_outcome_unknown");
+                SubmitDispatchOutcome::OutcomeUnknown
+            }
+        }
+    }
+
+    fn log_degraded_once(&self, component: &'static str) {
+        if !self.degraded_logged.swap(true, Ordering::AcqRel) {
+            tracing::error!(
+                event = "paper_authority_degraded",
+                component,
+                "paper authority entered a fail-closed degraded state"
+            );
         }
     }
 
@@ -138,26 +185,43 @@ enum TaskControl {
 }
 
 struct PaperTaskRegistry {
-    slots: HashMap<String, Arc<Mutex<TaskSlot>>>,
+    slots: HashMap<String, Arc<PaperTaskSlot>>,
     accepting_commands: RwLock<bool>,
+    shutdown_result: watch::Sender<Option<SubmitDispatchOutcome>>,
+}
+
+struct PaperTaskSlot {
+    state: Mutex<TaskSlot>,
+    changed: Arc<Notify>,
 }
 
 impl PaperTaskRegistry {
     fn new(task_ids: Vec<String>) -> Self {
         let slots = task_ids
             .into_iter()
-            .map(|task_id| (task_id, Arc::new(Mutex::new(TaskSlot::Vacant))))
+            .map(|task_id| {
+                (
+                    task_id,
+                    Arc::new(PaperTaskSlot {
+                        state: Mutex::new(TaskSlot::Vacant(None)),
+                        changed: Arc::new(Notify::new()),
+                    }),
+                )
+            })
             .collect();
+        let (shutdown_result, _) = watch::channel(None);
         Self {
             slots,
             accepting_commands: RwLock::new(true),
+            shutdown_result,
         }
     }
 
     async fn start<F, Fut>(&self, task_id: &str, starter: F) -> SubmitDispatchOutcome
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<StartedPaperTask, PaperProfileError>> + Send,
+        F: Send + 'static,
+        Fut: Future<Output = Result<StartedPaperTask, PaperProfileError>> + Send + 'static,
     {
         let accepting_commands = self.accepting_commands.read().await;
         if !*accepting_commands {
@@ -167,32 +231,41 @@ impl PaperTaskRegistry {
             return SubmitDispatchOutcome::Rejected;
         };
         {
-            let mut state = slot.lock().await;
+            let mut state = slot.state.lock().await;
             match &*state {
-                TaskSlot::Vacant => *state = TaskSlot::Starting,
+                TaskSlot::Vacant(_) => *state = TaskSlot::Starting,
                 TaskSlot::Running(task) if is_terminal(task) => *state = TaskSlot::Starting,
                 TaskSlot::Starting | TaskSlot::Stopping | TaskSlot::Running(_) => {
                     return SubmitDispatchOutcome::Rejected;
                 }
             }
         }
+        drop(accepting_commands);
 
-        match starter().await {
-            Ok(task) => {
-                let mut state = slot.lock().await;
-                *state = TaskSlot::Running(Box::new(task));
-                SubmitDispatchOutcome::Applied
-            }
-            Err(error) => {
-                let mut state = slot.lock().await;
-                *state = TaskSlot::Vacant;
-                if error.is_rejected() {
-                    SubmitDispatchOutcome::Rejected
-                } else {
-                    SubmitDispatchOutcome::OutcomeUnknown
+        let (result_sender, result_receiver) = watch::channel(None);
+        spawn_detached(async move {
+            let attempted = tokio::spawn(async move { starter().await }).await;
+            let (next_state, outcome) = match attempted {
+                Ok(Ok(task)) => (
+                    TaskSlot::Running(Box::new(task)),
+                    SubmitDispatchOutcome::Applied,
+                ),
+                Ok(Err(error)) if error.is_rejected() => {
+                    (TaskSlot::Vacant(None), SubmitDispatchOutcome::Rejected)
                 }
+                Ok(Err(_)) | Err(_) => (
+                    TaskSlot::Vacant(None),
+                    SubmitDispatchOutcome::OutcomeUnknown,
+                ),
+            };
+            {
+                let mut state = slot.state.lock().await;
+                *state = next_state;
             }
-        }
+            result_sender.send_replace(Some(outcome));
+            slot.changed.notify_one();
+        });
+        wait_for_dispatch_outcome(result_receiver).await
     }
 
     async fn control(&self, task_id: &str, control: TaskControl) -> SubmitDispatchOutcome {
@@ -204,13 +277,13 @@ impl PaperTaskRegistry {
             return SubmitDispatchOutcome::Rejected;
         };
         let task = {
-            let mut state = slot.lock().await;
+            let mut state = slot.state.lock().await;
             match &*state {
-                TaskSlot::Vacant | TaskSlot::Starting | TaskSlot::Stopping => {
+                TaskSlot::Vacant(_) | TaskSlot::Starting | TaskSlot::Stopping => {
                     return SubmitDispatchOutcome::Rejected;
                 }
                 TaskSlot::Running(task) if is_terminal(task) => {
-                    *state = TaskSlot::Vacant;
+                    *state = TaskSlot::Vacant(None);
                     return SubmitDispatchOutcome::Rejected;
                 }
                 TaskSlot::Running(_) => {}
@@ -220,56 +293,146 @@ impl PaperTaskRegistry {
             };
             task
         };
-        let outcome = match control {
-            TaskControl::Stop => stop_task(*task).await,
-            TaskControl::Cancel => cancel_task(*task).await,
-        };
-        let mut state = slot.lock().await;
-        *state = TaskSlot::Vacant;
-        outcome
+        drop(accepting_commands);
+
+        let (result_sender, result_receiver) = watch::channel(None);
+        spawn_detached(async move {
+            let attempted = tokio::spawn(async move {
+                match control {
+                    TaskControl::Stop => stop_task(*task).await,
+                    TaskControl::Cancel => cancel_task(*task).await,
+                }
+            })
+            .await;
+            let outcome = attempted.unwrap_or(SubmitDispatchOutcome::OutcomeUnknown);
+            {
+                let mut state = slot.state.lock().await;
+                *state = TaskSlot::Vacant(Some(outcome));
+            }
+            result_sender.send_replace(Some(outcome));
+            slot.changed.notify_one();
+        });
+        wait_for_dispatch_outcome(result_receiver).await
     }
 
-    async fn shutdown(&self) -> SubmitDispatchOutcome {
-        let mut accepting_commands = self.accepting_commands.write().await;
-        if !*accepting_commands {
-            return SubmitDispatchOutcome::Applied;
+    async fn shutdown(self: &Arc<Self>) -> SubmitDispatchOutcome {
+        let mut result = self.shutdown_result.subscribe();
+        let should_launch = {
+            let mut accepting_commands = self.accepting_commands.write().await;
+            if *accepting_commands {
+                *accepting_commands = false;
+                true
+            } else {
+                false
+            }
+        };
+        if should_launch {
+            tracing::info!(
+                event = "paper_registry_quiescing",
+                owner_count = self.slots.len(),
+                "paper command admission is closed and owner shutdown has begun"
+            );
+            let registry = Arc::clone(self);
+            spawn_detached(async move {
+                let worker = Arc::clone(&registry);
+                let outcome = tokio::spawn(async move { worker.stop_all().await })
+                    .await
+                    .unwrap_or(SubmitDispatchOutcome::OutcomeUnknown);
+                registry.shutdown_result.send_replace(Some(outcome));
+                tracing::info!(
+                    event = "paper_registry_shutdown_completed",
+                    outcome = dispatch_outcome_name(outcome),
+                    "paper owner shutdown reached a bounded outcome"
+                );
+            });
         }
-        *accepting_commands = false;
 
+        loop {
+            if let Some(outcome) = *result.borrow() {
+                return outcome;
+            }
+            if result.changed().await.is_err() {
+                return SubmitDispatchOutcome::OutcomeUnknown;
+            }
+        }
+    }
+
+    async fn stop_all(&self) -> SubmitDispatchOutcome {
         let mut overall = SubmitDispatchOutcome::Applied;
-        for slot in self.slots.values() {
-            let task = {
-                let mut state = slot.lock().await;
-                match &*state {
-                    TaskSlot::Vacant => continue,
+        loop {
+            let mut stop_jobs = JoinSet::new();
+            let mut transition_waiters = JoinSet::new();
+            for slot in self.slots.values() {
+                let mut state = slot.state.lock().await;
+                match &mut *state {
+                    TaskSlot::Vacant(previous_control) => {
+                        if let Some(outcome) = previous_control.take() {
+                            overall = combine_shutdown_outcomes(overall, outcome);
+                        }
+                        continue;
+                    }
                     TaskSlot::Running(task) if is_terminal(task) => {
-                        *state = TaskSlot::Vacant;
+                        *state = TaskSlot::Vacant(None);
+                        slot.changed.notify_one();
                         continue;
                     }
                     TaskSlot::Running(_) => {}
                     TaskSlot::Starting | TaskSlot::Stopping => {
-                        unreachable!(
-                            "the write gate excludes concurrent start/control transitions"
-                        );
+                        let notified = Arc::clone(&slot.changed).notified_owned();
+                        transition_waiters.spawn(notified);
+                        continue;
                     }
                 }
                 let TaskSlot::Running(task) = std::mem::replace(&mut *state, TaskSlot::Stopping)
                 else {
                     unreachable!();
                 };
-                task
-            };
-            let outcome = stop_task(*task).await;
-            let mut state = slot.lock().await;
-            *state = TaskSlot::Vacant;
-            overall = combine_shutdown_outcomes(overall, outcome);
+                let slot = Arc::clone(slot);
+                stop_jobs.spawn(async move {
+                    let outcome = tokio::spawn(async move { stop_task(*task).await })
+                        .await
+                        .unwrap_or(SubmitDispatchOutcome::OutcomeUnknown);
+                    {
+                        let mut state = slot.state.lock().await;
+                        *state = TaskSlot::Vacant(None);
+                    }
+                    slot.changed.notify_one();
+                    outcome
+                });
+            }
+
+            while let Some(joined) = stop_jobs.join_next().await {
+                let outcome = joined.unwrap_or(SubmitDispatchOutcome::OutcomeUnknown);
+                overall = combine_shutdown_outcomes(overall, outcome);
+            }
+            if transition_waiters.is_empty() {
+                return overall;
+            }
+            let _ = transition_waiters.join_next().await;
+            transition_waiters.abort_all();
         }
-        overall
+    }
+}
+
+fn spawn_detached(future: impl Future<Output = ()> + Send + 'static) {
+    std::mem::drop(tokio::spawn(future));
+}
+
+async fn wait_for_dispatch_outcome(
+    mut result: watch::Receiver<Option<SubmitDispatchOutcome>>,
+) -> SubmitDispatchOutcome {
+    loop {
+        if let Some(outcome) = *result.borrow() {
+            return outcome;
+        }
+        if result.changed().await.is_err() {
+            return SubmitDispatchOutcome::OutcomeUnknown;
+        }
     }
 }
 
 enum TaskSlot {
-    Vacant,
+    Vacant(Option<SubmitDispatchOutcome>),
     Starting,
     Running(Box<StartedPaperTask>),
     Stopping,
@@ -279,6 +442,28 @@ fn is_terminal(task: &StartedPaperTask) -> bool {
     match task {
         StartedPaperTask::Grid(task) => task.status().phase.is_terminal(),
         StartedPaperTask::Arbitrage(task) => task.status().phase.is_terminal(),
+    }
+}
+
+const fn command_kind(command: &SubmitCommand) -> &'static str {
+    match command {
+        SubmitCommand::StartPaperGrid { .. } => "start_paper_grid",
+        SubmitCommand::StartPaperArbitrage { .. } => "start_paper_arbitrage",
+        SubmitCommand::StopTask => "stop_task",
+        SubmitCommand::CancelTask => "cancel_task",
+        SubmitCommand::PauseAccountRisk { .. } => "pause_account_risk",
+        SubmitCommand::ResumeAccountRisk => "resume_account_risk",
+        SubmitCommand::EngageAccountKillSwitch { .. } => "engage_account_kill_switch",
+        SubmitCommand::ReconcileRelease { .. } => "reconcile_release",
+        SubmitCommand::RecordReconcileFailure { .. } => "record_reconcile_failure",
+    }
+}
+
+const fn dispatch_outcome_name(outcome: SubmitDispatchOutcome) -> &'static str {
+    match outcome {
+        SubmitDispatchOutcome::Applied => "applied",
+        SubmitDispatchOutcome::Rejected => "rejected",
+        SubmitDispatchOutcome::OutcomeUnknown => "outcome_unknown",
     }
 }
 
@@ -373,5 +558,71 @@ fn map_arbitrage_control_error(error: &ArbitragePaperTaskError) -> SubmitDispatc
         | ArbitragePaperTaskError::Saga(_)
         | ArbitragePaperTaskError::TaskCancelled
         | ArbitragePaperTaskError::PreviouslyFailed(_) => SubmitDispatchOutcome::Rejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_survives_caller_cancellation_and_reuses_the_final_outcome() {
+        let registry = Arc::new(PaperTaskRegistry::new(vec!["paper-owner".to_owned()]));
+        let slot = registry.slots.get("paper-owner").unwrap();
+        *slot.state.lock().await = TaskSlot::Starting;
+
+        let first_registry = Arc::clone(&registry);
+        let first = tokio::spawn(async move { first_registry.shutdown().await });
+        for _ in 0..100 {
+            if !*registry.accepting_commands.read().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!*registry.accepting_commands.read().await);
+        first.abort();
+        let _ = first.await;
+
+        let second_registry = Arc::clone(&registry);
+        let mut second = tokio::spawn(async move { second_registry.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "a concurrent caller must wait for the active quiesce operation"
+        );
+
+        *slot.state.lock().await = TaskSlot::Vacant(None);
+        slot.changed.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .expect("shutdown worker remained stranded")
+                .unwrap(),
+            SubmitDispatchOutcome::Applied
+        );
+        assert_eq!(
+            registry.shutdown().await,
+            SubmitDispatchOutcome::Applied,
+            "later callers must observe the stored final outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_a_concurrent_control_failure() {
+        let registry = Arc::new(PaperTaskRegistry::new(vec!["paper-owner".to_owned()]));
+        let slot = registry.slots.get("paper-owner").unwrap();
+        *slot.state.lock().await = TaskSlot::Vacant(Some(SubmitDispatchOutcome::OutcomeUnknown));
+
+        assert_eq!(
+            registry.shutdown().await,
+            SubmitDispatchOutcome::OutcomeUnknown
+        );
+        assert_eq!(
+            registry.shutdown().await,
+            SubmitDispatchOutcome::OutcomeUnknown,
+            "idempotent callers must receive the same failed cleanup outcome"
+        );
     }
 }

@@ -56,8 +56,10 @@ settled equity, and reduce-only capacity. This does not widen adapter authority:
 resting-maker callbacks, funding, mark-to-market, margin/liquidation rules,
 queue/depth impact, and external account truth remain unavailable.
 
-Offline research support is separately exposed as `research.indicators` and
-`research.backtest` in the capability manifest. The current backtest is a
-deterministic single-instrument kernel; it does not yet share the production
-market-event/strategy adapter seam and is not evidence of paper/live parity or
-profitability.
+The internal research kernels remain visible as `research.indicators` and
+`research.backtest` in the capability manifest, but both are explicitly
+`unavailable` product capabilities. They are workspace-only libraries: no
+shipped binary links them and no supported CLI or HTTP entry point exists. The
+current backtest is a deterministic single-instrument kernel; it does not yet
+share the production market-event/strategy adapter seam and is not evidence of
+paper/live parity or profitability.

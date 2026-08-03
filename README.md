@@ -29,7 +29,7 @@
 - 在提交模拟订单前执行产品身份、行情新鲜度、盘口深度和单批风险检查。
 - 记录稳定批次 ID、client order ID、提交计划、回执和对账摘要。
 - 开发并测试交易领域模型、策略、风险控制、交易所接口与运行时边界。
-- 用同一套 Decimal 算术运行增量指标、确定性事件带回测与仅报告样本外结果的 walk-forward 切分。
+- 在 workspace 内开发并测试 Decimal 指标与确定性事件带研究内核；这些 library-only crate 目前没有已出货的 CLI、HTTP 或二进制入口，不属于可用产品能力。
 
 它暂时不适合：
 
@@ -292,7 +292,7 @@ if ($LASTEXITCODE -ne 0) { throw "Binance Testnet soak evidence is not release-r
 和鉴权对账三类非零覆盖之前，它都会非零退出。完整 Linux 演练和留证清单见
 [`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md)。
 
-`--debug`、`--debug-detail` 和 `--no-ui` 目前主要保留 CLI 兼容性，尚不会改变对应 handler 的行为。运行时日志过滤由 `RUST_LOG` 控制，例如 PowerShell 中可设置 `$env:RUST_LOG = "debug"`。
+`--debug`、`--debug-detail` 和 `--no-ui` 目前主要保留 CLI 兼容性，尚不会改变对应 handler 的行为。运行时日志过滤只由进程环境变量 `RUST_LOG` 控制；例如 PowerShell 可设置 `$env:RUST_LOG = "warn,crypto_trading_web_app=info,crypto_trading_runtime=info,crypto_trading_exchange=info"`。`rust/config/logging.yaml` 是迁移期辅助配置，Rust runtime 不会读取它。
 
 `testnet-smoke` 只在显式选择远端探针时才出网：`--call-book-ticker` 会分别调用 Binance Spot 与 USD-M testnet 的 `bookTicker`，`--call-reconcile` 会在此基础上用 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 调 Binance testnet 的开放订单和持仓对账路由。该命令只产生留证输出，不会提交新订单。
 
@@ -386,7 +386,7 @@ rust/config/
 ├── price_alert/     # 价格提醒配置
 ├── scanner/         # 虚拟网格扫描器配置
 ├── volume_maker/    # 做量策略配置
-├── logging.yaml
+├── logging.yaml     # 迁移期辅助配置；Rust runtime 不读取
 └── symbol_conversion.yaml
 ```
 
@@ -451,8 +451,8 @@ Rust workspace 包含十一个 crate。依赖方向是单向的：`domain` 不�
 | `domain` | Symbol、MarketSnapshot、Order、Position、Price、Quantity、Money 等领域类型 |
 | `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
 | `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、风险、价格提醒、做量和虚拟网格算法 |
-| `indicators` | O(1) 增量 ATR、EMA、EWMA 实现波动率、滚动 z-score 与 Decimal 绩效指标 |
-| `backtest` | 确定性 `SimClock + EventTape + FillModel + Ledger`、逐笔/权益曲线产物与仅样本外 walk-forward 窗口 |
+| `indicators` | workspace 内部的 Decimal 指标研究库；未链接到已出货 CLI/HTTP/二进制，manifest 中为 `Unavailable` |
+| `backtest` | workspace 内部的确定性事件带研究库；未链接到已出货 CLI/HTTP/二进制，manifest 中为 `Unavailable` |
 | `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |
 | `runtime` | 执行模式、路由、批次、提交策略、部分结果对账、JSONL journal、operator read model 与 capability 清单 |
 | `control-plane` | journal 与各操作界面之间的最小权限读取/提交 seam |
@@ -460,7 +460,7 @@ Rust workspace 包含十一个 crate。依赖方向是单向的：`domain` 不�
 | `web-app` | `crypto-trading-web` 二进制，只在 loopback 上提供只读控制面 |
 | `apps` | `crypto-trading` 二进制、CLI 参数、配置检查、one-shot 与 Testnet 编排 |
 
-`backtest` 当前是研究闭环的 tracer bullet：它能稳定产出逐笔成交、权益曲线和样本外窗口，但仍是单标的即时成交模型，尚未接入生产 `MarketDataEvent`／`StrategyMachine` 适配层，也不模拟队列、延迟、资金费率、部分成交或多档深度。回测全绿不能解释为 paper/live 一致，更不能解释为策略盈利。
+`indicators` 与 `backtest` 当前只是 workspace 内部研究内核，不是已出货产品能力：没有受支持的 CLI/HTTP 入口，也没有生产二进制链接它们。`backtest` 仍是单标的模型，尚未接入生产 `MarketDataEvent`／`StrategyMachine` 适配层，也不模拟队列、延迟、资金费率、部分成交或多档深度。研究 crate 测试全绿不能解释为 paper/live 一致，更不能解释为策略盈利。
 
 详细的兼容面与设计目标见 [`docs/internal/specs/RUST_REFACTOR_PLAN.md`](docs/internal/specs/RUST_REFACTOR_PLAN.md)。
 

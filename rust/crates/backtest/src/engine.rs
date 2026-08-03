@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use crypto_trading_domain::{MarketSnapshot, Money, OrderIntent, OrderType, Price, Quantity, Side};
+use crypto_trading_domain::{
+    MarketSnapshot, MarketType, Money, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
+};
 use crypto_trading_indicators::{PerformanceMetrics, RatioConfig, summarize_performance};
 use rust_decimal::Decimal;
 
@@ -24,13 +26,23 @@ impl Default for MarketEventPrice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketEvent {
     pub occurred_at: DateTime<Utc>,
+    /// Mark used for equity valuation. Execution uses the opposing top of book.
     pub price: Price,
+    pub bid: Price,
+    pub ask: Price,
+    instrument: Option<TapeInstrument>,
 }
 
 impl MarketEvent {
     #[must_use]
     pub const fn new(occurred_at: DateTime<Utc>, price: Price) -> Self {
-        Self { occurred_at, price }
+        Self {
+            occurred_at,
+            price,
+            bid: price,
+            ask: price,
+            instrument: None,
+        }
     }
 
     #[must_use]
@@ -38,6 +50,33 @@ impl MarketEvent {
         Self {
             occurred_at: snapshot.timestamp,
             price: snapshot_price(snapshot, price_source),
+            bid: snapshot.bid(),
+            ask: snapshot.ask(),
+            instrument: Some(TapeInstrument::from_snapshot(snapshot)),
+        }
+    }
+
+    /// Returns the exact venue instrument carried by production snapshots.
+    #[must_use]
+    pub const fn instrument(&self) -> Option<&TapeInstrument> {
+        self.instrument.as_ref()
+    }
+}
+
+/// Exact identity shared by every event in a production-snapshot tape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapeInstrument {
+    pub exchange: String,
+    pub symbol: Symbol,
+    pub market_type: MarketType,
+}
+
+impl TapeInstrument {
+    fn from_snapshot(snapshot: &MarketSnapshot) -> Self {
+        Self {
+            exchange: snapshot.exchange().to_owned(),
+            symbol: snapshot.symbol.clone(),
+            market_type: snapshot.market_type,
         }
     }
 }
@@ -46,15 +85,17 @@ impl MarketEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTape {
     events: Vec<MarketEvent>,
+    instrument: Option<TapeInstrument>,
 }
 
 impl EventTape {
-    /// Creates a tape and validates monotonic timestamps.
+    /// Creates a tape and validates non-decreasing timestamps.
     ///
     /// # Errors
     ///
     /// Returns [`BacktestError::NonMonotonicTape`] when timestamps move
-    /// backwards.
+    /// backwards, or [`BacktestError::MixedInstrumentTape`] when event
+    /// identities differ.
     pub fn new(events: Vec<MarketEvent>) -> Result<Self, BacktestError> {
         if events
             .windows(2)
@@ -63,7 +104,15 @@ impl EventTape {
             return Err(BacktestError::NonMonotonicTape);
         }
 
-        Ok(Self { events })
+        let instrument = events.first().and_then(|event| event.instrument().cloned());
+        if events
+            .iter()
+            .any(|event| event.instrument() != instrument.as_ref())
+        {
+            return Err(BacktestError::MixedInstrumentTape);
+        }
+
+        Ok(Self { events, instrument })
     }
 
     /// Adapts production snapshots into a validated deterministic tape.
@@ -71,7 +120,8 @@ impl EventTape {
     /// # Errors
     ///
     /// Returns [`BacktestError::NonMonotonicTape`] when timestamps move
-    /// backwards.
+    /// backwards, or [`BacktestError::MixedInstrumentTape`] when snapshot
+    /// identities differ.
     pub fn from_market_snapshots(
         snapshots: &[MarketSnapshot],
         price_source: MarketEventPrice,
@@ -88,6 +138,12 @@ impl EventTape {
     #[must_use]
     pub fn events(&self) -> &[MarketEvent] {
         &self.events
+    }
+
+    /// Returns the exact instrument for a tape built from production snapshots.
+    #[must_use]
+    pub const fn instrument(&self) -> Option<&TapeInstrument> {
+        self.instrument.as_ref()
     }
 }
 
@@ -133,6 +189,7 @@ pub struct OrderRequest {
     pub side: Side,
     pub quantity: Quantity,
     pub liquidity: Liquidity,
+    pub instrument: Option<TapeInstrument>,
 }
 
 impl OrderRequest {
@@ -140,7 +197,9 @@ impl OrderRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`BacktestError::InvalidQuantity`] when `quantity <= 0`.
+    /// Returns [`BacktestError::InvalidQuantity`] when `quantity <= 0`, or
+    /// [`BacktestError::UnsupportedMakerLiquidity`] until a resting-order
+    /// model exists.
     pub fn new(
         side: Side,
         quantity: Quantity,
@@ -149,11 +208,15 @@ impl OrderRequest {
         if quantity.as_decimal() <= Decimal::ZERO {
             return Err(BacktestError::InvalidQuantity);
         }
+        if liquidity == Liquidity::Maker {
+            return Err(BacktestError::UnsupportedMakerLiquidity);
+        }
 
         Ok(Self {
             side,
             quantity,
             liquidity,
+            instrument: None,
         })
     }
 
@@ -163,8 +226,9 @@ impl OrderRequest {
     /// # Errors
     ///
     /// Returns [`BacktestError::UnsupportedOrderIntent`] for non-market
-    /// intents because the current fill model does not simulate resting-book
-    /// behavior.
+    /// intents, or [`BacktestError::UnsupportedMakerLiquidity`] for maker
+    /// requests, because the current fill model does not simulate
+    /// resting-book behavior.
     pub fn from_order_intent(
         intent: &OrderIntent,
         liquidity: Liquidity,
@@ -173,7 +237,13 @@ impl OrderRequest {
             return Err(BacktestError::UnsupportedOrderIntent);
         }
 
-        Self::new(intent.side, intent.quantity, liquidity)
+        let mut request = Self::new(intent.side, intent.quantity, liquidity)?;
+        request.instrument = Some(TapeInstrument {
+            exchange: intent.exchange.clone(),
+            symbol: intent.symbol.clone(),
+            market_type: intent.market_type,
+        });
+        Ok(request)
     }
 }
 
@@ -182,7 +252,8 @@ impl OrderRequest {
 /// # Errors
 ///
 /// Returns [`BacktestError::UnsupportedOrderIntent`] when any intent is not a
-/// market order.
+/// market order, or [`BacktestError::UnsupportedMakerLiquidity`] when maker
+/// liquidity is requested.
 pub fn adapt_order_intents(
     intents: &[OrderIntent],
     liquidity: Liquidity,
@@ -193,7 +264,10 @@ pub fn adapt_order_intents(
         .collect()
 }
 
-/// Explicit maker/taker fill assumptions expressed in basis points.
+/// Explicit fee and slippage assumptions expressed in basis points.
+///
+/// Maker inputs remain part of the configuration contract, but maker requests
+/// fail closed until the engine has a resting-order model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillModel {
     maker_fee: Decimal,
@@ -244,12 +318,24 @@ impl FillModel {
     ///
     /// # Errors
     ///
-    /// Returns [`BacktestError::ArithmeticOverflow`] on Decimal overflow.
+    /// Returns [`BacktestError::UnsupportedMakerLiquidity`] for maker
+    /// requests, [`BacktestError::OrderInstrumentMismatch`] when an identified
+    /// order and event disagree, and arithmetic or domain errors when the fill
+    /// price or fee cannot be represented.
     pub fn fill(
         &self,
         event: &MarketEvent,
         order: &OrderRequest,
     ) -> Result<TradeFill, BacktestError> {
+        if order.liquidity == Liquidity::Maker {
+            return Err(BacktestError::UnsupportedMakerLiquidity);
+        }
+        if let (Some(event_instrument), Some(order_instrument)) =
+            (event.instrument(), order.instrument.as_ref())
+            && event_instrument != order_instrument
+        {
+            return Err(BacktestError::OrderInstrumentMismatch);
+        }
         let (fee_bps, slippage_bps) = match order.liquidity {
             Liquidity::Maker => (self.maker_fee, self.maker_slippage),
             Liquidity::Taker => (self.taker_fee, self.taker_slippage),
@@ -257,9 +343,12 @@ impl FillModel {
         let slippage_factor = slippage_bps
             .checked_div(decimal_bps_denominator())
             .ok_or(BacktestError::ArithmeticOverflow)?;
+        let reference_price = match order.side {
+            Side::Buy => event.ask,
+            Side::Sell => event.bid,
+        };
         let fill_price = match order.side {
-            Side::Buy => event
-                .price
+            Side::Buy => reference_price
                 .as_decimal()
                 .checked_mul(
                     Decimal::ONE
@@ -267,8 +356,7 @@ impl FillModel {
                         .ok_or(BacktestError::ArithmeticOverflow)?,
                 )
                 .ok_or(BacktestError::ArithmeticOverflow)?,
-            Side::Sell => event
-                .price
+            Side::Sell => reference_price
                 .as_decimal()
                 .checked_mul(
                     Decimal::ONE
@@ -295,9 +383,13 @@ impl FillModel {
             side: order.side,
             quantity: order.quantity,
             liquidity: order.liquidity,
-            reference_price: event.price,
+            reference_price,
             fill_price,
             fee,
+            instrument: event
+                .instrument()
+                .cloned()
+                .or_else(|| order.instrument.clone()),
         })
     }
 }
@@ -312,6 +404,7 @@ pub struct TradeFill {
     pub reference_price: Price,
     pub fill_price: Price,
     pub fee: Money,
+    pub instrument: Option<TapeInstrument>,
 }
 
 /// Executed trade plus the resulting ledger state.
@@ -319,6 +412,9 @@ pub struct TradeFill {
 pub struct Trade {
     pub fill: TradeFill,
     pub realized_pnl_delta: Money,
+    /// Net `PnL` for quantity closed by this fill, including its proportional
+    /// entry and exit fees. Opening-only fills are `None`.
+    pub closed_trade_pnl: Option<Money>,
     pub cumulative_realized_pnl: Money,
     pub position_qty: Decimal,
     pub equity: Money,
@@ -340,7 +436,11 @@ pub struct StrategyContext {
     pub ledger: crate::LedgerSnapshot,
 }
 
-/// Pure strategy seam.
+/// Pure research-only strategy seam.
+///
+/// This is not the production `crypto_trading_strategy::StrategyMachine`
+/// interface. Production parity remains unsupported until both drivers share
+/// one state and execution-feedback contract.
 pub trait Strategy {
     fn on_event(&mut self, context: &StrategyContext) -> Vec<OrderRequest>;
 }
@@ -351,6 +451,9 @@ pub struct BacktestMetrics {
     pub realized_pnl: Money,
     pub unrealized_pnl: Money,
     pub ending_equity: Money,
+    /// Observation frequency used to annualize risk ratios. `None` when the
+    /// tape is too short to derive a period.
+    pub periods_per_year: Option<Decimal>,
     pub performance: PerformanceMetrics,
 }
 
@@ -367,7 +470,7 @@ pub struct BacktestResult {
 pub struct BacktestEngine {
     initial_cash: Money,
     fill_model: FillModel,
-    ratio_config: RatioConfig,
+    ratio_config: Option<RatioConfig>,
 }
 
 impl BacktestEngine {
@@ -384,14 +487,14 @@ impl BacktestEngine {
         Ok(Self {
             initial_cash,
             fill_model,
-            ratio_config: RatioConfig::default(),
+            ratio_config: None,
         })
     }
 
     /// Overrides ratio annualization assumptions for performance metrics.
     #[must_use]
     pub const fn with_ratio_config(mut self, ratio_config: RatioConfig) -> Self {
-        self.ratio_config = ratio_config;
+        self.ratio_config = Some(ratio_config);
         self
     }
 
@@ -409,6 +512,7 @@ impl BacktestEngine {
         let mut clock = SimClock::default();
         let mut ledger = Ledger::new(self.initial_cash)?;
         let mut trades = Vec::new();
+        let mut closed_trade_pnls = Vec::new();
         let mut equity_curve = Vec::with_capacity(tape.events().len());
 
         for event in tape.events() {
@@ -422,9 +526,13 @@ impl BacktestEngine {
                 let fill = self.fill_model.fill(event, &order)?;
                 let applied = ledger.apply_fill(&fill)?;
                 let marked = ledger.snapshot(event.price)?;
+                if let Some(closed_trade_pnl) = applied.closed_trade_pnl {
+                    closed_trade_pnls.push(closed_trade_pnl.as_decimal());
+                }
                 trades.push(Trade {
                     fill,
                     realized_pnl_delta: applied.realized_pnl_delta,
+                    closed_trade_pnl: applied.closed_trade_pnl,
                     cumulative_realized_pnl: marked.realized_pnl,
                     position_qty: marked.position_qty,
                     equity: marked.equity,
@@ -443,18 +551,23 @@ impl BacktestEngine {
             Some(event) => ledger.snapshot(event.price)?,
             None => ledger.snapshot(Price::new(Decimal::ONE)?)?,
         };
-        let trade_pnls: Vec<Decimal> = trades
-            .iter()
-            .map(|trade| trade.realized_pnl_delta.as_decimal())
-            .collect();
         let equity_values: Vec<Decimal> = equity_curve
             .iter()
             .map(|point| point.equity.as_decimal())
             .collect();
         let returns = equity_returns(&equity_values)?;
-        let performance =
-            summarize_performance(&equity_values, &trade_pnls, &returns, self.ratio_config)
-                .map_err(|_| BacktestError::ArithmeticOverflow)?;
+        let (ratio_config, periods_per_year) = self.ratio_config_for(tape)?;
+        let ratio_returns = if periods_per_year.is_some() {
+            returns.as_deref().unwrap_or_default()
+        } else {
+            &[]
+        };
+        let performance = summarize_performance(
+            &equity_values,
+            &closed_trade_pnls,
+            ratio_returns,
+            ratio_config,
+        )?;
 
         Ok(BacktestResult {
             trades,
@@ -463,9 +576,46 @@ impl BacktestEngine {
                 realized_pnl: terminal.realized_pnl,
                 unrealized_pnl: terminal.unrealized_pnl,
                 ending_equity: terminal.equity,
+                periods_per_year,
                 performance,
             },
         })
+    }
+
+    fn ratio_config_for(
+        &self,
+        tape: &EventTape,
+    ) -> Result<(RatioConfig, Option<Decimal>), BacktestError> {
+        if let Some(config) = self.ratio_config {
+            return Ok((config, Some(config.periods_per_year)));
+        }
+        let Some((first, last)) = tape.events().first().zip(tape.events().last()) else {
+            return Ok((RatioConfig::new(Decimal::ONE, Decimal::ZERO)?, None));
+        };
+        let periods = tape.events().len().saturating_sub(1);
+        if periods == 0 {
+            return Ok((RatioConfig::new(Decimal::ONE, Decimal::ZERO)?, None));
+        }
+        let elapsed_nanos = last
+            .occurred_at
+            .signed_duration_since(first.occurred_at)
+            .num_nanoseconds()
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        if elapsed_nanos < 0 {
+            return Err(BacktestError::NonMonotonicTape);
+        }
+        if elapsed_nanos == 0 {
+            return Ok((RatioConfig::new(Decimal::ONE, Decimal::ZERO)?, None));
+        }
+        let periods =
+            Decimal::from(u64::try_from(periods).map_err(|_| BacktestError::ArithmeticOverflow)?);
+        let nanos_per_year = Decimal::from(31_536_000_000_000_000_i64);
+        let periods_per_year = periods
+            .checked_mul(nanos_per_year)
+            .and_then(|value| value.checked_div(Decimal::from(elapsed_nanos)))
+            .ok_or(BacktestError::ArithmeticOverflow)?;
+        let config = RatioConfig::new(periods_per_year, Decimal::ZERO)?;
+        Ok((config, Some(periods_per_year)))
     }
 }
 
@@ -487,10 +637,12 @@ fn notional(price: Price, quantity: Quantity) -> Result<Money, BacktestError> {
     ))
 }
 
-fn equity_returns(equity_curve: &[Decimal]) -> Result<Vec<Decimal>, BacktestError> {
+fn equity_returns(equity_curve: &[Decimal]) -> Result<Option<Vec<Decimal>>, BacktestError> {
+    if equity_curve.windows(2).any(|pair| pair[0] <= Decimal::ZERO) {
+        return Ok(None);
+    }
     equity_curve
         .windows(2)
-        .filter(|pair| !pair[0].is_zero())
         .map(|pair| {
             pair[1]
                 .checked_sub(pair[0])
@@ -498,7 +650,8 @@ fn equity_returns(equity_curve: &[Decimal]) -> Result<Vec<Decimal>, BacktestErro
                 .checked_div(pair[0])
                 .ok_or(BacktestError::ArithmeticOverflow)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 const fn decimal_bps_denominator() -> Decimal {

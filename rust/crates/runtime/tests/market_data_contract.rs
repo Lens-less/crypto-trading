@@ -394,7 +394,9 @@ fn local_receipt_timestamps_do_not_trigger_duplicate_timestamp_continuity() {
     assert_eq!(update, MarketDataUpdate::Accepted);
     let view = book.view();
     let row = view.instrument(&key).unwrap();
-    assert_eq!(row.snapshot, Some(next));
+    let mut normalized_next = next;
+    normalized_next.timestamp = base + Duration::seconds(1);
+    assert_eq!(row.snapshot, Some(normalized_next));
     assert_eq!(row.revision, Some(2));
     assert_eq!(row.continuity, MarketContinuity::Continuous);
 }
@@ -432,6 +434,46 @@ fn source_disconnect_is_visible_and_does_not_fabricate_or_clear_quotes() {
         }
     );
     assert!(!row.is_ready());
+}
+
+#[test]
+fn older_wall_clock_source_event_degrades_without_cross_instrument_failure() {
+    let base = timestamp(0);
+    let first = instrument("paper", "BTC-USDT");
+    let second = instrument("paper", "ETH-USDT");
+    let mut book = book(
+        vec![first.clone(), second.clone()],
+        base + Duration::seconds(3),
+        Duration::seconds(10),
+    );
+    book.apply(observation_event(
+        snapshot("paper", "BTC-USDT", base),
+        1,
+        base + Duration::seconds(2),
+    ))
+    .unwrap();
+
+    let update = book
+        .apply(
+            MarketDataEvent::source_unavailable(
+                "paper",
+                MarketDataSourceFailure::Disconnected,
+                base + Duration::seconds(1),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(update, MarketDataUpdate::SourceDegraded);
+    let view = book.view();
+    assert_eq!(
+        view.instrument(&first).unwrap().status_changed_at,
+        Some(base + Duration::seconds(2))
+    );
+    assert_eq!(
+        view.instrument(&second).unwrap().status_changed_at,
+        Some(base + Duration::seconds(1))
+    );
 }
 
 #[test]
@@ -561,6 +603,41 @@ fn pair_skew_is_reported_and_rejected_beyond_tolerance() {
 }
 
 #[test]
+fn mixed_timestamp_provenance_uses_local_receipts_for_pair_skew() {
+    let base = timestamp(0);
+    let left = instrument("left", "BTC-USDT");
+    let right = instrument("right", "BTC-USDT");
+    let policy = MarketFreshnessPolicy::new(Duration::seconds(10), Duration::seconds(1))
+        .unwrap()
+        .with_max_pair_skew(Duration::milliseconds(500))
+        .unwrap();
+    let mut book = MarketDataBook::new(
+        MarketUniverse::new(vec![left.clone(), right.clone()]).unwrap(),
+        policy,
+        Arc::new(TestClock::new(base + Duration::seconds(3))),
+    );
+    book.apply(observation_event_with_metadata(
+        snapshot("left", "BTC-USDT", base),
+        1,
+        base + Duration::seconds(2),
+        MarketTimestampProvenance::VenueEventTime,
+        Some(1),
+    ))
+    .unwrap();
+    book.apply(observation_event_with_metadata(
+        snapshot("right", "BTC-USDT", base + Duration::seconds(20)),
+        1,
+        base + Duration::milliseconds(2_300),
+        MarketTimestampProvenance::LocalReceipt,
+        None,
+    ))
+    .unwrap();
+
+    let pair = book.current_pair(&left, &right).unwrap();
+    assert_eq!(pair.pair_skew_millis, 300);
+}
+
+#[test]
 fn timestamp_provenance_and_source_latency_are_observable() {
     let base = timestamp(0);
     let event_key = instrument("event", "BTC-USDT");
@@ -674,7 +751,14 @@ async fn slow_subscription_consumer_gets_a_gap_before_the_latest_snapshot() {
     book.apply(observation).unwrap();
     let view = book.view();
     let row = view.instrument(&key).unwrap();
-    assert_eq!(row.snapshot, Some(latest));
+    let mut normalized_latest = latest;
+    normalized_latest.timestamp = base + Duration::seconds(2);
+    assert_eq!(row.snapshot, Some(normalized_latest));
+    assert_eq!(
+        row.timestamp_provenance,
+        MarketTimestampProvenance::LocalReceipt
+    );
+    assert_eq!(row.source_latency_millis, None);
     assert_eq!(row.continuity, MarketContinuity::Continuous);
 }
 
@@ -705,7 +789,7 @@ fn observation_event(
     received_at: DateTime<Utc>,
 ) -> MarketDataEvent {
     MarketDataEvent::Observation(
-        MarketDataObservation::new(snapshot, revision, received_at).unwrap(),
+        MarketDataObservation::venue_event(snapshot, revision, received_at, None).unwrap(),
     )
 }
 

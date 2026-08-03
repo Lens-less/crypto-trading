@@ -2,10 +2,16 @@ use rust_decimal::Decimal;
 
 use crate::IndicatorError;
 
-/// Incremental Average True Range using Wilder smoothing.
+/// Incremental Average True Range with an explicit warm-up window.
+///
+/// The first `period` true ranges are accumulated into their arithmetic mean.
+/// The first `period - 1` updates produce `None`; the `period`th returns that
+/// average as the first ready value. Later updates apply Wilder smoothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Atr {
     period: Decimal,
+    pending_bars: u32,
+    warmup_true_range_sum: Decimal,
     value: Option<Decimal>,
     previous_close: Option<Decimal>,
 }
@@ -23,14 +29,18 @@ impl Atr {
 
         Ok(Self {
             period: Decimal::from(period),
+            pending_bars: period,
+            warmup_true_range_sum: Decimal::ZERO,
             value: None,
             previous_close: None,
         })
     }
 
-    /// Updates the ATR with a new OHLC bar and returns the new ATR value.
+    /// Updates the ATR with a new OHLC bar.
     ///
-    /// The first bar seeds ATR with its true range.
+    /// Returns `None` until `period` valid bars have been observed. The
+    /// `period`th bar returns the arithmetic mean of the warm-up true ranges,
+    /// and later bars return Wilder-smoothed ATR values.
     ///
     /// # Errors
     ///
@@ -43,7 +53,7 @@ impl Atr {
         high: Decimal,
         low: Decimal,
         close: Decimal,
-    ) -> Result<Decimal, IndicatorError> {
+    ) -> Result<Option<Decimal>, IndicatorError> {
         if high <= Decimal::ZERO || low <= Decimal::ZERO || close <= Decimal::ZERO {
             return Err(IndicatorError::NonPositivePrice);
         }
@@ -69,30 +79,52 @@ impl Atr {
             }
         };
 
-        let next = match self.value {
-            None => true_range,
-            Some(previous_atr) => {
-                let retained = previous_atr
-                    .checked_mul(
-                        self.period
-                            .checked_sub(Decimal::ONE)
-                            .ok_or(IndicatorError::ArithmeticOverflow)?,
-                    )
-                    .ok_or(IndicatorError::ArithmeticOverflow)?;
-                retained
-                    .checked_add(true_range)
-                    .ok_or(IndicatorError::ArithmeticOverflow)?
-                    .checked_div(self.period)
-                    .ok_or(IndicatorError::ArithmeticOverflow)?
-            }
-        };
+        if let Some(previous_atr) = self.value {
+            let retained = previous_atr
+                .checked_mul(
+                    self.period
+                        .checked_sub(Decimal::ONE)
+                        .ok_or(IndicatorError::ArithmeticOverflow)?,
+                )
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            let next = retained
+                .checked_add(true_range)
+                .ok_or(IndicatorError::ArithmeticOverflow)?
+                .checked_div(self.period)
+                .ok_or(IndicatorError::ArithmeticOverflow)?;
+            self.previous_close = Some(close);
+            self.value = Some(next);
+            return Ok(Some(next));
+        }
 
+        let pending_bars = self
+            .pending_bars
+            .checked_sub(1)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        let warmup_true_range_sum = self
+            .warmup_true_range_sum
+            .checked_add(true_range)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        if pending_bars > 0 {
+            self.pending_bars = pending_bars;
+            self.warmup_true_range_sum = warmup_true_range_sum;
+            self.previous_close = Some(close);
+            return Ok(None);
+        }
+
+        let next = warmup_true_range_sum
+            .checked_div(self.period)
+            .ok_or(IndicatorError::ArithmeticOverflow)?;
+        self.pending_bars = 0;
+        self.warmup_true_range_sum = warmup_true_range_sum;
         self.previous_close = Some(close);
         self.value = Some(next);
-        Ok(next)
+        Ok(Some(next))
     }
 
-    /// Returns the latest ATR value if any bars have been processed.
+    /// Returns the latest ready ATR value.
+    ///
+    /// This remains `None` until the full warm-up window has been observed.
     #[must_use]
     pub const fn value(&self) -> Option<Decimal> {
         self.value

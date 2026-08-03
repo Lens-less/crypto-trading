@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
     io::{self, Write},
     path::{Component, Path, PathBuf},
@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex as StdMutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use chrono::{DateTime, Utc};
@@ -23,6 +23,8 @@ use tracing::{debug, warn};
 pub const MAX_HISTORY_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_HISTORY_BATCH_BYTES: usize = 8_388_608;
 pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1_024 * 1_024;
+const MAX_HISTORY_QUARANTINE_FILES: usize = 16;
+const MAX_HISTORY_QUARANTINE_BYTES: u64 = MAX_HISTORY_FILE_BYTES;
 /// Maximum number of sealed, read-only segments in one journal chain.
 ///
 /// Together with the active file this bounds a chain at 64 files. Sealed
@@ -39,10 +41,12 @@ pub const MAX_HISTORY_CHAIN_BYTES: u64 = (MAX_HISTORY_SEALED_SEGMENTS + 1) * MAX
 
 type PathLock = AsyncMutex<()>;
 type CrossProcessLeaseState = StdMutex<Option<Arc<CrossProcessHistoryLease>>>;
+type AppendReceiptState = StdMutex<VecDeque<AppendReceiptEntry>>;
 const MIN_PATH_LOCK_CLEANUP_SIZE: usize = 64;
 const DEAD_PATH_LOCK_CLEANUP_THRESHOLD: usize = 64;
 const HISTORY_CROSS_PROCESS_LOCK_SUFFIX: &str = "jsonl.lock";
 static DEAD_PATH_LOCK_HINT: AtomicUsize = AtomicUsize::new(0);
+static DEAD_APPEND_RECEIPT_HINT: AtomicUsize = AtomicUsize::new(0);
 static PATH_LOCKS: OnceLock<StdMutex<PathLockRegistry>> = OnceLock::new();
 static CROSS_PROCESS_LEASE_STATES: OnceLock<StdMutex<CrossProcessLeaseRegistry>> = OnceLock::new();
 static APPEND_RECEIPTS: OnceLock<StdMutex<AppendReceiptRegistry>> = OnceLock::new();
@@ -232,43 +236,30 @@ pub(crate) fn sealed_segment_path(active_path: &Path, sequence: u64) -> PathBuf 
 pub(crate) fn inspect_sealed_segments(
     active_path: &Path,
 ) -> Result<Vec<SealedSegment>, SealedChainError> {
-    let parent = active_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut segments = BTreeMap::new();
-    let entries = match std::fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(SealedChainError::Inspect {
-                path: parent.to_path_buf(),
-                source,
-            });
-        }
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|source| SealedChainError::Inspect {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let Some(sequence) = sealed_segment_sequence(active_path, &entry.file_name(), &path)?
-        else {
-            continue;
+    let mut contiguous =
+        Vec::with_capacity(usize::try_from(MAX_HISTORY_SEALED_SEGMENTS).unwrap_or(usize::MAX));
+    let mut first_missing = None;
+    for sequence in 1..=MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1) {
+        let path = sealed_segment_path(active_path, sequence);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                first_missing.get_or_insert(path);
+                continue;
+            }
+            Err(source) => return Err(SealedChainError::Inspect { path, source }),
         };
-        if !(1..=MAX_HISTORY_SEALED_SEGMENTS).contains(&sequence) {
+        if sequence > MAX_HISTORY_SEALED_SEGMENTS {
             return Err(SealedChainError::TooManySegments {
                 segments: MAX_HISTORY_SEALED_SEGMENTS.saturating_add(1),
             });
         }
-        let metadata = entry
-            .metadata()
-            .map_err(|source| SealedChainError::Inspect {
-                path: path.clone(),
-                source,
-            })?;
+        if let Some(missing) = first_missing {
+            return Err(SealedChainError::Gap {
+                missing,
+                found: path,
+            });
+        }
         if !metadata.is_file() {
             return Err(SealedChainError::NotAFile { path });
         }
@@ -278,34 +269,10 @@ pub(crate) fn inspect_sealed_segments(
                 bytes: metadata.len(),
             });
         }
-        if segments
-            .insert(
-                sequence,
-                SealedSegment {
-                    path,
-                    bytes: metadata.len(),
-                },
-            )
-            .is_some()
-        {
-            return Err(duplicate_sealed_sequence(&candidate_path_for_sequence(
-                active_path,
-                sequence,
-            )));
-        }
-    }
-
-    let mut contiguous = Vec::with_capacity(segments.len());
-    let mut expected = 1u64;
-    for (sequence, segment) in segments {
-        if sequence != expected {
-            return Err(SealedChainError::Gap {
-                missing: sealed_segment_path(active_path, expected),
-                found: segment.path,
-            });
-        }
-        contiguous.push(segment);
-        expected = expected.saturating_add(1);
+        contiguous.push(SealedSegment {
+            path,
+            bytes: metadata.len(),
+        });
     }
     Ok(contiguous)
 }
@@ -379,9 +346,115 @@ struct AppendReceiptEntry {
     records: Vec<DecisionRecord>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryTailRepairOutcome {
+    Unchanged {
+        retained_bytes: u64,
+    },
+    Quarantined {
+        retained_bytes: u64,
+        quarantined_bytes: u64,
+        quarantine_path: PathBuf,
+        pruned_files: usize,
+        pruned_bytes: u64,
+    },
+    TerminatorRestored {
+        retained_bytes: u64,
+    },
+}
+
+impl HistoryTailRepairOutcome {
+    const fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Unchanged { retained_bytes }
+            | Self::Quarantined { retained_bytes, .. }
+            | Self::TerminatorRestored { retained_bytes } => *retained_bytes,
+        }
+    }
+
+    const fn requires_truncation(&self) -> bool {
+        matches!(self, Self::Quarantined { .. })
+    }
+
+    fn emit_telemetry(&self, path: &Path) {
+        match self {
+            Self::Unchanged { .. } => {}
+            Self::Quarantined {
+                retained_bytes,
+                quarantined_bytes,
+                quarantine_path,
+                pruned_files,
+                pruned_bytes,
+            } => warn!(
+                category = "partial_tail",
+                action = "quarantined",
+                retained_bytes,
+                quarantined_bytes,
+                quarantine_path = %quarantine_path.display(),
+                pruned_files,
+                pruned_bytes,
+                path = %path.display(),
+                "history partial tail recovered"
+            ),
+            Self::TerminatorRestored { retained_bytes } => warn!(
+                category = "partial_tail",
+                action = "terminator_restored",
+                retained_bytes,
+                path = %path.display(),
+                "history partial tail recovered"
+            ),
+        }
+    }
+}
+
+enum TailDisposition {
+    Quarantine {
+        bytes: Vec<u8>,
+        suffix_offset: usize,
+    },
+    RestoreTerminator {
+        record_body_bytes: usize,
+    },
+}
+
+#[derive(Debug)]
+struct QuarantineWrite {
+    path: PathBuf,
+    quarantined_bytes: u64,
+    pruned_files: usize,
+    pruned_bytes: u64,
+}
+
+struct QuarantineArtifact {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
+    file_name: OsString,
+}
+
+#[derive(Clone, Copy)]
+struct QuarantineLimits {
+    max_files: usize,
+    max_bytes: u64,
+}
+
+const HISTORY_QUARANTINE_LIMITS: QuarantineLimits = QuarantineLimits {
+    max_files: MAX_HISTORY_QUARANTINE_FILES,
+    max_bytes: MAX_HISTORY_QUARANTINE_BYTES,
+};
+
 struct AppendReceiptRegistry {
-    receipts: HashMap<PathBuf, VecDeque<AppendReceiptEntry>>,
+    receipts: HashMap<PathBuf, Weak<AppendReceiptState>>,
+    next_cleanup_size: usize,
+}
+
+impl Default for AppendReceiptRegistry {
+    fn default() -> Self {
+        Self {
+            receipts: HashMap::new(),
+            next_cleanup_size: MIN_PATH_LOCK_CLEANUP_SIZE,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -418,9 +491,9 @@ pub struct DecisionRecord {
 #[derive(Clone, Debug)]
 pub struct JsonlHistory {
     path: PathBuf,
-    lock_key: PathBuf,
     path_lock: Arc<PathLock>,
     cross_process_lease_state: Arc<CrossProcessLeaseState>,
+    append_receipts: Arc<AppendReceiptState>,
     startup_failure: Option<CrossProcessLeaseFailure>,
 }
 
@@ -441,6 +514,9 @@ impl Drop for JsonlHistory {
         if Arc::strong_count(&self.path_lock) == 1 {
             DEAD_PATH_LOCK_HINT.fetch_add(1, Ordering::Relaxed);
         }
+        if Arc::strong_count(&self.append_receipts) == 1 {
+            DEAD_APPEND_RECEIPT_HINT.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -450,12 +526,13 @@ impl JsonlHistory {
         let lock_key = normalized_lock_key(&path);
         let path_lock = shared_path_lock(lock_key.clone());
         let cross_process_lease_state = shared_cross_process_lease_state(lock_key.clone());
+        let append_receipts = shared_append_receipt_state(lock_key);
         let startup_failure = prime_cross_process_lease(&path, &cross_process_lease_state).err();
         Self {
             path,
-            lock_key,
             path_lock,
             cross_process_lease_state,
+            append_receipts,
             startup_failure,
         }
     }
@@ -474,7 +551,9 @@ impl JsonlHistory {
     /// preserved by writing and syncing that terminator. Complete malformed
     /// records remain fail-closed. An incomplete UTF-8 code point is
     /// recoverable only inside an otherwise EOF-incomplete record string.
-    pub(crate) async fn repair_recoverable_tail(&self) -> Result<(), HistoryError> {
+    pub(crate) async fn repair_recoverable_tail(
+        &self,
+    ) -> Result<HistoryTailRepairOutcome, HistoryError> {
         let _guard = self.path_lock.lock().await;
         let _lease = self.active_cross_process_lease()?;
         let mut file = match tokio::fs::OpenOptions::new()
@@ -484,7 +563,9 @@ impl JsonlHistory {
             .await
         {
             Ok(file) => file,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(HistoryTailRepairOutcome::Unchanged { retained_bytes: 0 });
+            }
             Err(source) => return Err(HistoryError::Open(source)),
         };
         let existing_bytes = file.metadata().await.map_err(HistoryError::Metadata)?.len();
@@ -495,14 +576,15 @@ impl JsonlHistory {
                 limit: MAX_HISTORY_FILE_BYTES,
             });
         }
-        let retained_bytes = self
+        let outcome = self
             .ensure_active_tail_is_complete(&mut file, existing_bytes)
             .await?;
-        if retained_bytes < existing_bytes {
+        if outcome.requires_truncation() {
             drop(file);
-            self.truncate_active_tail(retained_bytes).await?;
+            self.truncate_active_tail(outcome.retained_bytes()).await?;
         }
-        Ok(())
+        outcome.emit_telemetry(&self.path);
+        Ok(outcome)
     }
 
     pub(crate) async fn inspect_chain_head(&self) -> Result<HistoryChainHead, HistoryError> {
@@ -515,12 +597,10 @@ impl JsonlHistory {
     }
 
     pub(crate) fn same_process_delta_since(&self, head: &HistoryChainHead) -> Option<HistoryDelta> {
-        let registry =
-            APPEND_RECEIPTS.get_or_init(|| StdMutex::new(AppendReceiptRegistry::default()));
-        let registry = registry
+        let receipts = self
+            .append_receipts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let receipts = registry.receipts.get(&self.lock_key)?;
         let start = receipts
             .iter()
             .position(|entry| &entry.head_before == head)?;
@@ -601,11 +681,12 @@ impl JsonlHistory {
                 category = "success",
                 "history append batch completed"
             ),
-            Err(HistoryError::PartialTail { .. }) => warn!(
+            Err(error) if error.is_tail_recovery_failure() => warn!(
                 batch_records = records.len(),
                 batch_bytes = stats.batch_bytes,
                 elapsed_ms,
                 category = "partial_tail",
+                action = "failed",
                 "history append batch failed"
             ),
             Err(_) => warn!(
@@ -743,17 +824,17 @@ impl JsonlHistory {
                 limit: MAX_HISTORY_FILE_BYTES,
             });
         }
-        let retained_bytes = self
+        let outcome = self
             .ensure_active_tail_is_complete(&mut file, existing_bytes)
             .await?;
-        if retained_bytes < existing_bytes {
+        let retained_bytes = outcome.retained_bytes();
+        if outcome.requires_truncation() {
             drop(file);
             self.truncate_active_tail(retained_bytes).await?;
             file = self.open_active().await?;
-            existing_bytes = retained_bytes;
-        } else {
-            existing_bytes = retained_bytes;
         }
+        existing_bytes = retained_bytes;
+        outcome.emit_telemetry(&self.path);
         ensure_chain_budget(sealed_bytes, existing_bytes, batch_bytes)?;
         let head_before = HistoryChainHead {
             sealed_segment_bytes: sealed_segment_bytes.clone(),
@@ -829,12 +910,10 @@ impl JsonlHistory {
         head_after: HistoryChainHead,
         records: &[DecisionRecord],
     ) {
-        let registry =
-            APPEND_RECEIPTS.get_or_init(|| StdMutex::new(AppendReceiptRegistry::default()));
-        let mut registry = registry
+        let mut queue = self
+            .append_receipts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let queue = registry.receipts.entry(self.lock_key.clone()).or_default();
         queue.push_back(AppendReceiptEntry {
             head_before,
             head_after,
@@ -864,9 +943,9 @@ impl JsonlHistory {
         &self,
         file: &mut tokio::fs::File,
         existing_bytes: u64,
-    ) -> Result<u64, HistoryError> {
+    ) -> Result<HistoryTailRepairOutcome, HistoryError> {
         if existing_bytes == 0 {
-            return Ok(0);
+            return Ok(HistoryTailRepairOutcome::Unchanged { retained_bytes: 0 });
         }
         let mut tail = [0u8; 1];
         file.seek(io::SeekFrom::End(-1))
@@ -876,56 +955,42 @@ impl JsonlHistory {
             .await
             .map_err(HistoryError::TailInspect)?;
         if tail == [b'\n'] {
-            return Ok(existing_bytes);
+            return Ok(HistoryTailRepairOutcome::Unchanged {
+                retained_bytes: existing_bytes,
+            });
         }
 
         let bytes = self.read_active_bytes(file, existing_bytes).await?;
-        let complete_prefix_len = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        self.recover_unterminated_active_tail(file, &bytes, complete_prefix_len, existing_bytes)
-            .await
-    }
-
-    async fn recover_unterminated_active_tail(
-        &self,
-        file: &mut tokio::fs::File,
-        bytes: &[u8],
-        complete_prefix_len: usize,
-        existing_bytes: u64,
-    ) -> Result<u64, HistoryError> {
-        self.validate_complete_prefix(&bytes[..complete_prefix_len])?;
-        let suffix = &bytes[complete_prefix_len..];
-        let line = bytes[..complete_prefix_len]
-            .split(|byte| *byte == b'\n')
-            .count();
-        match serde_json::from_slice::<Value>(suffix) {
-            Err(source) if is_recoverable_partial_json_tail(suffix, &source) => {
-                let quarantined = self.quarantine_partial_tail(suffix).await?;
-                warn!(
-                    retained_bytes = complete_prefix_len,
-                    quarantine_path = %quarantined.display(),
-                    "history partial tail quarantined during recovery"
-                );
-                Ok(u64::try_from(complete_prefix_len).unwrap_or(u64::MAX))
+        let path = self.path.clone();
+        let disposition = tokio::task::spawn_blocking(move || {
+            run_tail_analysis_test_hook();
+            analyze_unterminated_tail(&path, bytes)
+        })
+        .await
+        .map_err(|_| {
+            HistoryError::TailInspect(io::Error::other("history tail analysis task failed"))
+        })??;
+        match disposition {
+            TailDisposition::Quarantine {
+                bytes,
+                suffix_offset,
+            } => {
+                let retained_bytes = u64::try_from(suffix_offset).unwrap_or(u64::MAX);
+                let quarantined = self.quarantine_partial_tail(bytes, suffix_offset).await?;
+                Ok(HistoryTailRepairOutcome::Quarantined {
+                    retained_bytes,
+                    quarantined_bytes: quarantined.quarantined_bytes,
+                    quarantine_path: quarantined.path,
+                    pruned_files: quarantined.pruned_files,
+                    pruned_bytes: quarantined.pruned_bytes,
+                })
             }
-            Err(source) => Err(HistoryError::MalformedActiveRecord {
-                path: self.path.clone(),
-                line,
-                source,
-            }),
-            Ok(_) => match serde_json::from_slice::<DecisionRecord>(suffix) {
-                Ok(_) => {
-                    self.restore_active_record_terminator(file, suffix.len(), existing_bytes)
-                        .await
-                }
-                Err(source) => Err(HistoryError::MalformedActiveRecord {
-                    path: self.path.clone(),
-                    line,
-                    source,
-                }),
-            },
+            TailDisposition::RestoreTerminator { record_body_bytes } => {
+                let retained_bytes = self
+                    .restore_active_record_terminator(file, record_body_bytes, existing_bytes)
+                    .await?;
+                Ok(HistoryTailRepairOutcome::TerminatorRestored { retained_bytes })
+            }
         }
     }
 
@@ -962,11 +1027,7 @@ impl JsonlHistory {
             .await
             .map_err(HistoryError::TailRepair)?;
         file.flush().await.map_err(HistoryError::TailRepair)?;
-        file.sync_data().await.map_err(HistoryError::Sync)?;
-        warn!(
-            retained_bytes = repaired_bytes,
-            "history complete active record terminator restored during recovery"
-        );
+        file.sync_data().await.map_err(HistoryError::TailRepair)?;
         Ok(repaired_bytes)
     }
 
@@ -1027,22 +1088,6 @@ impl JsonlHistory {
         Ok(bytes)
     }
 
-    fn validate_complete_prefix(&self, bytes: &[u8]) -> Result<(), HistoryError> {
-        for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-            if line.is_empty() {
-                continue;
-            }
-            serde_json::from_slice::<DecisionRecord>(line).map_err(|source| {
-                HistoryError::MalformedActiveRecord {
-                    path: self.path.clone(),
-                    line: index + 1,
-                    source,
-                }
-            })?;
-        }
-        Ok(())
-    }
-
     async fn truncate_active_tail(&self, retained_bytes: u64) -> Result<(), HistoryError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -1052,12 +1097,7 @@ impl JsonlHistory {
                 .map_err(HistoryError::TailRepair)?;
             file.set_len(retained_bytes)
                 .map_err(HistoryError::TailRepair)?;
-            file.sync_data().map_err(HistoryError::Sync)?;
-            warn!(
-                retained_bytes,
-                path = %path.display(),
-                "history partial tail truncated before append"
-            );
+            file.sync_data().map_err(HistoryError::TailRepair)?;
             Ok(())
         })
         .await
@@ -1066,16 +1106,21 @@ impl JsonlHistory {
         })?
     }
 
-    async fn quarantine_partial_tail(&self, suffix: &[u8]) -> Result<PathBuf, HistoryError> {
+    async fn quarantine_partial_tail(
+        &self,
+        bytes: Vec<u8>,
+        suffix_offset: usize,
+    ) -> Result<QuarantineWrite, HistoryError> {
         let path = self.path.clone();
         let quarantine_fallback = quarantine_candidate_path(&path, &uuid::Uuid::nil());
-        let suffix = suffix.to_vec();
-        tokio::task::spawn_blocking(move || quarantine_partial_tail(&path, &suffix))
-            .await
-            .map_err(|_| HistoryError::TailQuarantine {
-                path: quarantine_fallback,
-                source: io::Error::other("history partial-tail quarantine task failed"),
-            })?
+        tokio::task::spawn_blocking(move || {
+            quarantine_partial_tail(&path, &bytes, suffix_offset, HISTORY_QUARANTINE_LIMITS)
+        })
+        .await
+        .map_err(|_| HistoryError::TailQuarantine {
+            path: quarantine_fallback,
+            source: io::Error::other("history partial-tail quarantine task failed"),
+        })?
     }
 }
 
@@ -1127,6 +1172,55 @@ fn json_prefix_accepts_raw_string_byte(prefix: &[u8]) -> bool {
     in_string && !escaped && unicode_escape_digits == 0
 }
 
+fn analyze_unterminated_tail(path: &Path, bytes: Vec<u8>) -> Result<TailDisposition, HistoryError> {
+    let suffix_offset = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    validate_complete_prefix(path, &bytes[..suffix_offset])?;
+    let suffix = &bytes[suffix_offset..];
+    let line = bytes[..suffix_offset].split(|byte| *byte == b'\n').count();
+    match serde_json::from_slice::<Value>(suffix) {
+        Err(source) if is_recoverable_partial_json_tail(suffix, &source) => {
+            Ok(TailDisposition::Quarantine {
+                bytes,
+                suffix_offset,
+            })
+        }
+        Err(source) => Err(HistoryError::MalformedActiveRecord {
+            path: path.to_path_buf(),
+            line,
+            source,
+        }),
+        Ok(_) => match serde_json::from_slice::<DecisionRecord>(suffix) {
+            Ok(_) => Ok(TailDisposition::RestoreTerminator {
+                record_body_bytes: suffix.len(),
+            }),
+            Err(source) => Err(HistoryError::MalformedActiveRecord {
+                path: path.to_path_buf(),
+                line,
+                source,
+            }),
+        },
+    }
+}
+
+fn validate_complete_prefix(path: &Path, bytes: &[u8]) -> Result<(), HistoryError> {
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        serde_json::from_slice::<DecisionRecord>(line).map_err(|source| {
+            HistoryError::MalformedActiveRecord {
+                path: path.to_path_buf(),
+                line: index + 1,
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
 fn stable_history_path(path: &Path) -> PathBuf {
     canonicalize_existing_prefix(&absolute_key(path))
 }
@@ -1134,111 +1228,6 @@ fn stable_history_path(path: &Path) -> PathBuf {
 fn history_file_name(path: &Path) -> OsString {
     path.file_name()
         .map_or_else(|| OsString::from("history.jsonl"), OsStr::to_os_string)
-}
-
-fn duplicate_sealed_sequence(path: &Path) -> SealedChainError {
-    SealedChainError::Inspect {
-        path: path.to_path_buf(),
-        source: io::Error::new(
-            io::ErrorKind::InvalidData,
-            "multiple sealed segment names resolve to the same sequence",
-        ),
-    }
-}
-
-fn noncanonical_sealed_segment(
-    active_path: &Path,
-    candidate_path: &Path,
-    sequence: u64,
-) -> SealedChainError {
-    SealedChainError::Gap {
-        missing: sealed_segment_path(active_path, sequence),
-        found: candidate_path.to_path_buf(),
-    }
-}
-
-fn candidate_path_for_sequence(active_path: &Path, sequence: u64) -> PathBuf {
-    sealed_segment_path(active_path, sequence)
-}
-
-#[cfg(unix)]
-fn sealed_segment_sequence(
-    active_path: &Path,
-    candidate: &OsStr,
-    candidate_path: &Path,
-) -> Result<Option<u64>, SealedChainError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let active_name = history_file_name(active_path);
-    let active_bytes = active_name.as_os_str().as_bytes();
-    let candidate_bytes = candidate.as_bytes();
-    if !candidate_bytes.starts_with(active_bytes) {
-        return Ok(None);
-    }
-    let Some(suffix) = candidate_bytes.get(active_bytes.len()..) else {
-        return Ok(None);
-    };
-    let Some(suffix) = suffix.strip_prefix(b".") else {
-        return Ok(None);
-    };
-    if suffix.is_empty() || !suffix.iter().all(|byte| byte.is_ascii_digit()) {
-        return Ok(None);
-    }
-    let Ok(sequence_text) = std::str::from_utf8(suffix) else {
-        return Ok(None);
-    };
-    let Ok(sequence) = sequence_text.parse::<u64>() else {
-        return Ok(None);
-    };
-    if sequence.to_string().as_bytes() != suffix {
-        return Err(noncanonical_sealed_segment(
-            active_path,
-            candidate_path,
-            sequence,
-        ));
-    }
-    Ok(Some(sequence))
-}
-
-#[cfg(not(unix))]
-fn sealed_segment_sequence(
-    active_path: &Path,
-    candidate: &OsStr,
-    candidate_path: &Path,
-) -> Result<Option<u64>, SealedChainError> {
-    let active_name = history_file_name(active_path);
-    let Some(active_name) = active_name.to_str() else {
-        return Err(SealedChainError::Inspect {
-            path: active_path.to_path_buf(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidData,
-                "active history file name is not valid UTF-8 on this platform",
-            ),
-        });
-    };
-    let Some(candidate) = candidate.to_str() else {
-        return Ok(None);
-    };
-    let Some(suffix) = candidate
-        .strip_prefix(active_name)
-        .and_then(|rest| rest.strip_prefix('.'))
-    else {
-        return Ok(None);
-    };
-    if suffix.is_empty() || !suffix.as_bytes().iter().all(u8::is_ascii_digit) {
-        return Ok(None);
-    }
-    let Ok(sequence) = suffix.parse::<u64>() else {
-        return Ok(None);
-    };
-    if sequence.to_string() != suffix {
-        return Err(noncanonical_sealed_segment(
-            active_path,
-            candidate_path,
-            sequence,
-        ));
-    }
-    Ok(Some(sequence))
 }
 
 #[cfg(test)]
@@ -1260,6 +1249,26 @@ fn run_append_inspection_test_hook() {
 
 #[cfg(not(test))]
 fn run_append_inspection_test_hook() {}
+
+#[cfg(test)]
+type TailAnalysisHook = Arc<dyn Fn() + Send + Sync + 'static>;
+#[cfg(test)]
+static TAIL_ANALYSIS_HOOK: OnceLock<StdMutex<Option<TailAnalysisHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn run_tail_analysis_test_hook() {
+    let hook = TAIL_ANALYSIS_HOOK
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_tail_analysis_test_hook() {}
 
 pub(crate) fn stable_history_path_for_read(path: &Path) -> PathBuf {
     stable_history_path(path)
@@ -1446,6 +1455,40 @@ fn shared_cross_process_lease_state(path: PathBuf) -> Arc<CrossProcessLeaseState
     lease_state
 }
 
+fn shared_append_receipt_state(path: PathBuf) -> Arc<AppendReceiptState> {
+    let registry = APPEND_RECEIPTS.get_or_init(|| StdMutex::new(AppendReceiptRegistry::default()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cleanup_for_growth = registry.receipts.len() >= registry.next_cleanup_size;
+    let dead_cleanup_threshold = registry
+        .receipts
+        .len()
+        .saturating_div(4)
+        .max(DEAD_PATH_LOCK_CLEANUP_THRESHOLD);
+    let cleanup_for_dead_handles =
+        DEAD_APPEND_RECEIPT_HINT.load(Ordering::Relaxed) >= dead_cleanup_threshold;
+    if cleanup_for_growth || cleanup_for_dead_handles {
+        DEAD_APPEND_RECEIPT_HINT.swap(0, Ordering::Relaxed);
+        registry
+            .receipts
+            .retain(|_, receipt_state| receipt_state.strong_count() > 0);
+        registry.next_cleanup_size = registry
+            .receipts
+            .len()
+            .saturating_mul(2)
+            .max(MIN_PATH_LOCK_CLEANUP_SIZE);
+    }
+    if let Some(existing) = registry.receipts.get(&path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let receipt_state = Arc::new(StdMutex::new(VecDeque::new()));
+    registry
+        .receipts
+        .insert(path, Arc::downgrade(&receipt_state));
+    receipt_state
+}
+
 fn inspect_chain_head(path: &Path) -> Result<HistoryChainHead, HistoryError> {
     let sealed = inspect_sealed_segments(path).map_err(SealedChainError::into_history_error)?;
     let active_bytes = match std::fs::metadata(path) {
@@ -1473,13 +1516,56 @@ fn inspect_chain_head(path: &Path) -> Result<HistoryChainHead, HistoryError> {
     })
 }
 
-fn quarantine_candidate_path(path: &Path, quarantine_id: &uuid::Uuid) -> PathBuf {
+fn quarantine_directory_path(path: &Path) -> PathBuf {
     let mut file_name = history_file_name(path);
-    file_name.push(format!(".partial-tail.{quarantine_id}.quarantine"));
+    file_name.push(".quarantine");
     path.with_file_name(file_name)
 }
 
-fn quarantine_partial_tail(path: &Path, suffix: &[u8]) -> Result<PathBuf, HistoryError> {
+fn quarantine_candidate_path(path: &Path, quarantine_id: &uuid::Uuid) -> PathBuf {
+    quarantine_directory_path(path).join(format!("partial-tail.{quarantine_id}.quarantine"))
+}
+
+fn quarantine_partial_tail(
+    path: &Path,
+    bytes: &[u8],
+    suffix_offset: usize,
+    limits: QuarantineLimits,
+) -> Result<QuarantineWrite, HistoryError> {
+    let quarantine_directory = quarantine_directory_path(path);
+    let suffix = bytes.get(suffix_offset..).ok_or_else(|| {
+        tail_quarantine_error(
+            quarantine_directory.clone(),
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history quarantine suffix offset exceeded the recovery buffer",
+            ),
+        )
+    })?;
+    let quarantined_bytes = u64::try_from(suffix.len()).map_err(|_| {
+        tail_quarantine_error(
+            quarantine_directory.clone(),
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history quarantine suffix size exceeded u64",
+            ),
+        )
+    })?;
+    if limits.max_files == 0 || quarantined_bytes > limits.max_bytes {
+        return Err(tail_quarantine_error(
+            quarantine_directory,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "history quarantine limits cannot retain a {quarantined_bytes}-byte artifact"
+                ),
+            ),
+        ));
+    }
+
+    ensure_quarantine_directory(&quarantine_directory)?;
+    let (pruned_files, pruned_bytes) =
+        prune_quarantine_artifacts(&quarantine_directory, quarantined_bytes, limits)?;
     let quarantine_id = uuid::Uuid::new_v4();
     let quarantine_path = quarantine_candidate_path(path, &quarantine_id);
     let mut file = std::fs::OpenOptions::new()
@@ -1500,7 +1586,174 @@ fn quarantine_partial_tail(path: &Path, suffix: &[u8]) -> Result<PathBuf, Histor
             path: quarantine_path.clone(),
             source,
         })?;
-    Ok(quarantine_path)
+    #[cfg(unix)]
+    sync_quarantine_directory(&quarantine_directory)
+        .map_err(|source| tail_quarantine_error(quarantine_directory, source))?;
+    Ok(QuarantineWrite {
+        path: quarantine_path,
+        quarantined_bytes,
+        pruned_files,
+        pruned_bytes,
+    })
+}
+
+fn ensure_quarantine_directory(path: &Path) -> Result<(), HistoryError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_quarantine_directory(path, &metadata),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(tail_quarantine_error(path.to_path_buf(), source));
+                }
+            }
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|source| tail_quarantine_error(path.to_path_buf(), source))?;
+            validate_quarantine_directory(path, &metadata)
+        }
+        Err(source) => Err(tail_quarantine_error(path.to_path_buf(), source)),
+    }
+}
+
+fn validate_quarantine_directory(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), HistoryError> {
+    if is_link_or_reparse(metadata) || !metadata.file_type().is_dir() {
+        return Err(tail_quarantine_error(
+            path.to_path_buf(),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "history quarantine path must be a real directory, not a link or reparse point",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn prune_quarantine_artifacts(
+    directory: &Path,
+    incoming_bytes: u64,
+    limits: QuarantineLimits,
+) -> Result<(usize, u64), HistoryError> {
+    let mut artifacts = inspect_quarantine_artifacts(directory)?;
+    artifacts.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.file_name.cmp(&right.file_name))
+    });
+    let mut retained_files = artifacts.len();
+    let mut retained_bytes = artifacts
+        .iter()
+        .fold(0u64, |total, artifact| total.saturating_add(artifact.bytes));
+    let mut prune_count = 0usize;
+    while retained_files.saturating_add(1) > limits.max_files
+        || retained_bytes.saturating_add(incoming_bytes) > limits.max_bytes
+    {
+        let Some(artifact) = artifacts.get(prune_count) else {
+            return Err(tail_quarantine_error(
+                directory.to_path_buf(),
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history quarantine limits cannot retain the incoming artifact",
+                ),
+            ));
+        };
+        retained_files = retained_files.saturating_sub(1);
+        retained_bytes = retained_bytes.saturating_sub(artifact.bytes);
+        prune_count = prune_count.saturating_add(1);
+    }
+
+    let mut pruned_files = 0usize;
+    let mut pruned_bytes = 0u64;
+    for artifact in artifacts.into_iter().take(prune_count) {
+        std::fs::remove_file(&artifact.path)
+            .map_err(|source| tail_quarantine_error(artifact.path.clone(), source))?;
+        pruned_files = pruned_files.saturating_add(1);
+        pruned_bytes = pruned_bytes.saturating_add(artifact.bytes);
+    }
+    Ok((pruned_files, pruned_bytes))
+}
+
+fn inspect_quarantine_artifacts(directory: &Path) -> Result<Vec<QuarantineArtifact>, HistoryError> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|source| tail_quarantine_error(directory.to_path_buf(), source))?;
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| tail_quarantine_error(directory.to_path_buf(), source))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if !is_managed_quarantine_name(&file_name) {
+            return Err(tail_quarantine_error(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history quarantine directory contains an unmanaged entry",
+                ),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|source| tail_quarantine_error(path.clone(), source))?;
+        if is_link_or_reparse(&metadata) || !metadata.file_type().is_file() {
+            return Err(tail_quarantine_error(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "history quarantine artifact must be a regular non-link file",
+                ),
+            ));
+        }
+        let modified = metadata
+            .modified()
+            .map_err(|source| tail_quarantine_error(path.clone(), source))?;
+        artifacts.push(QuarantineArtifact {
+            path,
+            bytes: metadata.len(),
+            modified,
+            file_name,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn is_managed_quarantine_name(file_name: &OsStr) -> bool {
+    let Some(file_name) = file_name.to_str() else {
+        return false;
+    };
+    let Some(identifier) = file_name
+        .strip_prefix("partial-tail.")
+        .and_then(|name| name.strip_suffix(".quarantine"))
+    else {
+        return false;
+    };
+    uuid::Uuid::parse_str(identifier)
+        .ok()
+        .is_some_and(|parsed| parsed.to_string() == identifier)
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn sync_quarantine_directory(directory: &Path) -> io::Result<()> {
+    std::fs::File::open(directory)?.sync_data()
+}
+
+fn tail_quarantine_error(path: PathBuf, source: io::Error) -> HistoryError {
+    HistoryError::TailQuarantine { path, source }
 }
 
 #[derive(Debug, Error)]
@@ -1570,10 +1823,6 @@ pub enum HistoryError {
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "history file {path} ends in a partial record; quarantine the crash-left tail before appending"
-    )]
-    PartialTail { path: PathBuf },
     #[error("history file {path} contains a malformed complete record at line {line}: {source}")]
     MalformedActiveRecord {
         path: PathBuf,
@@ -1611,6 +1860,15 @@ pub enum HistoryError {
     CrossProcessLockBusy { path: PathBuf },
 }
 
+impl HistoryError {
+    const fn is_tail_recovery_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::TailInspect(_) | Self::TailRepair(_) | Self::TailQuarantine { .. }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1640,6 +1898,11 @@ mod tests {
 
         assert!(Arc::ptr_eq(&direct.path_lock, &dot_alias.path_lock));
         assert!(Arc::ptr_eq(&direct.path_lock, &alias.path_lock));
+        assert!(Arc::ptr_eq(
+            &direct.append_receipts,
+            &dot_alias.append_receipts
+        ));
+        assert!(Arc::ptr_eq(&direct.append_receipts, &alias.append_receipts));
 
         drop((direct, dot_alias, alias));
         std::fs::remove_dir_all(root).unwrap();
@@ -1707,6 +1970,31 @@ mod tests {
     }
 
     #[test]
+    fn append_receipt_registry_prunes_dead_entries_on_registration() {
+        let tag = Uuid::new_v4().to_string();
+        let root = std::env::temp_dir().join(format!("history-receipts-{tag}"));
+        let histories = (0..128)
+            .map(|index| JsonlHistory::new(root.join(format!("{index}.jsonl"))))
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching_append_receipt_registry_entries(&tag), 128);
+        drop(histories);
+
+        let mut pruned = false;
+        for index in 0..1024 {
+            let survivor = JsonlHistory::new(root.join(format!("survivor-{index}.jsonl")));
+            let remaining = matching_append_receipt_registry_entries(&tag);
+            drop(survivor);
+            if remaining <= 2 {
+                pruned = true;
+                break;
+            }
+        }
+        assert!(pruned, "dead append receipt entries were never pruned");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn inspect_sealed_segments_accepts_empty_chain_and_ignores_unrelated_files() {
         let root = temp_root("history-inspect-empty");
         std::fs::create_dir_all(&root).unwrap();
@@ -1770,39 +2058,30 @@ mod tests {
     }
 
     #[test]
-    fn inspect_sealed_segments_rejects_non_canonical_numeric_suffixes() {
+    fn inspect_sealed_segments_ignores_non_canonical_numeric_suffixes() {
         let root = temp_root("history-inspect-noncanonical");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("decisions.jsonl");
         std::fs::write(path.with_file_name("decisions.jsonl.01"), b"segment\n").unwrap();
 
-        let error = inspect_sealed_segments(&path).unwrap_err();
+        let segments = inspect_sealed_segments(&path).unwrap();
 
-        assert!(matches!(
-            error,
-            SealedChainError::Gap { missing, found }
-                if missing == sealed_segment_path(&path, 1)
-                    && found == path.with_file_name("decisions.jsonl.01")
-        ));
+        assert!(segments.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn inspect_sealed_segments_rejects_duplicate_numeric_sequences() {
+    fn inspect_sealed_segments_uses_only_canonical_numeric_sequences() {
         let root = temp_root("history-inspect-duplicate");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("decisions.jsonl");
         std::fs::write(sealed_segment_path(&path, 1), b"segment\n").unwrap();
         std::fs::write(path.with_file_name("decisions.jsonl.01"), b"segment\n").unwrap();
 
-        let error = inspect_sealed_segments(&path).unwrap_err();
+        let segments = inspect_sealed_segments(&path).unwrap();
 
-        assert!(matches!(
-            error,
-            SealedChainError::Gap { missing, found }
-                if missing == sealed_segment_path(&path, 1)
-                    && found == path.with_file_name("decisions.jsonl.01")
-        ));
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].path, sealed_segment_path(&path, 1));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1900,6 +2179,176 @@ mod tests {
         timer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         release.store(true, Ordering::Release);
         join.join().unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tail_analysis_runs_off_the_current_thread_runtime() {
+        let root = temp_root("history-tail-analysis-runtime");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        std::fs::write(&path, br#"{"decision":"interrupted""#).unwrap();
+        let history = JsonlHistory::new(&path);
+        let record = DecisionRecord {
+            timestamp: Utc::timestamp_opt(&Utc, 1_700_000_000, 0).unwrap(),
+            strategy: "spawn-blocking-tail".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "hold".to_owned(),
+            details: Value::Null,
+        };
+        let (analysis_tx, analysis_rx) = mpsc::channel();
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let (timer_tx, timer_rx) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_release = Arc::clone(&release);
+        let _hook = TestTailAnalysisHook::install(move || {
+            analysis_tx.send(std::thread::current().id()).unwrap();
+            while !hook_release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+
+        let join = std::thread::spawn(move || {
+            runtime_tx.send(std::thread::current().id()).unwrap();
+            runtime().block_on(async move {
+                let append = tokio::spawn({
+                    let history = history.clone();
+                    let record = record.clone();
+                    async move { history.append(&record).await }
+                });
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    timer_tx.send(()).unwrap();
+                });
+                append.await.unwrap()
+            })
+        });
+
+        let runtime_thread = runtime_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let analysis_thread = analysis_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        timer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.store(true, Ordering::Release);
+        join.join().unwrap().unwrap();
+        assert_ne!(analysis_thread, runtime_thread);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quarantine_retention_enforces_count_and_byte_limits() {
+        let root = temp_root("history-quarantine-limits");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        let limits = QuarantineLimits {
+            max_files: 3,
+            max_bytes: 7,
+        };
+        let mut latest = None;
+
+        for byte in b'a'..=b'f' {
+            let bytes = vec![byte; 3];
+            let write = quarantine_partial_tail(&path, &bytes, 0, limits).unwrap();
+            assert_eq!(write.quarantined_bytes, 3);
+            assert_eq!(std::fs::read(&write.path).unwrap(), bytes);
+            latest = Some(write.path);
+        }
+
+        let artifacts = inspect_quarantine_artifacts(&quarantine_directory_path(&path)).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().map(|artifact| artifact.bytes).sum::<u64>() <= 7);
+        assert!(latest.unwrap().exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn quarantine_rejects_a_linked_artifact_directory() {
+        let root = temp_root("history-quarantine-link");
+        let target = root.join("target");
+        let path = root.join("decisions.jsonl");
+        let link = quarantine_directory_path(&path);
+        std::fs::create_dir_all(&target).unwrap();
+        if let Err(error) = create_directory_symlink(&target, &link) {
+            std::fs::remove_dir_all(&root).unwrap();
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create directory symlink: {error}");
+        }
+
+        let error =
+            quarantine_partial_tail(&path, b"partial", 0, HISTORY_QUARANTINE_LIMITS).unwrap_err();
+
+        assert!(matches!(
+            error,
+            HistoryError::TailQuarantine { source, .. }
+                if source.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        remove_directory_symlink(&link).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_reports_the_quarantined_tail_outcome() {
+        let root = temp_root("history-tail-outcome-quarantined");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        let fragment = br#"{"decision":"interrupted""#;
+        std::fs::write(&path, fragment).unwrap();
+        let history = JsonlHistory::new(&path);
+
+        let outcome = history.repair_recoverable_tail().await.unwrap();
+
+        match outcome {
+            HistoryTailRepairOutcome::Quarantined {
+                retained_bytes,
+                quarantined_bytes,
+                quarantine_path,
+                pruned_files,
+                pruned_bytes,
+            } => {
+                assert_eq!(retained_bytes, 0);
+                assert_eq!(quarantined_bytes, u64::try_from(fragment.len()).unwrap());
+                assert_eq!(std::fs::read(quarantine_path).unwrap(), fragment);
+                assert_eq!(pruned_files, 0);
+                assert_eq!(pruned_bytes, 0);
+            }
+            other => panic!("unexpected tail repair outcome: {other:?}"),
+        }
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        drop(history);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_reports_the_restored_terminator_outcome() {
+        let root = temp_root("history-tail-outcome-terminator");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("decisions.jsonl");
+        let record = DecisionRecord {
+            timestamp: Utc::timestamp_opt(&Utc, 1_700_000_000, 0).unwrap(),
+            strategy: "tail-outcome".to_owned(),
+            symbol: "BTC".to_owned(),
+            decision: "complete".to_owned(),
+            details: Value::Null,
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let history = JsonlHistory::new(&path);
+
+        let outcome = history.repair_recoverable_tail().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            HistoryTailRepairOutcome::TerminatorRestored {
+                retained_bytes: u64::try_from(bytes.len()).unwrap() + 1,
+            }
+        );
+        let mut expected = bytes;
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        drop(history);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2156,6 +2605,18 @@ mod tests {
             .count()
     }
 
+    fn matching_append_receipt_registry_entries(tag: &str) -> usize {
+        let tag = tag.to_lowercase();
+        APPEND_RECEIPTS
+            .get_or_init(|| StdMutex::new(AppendReceiptRegistry::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .receipts
+            .keys()
+            .filter(|path| path.to_string_lossy().to_lowercase().contains(&tag))
+            .count()
+    }
+
     /// Grows `path` to `len` bytes ending in a record terminator, so size
     /// fixtures pass the writer's partial-tail check.
     fn newline_terminated_fill(path: &Path, len: u64) {
@@ -2323,6 +2784,35 @@ mod tests {
     impl Drop for TestInspectHookGuard {
         fn drop(&mut self) {
             let mut slot = APPEND_INSPECTION_HOOK
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = None;
+        }
+    }
+
+    struct TestTailAnalysisHook;
+
+    impl TestTailAnalysisHook {
+        fn install<F>(hook: F) -> TestTailAnalysisHookGuard
+        where
+            F: Fn() + Send + Sync + 'static,
+        {
+            let mut slot = TAIL_ANALYSIS_HOOK
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(slot.is_none(), "tail analysis hook already installed");
+            *slot = Some(Arc::new(hook));
+            TestTailAnalysisHookGuard
+        }
+    }
+
+    struct TestTailAnalysisHookGuard;
+
+    impl Drop for TestTailAnalysisHookGuard {
+        fn drop(&mut self) {
+            let mut slot = TAIL_ANALYSIS_HOOK
                 .get_or_init(|| StdMutex::new(None))
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);

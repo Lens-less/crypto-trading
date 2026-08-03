@@ -491,6 +491,7 @@ fn paper_adapter() -> AdapterSupport {
             &[
                 "rust/crates/exchange/src/paper.rs",
                 "rust/crates/exchange/tests/paper_exchange_contract.rs",
+                "rust/crates/apps/src/command.rs",
             ],
         ),
         live: adapter_facet(
@@ -599,7 +600,10 @@ fn foundation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Bounded YAML and JSON configuration parsing with executable classification.",
             &[],
-            &["rust/crates/config", "rust/crates/apps/src/command.rs"],
+            &[
+                "rust/crates/config/src/lib.rs",
+                "rust/crates/apps/src/command.rs",
+            ],
         ),
         capability(
             "control-plane.web",
@@ -719,6 +723,7 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 "rust/crates/runtime/tests/history_writer_lock_contract.rs",
                 "rust/crates/runtime/tests/history_rotation_contract.rs",
                 "rust/crates/runtime/tests/execution_contract.rs",
+                "rust/crates/apps/src/command.rs",
             ],
         ),
         capability(
@@ -758,11 +763,12 @@ fn research_capabilities() -> Vec<Capability> {
         capability(
             "research.backtest",
             CapabilityArea::Research,
-            CapabilityLevel::Available,
+            CapabilityLevel::Unavailable,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic single-instrument SimClock/EventTape backtests with explicit maker/taker fees, slippage, weighted-average-cost ledger outputs, equity curves, metrics, and out-of-sample-only walk-forward windows.",
+            "Internal library-only deterministic single-instrument SimClock/EventTape kernel with explicit fee/slippage assumptions, ledger outputs, equity curves, performance-metric primitives, and out-of-sample window primitives.",
             &[
-                "This is a bounded research kernel, not a profitability claim: production MarketDataEvent/strategy adapters, multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
+                "Unavailable as a product capability: no shipped binary links this crate, and no supported CLI or HTTP entry point, bounded tape input contract, or production strategy adapter exists.",
+                "This kernel is not a profitability claim: multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
             ],
             &[
                 "rust/crates/backtest/src/engine.rs",
@@ -774,14 +780,19 @@ fn research_capabilities() -> Vec<Capability> {
         capability(
             "research.indicators",
             CapabilityArea::Research,
-            CapabilityLevel::Available,
+            CapabilityLevel::Unavailable,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Incremental Decimal ATR, EMA, EWMA realized volatility, rolling z-score, Sharpe, Sortino, drawdown, win-rate, and profit-factor calculations with golden vectors.",
+            "Internal library-only Decimal indicator kernels for ATR, EMA, EWMA realized volatility, rolling z-score, and performance-metric primitives, covered by golden vectors.",
             &[
-                "Order-book imbalance and microprice indicators are not implemented, and these indicators are not yet wired into continuous strategy configuration.",
+                "Unavailable as a product capability: no shipped binary links this crate, no supported CLI or HTTP entry point exists, and continuous strategy configuration does not consume these indicators.",
+                "Order-book imbalance and microprice indicators are not implemented.",
             ],
             &[
-                "rust/crates/indicators/src",
+                "rust/crates/indicators/src/atr.rs",
+                "rust/crates/indicators/src/ema.rs",
+                "rust/crates/indicators/src/ewma_volatility.rs",
+                "rust/crates/indicators/src/metrics.rs",
+                "rust/crates/indicators/src/zscore.rs",
                 "rust/crates/indicators/tests/indicators_contract.rs",
             ],
         ),
@@ -1126,6 +1137,8 @@ fn strategy_capabilities() -> Vec<Capability> {
                 "rust/crates/strategy/src/arbitrage_history.rs",
                 "rust/crates/strategy/tests/segmented_arbitrage.rs",
                 "rust/crates/strategy/tests/arbitrage_history.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_arbitrage_task.rs",
             ],
         ),
         capability(
@@ -1140,6 +1153,8 @@ fn strategy_capabilities() -> Vec<Capability> {
                 "rust/crates/strategy/src/grid_protection.rs",
                 "rust/crates/strategy/tests/grid_planner.rs",
                 "rust/crates/strategy/tests/grid_protection.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_grid_task.rs",
             ],
         ),
         capability(
@@ -1152,6 +1167,8 @@ fn strategy_capabilities() -> Vec<Capability> {
             &[
                 "rust/crates/strategy/src/alert.rs",
                 "rust/crates/strategy/tests/price_alert.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/alert/mod.rs",
             ],
         ),
         capability(
@@ -1164,6 +1181,8 @@ fn strategy_capabilities() -> Vec<Capability> {
             &[
                 "rust/crates/strategy/src/virtual_grid.rs",
                 "rust/crates/strategy/tests/virtual_grid_golden.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/scanner.rs",
             ],
         ),
         capability(
@@ -1176,6 +1195,8 @@ fn strategy_capabilities() -> Vec<Capability> {
             &[
                 "rust/crates/strategy/src/volume_maker.rs",
                 "rust/crates/strategy/tests/volume_maker.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_volume_maker_task.rs",
             ],
         ),
     ]

@@ -14,9 +14,9 @@ pub use api::{
     PaperProfileKind, PaperProfileSettings, RequestLimitSettings, RuntimeLogSink,
     SETTINGS_SCHEMA_VERSION, SettingsResponse, SystemResponse, WEB_REQUEST_LIMIT_PER_MINUTE,
     WebAccessPolicy, WebAccessPolicyError, WebRequestRateLimiter, add_security_headers, api_router,
-    api_router_with_settings,
+    api_router_with_settings, api_router_with_settings_and_shutdown, api_router_with_shutdown,
 };
-pub use app::{app_router, app_router_with_settings};
+pub use app::{app_router, app_router_with_settings, app_router_with_settings_and_shutdown};
 pub use crypto_trading_control_plane::ReadControlPlane;
 pub use server::{DEFAULT_WEB_PORT, WebServerConfig, WebServerConfigError, serve_with_shutdown};
 pub use ui::{embedded_ui_assets, ui_assets_embedded};

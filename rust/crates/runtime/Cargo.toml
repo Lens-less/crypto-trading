@@ -26,5 +26,9 @@ uuid.workspace = true
 async-trait.workspace = true
 rust_decimal.workspace = true
 
+[[bench]]
+name = "history_inspection_scaling"
+harness = false
+
 [lints]
 workspace = true

@@ -10,11 +10,12 @@ use crypto_trading_domain::{
 use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
-    AccountRiskDirective, JsonlHistory, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
-    PaperReservationLeg, PaperReservationRequest,
+    AccountRiskDirective, AccountRiskError, DecisionRecord, JsonlHistory, PaperAccountAuthority,
+    PaperAccountConfig, PaperCostModel, PaperReservationLeg, PaperReservationRequest,
 };
 use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, AccountRiskRejection};
 use rust_decimal::Decimal;
+use serde_json::json;
 use uuid::Uuid;
 
 fn money(value: &str) -> Money {
@@ -114,6 +115,23 @@ async fn reserve_owner_leg(
     owner_task_id: &str,
     notional: &str,
 ) {
+    reserve_task_leg(
+        journal_id,
+        path,
+        account_id,
+        &format!("{owner_task_id}/op/000001"),
+        notional,
+    )
+    .await;
+}
+
+async fn reserve_task_leg(
+    journal_id: Uuid,
+    path: &std::path::Path,
+    account_id: &str,
+    reservation_task_id: &str,
+    notional: &str,
+) {
     let account = PaperAccountAuthority::new(
         journal_id,
         JsonlHistory::new(path),
@@ -129,8 +147,8 @@ async fn reserve_owner_leg(
     );
     let request = PaperReservationRequest::new(
         Uuid::new_v4(),
-        format!("{owner_task_id}/op/000001"),
-        format!("risk-gap:{owner_task_id}"),
+        reservation_task_id,
+        format!("risk-gap:{reservation_task_id}"),
         Uuid::new_v4(),
         PaperCostModel::v1(10, 5, 15).unwrap(),
         vec![PaperReservationLeg::from_intent(0, &intent, money(notional)).unwrap()],
@@ -320,6 +338,291 @@ async fn admitted_but_unreserved_notional_counts_toward_exposure_caps() {
 }
 
 #[tokio::test]
+async fn sixty_fifth_live_admission_is_refused_before_it_reaches_the_journal() {
+    let path = temp_path("live-admission-cap");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+
+    for index in 0..64 {
+        let admission = risk
+            .admit(
+                &candidate(&format!("owner-{index}"), "BTC-USDT", "1"),
+                at(9, 0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, AccountRiskAdmission::Admitted { .. }));
+    }
+
+    assert!(
+        risk.admit(&candidate("owner-64", "BTC-USDT", "1"), at(9, 1))
+            .await
+            .is_err(),
+        "the live capacity guard must run before an admitted fact is durable"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 64);
+}
+
+#[tokio::test]
+async fn expired_admission_is_compensated_once_and_restart_recovers() {
+    let path = temp_path("admission-lease");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+    let ticket = admitted_ticket(
+        risk.admit(&candidate("owner-a", "BTC-USDT", "10"), at(9, 0))
+            .await
+            .unwrap(),
+    );
+
+    let first: DecisionRecord = serde_json::from_str(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first.details["recorded_at"], json!(at(9, 0)));
+    let lease_expires_at: DateTime<Utc> =
+        serde_json::from_value(first.details["lease_expires_at"].clone()).unwrap();
+    assert_eq!(lease_expires_at, first.timestamp + Duration::seconds(300));
+
+    let recovery_now = Utc::now() + Duration::minutes(10);
+    assert_eq!(
+        risk.recover_expired_admissions(recovery_now).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        risk.recover_expired_admissions(recovery_now).await.unwrap(),
+        0
+    );
+    assert!(risk.state().await.unwrap().open_positions.is_empty());
+
+    let records = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(records.lines().count(), 2);
+    let expired: serde_json::Value = serde_json::from_str(records.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(expired["decision"], "account_risk_admission_expired");
+    assert_eq!(expired["details"]["ticket_id"], ticket.as_str());
+
+    let restarted = authority(journal_id, &path, AccountRiskLimits::default());
+    assert!(restarted.state().await.unwrap().open_positions.is_empty());
+    assert_eq!(
+        restarted
+            .recover_expired_admissions(recovery_now)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+}
+
+#[tokio::test]
+async fn v1_ticketless_admission_restarts_and_expires_with_a_stable_derived_ticket() {
+    let path = temp_path("v1-ticketless-expiry");
+    let journal_id = Uuid::new_v4();
+    let wall_time = Utc::now() - Duration::minutes(10);
+    JsonlHistory::new(&path)
+        .append(&DecisionRecord {
+            timestamp: wall_time,
+            strategy: "account_risk".to_owned(),
+            symbol: "paper".to_owned(),
+            decision: "account_risk_admitted".to_owned(),
+            details: json!({
+                "kind": "admitted",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "task_id": "legacy-owner",
+                "symbol": "BTC-USDT",
+                "notional": money("10"),
+                "utc_date": "2026-07-26",
+                "recorded_at": at(9, 0),
+                "warnings": [],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let restarted = authority(journal_id, &path, AccountRiskLimits::default());
+    assert_eq!(restarted.state().await.unwrap().open_positions.len(), 1);
+    assert_eq!(
+        restarted
+            .recover_expired_admissions(Utc::now())
+            .await
+            .unwrap(),
+        1
+    );
+    let records = std::fs::read_to_string(&path).unwrap();
+    let expired: serde_json::Value = serde_json::from_str(records.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(expired["details"]["schema_version"], 2);
+    assert!(
+        Uuid::parse_str(expired["details"]["ticket_id"].as_str().unwrap())
+            .is_ok_and(|ticket| !ticket.is_nil())
+    );
+
+    let replayed = authority(journal_id, &path, AccountRiskLimits::default());
+    assert!(replayed.state().await.unwrap().open_positions.is_empty());
+    assert_eq!(
+        replayed
+            .recover_expired_admissions(Utc::now())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+}
+
+#[tokio::test]
+async fn oversized_pre_guard_pending_set_is_replayable_and_durably_recoverable() {
+    let path = temp_path("legacy-pending-recovery");
+    let journal_id = Uuid::new_v4();
+    let history = JsonlHistory::new(&path);
+    let wall_time = Utc::now() - Duration::minutes(10);
+    let lease_expires_at = wall_time + Duration::minutes(5);
+    let records = (0..65)
+        .map(|index| DecisionRecord {
+            timestamp: wall_time,
+            strategy: "account_risk".to_owned(),
+            symbol: "paper".to_owned(),
+            decision: "account_risk_admitted".to_owned(),
+            details: json!({
+                "kind": "admitted",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "task_id": format!("legacy-owner-{index}"),
+                "symbol": "BTC-USDT",
+                "ticket_id": Uuid::new_v4().to_string(),
+                "notional": money("1"),
+                "utc_date": "2026-07-26",
+                "recorded_at": at(9, 0),
+                "lease_expires_at": lease_expires_at,
+                "warnings": [],
+            }),
+        })
+        .collect::<Vec<_>>();
+    history.append_batch(&records).await.unwrap();
+
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+    assert_eq!(risk.state().await.unwrap().open_positions.len(), 65);
+    assert_eq!(
+        risk.recover_expired_admissions(Utc::now()).await.unwrap(),
+        65
+    );
+
+    let restarted = authority(journal_id, &path, AccountRiskLimits::default());
+    assert!(restarted.state().await.unwrap().open_positions.is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 130);
+}
+
+#[tokio::test]
+async fn expiring_the_opening_ticket_promotes_the_next_live_ticket_clock() {
+    let path = temp_path("parallel-ticket-expiry");
+    let journal_id = Uuid::new_v4();
+    let history = JsonlHistory::new(&path);
+    let old_wall_time = Utc::now() - Duration::minutes(10);
+    let live_wall_time = Utc::now();
+    let admitted = |timestamp: DateTime<Utc>, recorded_at: DateTime<Utc>| DecisionRecord {
+        timestamp,
+        strategy: "account_risk".to_owned(),
+        symbol: "paper".to_owned(),
+        decision: "account_risk_admitted".to_owned(),
+        details: json!({
+            "kind": "admitted",
+            "schema_version": 1,
+            "journal_id": journal_id,
+            "scope_id": "paper",
+            "task_id": "owner-a",
+            "symbol": "BTC-USDT",
+            "ticket_id": Uuid::new_v4().to_string(),
+            "notional": money("1"),
+            "utc_date": recorded_at.format("%Y-%m-%d").to_string(),
+            "recorded_at": recorded_at,
+            "lease_expires_at": timestamp + Duration::minutes(5),
+            "warnings": [],
+        }),
+    };
+    history
+        .append_batch(&[
+            admitted(old_wall_time, at(9, 0)),
+            admitted(live_wall_time, at(9, 1)),
+        ])
+        .await
+        .unwrap();
+
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+    assert_eq!(
+        risk.recover_expired_admissions(Utc::now()).await.unwrap(),
+        1
+    );
+    let state = risk.state().await.unwrap();
+    assert_eq!(state.open_positions.len(), 1);
+    assert_eq!(state.open_positions[0].opened_at, at(9, 1));
+}
+
+#[tokio::test]
+async fn malformed_risk_fact_identity_and_money_fields_fail_closed() {
+    for case in [
+        "journal_id",
+        "strategy",
+        "scope",
+        "ticket",
+        "ticket_missing",
+        "lease_missing",
+        "notional",
+    ] {
+        let path = temp_path(&format!("invalid-{case}"));
+        let journal_id = Uuid::new_v4();
+        let wall_time = Utc::now();
+        let mut record = DecisionRecord {
+            timestamp: wall_time,
+            strategy: "account_risk".to_owned(),
+            symbol: "paper".to_owned(),
+            decision: "account_risk_admitted".to_owned(),
+            details: json!({
+                "kind": "admitted",
+                "schema_version": 2,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "task_id": "owner-a",
+                "symbol": "BTC-USDT",
+                "ticket_id": Uuid::new_v4().to_string(),
+                "notional": money("10"),
+                "utc_date": "2026-07-26",
+                "recorded_at": at(9, 0),
+                "lease_expires_at": wall_time + Duration::minutes(5),
+                "warnings": [],
+            }),
+        };
+        match case {
+            "journal_id" => record.details["journal_id"] = json!(Uuid::new_v4()),
+            "strategy" => record.strategy = "lookalike_risk".to_owned(),
+            "scope" => record.symbol = "another-scope".to_owned(),
+            "ticket" => record.details["ticket_id"] = json!(Uuid::nil().to_string()),
+            "ticket_missing" => {
+                record.details.as_object_mut().unwrap().remove("ticket_id");
+            }
+            "lease_missing" => {
+                record
+                    .details
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("lease_expires_at");
+            }
+            "notional" => record.details["notional"] = json!(money("0")),
+            _ => unreachable!(),
+        }
+        JsonlHistory::new(&path).append(&record).await.unwrap();
+
+        let risk = authority(journal_id, &path, AccountRiskLimits::default());
+        assert!(
+            matches!(risk.state().await, Err(AccountRiskError::DegradedState)),
+            "{case} mismatch must degrade the decision projection"
+        );
+    }
+}
+
+#[tokio::test]
 async fn reservation_consumption_and_cancellation_preserve_risk_scope_isolation() {
     let path = temp_path("scope-isolation");
     let journal_id = Uuid::new_v4();
@@ -357,6 +660,52 @@ async fn reservation_consumption_and_cancellation_preserve_risk_scope_isolation(
             .await
             .unwrap(),
         "the matching paper reservation must consume only scope-b's remaining ticket"
+    );
+}
+
+#[tokio::test]
+async fn legacy_reservation_fallback_accepts_only_a_numeric_operation_suffix() {
+    let path = temp_path("strict-operation-suffix");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+
+    for (owner, forged_task) in [
+        ("owner-fee", "owner-fee/op/fee"),
+        ("owner-nested", "owner-nested/op/000001/extra"),
+    ] {
+        let ticket = admitted_ticket(
+            risk.admit(&candidate(owner, "BTC-USDT", "10"), at(9, 0))
+                .await
+                .unwrap(),
+        );
+        reserve_task_leg(journal_id, &path, "paper-main", forged_task, "10").await;
+        assert!(
+            risk.cancel_admission(owner, &ticket, at(9, 1))
+                .await
+                .unwrap(),
+            "forged suffix {forged_task} must not consume the admission"
+        );
+    }
+
+    let ticket = admitted_ticket(
+        risk.admit(&candidate("owner-valid", "BTC-USDT", "10"), at(9, 2))
+            .await
+            .unwrap(),
+    );
+    reserve_task_leg(
+        journal_id,
+        &path,
+        "paper-main",
+        "owner-valid/op/000001",
+        "10",
+    )
+    .await;
+    assert!(
+        !risk
+            .cancel_admission("owner-valid", &ticket, at(9, 3))
+            .await
+            .unwrap(),
+        "the numeric legacy operation suffix must remain compatible"
     );
 }
 

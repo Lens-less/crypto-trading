@@ -27,6 +27,8 @@
 
 `grid` 和 `arbitrage` 的 one-shot 以及连续 Paper owner 都会先持久化计划/预留事实，再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。不确定结果不得直接重试，必须先按 journal 投影和权威对账处理。
 
+`research.indicators` 与 `research.backtest` 只标识 workspace 中存在的内部研究库；两者在 capability manifest 中均为 `Unavailable`。当前没有已出货二进制链接这些 crate，也没有受支持的 CLI 或 HTTP 入口。它们的单元/契约测试只证明库内算法约束，不代表 paper/live 等价、可执行生产策略或盈利能力。
+
 ## 快速验证
 
 `web` crate 在编译期嵌入 `../frontend/dist/`（React 操作台 bundle）。与 CI 完全一致的

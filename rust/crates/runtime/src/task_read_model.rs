@@ -141,6 +141,7 @@ pub struct ReadOnlyTaskSourceView {
     pub phase: ReadOnlyTaskSourcePhase,
     pub health: ReadOnlyTaskSourceHealth,
     pub event_sequence: u64,
+    pub dropped_event_count: u64,
     pub consecutive_source_failures: u32,
     pub last_event_at: Option<DateTime<Utc>>,
     pub exit: Option<ReadOnlyTaskSourceExit>,
@@ -502,6 +503,7 @@ fn validate_fact_shape(
                         || source.phase != ReadOnlyTaskSourcePhase::Starting
                         || source.health != ReadOnlyTaskSourceHealth::Unknown
                         || source.event_sequence != 0
+                        || source.dropped_event_count != 0
                         || source.consecutive_source_failures != 0
                         || source.last_event_at.is_some()
                         || source.exit.is_some()
@@ -563,25 +565,45 @@ fn parse_sources(value: &Value) -> Result<Vec<ReadOnlyTaskSourceView>, ()> {
 
 fn parse_source(value: &Value) -> Result<ReadOnlyTaskSourceView, ()> {
     let source = object(value)?;
-    ensure_exact_fields(
-        source,
-        &[
-            "schema_version",
-            "task_id",
-            "source_id",
-            "phase",
-            "health",
-            "event_sequence",
-            "consecutive_source_failures",
-            "last_event_at",
-            "exit",
-        ],
-    )?;
-    if required_u64(source, "schema_version")?
-        != u64::from(crate::MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION)
-    {
-        return Err(());
-    }
+    let schema_version = required_u64(source, "schema_version")?;
+    let dropped_event_count = match schema_version {
+        1 => {
+            ensure_exact_fields(
+                source,
+                &[
+                    "schema_version",
+                    "task_id",
+                    "source_id",
+                    "phase",
+                    "health",
+                    "event_sequence",
+                    "consecutive_source_failures",
+                    "last_event_at",
+                    "exit",
+                ],
+            )?;
+            0
+        }
+        version if version == u64::from(crate::MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION) => {
+            ensure_exact_fields(
+                source,
+                &[
+                    "schema_version",
+                    "task_id",
+                    "source_id",
+                    "phase",
+                    "health",
+                    "event_sequence",
+                    "dropped_event_count",
+                    "consecutive_source_failures",
+                    "last_event_at",
+                    "exit",
+                ],
+            )?;
+            required_u64(source, "dropped_event_count")?
+        }
+        _ => return Err(()),
+    };
     let task_id = optional_uuid(required(source, "task_id")?)?;
     let source_id = required_text(source, "source_id")?;
     let phase = match required_text(source, "phase")?.as_str() {
@@ -615,6 +637,7 @@ fn parse_source(value: &Value) -> Result<ReadOnlyTaskSourceView, ()> {
         phase,
         health,
         event_sequence,
+        dropped_event_count,
         consecutive_source_failures,
         last_event_at,
         exit,
@@ -640,6 +663,7 @@ fn same_source_contract(
         && previous.iter().zip(next).all(|(previous, next)| {
             previous.source_id == next.source_id
                 && next.event_sequence >= previous.event_sequence
+                && next.dropped_event_count >= previous.dropped_event_count
                 && previous
                     .task_id
                     .is_none_or(|task_id| next.task_id == Some(task_id))

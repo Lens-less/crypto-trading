@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
+use chrono::{DateTime, Utc};
 use crypto_trading_domain::Money;
 use uuid::Uuid;
 
@@ -21,6 +22,10 @@ use crate::{
 };
 
 const MAX_AUTHORITY_SNAPSHOT_ATTEMPTS: usize = 3;
+/// A full durability cross-check follows every 64 cache-backed refreshes.
+/// Cold replay already reads and projects the complete frozen journal, so it
+/// resets this counter without immediately repeating the same work.
+const AUTHORITY_DURABILITY_VERIFY_REFRESH_INTERVAL: u32 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AuthorityStateKey {
@@ -31,6 +36,8 @@ struct AuthorityStateKey {
 #[derive(Debug, Default)]
 struct AuthorityStateCell {
     cached: Option<Arc<AuthorityProjection>>,
+    durability_degraded: bool,
+    cache_refreshes_since_verification: u32,
 }
 
 static AUTHORITY_STATE_CELLS: OnceLock<
@@ -59,6 +66,46 @@ struct HistoricalReservationMaps {
     batch_ids: HashMap<(String, Uuid), Arc<PaperReservationView>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalAuthorityProjection {
+    head: HistoryChainHead,
+    last_sequence: u64,
+    paper_live: PaperAccountReadModel,
+    risk: AccountRiskReadModel,
+    open_admissions: Vec<CanonicalOpenAdmission>,
+    historical_reservations: CanonicalHistoricalReservationIndex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalOpenAdmission {
+    scope_id: String,
+    task_id: String,
+    symbol: String,
+    ticket_id: Option<String>,
+    recorded_at: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
+    notional: Money,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalHistoricalReservationIndex {
+    by_task_key: Vec<((String, String, String), PaperReservationView)>,
+    reservation_ids: Vec<((String, Uuid), PaperReservationView)>,
+    batch_ids: Vec<((String, Uuid), PaperReservationView)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurableVerification {
+    Match,
+    Mismatch,
+    Superseded,
+}
+
+struct ProjectionRefresh {
+    projection: Arc<AuthorityProjection>,
+    cold_replayed: bool,
+}
+
 impl HistoricalReservationIndex {
     fn empty() -> Self {
         Self {
@@ -66,23 +113,17 @@ impl HistoricalReservationIndex {
         }
     }
 
-    fn apply_model_updates(
+    fn apply_terminal_updates(
         &self,
-        model: &PaperAccountReadModel,
-        previous_last_sequence: u64,
+        updates: &[paper_account::TerminalReservationUpdate],
     ) -> Result<(), AuthorityStateError> {
-        let updates = model.accounts.iter().flat_map(|account| {
-            account
-                .reservations
-                .iter()
-                .filter(move |reservation| reservation.last_sequence > previous_last_sequence)
-                .map(|reservation| (account.account_id.clone(), Arc::new(reservation.clone())))
-        });
         let mut maps = self
             .maps
             .lock()
             .map_err(|_| AuthorityStateError::Degraded)?;
-        for (account_id, reservation) in updates {
+        for update in updates {
+            let account_id = update.account_id.clone();
+            let reservation = Arc::new(update.reservation.clone());
             maps.by_task_key.insert(
                 (
                     account_id.clone(),
@@ -99,6 +140,36 @@ impl HistoricalReservationIndex {
                 .insert((account_id, reservation.batch_id), reservation);
         }
         Ok(())
+    }
+
+    fn canonical(&self) -> Result<CanonicalHistoricalReservationIndex, AuthorityStateError> {
+        let maps = self
+            .maps
+            .lock()
+            .map_err(|_| AuthorityStateError::Degraded)?;
+        let mut by_task_key = maps
+            .by_task_key
+            .iter()
+            .map(|(key, reservation)| (key.clone(), reservation.as_ref().clone()))
+            .collect::<Vec<_>>();
+        by_task_key.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut reservation_ids = maps
+            .reservation_ids
+            .iter()
+            .map(|(key, reservation)| (key.clone(), reservation.as_ref().clone()))
+            .collect::<Vec<_>>();
+        reservation_ids.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut batch_ids = maps
+            .batch_ids
+            .iter()
+            .map(|(key, reservation)| (key.clone(), reservation.as_ref().clone()))
+            .collect::<Vec<_>>();
+        batch_ids.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(CanonicalHistoricalReservationIndex {
+            by_task_key,
+            reservation_ids,
+            batch_ids,
+        })
     }
 
     #[cfg(test)]
@@ -182,16 +253,51 @@ impl AuthorityStateCache {
         &self,
         history: &JsonlHistory,
     ) -> Result<Arc<AuthorityProjection>, AuthorityStateError> {
+        let refreshed = self.refresh_projection(history).await?;
+        if self.should_verify_after_refresh(&refreshed)? {
+            let verification = verify_projection_against_durable_history(
+                self.key.journal_id,
+                history,
+                Arc::clone(&refreshed.projection),
+            )
+            .await;
+            match self.require_verification_result(&verification)? {
+                DurableVerification::Match => {
+                    self.mark_durability_verified(&refreshed.projection)?;
+                }
+                DurableVerification::Mismatch => {
+                    self.latch_durability_degraded();
+                    return Err(AuthorityStateError::Degraded);
+                }
+                DurableVerification::Superseded => {}
+            }
+        }
+        Ok(refreshed.projection)
+    }
+
+    async fn refresh_projection(
+        &self,
+        history: &JsonlHistory,
+    ) -> Result<ProjectionRefresh, AuthorityStateError> {
+        let cached = {
+            let cell = self
+                .cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cell.durability_degraded {
+                return Err(AuthorityStateError::Degraded);
+            }
+            cell.cached.clone()
+        };
         let mut current_head = history.inspect_chain_head().await?;
-        let cached = self
-            .cell
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cached
-            .clone();
         if let Some(cached) = cached.as_ref() {
             match classify_head_progression(&cached.head, &current_head) {
-                HeadProgression::Same => return Ok(Arc::clone(cached)),
+                HeadProgression::Same => {
+                    return Ok(ProjectionRefresh {
+                        projection: Arc::clone(cached),
+                        cold_replayed: false,
+                    });
+                }
                 HeadProgression::RegressedOrDiscontinuous => {
                     return Err(AuthorityStateError::Degraded);
                 }
@@ -200,11 +306,18 @@ impl AuthorityStateCache {
                         && delta.head_after == current_head
                     {
                         let updated = Arc::new(apply_delta(cached.as_ref(), delta)?);
-                        self.cell
+                        let mut cell = self
+                            .cell
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .cached = Some(updated.clone());
-                        return Ok(updated);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if cell.durability_degraded {
+                            return Err(AuthorityStateError::Degraded);
+                        }
+                        cell.cached = Some(updated.clone());
+                        return Ok(ProjectionRefresh {
+                            projection: updated,
+                            cold_replayed: false,
+                        });
                     }
                 }
             }
@@ -213,7 +326,12 @@ impl AuthorityStateCache {
         current_head = history.inspect_chain_head().await?;
         if let Some(cached) = cached {
             match classify_head_progression(&cached.head, &current_head) {
-                HeadProgression::Same => return Ok(cached),
+                HeadProgression::Same => {
+                    return Ok(ProjectionRefresh {
+                        projection: cached,
+                        cold_replayed: false,
+                    });
+                }
                 HeadProgression::Forward => {}
                 HeadProgression::RegressedOrDiscontinuous => {
                     return Err(AuthorityStateError::Degraded);
@@ -225,12 +343,134 @@ impl AuthorityStateCache {
             .cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.durability_degraded {
+            return Err(AuthorityStateError::Degraded);
+        }
         cell.cached = Some(rebuilt.clone());
-        Ok(rebuilt)
+        Ok(ProjectionRefresh {
+            projection: rebuilt,
+            cold_replayed: true,
+        })
+    }
+
+    pub(crate) async fn verify_durable_state(
+        &self,
+        history: &JsonlHistory,
+    ) -> Result<(), AuthorityStateError> {
+        for _ in 0..MAX_AUTHORITY_SNAPSHOT_ATTEMPTS {
+            let refreshed = self.refresh_projection(history).await?;
+            let verification = verify_projection_against_durable_history(
+                self.key.journal_id,
+                history,
+                Arc::clone(&refreshed.projection),
+            )
+            .await;
+            match self.require_verification_result(&verification)? {
+                DurableVerification::Match => {
+                    self.mark_durability_verified(&refreshed.projection)?;
+                    return Ok(());
+                }
+                DurableVerification::Mismatch => {
+                    self.latch_durability_degraded();
+                    return Err(AuthorityStateError::Degraded);
+                }
+                DurableVerification::Superseded => {}
+            }
+        }
+        Err(AuthorityStateError::Degraded)
+    }
+
+    fn require_verification_result(
+        &self,
+        verification: &Result<DurableVerification, AuthorityStateError>,
+    ) -> Result<DurableVerification, AuthorityStateError> {
+        if let Ok(result) = verification {
+            return Ok(*result);
+        }
+        // Once a frozen head cannot be proven equivalent to the process-local
+        // projection, returning the old cache would put memory ahead of
+        // durable truth. Treat every verification failure as an integrity
+        // failure and require operator intervention, even if the bytes are
+        // later restored.
+        self.latch_durability_degraded();
+        Err(AuthorityStateError::Degraded)
+    }
+
+    fn should_verify_after_refresh(
+        &self,
+        refreshed: &ProjectionRefresh,
+    ) -> Result<bool, AuthorityStateError> {
+        let mut cell = self
+            .cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.durability_degraded {
+            return Err(AuthorityStateError::Degraded);
+        }
+        if refreshed.cold_replayed {
+            cell.cache_refreshes_since_verification = 0;
+            return Ok(false);
+        }
+        cell.cache_refreshes_since_verification =
+            cell.cache_refreshes_since_verification.saturating_add(1);
+        Ok(cell.cache_refreshes_since_verification >= AUTHORITY_DURABILITY_VERIFY_REFRESH_INTERVAL)
+    }
+
+    fn mark_durability_verified(
+        &self,
+        verified: &AuthorityProjection,
+    ) -> Result<(), AuthorityStateError> {
+        let mut cell = self
+            .cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.durability_degraded {
+            return Err(AuthorityStateError::Degraded);
+        }
+        if cell
+            .cached
+            .as_ref()
+            .is_some_and(|cached| cached.head == verified.head)
+        {
+            cell.cache_refreshes_since_verification = 0;
+        }
+        Ok(())
+    }
+
+    fn latch_durability_degraded(&self) {
+        self.cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability_degraded = true;
     }
 }
 
 impl AuthorityProjection {
+    fn canonical(&self) -> Result<CanonicalAuthorityProjection, AuthorityStateError> {
+        let mut open_admissions = self
+            .open_admissions
+            .iter()
+            .map(|admission| CanonicalOpenAdmission {
+                scope_id: admission.scope_id.clone(),
+                task_id: admission.task_id.clone(),
+                symbol: admission.symbol.clone(),
+                ticket_id: admission.ticket_id.clone(),
+                recorded_at: admission.recorded_at,
+                lease_expires_at: admission.lease_expires_at,
+                notional: admission.notional,
+            })
+            .collect::<Vec<_>>();
+        open_admissions.sort();
+        Ok(CanonicalAuthorityProjection {
+            head: self.head.clone(),
+            last_sequence: self.last_sequence,
+            paper_live: self.paper_live.clone(),
+            risk: self.risk.clone(),
+            open_admissions,
+            historical_reservations: self.historical_reservations.canonical()?,
+        })
+    }
+
     pub(crate) fn paper_snapshot(
         &self,
         account_id: &str,
@@ -289,6 +529,23 @@ impl AuthorityProjection {
             .filter(|admission| admission.scope_id == scope_id)
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn bound_open_admission(
+        &self,
+        scope_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<OpenAdmission>, AuthorityStateError> {
+        if self.risk.projection_status != ProjectionStatus::Complete {
+            return Err(AuthorityStateError::Degraded);
+        }
+        Ok(self
+            .open_admissions
+            .iter()
+            .find(|admission| {
+                admission.scope_id == scope_id && admission.ticket_id.as_deref() == Some(ticket_id)
+            })
+            .cloned())
     }
 
     pub(crate) fn historical_reservation(
@@ -416,33 +673,74 @@ async fn load_journal_snapshot(
     .map_err(|_| JournalReadError::Read(io::Error::other("authority snapshot task failed")))?
 }
 
+async fn verify_projection_against_durable_history(
+    journal_id: Uuid,
+    history: &JsonlHistory,
+    cached: Arc<AuthorityProjection>,
+) -> Result<DurableVerification, AuthorityStateError> {
+    let frozen_head = cached.head.clone();
+    if history.inspect_chain_head().await? != frozen_head {
+        return Ok(DurableVerification::Superseded);
+    }
+    let snapshot = load_journal_snapshot(journal_id, history.path()).await?;
+    let observed_head = history.inspect_chain_head().await?;
+    let snapshot_bytes = u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
+    if observed_head != frozen_head || history_head_bytes(&observed_head) != Some(snapshot_bytes) {
+        return Ok(DurableVerification::Superseded);
+    }
+
+    let replay_head = frozen_head.clone();
+    let replayed = tokio::task::spawn_blocking(move || project_snapshot(&snapshot, replay_head))
+        .await
+        .map_err(|_| authority_verification_task_failed("projection"))??;
+    let projections_match = tokio::task::spawn_blocking(move || {
+        Ok::<_, AuthorityStateError>(cached.canonical()? == replayed.canonical()?)
+    })
+    .await
+    .map_err(|_| authority_verification_task_failed("comparison"))??;
+
+    if history.inspect_chain_head().await? != frozen_head {
+        return Ok(DurableVerification::Superseded);
+    }
+    if projections_match {
+        Ok(DurableVerification::Match)
+    } else {
+        Ok(DurableVerification::Mismatch)
+    }
+}
+
+fn authority_verification_task_failed(stage: &str) -> AuthorityStateError {
+    AuthorityStateError::Journal(JournalReadError::Read(io::Error::other(format!(
+        "authority durability verification {stage} task failed"
+    ))))
+}
+
 fn project_snapshot(
     snapshot: &JournalSnapshot,
     head: HistoryChainHead,
 ) -> Result<AuthorityProjection, AuthorityStateError> {
     let mut risk = account_risk::ProjectionBuilder::new(snapshot.journal_id());
     let mut paper_live = paper_account::ProjectionBuilder::new(snapshot.journal_id());
-    let mut paper_all = paper_account::ProjectionBuilder::new(snapshot.journal_id())
-        .retain_terminal_reservations(true);
+    let historical_reservations = HistoricalReservationIndex::empty();
     let mut open_admissions = Vec::new();
     let mut cursor = None;
     let mut last_sequence = 0_u64;
     loop {
         let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())?;
+        let mut terminal_updates = Vec::new();
         for event in page.events() {
             last_sequence = event.sequence();
             risk.observe_event(event)?;
-            paper_live.observe_event(event);
-            paper_all.observe_event(event);
-            account_risk::apply_open_admission_event(&mut open_admissions, event.payload())
+            terminal_updates.extend(paper_live.observe_event_with_terminal_updates(event));
+            account_risk::apply_open_admission_event(&mut open_admissions, event)
                 .map_err(|_| AuthorityStateError::Degraded)?;
         }
+        historical_reservations.apply_terminal_updates(&terminal_updates)?;
         match page.boundary() {
             JournalPageBoundary::SnapshotEnd => break,
             JournalPageBoundary::PartialTail { .. } => {
                 risk.mark_partial_tail();
                 paper_live.mark_partial_tail();
-                paper_all.mark_partial_tail();
                 break;
             }
             JournalPageBoundary::PageLimit => {
@@ -458,14 +756,13 @@ fn project_snapshot(
     }
     let risk = risk.finish();
     let paper_live = paper_live.finish()?;
-    let paper_all = paper_all.finish()?;
     Ok(AuthorityProjection {
         head,
         last_sequence,
-        historical_reservations: build_historical_reservation_index(&paper_all)?,
         paper_live,
         risk,
         open_admissions,
+        historical_reservations,
     })
 }
 
@@ -499,10 +796,8 @@ fn apply_delta(
     }
 
     let mut risk = account_risk::ProjectionBuilder::from_model(cached.risk.clone());
-    let mut paper_live =
-        paper_account::ProjectionBuilder::from_model(cached.paper_live.clone(), false);
-    let mut paper_updates =
-        paper_account::ProjectionBuilder::from_model(cached.paper_live.clone(), true);
+    let mut paper_live = paper_account::ProjectionBuilder::from_model(cached.paper_live.clone());
+    let mut terminal_updates = Vec::new();
     let mut open_admissions = cached.open_admissions.clone();
     let mut sequence = cached.last_sequence;
     for record in delta.records {
@@ -511,17 +806,15 @@ fn apply_delta(
             .ok_or(AuthorityStateError::Degraded)?;
         let event = event_from_decision_record(cached.paper_live.journal_id, sequence, &record)?;
         risk.observe_event(&event)?;
-        paper_live.observe_event(&event);
-        paper_updates.observe_event(&event);
-        account_risk::apply_open_admission_event(&mut open_admissions, event.payload())
+        terminal_updates.extend(paper_live.observe_event_with_terminal_updates(&event));
+        account_risk::apply_open_admission_event(&mut open_admissions, &event)
             .map_err(|_| AuthorityStateError::Degraded)?;
     }
     let risk = risk.finish();
     let paper_live = paper_live.finish()?;
-    let paper_updates = paper_updates.finish()?;
     cached
         .historical_reservations
-        .apply_model_updates(&paper_updates, cached.last_sequence)?;
+        .apply_terminal_updates(&terminal_updates)?;
     Ok(AuthorityProjection {
         head: delta.head_after,
         last_sequence: sequence,
@@ -536,14 +829,6 @@ fn history_head_bytes(head: &HistoryChainHead) -> Option<u64> {
     head.sealed_segment_bytes
         .iter()
         .try_fold(head.active_bytes, |total, bytes| total.checked_add(*bytes))
-}
-
-fn build_historical_reservation_index(
-    model: &PaperAccountReadModel,
-) -> Result<HistoricalReservationIndex, AuthorityStateError> {
-    let index = HistoricalReservationIndex::empty();
-    index.apply_model_updates(model, 0)?;
-    Ok(index)
 }
 
 #[cfg(test)]
