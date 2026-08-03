@@ -1027,7 +1027,7 @@ fn dispatcher_config(capacity: usize) -> NotificationDispatcherConfig {
     NotificationDispatcherConfig::new(
         capacity,
         StdDuration::from_millis(100),
-        StdDuration::from_millis(200),
+        StdDuration::from_secs(5),
     )
     .unwrap()
 }

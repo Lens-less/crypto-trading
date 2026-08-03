@@ -954,7 +954,7 @@ impl JsonlHistory {
         file.read_exact(&mut tail)
             .await
             .map_err(HistoryError::TailInspect)?;
-        if tail == [b'\n'] {
+        if tail == *b"\n" {
             return Ok(HistoryTailRepairOutcome::Unchanged {
                 retained_bytes: existing_bytes,
             });

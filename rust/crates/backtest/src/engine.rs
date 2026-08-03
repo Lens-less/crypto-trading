@@ -8,18 +8,13 @@ use rust_decimal::Decimal;
 use crate::{BacktestError, ledger::Ledger};
 
 /// Which production quote field should become the deterministic backtest mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MarketEventPrice {
+    #[default]
     LastOrMid,
     Mid,
     Bid,
     Ask,
-}
-
-impl Default for MarketEventPrice {
-    fn default() -> Self {
-        Self::LastOrMid
-    }
 }
 
 /// Deterministic market data event consumed by a backtest tape.
