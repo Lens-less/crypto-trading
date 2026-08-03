@@ -31,6 +31,34 @@ const READY_PATH_ENV: &str = "JSONL_ROTATION_LOCK_READY_PATH";
 const RELEASE_PATH_ENV: &str = "JSONL_ROTATION_LOCK_RELEASE_PATH";
 
 #[tokio::test]
+async fn unrelated_numeric_neighbors_do_not_block_journal_appends() {
+    let root = temp_root("history-rotation-numeric-neighbors");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    std::fs::write(path.with_file_name("decisions.jsonl.0"), b"unrelated\n").unwrap();
+    std::fs::write(path.with_file_name("decisions.jsonl.01"), b"unrelated\n").unwrap();
+    std::fs::write(
+        path.with_file_name("decisions.jsonl.999999"),
+        b"unrelated\n",
+    )
+    .unwrap();
+    let expected = record("numeric_neighbors_ignored", 0);
+
+    JsonlHistory::new(&path).append(&expected).await.unwrap();
+
+    let journal_id = Uuid::from_bytes([6; 16]);
+    let source = FileJournalSnapshotSource::new(journal_id, &path).unwrap();
+    let page = LegacyJsonlJournalReader::read_page(&source.snapshot().unwrap(), None).unwrap();
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(
+        page.events()[0].payload()["decision"],
+        "numeric_neighbors_ignored"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn appends_across_the_file_limit_seal_a_segment_and_continue() {
     let root = temp_root("history-rotation-seal");
     std::fs::create_dir_all(&root).unwrap();
@@ -38,9 +66,7 @@ async fn appends_across_the_file_limit_seal_a_segment_and_continue() {
     let history = JsonlHistory::new(&path);
     let record = record("rotation_fill", 0);
     let record_bytes = u64::try_from(encoded(&record).len()).unwrap();
-    let file = std::fs::File::create(&path).unwrap();
-    file.set_len(MAX_HISTORY_FILE_BYTES - record_bytes).unwrap();
-    drop(file);
+    newline_terminated_fill(&path, MAX_HISTORY_FILE_BYTES - record_bytes);
 
     history.append(&record).await.unwrap();
     assert_eq!(file_len(&path), MAX_HISTORY_FILE_BYTES);
@@ -258,10 +284,7 @@ async fn segment_and_chain_budgets_fail_closed_without_writing() {
     }
     let overflow = record("rotation_overflow", 1);
     let overflow_bytes = u64::try_from(encoded(&overflow).len()).unwrap();
-    let file = std::fs::File::create(&path).unwrap();
-    file.set_len(MAX_HISTORY_FILE_BYTES - overflow_bytes + 1)
-        .unwrap();
-    drop(file);
+    newline_terminated_fill(&path, MAX_HISTORY_FILE_BYTES - overflow_bytes + 1);
     let before = file_len(&path);
 
     // A crossing append on a full chain fails closed instead of sealing.
@@ -314,6 +337,417 @@ async fn segment_and_chain_budgets_fail_closed_without_writing() {
     std::fs::remove_dir_all(oversized_root).unwrap();
 }
 
+#[tokio::test]
+async fn crash_left_partial_tail_is_truncated_at_the_last_complete_record_before_append() {
+    let root = temp_root("history-rotation-partial-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    let first = record("execution_planned", 0);
+    history.append(&first).await.unwrap();
+    let partial = encoded(&record("execution_partial", 1));
+
+    // Crash mid-write: the last record is cut off before its closing bytes.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&partial[..partial.len() - 2]);
+    std::fs::write(&path, &bytes).unwrap();
+
+    // Readers still see a detectable, recoverable partial-tail boundary...
+    let source = FileJournalSnapshotSource::new(Uuid::from_bytes([13; 16]), &path).unwrap();
+    let page = LegacyJsonlJournalReader::read_page(&source.snapshot().unwrap(), None).unwrap();
+    assert!(matches!(
+        page.boundary(),
+        JournalPageBoundary::PartialTail { .. }
+    ));
+
+    // ...and the writer quarantines only the crash-left tail before
+    // continuing, preserving the valid prefix.
+    let resumed = record("execution_completed", 2);
+    history.append(&resumed).await.unwrap();
+    let mut expected = encoded(&first);
+    expected.extend_from_slice(&encoded(&resumed));
+    assert_eq!(read_journal_chain(&path).unwrap(), expected);
+    let quarantines = partial_tail_quarantines(&root);
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(
+        std::fs::read(&quarantines[0]).unwrap(),
+        partial[..partial.len() - 2]
+    );
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn partial_tail_quarantine_retains_only_the_latest_sixteen_artifacts() {
+    let root = temp_root("history-quarantine-retention");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    history.append(&record("seed", 0)).await.unwrap();
+    let mut latest_fragment = Vec::new();
+
+    for index in 1..=20 {
+        let interrupted = encoded(&record("interrupted", index));
+        let fragment = interrupted[..interrupted.len() - 2].to_vec();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            &fragment,
+        )
+        .unwrap();
+        history
+            .append(&record("resumed", 100 + index))
+            .await
+            .unwrap();
+        latest_fragment = fragment;
+    }
+
+    let quarantines = partial_tail_quarantines(&root);
+    assert_eq!(quarantines.len(), 16);
+    assert!(quarantines.iter().all(|path| {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+    }));
+    assert!(
+        quarantines
+            .iter()
+            .any(|path| std::fs::read(path).unwrap() == latest_fragment)
+    );
+
+    let journal_id = Uuid::from_bytes([14; 16]);
+    let source = FileJournalSnapshotSource::new(journal_id, &path).unwrap();
+    let page = LegacyJsonlJournalReader::read_page(&source.snapshot().unwrap(), None).unwrap();
+    assert_eq!(page.events().len(), 21);
+    assert_eq!(page.boundary(), &JournalPageBoundary::SnapshotEnd);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn unmanaged_quarantine_entries_fail_closed_before_active_tail_truncation() {
+    let root = temp_root("history-quarantine-unmanaged-entry");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    let first = record("seed", 0);
+    history.append(&first).await.unwrap();
+    let fragment = br#"{"decision":"interrupted""#;
+    let mut active_bytes = std::fs::read(&path).unwrap();
+    active_bytes.extend_from_slice(fragment);
+    std::fs::write(&path, &active_bytes).unwrap();
+    let quarantine_directory = root.join("decisions.jsonl.quarantine");
+    std::fs::create_dir(&quarantine_directory).unwrap();
+    std::fs::write(
+        quarantine_directory.join("operator-note.txt"),
+        b"preserve me",
+    )
+    .unwrap();
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(error, HistoryError::TailQuarantine { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), active_bytes);
+    assert_eq!(
+        std::fs::read(quarantine_directory.join("operator-note.txt")).unwrap(),
+        b"preserve me"
+    );
+    assert!(partial_tail_quarantines(&root).is_empty());
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn crash_left_first_active_record_after_rotation_is_quarantined_before_append() {
+    let root = temp_root("history-rotation-unanchored-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let sealed_record = record("execution_planned", 0);
+    std::fs::write(sealed(&path, 1), encoded(&sealed_record)).unwrap();
+    let interrupted = encoded(&record("execution_interrupted", 1));
+    let fragment = &interrupted[..interrupted.len() - 2];
+    std::fs::write(&path, fragment).unwrap();
+
+    // A restart after rotation sees no newline anchor in the fresh active
+    // file. The fragment is nevertheless an exact crash-left suffix: it must
+    // be quarantined in full so the durable sealed prefix can keep running.
+    let history = JsonlHistory::new(&path);
+    let resumed = record("execution_resumed", 2);
+
+    history.append(&resumed).await.unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), encoded(&resumed));
+    let mut expected = encoded(&sealed_record);
+    expected.extend_from_slice(&encoded(&resumed));
+    assert_eq!(read_journal_chain(&path).unwrap(), expected);
+
+    let quarantines = partial_tail_quarantines(&root);
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(std::fs::read(&quarantines[0]).unwrap(), fragment);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn crash_inside_the_final_utf8_code_point_is_quarantined_before_append() {
+    let root = temp_root("history-rotation-unanchored-utf8-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let sealed_record = record("execution_planned", 0);
+    std::fs::write(sealed(&path, 1), encoded(&sealed_record)).unwrap();
+
+    let mut interrupted = record("placeholder", 1);
+    interrupted.decision = "路径\\\"执行\u{0001}中断🚀".to_owned();
+    let interrupted = encoded(&interrupted);
+    let emoji = "🚀".as_bytes();
+    let emoji_start = interrupted
+        .windows(emoji.len())
+        .rposition(|window| window == emoji)
+        .unwrap();
+    let fragment = &interrupted[..emoji_start + 2];
+    let utf8_error = std::str::from_utf8(fragment).unwrap_err();
+    assert_eq!(utf8_error.valid_up_to(), emoji_start);
+    assert_eq!(utf8_error.error_len(), None);
+    std::fs::write(&path, fragment).unwrap();
+
+    // SIGKILL can split the final UTF-8 code point emitted by the serializer.
+    // The incomplete code point is part of the exact crash-left suffix, not a
+    // complete malformed fact that should poison every later restart.
+    let history = JsonlHistory::new(&path);
+    let resumed = record("execution_resumed", 2);
+    history.append(&resumed).await.unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), encoded(&resumed));
+    let mut expected = encoded(&sealed_record);
+    expected.extend_from_slice(&encoded(&resumed));
+    assert_eq!(read_journal_chain(&path).unwrap(), expected);
+    let quarantines = partial_tail_quarantines(&root);
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(std::fs::read(&quarantines[0]).unwrap(), fragment);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn definite_invalid_utf8_at_the_active_tail_still_fails_closed() {
+    let root = temp_root("history-rotation-invalid-utf8-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted_record = record("placeholder", 0);
+    corrupted_record.decision = "执行中断🚀".to_owned();
+    let encoded = encoded(&corrupted_record);
+    let emoji = "🚀".as_bytes();
+    let emoji_start = encoded
+        .windows(emoji.len())
+        .rposition(|window| window == emoji)
+        .unwrap();
+    let mut corrupted = encoded[..emoji_start].to_vec();
+    corrupted.push(0xff);
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.valid_up_to(), emoji_start);
+    assert_eq!(utf8_error.error_len(), Some(1));
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    assert!(partial_tail_quarantines(&root).is_empty());
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_utf8_inside_a_complete_active_record_still_fails_closed() {
+    let root = temp_root("history-rotation-invalid-utf8-middle");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted_record = record("placeholder", 0);
+    corrupted_record.decision = "执行中断🚀".to_owned();
+    let mut corrupted = encoded(&corrupted_record);
+    assert_eq!(corrupted.pop(), Some(b'\n'));
+    let emoji = "🚀".as_bytes();
+    let emoji_start = corrupted
+        .windows(emoji.len())
+        .rposition(|window| window == emoji)
+        .unwrap();
+    corrupted[emoji_start] = 0xff;
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.valid_up_to(), emoji_start);
+    assert_eq!(utf8_error.error_len(), Some(1));
+    assert!(emoji_start + 1 < corrupted.len());
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn malformed_valid_utf8_prefix_plus_truncated_codepoint_still_fails_closed() {
+    let root = temp_root("history-rotation-malformed-prefix-truncated-utf8");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted = b"{bad json}".to_vec();
+    corrupted.push(0xf0);
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.error_len(), None);
+    assert_eq!(&corrupted[..utf8_error.valid_up_to()], b"{bad json}");
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 0)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    assert_eq!(partial_tail_quarantines(&root).len(), 0);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn truncated_codepoint_outside_json_string_still_fails_closed() {
+    let root = temp_root("history-rotation-truncated-utf8-outside-string");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let mut corrupted = b"{".to_vec();
+    corrupted.push(0xf0);
+    let utf8_error = std::str::from_utf8(&corrupted).unwrap_err();
+    assert_eq!(utf8_error.valid_up_to(), 1);
+    assert_eq!(utf8_error.error_len(), None);
+    std::fs::write(&path, &corrupted).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 0)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+    assert_eq!(partial_tail_quarantines(&root).len(), 0);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn complete_active_record_without_a_terminator_is_preserved_before_append() {
+    let root = temp_root("history-rotation-complete-unterminated");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let completed = record("execution_completed_before_crash", 0);
+    let mut completed_without_terminator = encoded(&completed);
+    assert_eq!(completed_without_terminator.pop(), Some(b'\n'));
+    std::fs::write(&path, &completed_without_terminator).unwrap();
+
+    // The JSON body is a complete durable fact. A crash may have lost only
+    // its line terminator, so recovery must retain the fact instead of
+    // quarantining it as though the body itself were incomplete.
+    let history = JsonlHistory::new(&path);
+    let resumed = record("execution_resumed", 1);
+    history.append(&resumed).await.unwrap();
+
+    let mut expected = encoded(&completed);
+    expected.extend_from_slice(&encoded(&resumed));
+    assert_eq!(read_journal_chain(&path).unwrap(), expected);
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+    assert!(partial_tail_quarantines(&root).is_empty());
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn complete_unterminated_tail_after_an_anchored_prefix_is_preserved() {
+    let root = temp_root("history-rotation-complete-anchored-tail");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let first = record("execution_planned", 0);
+    let completed = record("execution_completed_before_crash", 1);
+    let mut bytes = encoded(&first);
+    bytes.extend_from_slice(&serde_json::to_vec(&completed).unwrap());
+    std::fs::write(&path, bytes).unwrap();
+
+    let history = JsonlHistory::new(&path);
+    let resumed = record("execution_resumed", 2);
+    history.append(&resumed).await.unwrap();
+
+    let mut expected = encoded(&first);
+    expected.extend_from_slice(&encoded(&completed));
+    expected.extend_from_slice(&encoded(&resumed));
+    assert_eq!(read_journal_chain(&path).unwrap(), expected);
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn complete_malformed_unterminated_active_record_still_fails_closed() {
+    let root = temp_root("history-rotation-malformed-unterminated");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let malformed = br#"{"decision":not-json}"#;
+    std::fs::write(&path, malformed).unwrap();
+    let history = JsonlHistory::new(&path);
+
+    let error = history.append(&record("blocked", 0)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 1, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), malformed);
+    assert!(partial_tail_quarantines(&root).is_empty());
+
+    drop(history);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn recovery_refuses_to_truncate_past_a_complete_malformed_record() {
+    let root = temp_root("history-rotation-malformed-prefix");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("decisions.jsonl");
+    let history = JsonlHistory::new(&path);
+    let mut bytes = encoded(&record("execution_planned", 0));
+    bytes.extend_from_slice(b"{bad json}\n");
+    bytes.extend_from_slice(br#"{"decision":"partial"#);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let error = history.append(&record("blocked", 1)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        HistoryError::MalformedActiveRecord { line: 2, .. }
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn cross_process_writers_stay_excluded_across_rotation() {
     let root = temp_root("history-rotation-lease");
@@ -348,11 +782,7 @@ fn cross_process_writers_stay_excluded_across_rotation() {
     let recovered = JsonlHistory::new(&history_path);
     let padding = record("rotation_fill", 2);
     let padding_bytes = u64::try_from(encoded(&padding).len()).unwrap();
-    let active = std::fs::File::create(&history_path).unwrap();
-    active
-        .set_len(MAX_HISTORY_FILE_BYTES - padding_bytes)
-        .unwrap();
-    drop(active);
+    newline_terminated_fill(&history_path, MAX_HISTORY_FILE_BYTES - padding_bytes);
     runtime().block_on(recovered.append(&padding)).unwrap();
     runtime().block_on(recovered.append(&padding)).unwrap();
     assert_eq!(file_len(&sealed(&history_path, 2)), MAX_HISTORY_FILE_BYTES);
@@ -427,6 +857,41 @@ fn encoded(record: &DecisionRecord) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(record).unwrap();
     bytes.push(b'\n');
     bytes
+}
+
+fn partial_tail_quarantines(root: &Path) -> Vec<PathBuf> {
+    let directory = root.join("decisions.jsonl.quarantine");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(source) => panic!(
+            "failed to read quarantine directory {}: {source}",
+            directory.display()
+        ),
+    };
+    let mut quarantines = entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("partial-tail.") && name.ends_with(".quarantine")
+                })
+        })
+        .collect::<Vec<_>>();
+    quarantines.sort();
+    quarantines
+}
+
+/// Grows `path` to `len` bytes ending in a record terminator, so size fixtures
+/// pass the writer's partial-tail check.
+fn newline_terminated_fill(path: &Path, len: u64) {
+    let file = std::fs::File::create(path).unwrap();
+    file.set_len(len - 1).unwrap();
+    drop(file);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut file, b"\n").unwrap();
 }
 
 fn sealed(path: &Path, sequence: u64) -> PathBuf {

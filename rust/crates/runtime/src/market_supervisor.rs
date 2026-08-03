@@ -4,17 +4,23 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::{
-    sync::watch,
+    sync::{broadcast, watch},
     task::{JoinError, JoinHandle},
 };
 use uuid::Uuid;
 
 use crate::market_data::{
-    MarketDataError, MarketDataEvent, SubscriptionMarketDataAdapter, validated_exchange,
+    MAX_MARKET_DATA_TARGETS, MarketDataError, MarketDataEvent, SubscriptionMarketDataAdapter,
+    validated_exchange,
 };
 
 /// Version of the stable, non-secret supervisor status view.
-pub const MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION: u16 = 1;
+pub const MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION: u16 = 2;
+/// Maximum events retained between a supervised source and its consumer.
+///
+/// One complete polling round fits without loss because sources cannot own
+/// more than [`MAX_MARKET_DATA_TARGETS`] routes.
+pub const MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS: usize = MAX_MARKET_DATA_TARGETS;
 
 const MAX_SHUTDOWN_GRACE: Duration = Duration::from_secs(60);
 
@@ -88,6 +94,9 @@ pub struct MarketSupervisorStatus {
     pub phase: MarketSupervisorPhase,
     pub health: MarketSupervisorHealth,
     pub event_sequence: u64,
+    /// Events that this consumer could not observe because the bounded
+    /// broadcast retention window was overwritten.
+    pub dropped_event_count: u64,
     pub consecutive_source_failures: u32,
     pub last_event_at: Option<DateTime<Utc>>,
     pub exit: Option<MarketSupervisorExit>,
@@ -102,6 +111,7 @@ impl MarketSupervisorStatus {
             phase: MarketSupervisorPhase::Starting,
             health: MarketSupervisorHealth::Unknown,
             event_sequence: 0,
+            dropped_event_count: 0,
             consecutive_source_failures: 0,
             last_event_at: None,
             exit: None,
@@ -109,7 +119,11 @@ impl MarketSupervisorStatus {
     }
 
     fn observe(&mut self, event: &MarketDataEvent) {
-        self.last_event_at = Some(event.observed_at());
+        let observed_at = event.observed_at();
+        self.last_event_at = Some(
+            self.last_event_at
+                .map_or(observed_at, |last_event_at| last_event_at.max(observed_at)),
+        );
         match event {
             MarketDataEvent::Observation(_) => {
                 self.health = MarketSupervisorHealth::Healthy;
@@ -176,9 +190,11 @@ type SupervisorTaskResult = Result<MarketSupervisorExit, MarketSupervisorError>;
 
 /// Single-owner interface for a bounded, cancellable, read-only source task.
 ///
-/// Event retention is O(1): a slow consumer first receives an explicit source
-/// gap and then the latest retained event. Dropping the supervisor requests
-/// cancellation; [`Self::stop`] additionally waits for graceful completion.
+/// Event retention has a fixed upper bound. One complete polling round is
+/// retained exactly; a consumer that falls farther behind first receives an
+/// explicit source gap and then every retained event in source order. Dropping the
+/// supervisor requests cancellation; [`Self::stop`] additionally waits for
+/// graceful completion.
 #[derive(Debug)]
 pub struct MarketSupervisor {
     source_id: String,
@@ -186,9 +202,10 @@ pub struct MarketSupervisor {
     stop: watch::Sender<bool>,
     status_sender: watch::Sender<MarketSupervisorStatus>,
     status: watch::Receiver<MarketSupervisorStatus>,
-    events: watch::Receiver<Option<SequencedMarketEvent>>,
+    events: broadcast::Receiver<SequencedMarketEvent>,
     join: Option<JoinHandle<SupervisorTaskResult>>,
     last_event_sequence: u64,
+    dropped_event_count: u64,
     pending_event: Option<MarketDataEvent>,
     completion: Option<SupervisorTaskResult>,
 }
@@ -233,7 +250,7 @@ impl MarketSupervisor {
         let (stop, mut stop_receiver) = watch::channel(false);
         let (status_sender, status) = watch::channel(initial.clone());
         let task_status_sender = status_sender.clone();
-        let (event_sender, events) = watch::channel(None);
+        let (event_sender, events) = broadcast::channel(MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS);
         let task_source_id = source_id.clone();
         let join = tokio::spawn(async move {
             let mut current = initial;
@@ -272,10 +289,10 @@ impl MarketSupervisor {
                                 };
                                 current.event_sequence = sequence;
                                 current.observe(&event);
-                                event_sender.send_replace(Some(SequencedMarketEvent {
+                                let _ = event_sender.send(SequencedMarketEvent {
                                     sequence: current.event_sequence,
                                     event,
-                                }));
+                                });
                                 task_status_sender.send_replace(current.clone());
                             }
                             Ok(None) => {
@@ -305,6 +322,7 @@ impl MarketSupervisor {
             events,
             join: Some(join),
             last_event_sequence: 0,
+            dropped_event_count: 0,
             pending_event: None,
             completion: None,
         })
@@ -312,13 +330,16 @@ impl MarketSupervisor {
 
     /// Returns the latest stable task status without waiting.
     pub fn status(&self) -> MarketSupervisorStatus {
-        self.status.borrow().clone()
+        let mut status = self.status.borrow().clone();
+        status.dropped_event_count = status.dropped_event_count.max(self.dropped_event_count);
+        status
     }
 
     /// Waits for the next source event.
     ///
-    /// A slow caller receives a source-gap event before the latest retained
-    /// source event. `None` means the source ended normally.
+    /// A slow caller receives a source-gap event before the oldest retained
+    /// source event, followed by the remainder of the retained window in
+    /// source order. `None` means the source ended normally.
     ///
     /// # Errors
     ///
@@ -329,32 +350,51 @@ impl MarketSupervisor {
             return Ok(Some(event));
         }
         loop {
-            if self.events.changed().await.is_err() {
-                return match self.settle_join().await? {
-                    MarketSupervisorExit::SourceEnded
-                    | MarketSupervisorExit::StopRequested
-                    | MarketSupervisorExit::ShutdownTimedOut => Ok(None),
-                };
-            }
-            let Some(envelope) = self.events.borrow_and_update().clone() else {
-                continue;
+            let envelope = match self.events.recv().await {
+                Ok(envelope) => envelope,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    self.dropped_event_count = self.dropped_event_count.saturating_add(skipped);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return self.settle_closed_source().await;
+                }
             };
-            if envelope.sequence <= self.last_event_sequence {
-                continue;
+            if let Some(event) = self.accept_event(envelope)? {
+                return Ok(Some(event));
             }
-            let skipped = envelope
-                .sequence
-                .saturating_sub(self.last_event_sequence)
-                .saturating_sub(1);
-            self.last_event_sequence = envelope.sequence;
-            if skipped > 0 {
-                let observed_at = envelope.event.observed_at();
-                self.pending_event = Some(envelope.event);
-                return MarketDataEvent::source_gap(&self.source_id, skipped, observed_at)
-                    .map(Some)
-                    .map_err(MarketSupervisorError::SourceContract);
-            }
-            return Ok(Some(envelope.event));
+        }
+    }
+
+    fn accept_event(
+        &mut self,
+        envelope: SequencedMarketEvent,
+    ) -> Result<Option<MarketDataEvent>, MarketSupervisorError> {
+        if envelope.sequence <= self.last_event_sequence {
+            return Ok(None);
+        }
+        let skipped = envelope
+            .sequence
+            .saturating_sub(self.last_event_sequence)
+            .saturating_sub(1);
+        self.last_event_sequence = envelope.sequence;
+        if skipped > 0 {
+            let observed_at = envelope.event.observed_at();
+            self.pending_event = Some(envelope.event);
+            return MarketDataEvent::source_gap(&self.source_id, skipped, observed_at)
+                .map(Some)
+                .map_err(MarketSupervisorError::SourceContract);
+        }
+        Ok(Some(envelope.event))
+    }
+
+    async fn settle_closed_source(
+        &mut self,
+    ) -> Result<Option<MarketDataEvent>, MarketSupervisorError> {
+        match self.settle_join().await? {
+            MarketSupervisorExit::SourceEnded
+            | MarketSupervisorExit::StopRequested
+            | MarketSupervisorExit::ShutdownTimedOut => Ok(None),
         }
     }
 

@@ -76,11 +76,18 @@ fn config(task_id: &str, mode: VolumeMakerMode, grace: StdDuration) -> VolumeMak
 }
 
 fn account(label: &str) -> (PaperAccountAuthority, JsonlHistory, PathBuf) {
+    account_with_available(label, "10000")
+}
+
+fn account_with_available(
+    label: &str,
+    initial_available: &str,
+) -> (PaperAccountAuthority, JsonlHistory, PathBuf) {
     let path = temp_path(label, "jsonl");
     let history = JsonlHistory::new(&path);
     let account = PaperAccountAuthority::planned(
         history.clone(),
-        PaperAccountConfig::new(EXCHANGE, Money::new(decimal("10000"))).unwrap(),
+        PaperAccountConfig::new(EXCHANGE, Money::new(decimal(initial_available))).unwrap(),
     )
     .unwrap();
     (account, history, path)
@@ -224,16 +231,26 @@ impl MarketDataEventSource for SteppedSource {
 #[derive(Debug, Default)]
 struct FillExecutor {
     calls: AtomicUsize,
+    market_fill_prices: Mutex<VecDeque<Price>>,
 }
 
-fn filled_receipts(batch: &ExecutionBatch) -> Vec<TradingReceipt> {
+impl FillExecutor {
+    fn with_market_fill_prices(prices: &[&str]) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            market_fill_prices: Mutex::new(prices.iter().map(|value| price(value)).collect()),
+        }
+    }
+}
+
+fn filled_receipts(batch: &ExecutionBatch, average_fill_price: Price) -> Vec<TradingReceipt> {
     let intent = batch.intents()[0].clone();
     vec![TradingReceipt::Submitted {
         order: Order {
             id: format!("paper-{}", intent.client_order_id),
             intent: intent.clone(),
             filled_quantity: intent.quantity,
-            average_fill_price: intent.price,
+            average_fill_price: Some(intent.price.unwrap_or(average_fill_price)),
             status: OrderStatus::Filled,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -245,7 +262,16 @@ fn filled_receipts(batch: &ExecutionBatch) -> Vec<TradingReceipt> {
 impl VolumeMakerPaperExecutor for FillExecutor {
     fn execute(&self, batch: ExecutionBatch) -> VolumeMakerPaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { Ok(filled_receipts(&batch)) })
+        let intent = &batch.intents()[0];
+        let average_fill_price = intent
+            .price
+            .or_else(|| self.market_fill_prices.lock().unwrap().pop_front());
+        Box::pin(async move {
+            let average_fill_price = average_fill_price.ok_or(
+                RuntimeError::InvalidExecutionPolicy("test fixture omitted a market fill price"),
+            )?;
+            Ok(filled_receipts(&batch, average_fill_price))
+        })
     }
 }
 
@@ -257,6 +283,17 @@ type RecordedIntent = (Side, OrderType, Option<Decimal>, bool);
 struct RecordingExecutor {
     intents: Mutex<Vec<RecordedIntent>>,
     calls: AtomicUsize,
+    market_fill_prices: Mutex<VecDeque<Price>>,
+}
+
+impl RecordingExecutor {
+    fn with_market_fill_prices(prices: &[&str]) -> Self {
+        Self {
+            intents: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            market_fill_prices: Mutex::new(prices.iter().map(|value| price(value)).collect()),
+        }
+    }
 }
 
 impl VolumeMakerPaperExecutor for RecordingExecutor {
@@ -269,7 +306,15 @@ impl VolumeMakerPaperExecutor for RecordingExecutor {
             intent.reduce_only,
         ));
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { Ok(filled_receipts(&batch)) })
+        let average_fill_price = intent
+            .price
+            .or_else(|| self.market_fill_prices.lock().unwrap().pop_front());
+        Box::pin(async move {
+            let average_fill_price = average_fill_price.ok_or(
+                RuntimeError::InvalidExecutionPolicy("test fixture omitted a market fill price"),
+            )?;
+            Ok(filled_receipts(&batch, average_fill_price))
+        })
     }
 }
 
@@ -301,7 +346,7 @@ impl VolumeMakerPaperExecutor for PendingExecutor {
 #[tokio::test]
 async fn market_mode_cycle_opens_and_closes_with_independent_reservations() {
     let (account, history, path) = account("market-cycle");
-    let executor = Arc::new(RecordingExecutor::default());
+    let executor = Arc::new(RecordingExecutor::with_market_fill_prices(&["101", "102"]));
     let stepper = Arc::new(Semaphore::new(1));
     let source = SteppedSource::new(
         vec![
@@ -343,19 +388,13 @@ async fn market_mode_cycle_opens_and_closes_with_independent_reservations() {
         ]
     );
     let snapshot = account.snapshot().await.unwrap();
-    assert_eq!(snapshot.reservations.len(), 2);
-    assert_eq!(
-        snapshot
-            .reservations
-            .iter()
-            .map(|reservation| reservation.task_id.as_str())
-            .collect::<Vec<_>>(),
-        ["volume:market/op/000001", "volume:market/op/000002"]
+    assert!(
+        snapshot.reservations.is_empty(),
+        "completed market cycles should prune released reservations from the live snapshot"
     );
-    assert!(snapshot.reservations.iter().all(|reservation| {
-        reservation.phase == PaperReservationPhase::Committed
-            && reservation.idempotency_key.starts_with("volume:")
-    }));
+    assert!(snapshot.open_lots.is_empty());
+    assert_eq!(snapshot.cumulative_fees, Money::new(decimal("0.203")));
+    assert_eq!(snapshot.realized_pnl, Money::new(decimal("0.797")));
 
     let status = task.status();
     assert_eq!(status.completed_cycle_count, 1);
@@ -383,7 +422,7 @@ async fn market_mode_cycle_opens_and_closes_with_independent_reservations() {
 #[tokio::test]
 async fn limit_mode_virtual_quote_fills_only_after_a_crossing_observation() {
     let (account, history, path) = account("limit-quote");
-    let executor = Arc::new(RecordingExecutor::default());
+    let executor = Arc::new(RecordingExecutor::with_market_fill_prices(&["98"]));
     let stepper = Arc::new(Semaphore::new(1));
     // Quote at 100/101, then the book falls through the standing bid, then a
     // final observation closes the bought position.
@@ -432,7 +471,10 @@ async fn limit_mode_virtual_quote_fills_only_after_a_crossing_observation() {
     );
     assert_eq!(task.status().completed_cycle_count, 1);
     let snapshot = account.snapshot().await.unwrap();
-    assert_eq!(snapshot.reservations.len(), 2);
+    assert!(
+        snapshot.reservations.is_empty(),
+        "completed limit cycles should prune released reservations from the live snapshot"
+    );
     let body = std::fs::read_to_string(path).unwrap();
     // Realized cycle: bought at 100, closed at the observed bid 98.
     assert!(body.contains("\"realized_pnl\":\"-2\""), "{body}");
@@ -488,6 +530,92 @@ async fn account_risk_rejections_skip_cycles_without_reservations() {
     assert!(body.contains("\"decision\":\"account_risk_rejected\""));
     assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
     assert!(body.contains("\"rejected_entries\":1"), "{body}");
+}
+
+#[tokio::test]
+async fn reservation_failures_cancel_admitted_cycles_without_leaking_owner_risk() {
+    let (account, history, path) = account_with_available("reserve-after-admit", "50");
+    let risk = account_risk(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(FillExecutor::default());
+    let first_source = VecSource::new(vec![observation(
+        "100",
+        "101",
+        1,
+        base_time() + Duration::seconds(10),
+    )]);
+    let mut first = VolumeMakerPaperTask::start(
+        config(
+            "volume:reserve-fail:first",
+            VolumeMakerMode::MarketImbalance,
+            StdDuration::from_secs(1),
+        )
+        .with_account_risk(risk.clone()),
+        first_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let first_error = first.wait().await.unwrap_err();
+    assert!(matches!(first_error, VolumeMakerPaperTaskError::Saga(_)));
+    assert_eq!(first.status().phase, VolumeMakerPaperTaskPhase::Failed);
+    assert_eq!(
+        first.status().failure,
+        Some(VolumeMakerPaperTaskFailure::AccountContract)
+    );
+
+    let second_source = VecSource::new(vec![observation(
+        "100",
+        "101",
+        2,
+        base_time() + Duration::seconds(20),
+    )]);
+    let mut second = VolumeMakerPaperTask::start(
+        config(
+            "volume:reserve-fail:second",
+            VolumeMakerMode::MarketImbalance,
+            StdDuration::from_secs(1),
+        )
+        .with_account_risk(risk.clone()),
+        second_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let second_error = second.wait().await.unwrap_err();
+    assert!(matches!(second_error, VolumeMakerPaperTaskError::Saga(_)));
+    assert_eq!(second.status().phase, VolumeMakerPaperTaskPhase::Failed);
+    assert_eq!(
+        second.status().failure,
+        Some(VolumeMakerPaperTaskFailure::AccountContract)
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+
+    let state = risk.state().await.unwrap();
+    assert!(state.open_positions.is_empty());
+    assert_eq!(state.admitted_count, 2);
+    assert_eq!(state.rejected_count, 0);
+
+    let body = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admitted\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admission_cancelled\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
 }
 
 #[tokio::test]
@@ -554,14 +682,14 @@ async fn execution_failure_marks_reservation_uncertain_and_restart_fails_closed(
     .unwrap();
 
     let error = task.wait().await.unwrap_err();
-    assert!(matches!(
-        error,
-        VolumeMakerPaperTaskError::Saga(_) | VolumeMakerPaperTaskError::Runtime(_)
-    ));
+    assert!(
+        matches!(error, VolumeMakerPaperTaskError::RecoveryRequired),
+        "unexpected execution failure: {error:?}"
+    );
     assert_eq!(task.status().phase, VolumeMakerPaperTaskPhase::Failed);
     assert_eq!(
         task.status().failure,
-        Some(VolumeMakerPaperTaskFailure::ExecutionFailed)
+        Some(VolumeMakerPaperTaskFailure::RecoveryRequired)
     );
     assert_eq!(
         account.snapshot().await.unwrap().reservations[0].phase,
@@ -615,7 +743,16 @@ async fn cancel_during_unknown_execution_retains_capacity_without_release() {
     wait_until(|| executor.started.load(Ordering::SeqCst)).await;
 
     let error = task.cancel().await.unwrap_err();
-    assert!(matches!(error, VolumeMakerPaperTaskError::RecoveryRequired));
+    // The outer shutdown deadline may win the race with the owner recording
+    // recovery-required. Both outcomes retain the unknown reservation.
+    assert!(
+        matches!(
+            error,
+            VolumeMakerPaperTaskError::RecoveryRequired
+                | VolumeMakerPaperTaskError::ShutdownTimedOut
+        ),
+        "unexpected cancellation failure: {error:?}"
+    );
     let snapshot = account.snapshot().await.unwrap();
     assert_eq!(snapshot.reservations.len(), 1);
     assert_eq!(
@@ -630,7 +767,7 @@ async fn cancel_during_unknown_execution_retains_capacity_without_release() {
 #[tokio::test]
 async fn max_cycles_bound_stops_with_completed_exit_and_clean_restart() {
     let (account, history, path) = account("max-cycles");
-    let executor = Arc::new(FillExecutor::default());
+    let executor = Arc::new(FillExecutor::with_market_fill_prices(&["101", "100"]));
     let stepper = Arc::new(Semaphore::new(1));
     let source = SteppedSource::new(
         vec![
@@ -684,13 +821,16 @@ async fn max_cycles_bound_stops_with_completed_exit_and_clean_restart() {
         second.wait().await.unwrap(),
         VolumeMakerPaperTaskExit::SourceEnded
     );
-    assert_eq!(account.snapshot().await.unwrap().reservations.len(), 2);
+    assert!(
+        account.snapshot().await.unwrap().reservations.is_empty(),
+        "restart after a bounded run should not retain released reservations"
+    );
 }
 
 #[tokio::test]
 async fn hour_rollover_journals_one_bounded_statistics_fact() {
     let (account, history, path) = account("hour-rollover");
-    let executor = Arc::new(FillExecutor::default());
+    let executor = Arc::new(FillExecutor::with_market_fill_prices(&["101", "100"]));
     let stepper = Arc::new(Semaphore::new(1));
     // One completed cycle inside hour zero, then a depth-free observation in
     // hour one flushes the closed bucket without opening a new cycle.

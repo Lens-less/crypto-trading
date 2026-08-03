@@ -1,10 +1,12 @@
 services:
   operator:
+    init: true
     build:
       context: ..
       dockerfile: Dockerfile
     image: crypto-trading:production-candidate
     restart: unless-stopped
+    stop_grace_period: 70s
     healthcheck:
       test:
         - CMD
@@ -34,6 +36,8 @@ services:
       - no-new-privileges:true
     environment:
       CRYPTO_TRADING_WEB_TOKEN: ${CRYPTO_TRADING_WEB_TOKEN:?set CRYPTO_TRADING_WEB_TOKEN}
+      RUST_LOG: ${RUST_LOG:-warn,crypto_trading_web_app=info,crypto_trading_web=info,crypto_trading_cli=info,crypto_trading_control_plane=info,crypto_trading_runtime=info,crypto_trading_exchange=info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
     command:
       - --history-path
       - /var/lib/crypto-trading/operations.jsonl

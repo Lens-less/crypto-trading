@@ -14,8 +14,9 @@ use crypto_trading_exchange::{
 };
 use crypto_trading_runtime::{
     JsonlHistory, PAPER_ACCOUNT_SCHEMA_VERSION, PaperAccountAuthority, PaperAccountConfig,
-    PaperAccountSnapshot, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, PaperReservationView, ProjectionStatus,
+    PaperAccountSnapshot, PaperCostModel, PaperExecutionLedgerKind, PaperReconciliationOutcome,
+    PaperReservationLeg, PaperReservationPhase, PaperReservationRequest, PaperReservationView,
+    ProjectionStatus,
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -64,6 +65,11 @@ fn account(symbol: &Symbol) -> PaperAccountSnapshot {
         pending_reserved: Money::default(),
         uncertain_reserved: Money::default(),
         committed_exposure: Money::new(decimal("100")),
+        ledger_kind: PaperExecutionLedgerKind::LegacyReservationOnly,
+        cumulative_fees: Money::default(),
+        realized_pnl: Money::default(),
+        settled_equity_base: Money::new(decimal("1000")),
+        open_lots: Vec::new(),
         reservations: vec![PaperReservationView {
             reservation_id,
             task_id: "grid-btc".to_owned(),
@@ -77,6 +83,8 @@ fn account(symbol: &Symbol) -> PaperAccountSnapshot {
             first_sequence: 1,
             last_sequence: 2,
             reconciliation: None,
+            ledger_kind: PaperExecutionLedgerKind::LegacyReservationOnly,
+            settlement: None,
         }],
     }
 }
@@ -280,22 +288,27 @@ async fn comparator_proofs_drive_release_and_failure_transitions() {
     )
     .unwrap();
     let release_report = release_plan.compare(&remote("1000"), captured_at).unwrap();
-    release_authority
+    let release_proof = release_report.proof.clone();
+    let released_view = release_authority
         .reconcile_release(release_report.proof)
         .await
         .unwrap();
-    let released = release_authority.snapshot().await.unwrap();
+    assert_eq!(released_view.phase, PaperReservationPhase::Released);
     assert_eq!(
-        released.reservations[0].phase,
-        PaperReservationPhase::Released
+        released_view.reconciliation.as_ref().unwrap().outcome,
+        PaperReconciliationOutcome::Released
     );
     assert_eq!(
-        released.reservations[0]
-            .reconciliation
-            .as_ref()
-            .unwrap()
-            .outcome,
-        PaperReconciliationOutcome::Released
+        release_authority
+            .reconcile_release(release_proof)
+            .await
+            .unwrap(),
+        released_view
+    );
+    let released = release_authority.snapshot().await.unwrap();
+    assert!(
+        released.reservations.is_empty(),
+        "released reservations must not consume the bounded live snapshot"
     );
 
     let failure_history = temp_history("failure");

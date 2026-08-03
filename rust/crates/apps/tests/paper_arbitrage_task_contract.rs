@@ -3,7 +3,7 @@ use std::{
     future::pending,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use crypto_trading_cli::{
-    ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperTask,
-    ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
+    ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperMarketEventFuture,
+    ArbitragePaperTask, ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
     ArbitragePaperTaskFailure, ArbitragePaperTaskPhase,
     monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock},
 };
@@ -26,10 +26,10 @@ use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
     AccountRiskAuthority, ExecutionBatch, JsonlHistory, MarketDataBook, MarketDataEvent,
     MarketDataEventFuture, MarketDataEventSource, MarketDataObservation, MarketFreshnessPolicy,
-    MarketInstrument, MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority,
-    PaperAccountConfig, PaperCostModel, PaperReconciliationEvidence, PaperReconciliationProof,
-    PaperReservationPhase, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
-    ReadOnlyTaskRecovery, SpreadHistoryRecord, SpreadHistoryWriter,
+    MarketInstrument, MarketSupervisorConfig, MarketUniverse, ObservedMarketPair,
+    PaperAccountAuthority, PaperAccountConfig, PaperCostModel, PaperReconciliationEvidence,
+    PaperReconciliationProof, PaperReservationPhase, ReadOnlyTaskFailure, ReadOnlyTaskKind,
+    ReadOnlyTaskPhase, ReadOnlyTaskRecovery, SpreadHistoryRecord, SpreadHistoryWriter,
 };
 use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
 use rust_decimal::Decimal;
@@ -69,7 +69,10 @@ fn monitor_for(left_exchange: &str, right_exchange: &str) -> ReadOnlyArbitrageMo
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()]).unwrap();
     let book = MarketDataBook::new(
         universe,
-        MarketFreshnessPolicy::new(Duration::minutes(5), Duration::seconds(1)).unwrap(),
+        MarketFreshnessPolicy::new(Duration::minutes(5), Duration::seconds(1))
+            .unwrap()
+            .with_max_pair_skew(Duration::minutes(5))
+            .unwrap(),
         Arc::new(ReplayMarketDataClock::new(
             base_time() + Duration::minutes(1),
         )),
@@ -130,11 +133,18 @@ fn task_config_with_max(
 }
 
 fn account(label: &str) -> (PaperAccountAuthority, JsonlHistory, std::path::PathBuf) {
+    account_with_available(label, "100000")
+}
+
+fn account_with_available(
+    label: &str,
+    available: &str,
+) -> (PaperAccountAuthority, JsonlHistory, std::path::PathBuf) {
     let path = temp_path(label);
     let history = JsonlHistory::new(&path);
     let account = PaperAccountAuthority::planned(
         history.clone(),
-        PaperAccountConfig::new("paper-arbitrage", Money::new(decimal("100000"))).unwrap(),
+        PaperAccountConfig::new("paper-arbitrage", Money::new(decimal(available))).unwrap(),
     )
     .unwrap();
     (account, history, path)
@@ -172,6 +182,15 @@ fn observation_with_depth(
     MarketDataEvent::Observation(MarketDataObservation::new(snapshot, revision, at).unwrap())
 }
 
+fn observed_snapshot(event: &MarketDataEvent) -> MarketSnapshot {
+    match event {
+        MarketDataEvent::Observation(observation) => observation.snapshot.clone(),
+        MarketDataEvent::SourceGap { .. } | MarketDataEvent::SourceUnavailable { .. } => {
+            panic!("expected a market observation")
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ChannelSource {
     source_id: String,
@@ -204,12 +223,14 @@ impl MarketDataEventSource for ChannelSource {
 #[derive(Debug, Default)]
 struct FillExecutor {
     calls: AtomicUsize,
+    pairs: Mutex<Vec<ObservedMarketPair>>,
 }
 
 #[derive(Debug)]
 struct GatedFillExecutor {
     calls: AtomicUsize,
     permits: Arc<Semaphore>,
+    pairs: Arc<Mutex<Vec<ObservedMarketPair>>>,
 }
 
 impl Default for GatedFillExecutor {
@@ -217,6 +238,7 @@ impl Default for GatedFillExecutor {
         Self {
             calls: AtomicUsize::new(0),
             permits: Arc::new(Semaphore::new(0)),
+            pairs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -228,11 +250,24 @@ impl GatedFillExecutor {
 }
 
 impl ArbitragePaperExecutor for GatedFillExecutor {
-    fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn execute(
+        &self,
+        batch: ExecutionBatch,
+        pair: ObservedMarketPair,
+    ) -> ArbitragePaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let permits = Arc::clone(&self.permits);
+        let pairs = Arc::clone(&self.pairs);
         Box::pin(async move {
             permits.acquire_owned().await.unwrap().forget();
+            pairs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(pair);
             Ok(batch
                 .intents()
                 .iter()
@@ -257,18 +292,43 @@ impl ArbitragePaperExecutor for GatedFillExecutor {
 #[derive(Debug, Default)]
 struct PendingExecutor {
     calls: AtomicUsize,
+    pairs: Mutex<Vec<ObservedMarketPair>>,
 }
 
 impl ArbitragePaperExecutor for PendingExecutor {
-    fn execute(&self, _batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn execute(
+        &self,
+        _batch: ExecutionBatch,
+        pair: ObservedMarketPair,
+    ) -> ArbitragePaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pair);
         Box::pin(pending())
     }
 }
 
 impl ArbitragePaperExecutor for FillExecutor {
-    fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn execute(
+        &self,
+        batch: ExecutionBatch,
+        pair: ObservedMarketPair,
+    ) -> ArbitragePaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pair);
         Box::pin(async move {
             Ok(batch
                 .intents()
@@ -458,6 +518,55 @@ async fn account_risk_pause_skips_opportunities_without_failing_the_owner() {
     let body = std::fs::read_to_string(path).unwrap();
     assert!(body.contains("\"decision\":\"account_risk_rejected\""));
     assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
+}
+
+#[tokio::test]
+async fn reservation_rejection_cancels_the_previously_admitted_account_risk_ticket() {
+    let (account, history, path) = account_with_available("admission-cancelled", "1");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:admission-cancelled", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        task.wait().await.unwrap_err(),
+        ArbitragePaperTaskError::Saga(_)
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let risk_state = risk.state().await.unwrap();
+    assert_eq!(risk_state.admitted_count, 1);
+    assert!(risk_state.open_positions.is_empty());
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_admitted\""));
+    assert!(body.contains("\"decision\":\"account_risk_admission_cancelled\""));
 }
 
 #[tokio::test]
@@ -778,7 +887,15 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
     first.stop().await.unwrap();
 
-    let reservation = account.snapshot().await.unwrap().reservations[0].clone();
+    let account_snapshot = account.snapshot().await.unwrap();
+    let reservation = account_snapshot.reservations[0].clone();
+    let expected_available = Money::new(
+        account_snapshot
+            .available
+            .as_decimal()
+            .checked_add(reservation.held_exposure.as_decimal())
+            .unwrap(),
+    );
     account
         .record_reconciliation_failure(
             PaperReconciliationProof::from_evidence(
@@ -790,7 +907,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
                     reservation.batch_id,
                     "binance-testnet/account-snapshot-1",
                     1,
-                    Money::new(decimal("100000")),
+                    expected_available,
                     "fixture_mismatch",
                 )
                 .unwrap(),
@@ -1000,6 +1117,94 @@ async fn inflight_opportunities_coalesce_into_one_latest_pair_re_evaluation() {
             "arbitrage:coalesce/op/000002",
         ]
     );
+}
+
+#[tokio::test]
+async fn inflight_future_ticks_do_not_change_the_pair_frozen_for_execution() {
+    let (account, history, _) = account("frozen-execution-pair");
+    let executor = Arc::new(GatedFillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:frozen-pair", StdDuration::from_secs(30)),
+        monitor(),
+        left_source,
+        right_source,
+        account,
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let triggering_left = observation("left", "99", "100", 1, base_time());
+    let triggering_right = observation(
+        "right",
+        "101.5",
+        "102",
+        1,
+        base_time() + Duration::seconds(1),
+    );
+    let expected_left = observed_snapshot(&triggering_left);
+    let expected_right = observed_snapshot(&triggering_right);
+    left_sender.send(triggering_left).await.unwrap();
+    right_sender.send(triggering_right).await.unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+
+    left_sender
+        .send(observation(
+            "left",
+            "100.8",
+            "101",
+            2,
+            base_time() + Duration::seconds(2),
+        ))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "100.8",
+            "101",
+            2,
+            base_time() + Duration::seconds(3),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| task.status().processed_event_count >= 4).await;
+    assert!(
+        executor
+            .pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the execution future must still be blocked while later ticks are consumed"
+    );
+
+    executor.release_one();
+    wait_until(|| {
+        executor
+            .pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+            == 1
+    })
+    .await;
+    wait_until(|| task.status().operation_count == 1).await;
+    {
+        let pairs = executor
+            .pairs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(pairs[0].left, expected_left);
+        assert_eq!(pairs[0].right, expected_right);
+    }
+    assert_eq!(
+        task.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
 
 fn history_task_config(

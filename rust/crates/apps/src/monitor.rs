@@ -13,12 +13,13 @@ use std::{
 };
 
 use anyhow::{Context, Result as AnyResult, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use crypto_trading_config::MonitorConfig;
 use crypto_trading_domain::{MarketSnapshot, Price};
 use crypto_trading_runtime::{
     DecisionRecord, MAX_MARKET_DATA_EVENTS, MarketContinuity, MarketDataBook, MarketDataClock,
     MarketDataError, MarketDataEvent, MarketDataFreshness, MarketDataObservation, MarketDataUpdate,
-    MarketInstrument,
+    MarketDataView, MarketFreshnessPolicy, MarketInstrument,
 };
 use crypto_trading_strategy::{SpreadCalculator, StrategyError};
 use rust_decimal::Decimal;
@@ -172,11 +173,9 @@ pub fn load_market_snapshot_replay(path: &Path) -> AnyResult<Vec<MarketDataEvent
             .checked_add(1)
             .context("monitor replay revision counter is exhausted")?;
         let received_at = snapshot.timestamp;
-        events.push(MarketDataEvent::Observation(MarketDataObservation::new(
-            snapshot,
-            *revision,
-            received_at,
-        )?));
+        events.push(MarketDataEvent::Observation(
+            MarketDataObservation::local_receipt(snapshot, *revision, received_at, None)?,
+        ));
     }
     Ok(events)
 }
@@ -292,6 +291,32 @@ impl ReadOnlyArbitrageMonitor {
                 freshness,
                 continuity,
             },
+            Err(MarketDataError::PairSkew {
+                left,
+                right,
+                skew_millis,
+                tolerance_millis,
+            }) => {
+                let Some((instrument, continuity)) =
+                    lagging_pair_leg(&view, left.as_ref(), right.as_ref())
+                else {
+                    return Err(MarketDataError::PairSkew {
+                        left,
+                        right,
+                        skew_millis,
+                        tolerance_millis,
+                    }
+                    .into());
+                };
+                ArbitrageMonitorOutcome::Waiting {
+                    instrument,
+                    freshness: MarketDataFreshness::PairSkew {
+                        skew_millis,
+                        tolerance_millis,
+                    },
+                    continuity,
+                }
+            }
             Err(error) => return Err(error.into()),
         };
         Ok(ArbitrageMonitorEvent {
@@ -304,6 +329,39 @@ impl ReadOnlyArbitrageMonitor {
             right: self.right.clone(),
             outcome,
         })
+    }
+}
+
+pub(crate) fn freshness_policy_from_monitor_config(
+    monitor: &MonitorConfig,
+) -> Result<MarketFreshnessPolicy, ArbitrageMonitorError> {
+    let max_age_seconds = i64::try_from(monitor.data_timeout_seconds).map_err(|_| {
+        MarketDataError::InvalidFreshnessPolicy("monitor data timeout exceeds runtime duration")
+    })?;
+    let max_age =
+        Duration::try_seconds(max_age_seconds).ok_or(MarketDataError::InvalidFreshnessPolicy(
+            "monitor data timeout is outside the supported duration",
+        ))?;
+    let max_pair_skew_ms = i64::try_from(monitor.max_pair_skew_ms).map_err(|_| {
+        MarketDataError::InvalidFreshnessPolicy("monitor pair skew exceeds runtime duration")
+    })?;
+    Ok(MarketFreshnessPolicy::new(max_age, Duration::seconds(1))?
+        .with_max_pair_skew(Duration::milliseconds(max_pair_skew_ms))?)
+}
+
+fn lagging_pair_leg(
+    view: &MarketDataView,
+    left: &MarketInstrument,
+    right: &MarketInstrument,
+) -> Option<(MarketInstrument, MarketContinuity)> {
+    let left_row = view.instrument(left)?;
+    let right_row = view.instrument(right)?;
+    let left_timestamp = left_row.snapshot.as_ref()?.timestamp;
+    let right_timestamp = right_row.snapshot.as_ref()?.timestamp;
+    if left_timestamp <= right_timestamp {
+        Some((left.clone(), left_row.continuity.clone()))
+    } else {
+        Some((right.clone(), right_row.continuity.clone()))
     }
 }
 

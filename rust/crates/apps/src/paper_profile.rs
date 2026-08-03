@@ -20,9 +20,9 @@ use crypto_trading_exchange::PaperExchange;
 use crypto_trading_runtime::{
     AccountRiskAuthority, ExchangeRouter, ExecutionBatch, ExecutionClock, ExecutionMode,
     ExecutionPolicy, IntentExecutor, JsonlHistory, MarketDataBook, MarketDataClock,
-    MarketDataError, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
-    MarketDataObservation, MarketFreshnessPolicy, MarketInstrument, MarketUniverse,
-    PaperAccountAuthority, PaperAccountConfig, PaperCostModel, RuntimeError,
+    MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketDataObservation,
+    MarketInstrument, MarketUniverse, ObservedMarketPair, PaperAccountAuthority,
+    PaperAccountConfig, PaperCostModel, RuntimeError,
 };
 use crypto_trading_strategy::{
     AccountRiskLimits, AccountRiskPolicy, CapitalProtectionPolicyConfig, GridDirection,
@@ -32,13 +32,18 @@ use crypto_trading_strategy::{
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::{
-    ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperTask,
-    ArbitragePaperTaskConfig, ArbitragePaperTaskError, GridPaperExecutionFuture, GridPaperExecutor,
-    GridPaperTask, GridPaperTaskConfig, GridPaperTaskError,
-    monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock, load_market_snapshot_replay},
+    ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperMarketEventFuture,
+    ArbitragePaperTask, ArbitragePaperTaskConfig, ArbitragePaperTaskError,
+    GridPaperExecutionFuture, GridPaperExecutor, GridPaperObservationFuture, GridPaperTask,
+    GridPaperTaskConfig, GridPaperTaskError,
+    monitor::{
+        ReadOnlyArbitrageMonitor, ReplayMarketDataClock, freshness_policy_from_monitor_config,
+        load_market_snapshot_replay,
+    },
 };
 
 const DEFAULT_COST_FEE_BPS: u32 = 10;
@@ -287,13 +292,8 @@ impl GridPaperProfile {
             paper_exchange(self.config.exchange.clone(), &clock)
                 .map_err(|_| GridPaperTaskError::InvalidConfig)?,
         );
-        let source = MirroredReplaySource::new(
-            self.config.exchange.clone(),
-            self.replay_events.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&latest),
-            vec![Arc::clone(&exchange)],
-        );
+        let source =
+            OwnerReplaySource::new(self.config.exchange.clone(), self.replay_events.clone());
         let history = JsonlHistory::new(history_path);
         let account = PaperAccountAuthority::new(
             journal_id,
@@ -362,14 +362,14 @@ impl ArbitragePaperProfile {
     ) -> Result<ArbitragePaperTask, ArbitragePaperTaskError> {
         let first_snapshot =
             first_observation(&self.replay_events).ok_or(ArbitragePaperTaskError::InvalidConfig)?;
-        let clock = Arc::new(ReplayMarketDataClock::new(first_snapshot.timestamp));
-        let latest = Arc::new(MirroredReplayState::default());
+        let monitor_clock = Arc::new(ReplayMarketDataClock::new(first_snapshot.timestamp));
+        let execution_clock = Arc::new(ReplayMarketDataClock::new(first_snapshot.timestamp));
         let left_exchange = Arc::new(
-            paper_exchange(self.left_exchange.clone(), &clock)
+            paper_exchange(self.left_exchange.clone(), &execution_clock)
                 .map_err(|_| ArbitragePaperTaskError::InvalidConfig)?,
         );
         let right_exchange = Arc::new(
-            paper_exchange(self.right_exchange.clone(), &clock)
+            paper_exchange(self.right_exchange.clone(), &execution_clock)
                 .map_err(|_| ArbitragePaperTaskError::InvalidConfig)?,
         );
         let history = JsonlHistory::new(history_path);
@@ -388,30 +388,29 @@ impl ArbitragePaperProfile {
             &self.left_exchange,
             &self.right_exchange,
             self.symbol.clone(),
-            Arc::clone(&clock),
+            Arc::clone(&monitor_clock),
         )
         .map_err(ArbitragePaperTaskError::Monitor)?;
-        let left_source = MirroredReplaySource::new(
+        let replay_order = ReplayOrderGate::new(self.replay_events.clone());
+        let left_source = OrderedReplaySource::new(
             self.left_exchange.clone(),
-            filter_events(&self.replay_events, &self.left_exchange, &self.symbol),
-            Arc::clone(&clock),
-            Arc::clone(&latest),
-            vec![Arc::clone(&left_exchange)],
+            &self.symbol,
+            Arc::clone(&replay_order),
         );
-        let right_source = MirroredReplaySource::new(
+        let right_source = OrderedReplaySource::new(
             self.right_exchange.clone(),
-            filter_events(&self.replay_events, &self.right_exchange, &self.symbol),
-            Arc::clone(&clock),
-            Arc::clone(&latest),
-            vec![Arc::clone(&right_exchange)],
+            &self.symbol,
+            Arc::clone(&replay_order),
         );
         let executor = Arc::new(ArbitrageReplayExecutor {
             left: left_exchange,
             left_exchange: self.left_exchange.clone(),
             right: right_exchange,
             right_exchange: self.right_exchange.clone(),
-            clock,
-            latest,
+            monitor_clock,
+            execution_clock,
+            published: Arc::new(FrozenReplayPublicationState::default()),
+            replay_order,
         });
         let account_risk = AccountRiskAuthority::new(
             journal_id,
@@ -506,43 +505,50 @@ impl MirroredReplayState {
     }
 }
 
-struct MirroredReplaySource {
+struct OwnerReplaySource {
     source_id: String,
     events: VecDeque<MarketDataEvent>,
-    clock: Arc<ReplayMarketDataClock>,
-    latest: Arc<MirroredReplayState>,
-    exchanges: Vec<Arc<PaperExchange>>,
 }
 
-impl fmt::Debug for MirroredReplaySource {
+struct OrderedReplaySource {
+    source_id: String,
+    event_indices: VecDeque<usize>,
+    replay_order: Arc<ReplayOrderGate>,
+    cursor: watch::Receiver<usize>,
+}
+
+/// Shared cursor for a replay tape split across two supervisor tasks.
+///
+/// A source may publish only the event at `cursor`. The cursor advances only
+/// after the owner has validated the complete event and advanced the monitor
+/// clock, so producer speed and biased receiver selection cannot reorder the
+/// original tape. Execution books advance later from an operation's frozen
+/// pair, never from this consumer hook.
+struct ReplayOrderGate {
+    tape: Arc<[MarketDataEvent]>,
+    cursor: watch::Sender<usize>,
+}
+
+impl fmt::Debug for OwnerReplaySource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("MirroredReplaySource")
+            .debug_struct("OwnerReplaySource")
             .field("source_id", &self.source_id)
             .field("remaining_events", &self.events.len())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
-impl MirroredReplaySource {
-    fn new(
-        source_id: String,
-        events: Vec<MarketDataEvent>,
-        clock: Arc<ReplayMarketDataClock>,
-        latest: Arc<MirroredReplayState>,
-        exchanges: Vec<Arc<PaperExchange>>,
-    ) -> Self {
+impl OwnerReplaySource {
+    fn new(source_id: String, events: Vec<MarketDataEvent>) -> Self {
         Self {
             source_id,
             events: events.into(),
-            clock,
-            latest,
-            exchanges,
         }
     }
 }
 
-impl MarketDataEventSource for MirroredReplaySource {
+impl MarketDataEventSource for OwnerReplaySource {
     fn source_id(&self) -> &str {
         &self.source_id
     }
@@ -551,31 +557,143 @@ impl MarketDataEventSource for MirroredReplaySource {
         let Some(event) = self.events.pop_front() else {
             return Box::pin(async move { pending().await });
         };
-        let clock = Arc::clone(&self.clock);
-        let latest = Arc::clone(&self.latest);
-        let exchanges = self.exchanges.clone();
+        Box::pin(async move { Ok(Some(event)) })
+    }
+}
+
+impl fmt::Debug for OrderedReplaySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrderedReplaySource")
+            .field("source_id", &self.source_id)
+            .field("remaining_events", &self.event_indices.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OrderedReplaySource {
+    fn new(source_id: String, symbol: &Symbol, replay_order: Arc<ReplayOrderGate>) -> Self {
+        let event_indices = replay_order
+            .tape
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                MarketDataEvent::Observation(observation)
+                    if observation.snapshot.exchange() == source_id
+                        && observation.snapshot.symbol == *symbol =>
+                {
+                    Some(index)
+                }
+                MarketDataEvent::SourceGap {
+                    exchange: event_exchange,
+                    ..
+                }
+                | MarketDataEvent::SourceUnavailable {
+                    exchange: event_exchange,
+                    ..
+                } if event_exchange == &source_id => Some(index),
+                MarketDataEvent::Observation(_)
+                | MarketDataEvent::SourceGap { .. }
+                | MarketDataEvent::SourceUnavailable { .. } => None,
+            })
+            .collect();
+        let cursor = replay_order.cursor.subscribe();
+        Self {
+            source_id,
+            event_indices,
+            replay_order,
+            cursor,
+        }
+    }
+}
+
+impl MarketDataEventSource for OrderedReplaySource {
+    fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    fn next_event(&mut self) -> MarketDataEventFuture<'_> {
+        let Some(event_index) = self.event_indices.pop_front() else {
+            return Box::pin(async move { pending().await });
+        };
         let source_id = self.source_id.clone();
+        let replay_order = Arc::clone(&self.replay_order);
+        let cursor = &mut self.cursor;
         Box::pin(async move {
-            match &event {
-                MarketDataEvent::Observation(observation) => {
-                    clock.advance(observation.received_at);
-                    latest.update(observation.snapshot.clone());
-                    for exchange in exchanges {
-                        exchange
-                            .publish_snapshot(observation.snapshot.clone())
-                            .await
-                            .map_err(|_| MarketDataError::SourceEventTimeRollback {
-                                exchange: source_id.clone(),
+            loop {
+                let current = *cursor.borrow_and_update();
+                match current.cmp(&event_index) {
+                    std::cmp::Ordering::Equal => {
+                        let event =
+                            replay_order.tape.get(event_index).cloned().ok_or_else(|| {
+                                replay_order_mismatch(&source_id, event_index, current)
                             })?;
+                        return Ok(Some(event));
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(replay_order_mismatch(&source_id, event_index, current));
+                    }
+                    std::cmp::Ordering::Less => {
+                        cursor
+                            .changed()
+                            .await
+                            .map_err(|_| replay_order_mismatch(&source_id, event_index, current))?;
                     }
                 }
-                MarketDataEvent::SourceGap { observed_at, .. }
-                | MarketDataEvent::SourceUnavailable { observed_at, .. } => {
-                    clock.advance(*observed_at);
-                }
             }
-            Ok(Some(event))
         })
+    }
+}
+
+impl ReplayOrderGate {
+    fn new(events: Vec<MarketDataEvent>) -> Arc<Self> {
+        let (cursor, _) = watch::channel(0);
+        Arc::new(Self {
+            tape: events.into(),
+            cursor,
+        })
+    }
+
+    fn expected_index(&self, event: &MarketDataEvent) -> Result<usize, RuntimeError> {
+        let current = *self.cursor.borrow();
+        let Some(expected) = self.tape.get(current) else {
+            return Err(RuntimeError::InvalidExecutionPolicy(
+                "arbitrage replay owner observed an event after the tape ended",
+            ));
+        };
+        if expected != event {
+            return Err(RuntimeError::InvalidExecutionPolicy(
+                "arbitrage replay owner observed an event out of global tape order",
+            ));
+        }
+        Ok(current)
+    }
+
+    fn advance(&self, expected_index: usize) -> Result<(), RuntimeError> {
+        let current = *self.cursor.borrow();
+        if current != expected_index {
+            return Err(RuntimeError::InvalidExecutionPolicy(
+                "arbitrage replay global tape cursor changed unexpectedly",
+            ));
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(RuntimeError::InvalidExecutionPolicy(
+                "arbitrage replay global tape cursor is exhausted",
+            ))?;
+        self.cursor.send_replace(next);
+        Ok(())
+    }
+}
+
+fn replay_order_mismatch(
+    source_id: &str,
+    expected_index: usize,
+    current_index: usize,
+) -> crypto_trading_runtime::MarketDataError {
+    crypto_trading_runtime::MarketDataError::SourceIdentityMismatch {
+        expected: format!("{source_id}/replay-index/{expected_index}"),
+        actual: format!("{source_id}/replay-index/{current_index}"),
     }
 }
 
@@ -593,6 +711,15 @@ struct GridReplayExecutor {
 }
 
 impl GridPaperExecutor for GridReplayExecutor {
+    fn observe_market(&self, observation: MarketDataObservation) -> GridPaperObservationFuture {
+        observe_replay_market(
+            Arc::clone(&self.exchange),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.latest),
+            observation,
+        )
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         let exchange = Arc::clone(&self.exchange);
         let exchange_name = self.exchange_name.clone();
@@ -626,34 +753,150 @@ struct ArbitrageReplayExecutor {
     left_exchange: String,
     right: Arc<PaperExchange>,
     right_exchange: String,
-    clock: Arc<ReplayMarketDataClock>,
-    latest: Arc<MirroredReplayState>,
+    monitor_clock: Arc<ReplayMarketDataClock>,
+    execution_clock: Arc<ReplayMarketDataClock>,
+    published: Arc<FrozenReplayPublicationState>,
+    replay_order: Arc<ReplayOrderGate>,
+}
+
+#[derive(Debug, Default)]
+struct FrozenReplayPublicationState {
+    snapshots: Mutex<HashMap<SnapshotKey, MarketSnapshot>>,
+}
+
+impl FrozenReplayPublicationState {
+    fn publication_plan(&self, pair: &ObservedMarketPair) -> Result<[bool; 2], RuntimeError> {
+        let snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok([
+            requires_frozen_publication(
+                snapshots.get(&SnapshotKey::from_snapshot(&pair.left)),
+                &pair.left,
+            )?,
+            requires_frozen_publication(
+                snapshots.get(&SnapshotKey::from_snapshot(&pair.right)),
+                &pair.right,
+            )?,
+        ])
+    }
+
+    fn record(&self, snapshot: MarketSnapshot) {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(SnapshotKey::from_snapshot(&snapshot), snapshot);
+    }
+}
+
+fn requires_frozen_publication(
+    current: Option<&MarketSnapshot>,
+    next: &MarketSnapshot,
+) -> Result<bool, RuntimeError> {
+    let Some(current) = current else {
+        return Ok(true);
+    };
+    if current == next {
+        return Ok(false);
+    }
+    if next.timestamp < current.timestamp {
+        return Err(RuntimeError::InvalidExecutionPolicy(
+            "arbitrage frozen snapshot moved backwards in time",
+        ));
+    }
+    if next.timestamp == current.timestamp {
+        return Err(RuntimeError::InvalidExecutionPolicy(
+            "arbitrage frozen snapshot changed at the same timestamp",
+        ));
+    }
+    Ok(true)
 }
 
 impl ArbitragePaperExecutor for ArbitrageReplayExecutor {
-    fn execute(&self, batch: ExecutionBatch) -> ArbitragePaperExecutionFuture {
+    fn observe_market_event(&self, event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        let expected_index = match self.replay_order.expected_index(&event) {
+            Ok(index) => index,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let observed_at = event.observed_at();
+        let monitor_clock = Arc::clone(&self.monitor_clock);
+        let replay_order = Arc::clone(&self.replay_order);
+        Box::pin(async move {
+            monitor_clock.advance(observed_at);
+            replay_order.advance(expected_index)
+        })
+    }
+
+    fn execute(
+        &self,
+        batch: ExecutionBatch,
+        pair: ObservedMarketPair,
+    ) -> ArbitragePaperExecutionFuture {
         let left = Arc::clone(&self.left);
         let left_exchange = self.left_exchange.clone();
         let right = Arc::clone(&self.right);
         let right_exchange = self.right_exchange.clone();
-        let clock = Arc::clone(&self.clock);
-        let latest = Arc::clone(&self.latest);
+        let execution_clock = Arc::clone(&self.execution_clock);
+        let published = Arc::clone(&self.published);
         Box::pin(async move {
-            let snapshots = latest.snapshots_for_batch(batch.intents())?;
+            if pair.left.exchange() != left_exchange || pair.right.exchange() != right_exchange {
+                return Err(RuntimeError::InvalidExecutionPolicy(
+                    "arbitrage frozen pair identity drifted from the configured legs",
+                ));
+            }
+            if pair.observed_at < ExecutionClock::now(execution_clock.as_ref()) {
+                return Err(RuntimeError::InvalidExecutionPolicy(
+                    "arbitrage frozen pair moved the execution clock backwards",
+                ));
+            }
+            let publication_plan = published.publication_plan(&pair)?;
+            execution_clock.advance(pair.observed_at);
+            if publication_plan[0] {
+                left.publish_snapshot(pair.left.clone())
+                    .await
+                    .map_err(RuntimeError::from)?;
+                published.record(pair.left.clone());
+            }
+            if publication_plan[1] {
+                right
+                    .publish_snapshot(pair.right.clone())
+                    .await
+                    .map_err(RuntimeError::from)?;
+                published.record(pair.right.clone());
+            }
+            let snapshots = vec![pair.left, pair.right];
             let policy = ExecutionPolicy::new(
                 true,
                 false,
-                ExecutionClock::now(clock.as_ref()),
+                ExecutionClock::now(execution_clock.as_ref()),
                 Duration::seconds(30),
                 snapshots,
             )?
-            .with_clock(clock);
+            .with_clock(execution_clock);
             let mut router = ExchangeRouter::new(ExecutionMode::Paper, policy);
             router.register(left_exchange, left);
             router.register(right_exchange, right);
             router.execute_batch(batch).await
         })
     }
+}
+
+fn observe_replay_market(
+    exchange: Arc<PaperExchange>,
+    clock: Arc<ReplayMarketDataClock>,
+    latest: Arc<MirroredReplayState>,
+    observation: MarketDataObservation,
+) -> GridPaperObservationFuture {
+    Box::pin(async move {
+        clock.advance(observation.received_at);
+        exchange
+            .publish_snapshot(observation.snapshot.clone())
+            .await
+            .map_err(RuntimeError::from)?;
+        latest.update(observation.snapshot);
+        Ok(())
+    })
 }
 
 fn load_account_risk_policy(path: Option<PathBuf>) -> Result<AccountRiskPolicy> {
@@ -913,10 +1156,7 @@ fn build_monitor(
     let left = MarketInstrument::new(left_exchange, symbol.clone(), market_type)?;
     let right = MarketInstrument::new(right_exchange, symbol, market_type)?;
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()])?;
-    let freshness = MarketFreshnessPolicy::new(
-        Duration::seconds(i64::try_from(monitor.data_timeout_seconds).unwrap_or(i64::MAX)),
-        Duration::seconds(1),
-    )?;
+    let freshness = freshness_policy_from_monitor_config(monitor)?;
     let book = MarketDataBook::new(universe, freshness, clock);
     ReadOnlyArbitrageMonitor::new(book, left, right, monitor.min_spread_pct)
 }
@@ -1002,41 +1242,42 @@ fn first_observation(events: &[MarketDataEvent]) -> Option<MarketSnapshot> {
     })
 }
 
-fn filter_events(
-    events: &[MarketDataEvent],
-    exchange: &str,
-    symbol: &Symbol,
-) -> Vec<MarketDataEvent> {
-    events
-        .iter()
-        .filter(|event| match event {
-            MarketDataEvent::Observation(observation) => {
-                observation.snapshot.exchange() == exchange
-                    && observation.snapshot.symbol == *symbol
-            }
-            MarketDataEvent::SourceGap {
-                exchange: event_exchange,
-                ..
-            }
-            | MarketDataEvent::SourceUnavailable {
-                exchange: event_exchange,
-                ..
-            } => event_exchange == exchange,
-        })
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{paper_exchange, validate_grid_replay, validate_profile_identity};
+    use super::{
+        paper_exchange, requires_frozen_publication, validate_grid_replay,
+        validate_profile_identity,
+    };
     use crate::monitor::ReplayMarketDataClock;
-    use chrono::{TimeZone, Utc};
-    use crypto_trading_domain::{MarketType, Symbol};
+    use chrono::{Duration, TimeZone, Utc};
+    use crypto_trading_domain::{MarketSnapshot, MarketType, Quantity, Symbol};
     use crypto_trading_exchange::{ExchangeHandle, ExchangeMode};
-    use crypto_trading_runtime::{MarketDataEvent, MarketDataObservation};
+    use crypto_trading_runtime::{MarketDataEvent, MarketDataObservation, RuntimeError};
+    use rust_decimal::Decimal;
     use serde_json::json;
+    use std::str::FromStr;
     use std::sync::Arc;
+
+    fn replay_snapshot(
+        exchange: &str,
+        bid: &str,
+        ask: &str,
+        at: chrono::DateTime<Utc>,
+    ) -> MarketSnapshot {
+        let mut snapshot = MarketSnapshot::new(
+            exchange,
+            Symbol::new("ETH-USDC-PERP").unwrap(),
+            MarketType::Perpetual,
+            crypto_trading_domain::Price::new(Decimal::from_str(bid).unwrap()).unwrap(),
+            crypto_trading_domain::Price::new(Decimal::from_str(ask).unwrap()).unwrap(),
+            at,
+        )
+        .unwrap();
+        let depth = Quantity::new(Decimal::from(20_u32)).unwrap();
+        snapshot.bid_quantity = Some(depth);
+        snapshot.ask_quantity = Some(depth);
+        snapshot
+    }
 
     #[tokio::test]
     async fn mirror_factory_is_always_paper_mode_even_for_live_named_exchanges() {
@@ -1046,6 +1287,23 @@ mod tests {
         let exchange = paper_exchange("binance".to_owned(), &clock).unwrap();
         let status = exchange.status().await.unwrap();
         assert_eq!(status.mode, ExchangeMode::Paper);
+    }
+
+    #[test]
+    fn frozen_snapshot_publication_rejects_time_regressions_and_timestamp_drift() {
+        let at = Utc.with_ymd_and_hms(2026, 7, 25, 0, 0, 1).unwrap();
+        let current = replay_snapshot("paper-left", "99", "100", at);
+        assert!(!requires_frozen_publication(Some(&current), &current).unwrap());
+        let older = replay_snapshot("paper-left", "98", "99", at - Duration::seconds(1));
+        assert!(matches!(
+            requires_frozen_publication(Some(&current), &older),
+            Err(RuntimeError::InvalidExecutionPolicy(_))
+        ));
+        let changed_at_same_time = replay_snapshot("paper-left", "98", "100", at);
+        assert!(matches!(
+            requires_frozen_publication(Some(&current), &changed_at_same_time),
+            Err(RuntimeError::InvalidExecutionPolicy(_))
+        ));
     }
 
     #[test]

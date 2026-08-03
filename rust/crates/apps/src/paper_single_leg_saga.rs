@@ -207,9 +207,8 @@ impl DurablePaperSingleLegSaga {
                     outcome_details(request.batch(), &receipts),
                 )
                 .await?;
-                let confirmed = request.reservation().gross_notional()?;
                 self.account
-                    .commit(reservation.reservation_id, confirmed)
+                    .settle_execution(reservation.reservation_id, &receipts)
                     .await?;
                 Ok(PaperSingleLegRun::Completed { receipts })
             }

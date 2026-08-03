@@ -22,6 +22,13 @@ fn money(value: &str) -> Money {
 }
 
 fn reservation_request() -> PaperReservationRequest {
+    reservation_request_with_identity("arb:btc", "open:0001")
+}
+
+fn reservation_request_with_identity(
+    task_id: &str,
+    idempotency_key: &str,
+) -> PaperReservationRequest {
     let left = OrderIntent::market(
         "paper-left",
         Symbol::new("BTC-USDT").unwrap(),
@@ -38,8 +45,8 @@ fn reservation_request() -> PaperReservationRequest {
     );
     PaperReservationRequest::new(
         Uuid::new_v4(),
-        "arb:btc",
-        "open:0001",
+        task_id,
+        idempotency_key,
         Uuid::new_v4(),
         PaperCostModel::v1(10, 5, 15).unwrap(),
         vec![
@@ -131,6 +138,10 @@ async fn invalid_paper_fact_degrades_without_overwriting_last_valid_reservation(
     assert_eq!(degraded.projection_status, ProjectionStatus::Degraded);
     assert_eq!(degraded.invalid_event_count, 1);
     assert_eq!(degraded.reservations, vec![committed]);
+    assert!(matches!(
+        authority.decision_snapshot().await,
+        Err(PaperAccountError::DurableStateDegraded)
+    ));
 
     let error = authority
         .record_reconciliation_failure(
@@ -152,7 +163,7 @@ async fn invalid_paper_fact_degrades_without_overwriting_last_valid_reservation(
 }
 
 #[tokio::test]
-async fn partial_tail_is_visible_and_blocks_all_new_account_writes() {
+async fn partial_tail_is_visible_then_quarantined_before_the_next_account_write() {
     let path = temp_path("partial-tail");
     let journal_id = Uuid::new_v4();
     let authority = PaperAccountAuthority::new(
@@ -177,8 +188,36 @@ async fn partial_tail_is_visible_and_blocks_all_new_account_writes() {
     assert_eq!(model.accounts.len(), 1);
     assert_eq!(model.accounts[0].reservations.len(), 1);
 
-    let error = authority.reserve(reservation_request()).await.unwrap_err();
-    assert!(matches!(error, PaperAccountError::DurableStateDegraded));
+    authority
+        .reserve(reservation_request_with_identity("arb:eth", "open:0002"))
+        .await
+        .unwrap();
+
+    let recovered = authority.snapshot().await.unwrap();
+    assert_eq!(recovered.projection_status, ProjectionStatus::Complete);
+    assert_eq!(recovered.reservations.len(), 2);
+    assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
+    let quarantine_dir = path.parent().unwrap().join(format!(
+        "{}.quarantine",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let quarantines = std::fs::read_dir(&quarantine_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("partial-tail.") && name.ends_with(".quarantine")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(
+        std::fs::read(&quarantines[0]).unwrap(),
+        br#"{"timestamp":"incomplete""#
+    );
 }
 
 #[tokio::test]

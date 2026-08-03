@@ -24,6 +24,7 @@ jobs:
   frontend:
     name: ${{ matrix.os }} / typecheck, lint, test, build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +57,7 @@ jobs:
   e2e:
     name: Browser contract against the embedded binary
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -94,6 +96,7 @@ jobs:
   supply-chain-frontend:
     name: Frontend registry, advisory, and license policy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: frontend

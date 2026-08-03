@@ -31,6 +31,7 @@ pub enum CapabilityArea {
     ControlPlane,
     Exchange,
     History,
+    Research,
     Risk,
     Runtime,
     Strategy,
@@ -43,6 +44,7 @@ impl fmt::Display for CapabilityArea {
             Self::ControlPlane => "control-plane",
             Self::Exchange => "exchange",
             Self::History => "history",
+            Self::Research => "research",
             Self::Risk => "risk",
             Self::Runtime => "runtime",
             Self::Strategy => "strategy",
@@ -316,17 +318,19 @@ impl CapabilityManifest {
 #[must_use]
 pub fn current_capability_manifest() -> CapabilityManifest {
     let adapters = adapter_support_matrix();
-    let capabilities = [
+    let mut capabilities = [
         foundation_capabilities(),
         exchange_capabilities(&adapters),
         state_and_risk_capabilities(),
+        research_capabilities(),
         runtime_execution_capabilities(),
         runtime_validation_capabilities(),
         strategy_capabilities(),
     ]
     .into_iter()
     .flatten()
-    .collect();
+    .collect::<Vec<_>>();
+    capabilities.sort_by(|left, right| left.id.cmp(&right.id));
     let manifest = CapabilityManifest {
         schema_version: CAPABILITY_SCHEMA_VERSION,
         product_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -487,6 +491,7 @@ fn paper_adapter() -> AdapterSupport {
             &[
                 "rust/crates/exchange/src/paper.rs",
                 "rust/crates/exchange/tests/paper_exchange_contract.rs",
+                "rust/crates/apps/src/command.rs",
             ],
         ),
         live: adapter_facet(
@@ -595,7 +600,10 @@ fn foundation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Bounded YAML and JSON configuration parsing with executable classification.",
             &[],
-            &["rust/crates/config", "rust/crates/apps/src/command.rs"],
+            &[
+                "rust/crates/config/src/lib.rs",
+                "rust/crates/apps/src/command.rs",
+            ],
         ),
         capability(
             "control-plane.web",
@@ -715,6 +723,7 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 "rust/crates/runtime/tests/history_writer_lock_contract.rs",
                 "rust/crates/runtime/tests/history_rotation_contract.rs",
                 "rust/crates/runtime/tests/execution_contract.rs",
+                "rust/crates/apps/src/command.rs",
             ],
         ),
         capability(
@@ -725,9 +734,9 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Journal-backed paper account-level risk authority: per-symbol and global exposure caps, total-balance warning/forced-close thresholds, UTC-midnight daily trade caps, symbol deny/high-risk lists, owner position clocks with timeout close directives, durable pause/resume, and a latching kill switch wired ahead of every paper reservation and into the trusted submit path.",
+            "Journal-backed paper account-level risk authority: exact FIFO lots, immediate taker-fee and realized-PnL settlement for fully filled paper receipts, reduce-only capacity, settled-equity balance thresholds, per-symbol/global exposure caps, UTC-midnight daily trade caps, owner position clocks, durable pause/resume, and a latching kill switch.",
             &[
-                "The authority is paper-scoped only: it composes the journal-backed paper reservation model and does not own exchange equity, margin, mark-to-market, position truth, or any testnet/mainnet account state; those remain mandatory gates for live authority.",
+                "The authority is paper-scoped only: exact settlement currently covers synchronous fully filled taker receipts, not resting-maker lifecycle, funding, unrealized mark-to-market, margin/liquidation mechanics, or any testnet/mainnet account truth; those remain mandatory gates for live authority.",
                 "Close directives are demands recorded as durable facts; consumers stop the paper owner rather than submitting exchange orders, and the kill switch has deliberately no disengage transition.",
             ],
             &[
@@ -744,6 +753,47 @@ fn state_and_risk_capabilities() -> Vec<Capability> {
                 "rust/crates/control-plane/src/submit.rs",
                 "rust/crates/web-app/src/paper_dispatcher.rs",
                 "rust/crates/web/tests/http_contract.rs",
+            ],
+        ),
+    ]
+}
+
+fn research_capabilities() -> Vec<Capability> {
+    vec![
+        capability(
+            "research.backtest",
+            CapabilityArea::Research,
+            CapabilityLevel::Unavailable,
+            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
+            "Internal library-only deterministic single-instrument SimClock/EventTape kernel with explicit fee/slippage assumptions, ledger outputs, equity curves, performance-metric primitives, and out-of-sample window primitives.",
+            &[
+                "Unavailable as a product capability: no shipped binary links this crate, and no supported CLI or HTTP entry point, bounded tape input contract, or production strategy adapter exists.",
+                "This kernel is not a profitability claim: multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
+            ],
+            &[
+                "rust/crates/backtest/src/engine.rs",
+                "rust/crates/backtest/src/ledger.rs",
+                "rust/crates/backtest/src/walk_forward.rs",
+                "rust/crates/backtest/tests/backtest_contract.rs",
+            ],
+        ),
+        capability(
+            "research.indicators",
+            CapabilityArea::Research,
+            CapabilityLevel::Unavailable,
+            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
+            "Internal library-only Decimal indicator kernels for ATR, EMA, EWMA realized volatility, rolling z-score, and performance-metric primitives, covered by golden vectors.",
+            &[
+                "Unavailable as a product capability: no shipped binary links this crate, no supported CLI or HTTP entry point exists, and continuous strategy configuration does not consume these indicators.",
+                "Order-book imbalance and microprice indicators are not implemented.",
+            ],
+            &[
+                "rust/crates/indicators/src/atr.rs",
+                "rust/crates/indicators/src/ema.rs",
+                "rust/crates/indicators/src/ewma_volatility.rs",
+                "rust/crates/indicators/src/metrics.rs",
+                "rust/crates/indicators/src/zscore.rs",
+                "rust/crates/indicators/tests/indicators_contract.rs",
             ],
         ),
     ]
@@ -861,9 +911,9 @@ fn market_data_capability() -> Capability {
             ],
             CapabilityAccess::MarketData,
         ),
-        "Bounded exact-universe market book with freshness, continuity, deterministic replay, subscription gaps, credential-free Binance Spot polling, and credential-free Hyperliquid perpetual polling with an hourly funding-rate side feed.",
+        "Bounded exact-universe market book with explicit timestamp provenance, venue sequence metadata, cross-venue skew rejection, deterministic replay, subscription gaps, credential-free Binance Spot polling, and credential-free Hyperliquid perpetual polling with an hourly funding-rate side feed.",
         &[
-            "Both real venues are credential-free HTTP polling rather than realtime streams, and the executable live bootstrap is limited to the explicit opt-in binance+hyperliquid monitor pair; the funding side feed is observation-only and drives no decision yet.",
+            "Both real venues are credential-free HTTP polling rather than realtime streams. Their documented REST payloads do not expose venue event time, so observations are explicitly marked local-receipt-time; the executable live bootstrap remains limited to the opt-in binance+hyperliquid monitor pair, and the funding side feed drives no decision yet.",
         ],
         &[
             "rust/crates/runtime/src/market_data.rs",
@@ -1087,6 +1137,8 @@ fn strategy_capabilities() -> Vec<Capability> {
                 "rust/crates/strategy/src/arbitrage_history.rs",
                 "rust/crates/strategy/tests/segmented_arbitrage.rs",
                 "rust/crates/strategy/tests/arbitrage_history.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_arbitrage_task.rs",
             ],
         ),
         capability(
@@ -1101,6 +1153,8 @@ fn strategy_capabilities() -> Vec<Capability> {
                 "rust/crates/strategy/src/grid_protection.rs",
                 "rust/crates/strategy/tests/grid_planner.rs",
                 "rust/crates/strategy/tests/grid_protection.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_grid_task.rs",
             ],
         ),
         capability(
@@ -1113,6 +1167,8 @@ fn strategy_capabilities() -> Vec<Capability> {
             &[
                 "rust/crates/strategy/src/alert.rs",
                 "rust/crates/strategy/tests/price_alert.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/alert/mod.rs",
             ],
         ),
         capability(
@@ -1125,6 +1181,8 @@ fn strategy_capabilities() -> Vec<Capability> {
             &[
                 "rust/crates/strategy/src/virtual_grid.rs",
                 "rust/crates/strategy/tests/virtual_grid_golden.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/scanner.rs",
             ],
         ),
         capability(
@@ -1137,6 +1195,8 @@ fn strategy_capabilities() -> Vec<Capability> {
             &[
                 "rust/crates/strategy/src/volume_maker.rs",
                 "rust/crates/strategy/tests/volume_maker.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/src/paper_volume_maker_task.rs",
             ],
         ),
     ]

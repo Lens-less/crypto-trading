@@ -253,6 +253,12 @@ impl AlertStrategy {
 
     /// Evaluates volatility and absolute-price thresholds at snapshot time.
     ///
+    /// The volatility baseline is the newest sample at or before the window
+    /// start; when the retained history holds no such sample (callers prune
+    /// history to exactly the window, so real timestamps almost never land on
+    /// the boundary), the oldest retained sample serves as the baseline and
+    /// the change is measured over at most the window.
+    ///
     /// # Errors
     ///
     /// Returns [`StrategyError::InvalidFinancialValue`] when the current price
@@ -288,7 +294,13 @@ impl AlertStrategy {
                 .history
                 .iter()
                 .rev()
-                .find(|point| point.timestamp <= window_start);
+                .find(|point| point.timestamp <= window_start)
+                // `prune_before` keeps only samples at or after the cutoff, so
+                // a sample at or before the window start survives only when a
+                // timestamp lands exactly on the boundary. Any fallback sample
+                // is strictly inside the window, so a threshold move against
+                // it still happened within the configured window.
+                .or_else(|| state.history.front());
             if let Some(baseline) =
                 baseline.filter(|point| point.price.as_decimal() > Decimal::ZERO)
             {

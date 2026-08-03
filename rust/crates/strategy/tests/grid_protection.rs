@@ -157,13 +157,16 @@ fn scalping_long_derives_the_breakeven_plus_two_take_profit_order() {
     );
 }
 
-// Golden vector: the short leg mirrors `scalping_manager.py:316-340` with
-// breakeven = price - required move and take-profit level
-// `max(1, conservative(breakeven) - take_profit_grids)`. With price=181,
-// pnl=-50, position=-10: breakeven=176, level 25, take-profit level 23,
-// price $178 via `grid_config.py:311-314`.
+// Golden vector: the short leg computes breakeven = price - required move and
+// the take-profit level `min(grid_count, conservative(breakeven) +
+// take_profit_grids)` — in short index space a larger index is a lower price,
+// so adding levels moves the buy-to-cover past breakeven into profit. This
+// deliberately deviates from the buggy legacy `scalping_manager.py:316-340`,
+// which subtracted the levels and exited on the loss side of breakeven. With
+// price=181, pnl=-50, position=-10: breakeven=176, level 25, take-profit
+// level 27, price $174 via `grid_config.py:311-314`.
 #[test]
-fn scalping_short_derives_the_breakeven_minus_two_take_profit_order() {
+fn scalping_short_derives_the_breakeven_plus_two_take_profit_order() {
     let geometry = short_geometry();
     let mut policy = ScalpingPolicy::new(ScalpingPolicyConfig::new(80, 2).unwrap());
 
@@ -181,7 +184,7 @@ fn scalping_short_derives_the_breakeven_minus_two_take_profit_order() {
             reason: GridProtectionReason::ScalpingActive,
             side: Side::Buy,
             quantity: decimal("10").try_into().unwrap(),
-            take_profit_price: price("178"),
+            take_profit_price: price("174"),
         }
     );
 }

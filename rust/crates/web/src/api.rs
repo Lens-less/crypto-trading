@@ -1,7 +1,10 @@
 use std::{
     convert::Infallible,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -28,6 +31,7 @@ use crypto_trading_control_plane::{
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::watch;
 
 const API_SCHEMA_VERSION: u16 = 1;
 const MIN_BEARER_TOKEN_BYTES: usize = 32;
@@ -50,6 +54,8 @@ struct ApiState {
     control_plane: Arc<ReadControlPlane>,
     authentication_required: bool,
     settings: Arc<SettingsResponse>,
+    shutdown: Option<watch::Receiver<bool>>,
+    degraded_logged: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -283,20 +289,55 @@ pub fn api_router(control_plane: Arc<ReadControlPlane>, access: WebAccessPolicy)
     api_router_with_settings(control_plane, access, SettingsResponse::default())
 }
 
+/// Builds the read-only API router with an application-lifecycle signal.
+/// Long-lived event streams close as soon as `shutdown` changes to `true`.
+pub fn api_router_with_shutdown(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
+    api_router_with_settings_and_shutdown(
+        control_plane,
+        access,
+        SettingsResponse::default(),
+        shutdown,
+    )
+}
+
 /// Builds the read-only API router with trusted deployment metadata.
 pub fn api_router_with_settings(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
     settings: SettingsResponse,
 ) -> Router {
+    api_router_with_optional_shutdown(control_plane, access, settings, None)
+}
+
+/// Builds the read-only API router with deployment metadata and a lifecycle signal.
+pub fn api_router_with_settings_and_shutdown(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    settings: SettingsResponse,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
+    api_router_with_optional_shutdown(control_plane, access, settings, Some(shutdown))
+}
+
+fn api_router_with_optional_shutdown(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    settings: SettingsResponse,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Router {
     Router::new()
         .nest(
             "/api/v1",
-            api_routes_with_settings(
+            api_routes_with_optional_shutdown(
                 control_plane,
                 access,
                 settings,
                 WebRequestRateLimiter::default(),
+                shutdown,
             ),
         )
         .fallback(not_found)
@@ -306,14 +347,42 @@ pub fn api_router_with_settings(
 pub(crate) fn api_routes_with_settings(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
+    settings: SettingsResponse,
+    rate_limiter: WebRequestRateLimiter,
+) -> Router {
+    api_routes_with_optional_shutdown(control_plane, access, settings, rate_limiter, None)
+}
+
+pub(crate) fn api_routes_with_settings_and_shutdown(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
+    settings: SettingsResponse,
+    rate_limiter: WebRequestRateLimiter,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
+    api_routes_with_optional_shutdown(
+        control_plane,
+        access,
+        settings,
+        rate_limiter,
+        Some(shutdown),
+    )
+}
+
+fn api_routes_with_optional_shutdown(
+    control_plane: Arc<ReadControlPlane>,
+    access: WebAccessPolicy,
     mut settings: SettingsResponse,
     rate_limiter: WebRequestRateLimiter,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> Router {
     settings.request_limit = rate_limiter.settings();
     let state = ApiState {
         control_plane,
         authentication_required: access.authentication_required(),
         settings: Arc::new(settings),
+        shutdown,
+        degraded_logged: Arc::new(AtomicBool::new(false)),
     };
     let access_state = ApiAccessState {
         access,
@@ -364,7 +433,7 @@ async fn capabilities(State(state): State<ApiState>) -> Json<CapabilityManifest>
 }
 
 async fn system(State(state): State<ApiState>) -> Result<Json<SystemResponse>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
+    let snapshot = load_snapshot(&state).await?;
     Ok(Json(SystemResponse::from_snapshot(
         snapshot,
         state.authentication_required,
@@ -374,24 +443,24 @@ async fn system(State(state): State<ApiState>) -> Result<Json<SystemResponse>, A
 async fn monitor(
     State(state): State<ApiState>,
 ) -> Result<Json<ArbitrageMonitorReadModel>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
+    let snapshot = load_snapshot(&state).await?;
     Ok(Json(snapshot.monitor))
 }
 
 async fn alerts(State(state): State<ApiState>) -> Result<Json<PriceAlertReadModel>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
+    let snapshot = load_snapshot(&state).await?;
     Ok(Json(snapshot.alerts))
 }
 
 async fn tasks(State(state): State<ApiState>) -> Result<Json<ReadOnlyTaskReadModel>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
+    let snapshot = load_snapshot(&state).await?;
     Ok(Json(snapshot.tasks))
 }
 
 async fn scanner(
     State(state): State<ApiState>,
 ) -> Result<Json<VirtualGridScannerReadModel>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
+    let snapshot = load_snapshot(&state).await?;
     Ok(Json(snapshot.scanner))
 }
 
@@ -406,7 +475,7 @@ pub struct RiskResponse {
 }
 
 async fn risk(State(state): State<ApiState>) -> Result<Json<RiskResponse>, ApiError> {
-    let snapshot = load_snapshot(state.control_plane).await?;
+    let snapshot = load_snapshot(&state).await?;
     Ok(Json(RiskResponse {
         schema_version: API_SCHEMA_VERSION,
         paper_accounts: snapshot.paper_accounts,
@@ -431,10 +500,13 @@ async fn executions(
         return Err(ApiError::from_failure(ReadFailureKind::InvalidCursor));
     }
     let control_plane = state.control_plane;
+    let degraded_logged = state.degraded_logged;
+    let worker_degraded_logged = Arc::clone(&degraded_logged);
     let response = tokio::task::spawn_blocking(move || {
         let read = control_plane
             .snapshot_with_events_after(query.cursor.as_deref())
             .map_err(|error| error.kind())?;
+        log_degraded_snapshot_once(&worker_degraded_logged, &read.snapshot);
         Ok::<_, ReadFailureKind>(ExecutionsResponse {
             schema_version: API_SCHEMA_VERSION,
             operator: read.snapshot.operator,
@@ -442,8 +514,16 @@ async fn executions(
         })
     })
     .await
-    .map_err(|_| ApiError::internal())?
-    .map_err(ApiError::from_failure)?;
+    .map_err(|_| {
+        log_projection_failure_once(&degraded_logged, "projection_worker_failed");
+        ApiError::internal()
+    })?
+    .map_err(|kind| {
+        if projection_failure_is_degraded(kind) {
+            log_projection_failure_once(&degraded_logged, "projection_read_failed");
+        }
+        ApiError::from_failure(kind)
+    })?;
     Ok(Json(response))
 }
 
@@ -459,6 +539,7 @@ async fn events(
         state.control_plane,
         cursor,
         first_page,
+        state.shutdown,
     ))
     .keep_alive(
         KeepAlive::new()
@@ -501,6 +582,7 @@ fn operation_event_stream(
     control_plane: Arc<ReadControlPlane>,
     cursor: Option<String>,
     first_page: ControlPlaneEventsPage,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let state = EventStreamState {
         control_plane,
@@ -509,19 +591,52 @@ fn operation_event_stream(
         sent_initial: false,
         poll_immediately: true,
         terminal: false,
+        shutdown,
     };
     stream::unfold(state, |mut state| async move {
         if state.terminal {
             return None;
         }
         loop {
+            if state
+                .shutdown
+                .as_ref()
+                .is_some_and(|shutdown| *shutdown.borrow())
+            {
+                return None;
+            }
             let page = if let Some(page) = state.pending.take() {
                 page
             } else {
                 if !state.poll_immediately {
-                    tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                    if let Some(shutdown) = state.shutdown.as_mut() {
+                        let shutting_down = tokio::select! {
+                            () = tokio::time::sleep(EVENT_POLL_INTERVAL) => false,
+                            changed = shutdown.changed() => {
+                                changed.is_err() || *shutdown.borrow()
+                            }
+                        };
+                        if shutting_down {
+                            return None;
+                        }
+                    } else {
+                        tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                    }
                 }
-                match load_events(state.control_plane.clone(), state.cursor.clone()).await {
+                let loaded = if let Some(shutdown) = state.shutdown.as_mut() {
+                    tokio::select! {
+                        result = load_events(state.control_plane.clone(), state.cursor.clone()) => result,
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return None;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    load_events(state.control_plane.clone(), state.cursor.clone()).await
+                };
+                match loaded {
                     Ok(page) => page,
                     Err(error) => {
                         state.terminal = true;
@@ -579,13 +694,61 @@ async fn load_events(
     .map_err(ApiError::from_failure)
 }
 
-async fn load_snapshot(
-    control_plane: Arc<ReadControlPlane>,
-) -> Result<ControlPlaneSnapshot, ApiError> {
-    tokio::task::spawn_blocking(move || control_plane.snapshot())
-        .await
-        .map_err(|_| ApiError::internal())?
-        .map_err(|error| ApiError::from_failure(error.kind()))
+async fn load_snapshot(state: &ApiState) -> Result<ControlPlaneSnapshot, ApiError> {
+    let control_plane = Arc::clone(&state.control_plane);
+    let result = tokio::task::spawn_blocking(move || control_plane.snapshot()).await;
+    match result {
+        Ok(Ok(snapshot)) => {
+            log_degraded_snapshot_once(&state.degraded_logged, &snapshot);
+            Ok(snapshot)
+        }
+        Ok(Err(error)) => {
+            let kind = error.kind();
+            if projection_failure_is_degraded(kind) {
+                log_projection_failure_once(&state.degraded_logged, "projection_read_failed");
+            }
+            Err(ApiError::from_failure(kind))
+        }
+        Err(_) => {
+            log_projection_failure_once(&state.degraded_logged, "projection_worker_failed");
+            Err(ApiError::internal())
+        }
+    }
+}
+
+fn log_degraded_snapshot_once(degraded_logged: &AtomicBool, snapshot: &ControlPlaneSnapshot) {
+    let degraded = [
+        snapshot.operator.projection_status,
+        snapshot.monitor.projection_status,
+        snapshot.alerts.projection_status,
+        snapshot.tasks.projection_status,
+        snapshot.scanner.projection_status,
+        snapshot.paper_accounts.projection_status,
+        snapshot.account_risk.projection_status,
+    ]
+    .contains(&ProjectionStatus::Degraded);
+    if degraded {
+        log_projection_failure_once(degraded_logged, "projection_degraded");
+    }
+}
+
+fn log_projection_failure_once(degraded_logged: &AtomicBool, state: &'static str) {
+    if !degraded_logged.swap(true, Ordering::AcqRel) {
+        tracing::error!(
+            event = "control_plane_projection_degraded",
+            state,
+            "control-plane projection is not trustworthy"
+        );
+    }
+}
+
+const fn projection_failure_is_degraded(kind: ReadFailureKind) -> bool {
+    matches!(
+        kind,
+        ReadFailureKind::SourceUnavailable
+            | ReadFailureKind::ResourceLimit
+            | ReadFailureKind::InvalidJournal
+    )
 }
 
 async fn authorize(State(state): State<ApiAccessState>, request: Request, next: Next) -> Response {
@@ -905,6 +1068,7 @@ struct EventStreamState {
     sent_initial: bool,
     poll_immediately: bool,
     terminal: bool,
+    shutdown: Option<watch::Receiver<bool>>,
 }
 
 fn constant_time_eq(expected: &[u8], supplied: &[u8]) -> bool {

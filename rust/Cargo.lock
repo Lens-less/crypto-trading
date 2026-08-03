@@ -373,8 +373,20 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "crypto-trading-backtest"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crypto-trading-domain",
+ "crypto-trading-indicators",
+ "rust_decimal",
+ "thiserror",
 ]
 
 [[package]]
@@ -427,7 +439,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
+]
+
+[[package]]
+name = "crypto-trading-indicators"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "thiserror",
 ]
 
 [[package]]
@@ -444,6 +465,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -473,6 +495,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+ "tracing",
  "uuid",
 ]
 
@@ -492,6 +515,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]

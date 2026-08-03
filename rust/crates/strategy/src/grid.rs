@@ -1,3 +1,10 @@
+//! Deterministic grid planning derived from the frozen Python subsystem.
+//!
+//! The legacy implementation is a behavioral reference, not a byte-for-byte
+//! compatibility contract. Where a legacy index formula contradicts its own
+//! documented economic meaning, the Rust planner keeps the documented meaning
+//! and calls out that deviation at the formula and in the changelog.
+
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, OrderIntent, Price, Quantity, Side, Symbol,
 };
@@ -305,10 +312,15 @@ impl GridPlanner {
                 GridDirection::Short => upper.checked_sub(level_offset),
             }
             .ok_or(StrategyError::InvalidFinancialValue("grid level price"))?;
-            let increment_count = match self.config.direction {
-                GridDirection::Long => count - index,
-                GridDirection::Short => index - 1,
-            };
+            // Index 1 is the deepest adverse excursion in both directions
+            // (lowest price for long, highest price for short), so martingale
+            // sizing is largest there. The legacy short formula
+            // (`grid_config.py:565-569`, `order_amount + (grid_index - 1) *
+            // increment`) contradicts its own documented intent ("higher
+            // price, larger quantity") because legacy Grid 1 is the highest
+            // short price. We deliberately deviate to deliver the documented
+            // intent.
+            let increment_count = count - index;
             let quantity_increment = self
                 .config
                 .martingale_increment

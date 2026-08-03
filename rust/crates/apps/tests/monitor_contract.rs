@@ -1,16 +1,19 @@
 use std::{
     fmt,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use crypto_trading_cli::monitor::{
     ARBITRAGE_MONITOR_EVENT_SCHEMA_VERSION, ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor,
+    load_market_snapshot_replay,
 };
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_runtime::{
-    MarketContinuity, MarketDataBook, MarketDataClock, MarketDataEvent, MarketDataObservation,
-    MarketFreshnessPolicy, MarketInstrument, MarketUniverse,
+    MarketContinuity, MarketDataBook, MarketDataClock, MarketDataEvent, MarketDataFreshness,
+    MarketDataObservation, MarketFreshnessPolicy, MarketInstrument, MarketTimestampProvenance,
+    MarketUniverse,
 };
 use rust_decimal::Decimal;
 
@@ -137,6 +140,83 @@ fn below_threshold_and_stale_market_are_distinct_read_only_outcomes() {
 }
 
 #[test]
+fn legacy_replay_timestamps_are_local_receipts_not_fabricated_venue_time() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let replay = std::env::temp_dir().join(format!(
+        "crypto-trading-monitor-provenance-{}-{nonce}.jsonl",
+        std::process::id()
+    ));
+    std::fs::write(
+        &replay,
+        concat!(
+            r#"{"exchange":"paper","symbol":"BTC-USDT","market_type":"perpetual","bid":"99","ask":"100","timestamp":"2026-07-24T00:00:00Z"}"#,
+            "\n",
+            r#"{"exchange":"paper","symbol":"BTC-USDT","market_type":"perpetual","bid":"100","ask":"101","timestamp":"2026-07-24T00:00:00Z"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let events = load_market_snapshot_replay(&replay).unwrap();
+    assert!(events.iter().all(|event| matches!(
+        event,
+        MarketDataEvent::Observation(observation)
+            if observation.timestamp_provenance == MarketTimestampProvenance::LocalReceipt
+    )));
+
+    let key = instrument("paper");
+    let mut book = MarketDataBook::new(
+        MarketUniverse::new(vec![key.clone()]).unwrap(),
+        MarketFreshnessPolicy::new(Duration::seconds(10), Duration::seconds(1)).unwrap(),
+        Arc::new(TestClock::new(timestamp(0))),
+    );
+    for event in events {
+        book.apply(event).unwrap();
+    }
+    let view = book.view();
+    let row = view.instrument(&key).unwrap();
+    assert_eq!(row.continuity, MarketContinuity::Continuous);
+    assert_eq!(row.source_latency_millis, None);
+    assert_eq!(row.revision, Some(2));
+
+    std::fs::remove_file(replay).unwrap();
+}
+
+#[test]
+fn pair_skew_waits_for_the_lagging_leg_without_terminating_the_monitor() {
+    let base = timestamp(0);
+    let (mut monitor, _, _, clock) = monitor(base);
+    monitor
+        .process(observation(snapshot("left", "99", "100", base), 1, base))
+        .unwrap();
+    clock.set(base + Duration::seconds(2));
+
+    let waiting = monitor
+        .process(observation(
+            snapshot("right", "102", "103", base + Duration::seconds(2)),
+            1,
+            base + Duration::seconds(2),
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        waiting.outcome,
+        ArbitrageMonitorOutcome::Waiting {
+            ref instrument,
+            freshness: MarketDataFreshness::PairSkew {
+                skew_millis: 2_000,
+                tolerance_millis: 1_000,
+            },
+            continuity: MarketContinuity::Continuous,
+        } if instrument.exchange() == "left"
+    ));
+    assert_eq!(waiting.to_record().decision, "monitor_waiting");
+}
+
+#[test]
 fn duplicate_gap_and_recovery_are_events_not_silent_state_changes() {
     let base = timestamp(0);
     let (mut monitor, _, right, clock) = monitor(base);
@@ -162,6 +242,16 @@ fn duplicate_gap_and_recovery_are_events_not_silent_state_changes() {
             ..
         } if instrument == right
     ));
+
+    // Keep the sibling leg inside the independent pair-skew bound while this
+    // test focuses on right-source gap recovery.
+    monitor
+        .process(observation(
+            snapshot("left", "99", "100", base + Duration::seconds(1)),
+            2,
+            base + Duration::seconds(1),
+        ))
+        .unwrap();
 
     let gap = monitor
         .process(MarketDataEvent::source_gap("right", 3, base + Duration::seconds(2)).unwrap())

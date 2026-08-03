@@ -1,5 +1,8 @@
-//! Pure grid-protection state machines ported from the frozen Python grid
-//! subsystem (`archive/python-legacy/core/services/grid/`).
+//! Pure grid-protection state machines derived from the frozen Python grid
+//! subsystem (`archive/python-legacy/core/services/grid/`). The archive is a
+//! behavioral reference rather than a byte-for-byte compatibility contract;
+//! deliberate corrections to economically inverted legacy formulas are
+//! documented at their decision points and in the changelog.
 //!
 //! Five independent policies observe one price/position/equity snapshot and
 //! emit a single [`GridDirective`]. [`GridProtectionMachine`] arbitrates them
@@ -392,20 +395,18 @@ impl ScalpingPolicy {
         };
         let breakeven_index = geometry.conservative_index(breakeven)?;
         // Clamp the take-profit level to the grid range
-        // (`scalping_manager.py:296-340`).
-        let take_profit_index = match geometry.direction {
-            GridDirection::Long => {
-                if breakeven_index > geometry.level_count {
-                    geometry.level_count
-                } else {
-                    breakeven_index
-                        .saturating_add(self.config.take_profit_levels)
-                        .min(geometry.level_count)
-                }
-            }
-            GridDirection::Short => breakeven_index
-                .saturating_sub(self.config.take_profit_levels)
-                .max(1),
+        // (`scalping_manager.py:296-340`). In both directions a larger index
+        // lies further past breakeven in the profit direction of the
+        // reduce-only exit (long: higher sell price, short: lower buy price),
+        // so the offset is always added in index space. Deliberate deviation
+        // from `scalping_manager.py:316-340`, which subtracted the offset for
+        // shorts and thereby placed the exit on the loss side of breakeven.
+        let take_profit_index = if breakeven_index > geometry.level_count {
+            geometry.level_count
+        } else {
+            breakeven_index
+                .saturating_add(self.config.take_profit_levels)
+                .min(geometry.level_count)
         };
         let take_profit_price = Price::new(geometry.level_price(take_profit_index)?)
             .map_err(|_| StrategyError::InvalidFinancialValue("scalping take-profit price"))?;

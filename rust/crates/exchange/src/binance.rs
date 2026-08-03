@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Quantity, Symbol};
 use serde::Deserialize;
 
+use crate::remote::metadata_from_reqwest_headers;
 use crate::{
     ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeOperation,
     ExchangeStatus, MarketSubscription, ReconcileReceipt, ReconcileScope, SubscriptionReceipt,
@@ -24,6 +25,15 @@ pub struct BinancePublicExchange {
     book_ticker_url: reqwest::Url,
 }
 
+/// One public Binance book-ticker observation plus the bounded source metadata
+/// the runtime can safely rely on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinancePublicObservation {
+    pub snapshot: MarketSnapshot,
+    pub event_time: Option<DateTime<Utc>>,
+    pub source_sequence: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BookTickerWire {
@@ -32,6 +42,8 @@ struct BookTickerWire {
     bid_qty: String,
     ask_price: String,
     ask_qty: String,
+    #[serde(rename = "updateId", alias = "u", default)]
+    source_sequence: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +106,27 @@ impl BinancePublicExchange {
     /// HTTP responses, and [`ExchangeError::InvalidResponse`] for malformed or
     /// mismatched response data.
     pub async fn fetch_snapshot(&self, symbol: &Symbol) -> Result<MarketSnapshot, ExchangeError> {
+        Ok(self.fetch_observation(symbol, Utc::now()).await?.snapshot)
+    }
+
+    /// Fetches one public Binance Spot book-ticker observation using a
+    /// caller-supplied local receive time.
+    ///
+    /// Binance's REST `bookTicker` payload does not carry an event timestamp.
+    /// The runtime therefore injects the local receive time it wants the
+    /// resulting snapshot to carry, while still preserving any optional source
+    /// sequence compatible endpoints expose via `updateId`/`u`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::RemoteFailure`] for transport or non-success
+    /// HTTP responses, and [`ExchangeError::InvalidResponse`] for malformed or
+    /// mismatched response data.
+    pub async fn fetch_observation(
+        &self,
+        symbol: &Symbol,
+        received_at: DateTime<Utc>,
+    ) -> Result<BinancePublicObservation, ExchangeError> {
         let response = self
             .client
             .get(self.book_ticker_url.clone())
@@ -102,19 +135,25 @@ impl BinancePublicExchange {
             .await
             .map_err(|error| ExchangeError::remote_failure(EXCHANGE, None, error.to_string()))?;
         let status = response.status();
+        let failure_metadata = metadata_from_reqwest_headers(response.headers());
         let payload = Self::read_response_body(response).await?;
 
         if !status.is_success() {
-            return Err(Self::map_remote_failure(status, &payload));
+            return Err(
+                Self::map_remote_failure(status, &payload).with_remote_metadata(failure_metadata)
+            );
         }
-        let snapshot = Self::parse_book_ticker(&payload, Utc::now())?;
-        if snapshot.symbol != *symbol {
+        let observation = Self::parse_book_ticker_observation(&payload, received_at)?;
+        if observation.snapshot.symbol != *symbol {
             return Err(ExchangeError::invalid_response(
                 EXCHANGE,
-                format!("requested symbol {symbol}, received {}", snapshot.symbol),
+                format!(
+                    "requested symbol {symbol}, received {}",
+                    observation.snapshot.symbol
+                ),
             ));
         }
-        Ok(snapshot)
+        Ok(observation)
     }
 
     async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, ExchangeError> {
@@ -162,7 +201,8 @@ impl BinancePublicExchange {
                 Some(&error.msg),
                 false,
             );
-            return ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), reason);
+            return ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), reason)
+                .with_exchange_code(error.code.to_string());
         }
 
         let status_reason = status.canonical_reason().unwrap_or("HTTP request failed");
@@ -245,6 +285,25 @@ impl BinancePublicExchange {
         payload: &[u8],
         received_at: DateTime<Utc>,
     ) -> Result<MarketSnapshot, ExchangeError> {
+        Ok(Self::parse_book_ticker_observation(payload, received_at)?.snapshot)
+    }
+
+    /// Parses the documented Binance `bookTicker` object into one observation
+    /// with explicit source metadata.
+    ///
+    /// Compatible payloads may expose a source sequence as either `updateId`
+    /// or `u`. Binance's REST response does not include an event timestamp, so
+    /// `event_time` stays absent and the caller-provided local receive time is
+    /// written into the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed JSON, invalid
+    /// financial values, empty symbols, or crossed quotes.
+    pub fn parse_book_ticker_observation(
+        payload: &[u8],
+        received_at: DateTime<Utc>,
+    ) -> Result<BinancePublicObservation, ExchangeError> {
         let wire: BookTickerWire = serde_json::from_slice(payload)
             .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
         let symbol = Symbol::new(wire.symbol)
@@ -278,7 +337,11 @@ impl BinancePublicExchange {
                 .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
         snapshot.bid_quantity = Some(bid_quantity);
         snapshot.ask_quantity = Some(ask_quantity);
-        Ok(snapshot)
+        Ok(BinancePublicObservation {
+            snapshot,
+            event_time: None,
+            source_sequence: wire.source_sequence,
+        })
     }
 }
 

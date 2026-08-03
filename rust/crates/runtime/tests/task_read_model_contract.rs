@@ -92,6 +92,46 @@ fn lifecycle_projects_exact_sources_and_a_terminal_task() {
 }
 
 #[test]
+fn source_status_v2_adds_monotonic_drop_accounting_without_breaking_v1_history() {
+    let snapshot = snapshot(jsonl(&[
+        task_record(
+            "task_registered",
+            "registered",
+            0,
+            registered_sources(),
+            None,
+            None,
+            "2026-07-25T00:00:00Z",
+        ),
+        task_record(
+            "task_running",
+            "running",
+            2,
+            running_sources(1, "healthy", "healthy"),
+            None,
+            None,
+            "2026-07-25T00:00:01Z",
+        ),
+        task_record(
+            "task_checkpointed",
+            "running",
+            2,
+            running_sources_v2(1, "healthy", "healthy", [3, 0]),
+            None,
+            None,
+            "2026-07-25T00:00:02Z",
+        ),
+    ]));
+
+    let model = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Complete);
+    assert_eq!(model.invalid_event_count, 0);
+    assert_eq!(model.tasks[0].sources[0].dropped_event_count, 3);
+    assert_eq!(model.tasks[0].sources[1].dropped_event_count, 0);
+}
+
+#[test]
 fn nonterminal_durable_state_is_recovered_as_unverified_not_auto_resumed() {
     let bytes = jsonl(&[
         task_record_with_kind(
@@ -728,6 +768,25 @@ fn running_sources(event_sequence: u64, left_health: &str, right_health: &str) -
             None,
         ),
     ])
+}
+
+fn running_sources_v2(
+    event_sequence: u64,
+    left_health: &str,
+    right_health: &str,
+    dropped_event_counts: [u64; 2],
+) -> Value {
+    let mut sources = running_sources(event_sequence, left_health, right_health);
+    for (source, dropped_event_count) in sources
+        .as_array_mut()
+        .expect("source fixture must be an array")
+        .iter_mut()
+        .zip(dropped_event_counts)
+    {
+        source["schema_version"] = json!(2);
+        source["dropped_event_count"] = json!(dropped_event_count);
+    }
+    sources
 }
 
 fn grid_running_sources(event_sequence: u64, health: &str) -> Value {

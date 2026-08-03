@@ -19,11 +19,16 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 rust_decimal.workspace = true
+
+[[bench]]
+name = "history_inspection_scaling"
+harness = false
 
 [lints]
 workspace = true

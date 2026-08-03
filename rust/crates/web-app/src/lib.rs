@@ -5,7 +5,7 @@
 //! [`ReadControlPlane`] and therefore cannot discover files or construct
 //! execution authority.
 
-use std::{env, future::Future, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser};
@@ -18,7 +18,8 @@ use crypto_trading_runtime::{FileJournalSnapshotSource, JournalSnapshotSource};
 use crypto_trading_web::{
     CredentialConfiguration, CredentialSettings, NotificationEvidence, PaperProfileKind,
     PaperProfileSettings, ReadControlPlane, RuntimeLogSink, SettingsResponse, WebAccessPolicy,
-    WebRequestRateLimiter, WebServerConfig, app_router_with_settings, serve_with_shutdown,
+    WebRequestRateLimiter, WebServerConfig, app_router_with_settings,
+    app_router_with_settings_and_shutdown, serve_with_shutdown,
 };
 use uuid::Uuid;
 
@@ -26,11 +27,13 @@ mod paper_dispatcher;
 mod submit;
 
 const PAPER_WRITE_PRINCIPAL_ID: &str = "local-paper-operator";
+const APPLICATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub use paper_dispatcher::TrustedPaperSubmitDispatcher;
 pub use submit::{
     MAX_TRUSTED_SUBMIT_BODY_BYTES, TrustedSubmitApplication, TrustedSubmitIdentity,
     bind_trusted_submit_app, bind_trusted_submit_app_with_settings,
+    bind_trusted_submit_app_with_settings_and_shutdown,
 };
 
 /// Local control-plane server with an explicit opt-in paper-only write mode.
@@ -135,35 +138,86 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let write_mode = write_mode_config(&cli)?;
-    let (listener, router, address, dispatcher) = prepare(&cli, write_mode.as_ref()).await?;
-    println!("control-plane web: http://{address}/overview");
-    if write_mode.is_some() {
-        println!(
-            "authority: paper-only; live-trading=false; access=loopback; trusted-submit=enabled"
-        );
-    } else {
-        println!("authority: paper-only; live-trading=false; access=loopback");
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let (listener, router, address, dispatcher) =
+        prepare(&cli, write_mode.as_ref(), Some(shutdown_receiver.clone())).await?;
+    tracing::info!(
+        event = "web_server_ready",
+        address = %address,
+        authority = "paper_only",
+        live_trading = false,
+        trusted_submit = write_mode.is_some(),
+        "control-plane web server is ready"
+    );
+
+    let server = serve_with_shutdown(listener, router, wait_for_shutdown(shutdown_receiver));
+    tokio::pin!(server);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        server_result = &mut server => {
+            shutdown_sender.send_replace(true);
+            let deadline = tokio::time::Instant::now() + APPLICATION_SHUTDOWN_TIMEOUT;
+            let shutdown_outcome = tokio::time::timeout_at(
+                deadline,
+                shutdown_dispatcher(dispatcher),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("paper owner cleanup exceeded the application shutdown deadline"))?;
+            validate_shutdown_outcome(shutdown_outcome)?;
+            server_result.context("Web control-plane server stopped with an I/O error")
+        }
+        () = &mut shutdown => {
+            tracing::info!(
+                event = "web_shutdown_started",
+                deadline_seconds = APPLICATION_SHUTDOWN_TIMEOUT.as_secs(),
+                "application quiescing began"
+            );
+            shutdown_sender.send_replace(true);
+            let deadline = tokio::time::Instant::now() + APPLICATION_SHUTDOWN_TIMEOUT;
+            let (server_result, dispatcher_result) = tokio::join!(
+                tokio::time::timeout_at(deadline, &mut server),
+                tokio::time::timeout_at(deadline, shutdown_dispatcher(dispatcher)),
+            );
+            let server_result = server_result.map_err(|_| {
+                anyhow::anyhow!("HTTP drain exceeded the application shutdown deadline")
+            })?;
+            let shutdown_outcome = dispatcher_result.map_err(|_| {
+                anyhow::anyhow!("paper owner cleanup exceeded the application shutdown deadline")
+            })?;
+            validate_shutdown_outcome(shutdown_outcome)?;
+            server_result.context("Web control-plane server stopped with an I/O error")?;
+            tracing::info!(
+                event = "web_shutdown_completed",
+                "HTTP drain and paper owner cleanup completed"
+            );
+            Ok(())
+        }
     }
-    let shutdown_dispatcher = dispatcher.clone();
-    let (shutdown_result_sender, shutdown_result_receiver) = tokio::sync::oneshot::channel();
-    let server_result = serve_with_shutdown(listener, router, async move {
-        shutdown.await;
-        let outcome = match shutdown_dispatcher {
-            Some(dispatcher) => dispatcher.shutdown().await,
-            None => SubmitDispatchOutcome::Applied,
-        };
-        let _ = shutdown_result_sender.send(outcome);
-    })
-    .await;
-    let shutdown_outcome = match shutdown_result_receiver.await {
-        Ok(outcome) => outcome,
-        Err(_) => match dispatcher {
-            Some(dispatcher) => dispatcher.shutdown().await,
-            None => SubmitDispatchOutcome::Applied,
-        },
-    };
-    match shutdown_outcome {
-        SubmitDispatchOutcome::Applied => {}
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+async fn shutdown_dispatcher(
+    dispatcher: Option<Arc<TrustedPaperSubmitDispatcher>>,
+) -> SubmitDispatchOutcome {
+    match dispatcher {
+        Some(dispatcher) => dispatcher.shutdown().await,
+        None => SubmitDispatchOutcome::Applied,
+    }
+}
+
+fn validate_shutdown_outcome(outcome: SubmitDispatchOutcome) -> Result<()> {
+    match outcome {
+        SubmitDispatchOutcome::Applied => Ok(()),
         SubmitDispatchOutcome::Rejected => {
             bail!("one or more paper owners failed during graceful shutdown")
         }
@@ -171,12 +225,12 @@ where
             bail!("paper owner shutdown outcome is unknown; inspect the durable task projection")
         }
     }
-    server_result.context("Web control-plane server stopped with an I/O error")
 }
 
 async fn prepare(
     cli: &Cli,
     write_mode: Option<&WriteModeConfig>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(
     tokio::net::TcpListener,
     axum::Router,
@@ -211,15 +265,31 @@ async fn prepare(
             SubmitService::new(cli.journal_id, &cli.history_path, submit_dispatcher)
                 .context("failed to construct the trusted submit service")?,
         );
-        let application = bind_trusted_submit_app_with_settings(
-            cli.port,
-            control_plane,
-            submit,
-            write_mode.bearer_token.clone(),
-            write_mode.identity.clone(),
-            settings,
-        )
-        .await?;
+        let application = match shutdown {
+            Some(shutdown) => {
+                bind_trusted_submit_app_with_settings_and_shutdown(
+                    cli.port,
+                    control_plane,
+                    submit,
+                    write_mode.bearer_token.clone(),
+                    write_mode.identity.clone(),
+                    settings,
+                    shutdown,
+                )
+                .await?
+            }
+            None => {
+                bind_trusted_submit_app_with_settings(
+                    cli.port,
+                    control_plane,
+                    submit,
+                    write_mode.bearer_token.clone(),
+                    write_mode.identity.clone(),
+                    settings,
+                )
+                .await?
+            }
+        };
         let address = application.address();
         let (listener, router) = application.into_parts();
         return Ok((listener, router, address, Some(dispatcher)));
@@ -233,12 +303,17 @@ async fn prepare(
     let address = listener
         .local_addr()
         .context("failed to inspect the bound loopback address")?;
-    let router = app_router_with_settings(
-        control_plane,
-        access,
-        settings,
-        WebRequestRateLimiter::default(),
-    );
+    let rate_limiter = WebRequestRateLimiter::default();
+    let router = match shutdown {
+        Some(shutdown) => app_router_with_settings_and_shutdown(
+            control_plane,
+            access,
+            settings,
+            rate_limiter,
+            shutdown,
+        ),
+        None => app_router_with_settings(control_plane, access, settings, rate_limiter),
+    };
     Ok((listener, router, address, None))
 }
 
@@ -643,7 +718,7 @@ mod tests {
             paper_write: PaperWriteArgs::default(),
         };
 
-        let (listener, router, address, dispatcher) = prepare(&cli, None).await.unwrap();
+        let (listener, router, address, dispatcher) = prepare(&cli, None, None).await.unwrap();
         assert!(address.ip().is_loopback());
         assert!(dispatcher.is_none());
         assert_ne!(address.port(), 0);
@@ -695,7 +770,7 @@ mod tests {
             paper_write: PaperWriteArgs::default(),
         };
 
-        let (listener, router, _, dispatcher) = prepare(&cli, None).await.unwrap();
+        let (listener, router, _, dispatcher) = prepare(&cli, None, None).await.unwrap();
         assert!(dispatcher.is_none());
         let response = router
             .oneshot(

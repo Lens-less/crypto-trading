@@ -75,6 +75,19 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
                 .as_array()
                 .is_some_and(|environments| environments.iter().any(|mode| mode == "mainnet"))
     }));
+    for capability_id in ["research.backtest", "research.indicators"] {
+        let capability = capabilities
+            .iter()
+            .find(|entry| entry["id"] == capability_id)
+            .unwrap_or_else(|| panic!("missing capability {capability_id}"));
+        assert_eq!(capability["level"], "unavailable", "{capability_id}");
+        assert!(
+            capability["blockers"]
+                .as_array()
+                .is_some_and(|blockers| !blockers.is_empty()),
+            "{capability_id} must explain its library-only boundary"
+        );
+    }
 }
 
 #[test]

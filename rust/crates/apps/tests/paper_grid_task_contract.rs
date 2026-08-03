@@ -11,8 +11,9 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use crypto_trading_cli::{
-    GridPaperExecutionFuture, GridPaperExecutor, GridPaperTask, GridPaperTaskConfig,
-    GridPaperTaskError, GridPaperTaskExit, GridPaperTaskFailure, GridPaperTaskPhase,
+    GridPaperExecutionFuture, GridPaperExecutor, GridPaperObservationFuture, GridPaperTask,
+    GridPaperTaskConfig, GridPaperTaskError, GridPaperTaskExit, GridPaperTaskFailure,
+    GridPaperTaskPhase,
 };
 use crypto_trading_domain::{
     MarketSnapshot, MarketType, Money, Order, OrderStatus, Price, Quantity, Side, Symbol,
@@ -74,11 +75,18 @@ fn config(task_id: &str, grace: StdDuration) -> GridPaperTaskConfig {
 }
 
 fn account(label: &str) -> (PaperAccountAuthority, JsonlHistory, std::path::PathBuf) {
+    account_with_available(label, "10000")
+}
+
+fn account_with_available(
+    label: &str,
+    initial_available: &str,
+) -> (PaperAccountAuthority, JsonlHistory, std::path::PathBuf) {
     let path = temp_path(label);
     let history = JsonlHistory::new(&path);
     let account = PaperAccountAuthority::planned(
         history.clone(),
-        PaperAccountConfig::new("paper-grid", Money::new(decimal("10000"))).unwrap(),
+        PaperAccountConfig::new("paper-grid", Money::new(decimal(initial_available))).unwrap(),
     )
     .unwrap();
     (account, history, path)
@@ -147,6 +155,10 @@ struct FillExecutor {
 }
 
 impl GridPaperExecutor for FillExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
@@ -171,6 +183,10 @@ impl GridPaperExecutor for FillExecutor {
 struct TimeoutExecutor;
 
 impl GridPaperExecutor for TimeoutExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, _batch: ExecutionBatch) -> GridPaperExecutionFuture {
         Box::pin(async {
             Err(RuntimeError::InvalidExecutionPolicy(
@@ -186,6 +202,10 @@ struct PendingExecutor {
 }
 
 impl GridPaperExecutor for PendingExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, _batch: ExecutionBatch) -> GridPaperExecutionFuture {
         self.started.store(true, Ordering::SeqCst);
         Box::pin(pending())
@@ -214,6 +234,10 @@ impl GatedFillExecutor {
 }
 
 impl GridPaperExecutor for GatedFillExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         self.started.store(true, Ordering::SeqCst);
         let permit = self.release.clone();
@@ -350,6 +374,84 @@ async fn account_risk_rejections_skip_entry_crossings_without_reservations() {
 }
 
 #[tokio::test]
+async fn reservation_failures_cancel_admitted_grid_entries_without_leaking_owner_risk() {
+    let (account, history, path) = account_with_available("reserve-after-admit", "50");
+    let risk = account_risk(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(FillExecutor::default());
+    let first_source = VecSource::new(vec![observation(
+        "99",
+        1,
+        base_time() + Duration::seconds(10),
+    )]);
+    let mut first = GridPaperTask::start(
+        config("grid:reserve-fail:first", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        grid(),
+        first_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let first_error = first.wait().await.unwrap_err();
+    assert!(matches!(first_error, GridPaperTaskError::Saga(_)));
+    assert_eq!(first.status().phase, GridPaperTaskPhase::Failed);
+    assert_eq!(
+        first.status().failure,
+        Some(GridPaperTaskFailure::AccountContract)
+    );
+
+    let second_source = VecSource::new(vec![observation(
+        "99",
+        2,
+        base_time() + Duration::seconds(20),
+    )]);
+    let mut second = GridPaperTask::start(
+        config("grid:reserve-fail:second", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        grid(),
+        second_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let second_error = second.wait().await.unwrap_err();
+    assert!(matches!(second_error, GridPaperTaskError::Saga(_)));
+    assert_eq!(second.status().phase, GridPaperTaskPhase::Failed);
+    assert_eq!(
+        second.status().failure,
+        Some(GridPaperTaskFailure::AccountContract)
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+
+    let state = risk.state().await.unwrap();
+    assert!(state.open_positions.is_empty());
+    assert_eq!(state.admitted_count, 2);
+    assert_eq!(state.rejected_count, 0);
+
+    let body = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admitted\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches("\"decision\":\"account_risk_admission_cancelled\"")
+            .count(),
+        2,
+        "{body}"
+    );
+    assert!(!body.contains("\"decision\":\"paper_account_reserved\""));
+}
+
+#[tokio::test]
 async fn engaged_kill_switch_stops_the_grid_owner_before_any_entry() {
     let (account, history, path) = account("account-risk-kill");
     let risk = account_risk(&account, &history, AccountRiskLimits::default());
@@ -460,14 +562,14 @@ async fn timeout_marks_operation_uncertain_and_restart_fails_closed() {
     .unwrap();
 
     let error = task.wait().await.unwrap_err();
-    assert!(matches!(
-        error,
-        GridPaperTaskError::Saga(_) | GridPaperTaskError::Runtime(_)
-    ));
+    assert!(
+        matches!(error, GridPaperTaskError::RecoveryRequired),
+        "unexpected timeout error: {error:?}"
+    );
     assert_eq!(task.status().phase, GridPaperTaskPhase::Failed);
     assert_eq!(
         task.status().failure,
-        Some(GridPaperTaskFailure::ExecutionFailed)
+        Some(GridPaperTaskFailure::RecoveryRequired)
     );
     assert_eq!(
         account.snapshot().await.unwrap().reservations[0].phase,
@@ -507,7 +609,16 @@ async fn cancel_during_unknown_execution_retains_capacity_without_release() {
     wait_until(|| executor.started.load(Ordering::SeqCst)).await;
 
     let error = task.cancel().await.unwrap_err();
-    assert!(matches!(error, GridPaperTaskError::RecoveryRequired));
+    // The owner may preserve the unknown reservation before the outer
+    // two-grace deadline or the caller may observe that deadline first. Both
+    // outcomes are fail-closed and retain the same uncertain capacity.
+    assert!(
+        matches!(
+            error,
+            GridPaperTaskError::RecoveryRequired | GridPaperTaskError::ShutdownTimedOut
+        ),
+        "unexpected cancellation error: {error:?}"
+    );
     let snapshot = account.snapshot().await.unwrap();
     assert_eq!(snapshot.reservations.len(), 1);
     assert_eq!(
@@ -539,7 +650,15 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
     .unwrap();
     first.wait().await.unwrap();
 
-    let reservation = account.snapshot().await.unwrap().reservations[0].clone();
+    let account_snapshot = account.snapshot().await.unwrap();
+    let reservation = account_snapshot.reservations[0].clone();
+    let expected_available = Money::new(
+        account_snapshot
+            .available
+            .as_decimal()
+            .checked_add(reservation.held_exposure.as_decimal())
+            .unwrap(),
+    );
     account
         .record_reconciliation_failure(
             PaperReconciliationProof::from_evidence(
@@ -551,7 +670,7 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
                     reservation.batch_id,
                     "binance-testnet/account-snapshot-1",
                     1,
-                    Money::new(decimal("10000")),
+                    expected_available,
                     "fixture_mismatch",
                 )
                 .unwrap(),
@@ -700,6 +819,10 @@ struct RecordingExecutor {
 }
 
 impl GridPaperExecutor for RecordingExecutor {
+    fn observe_market(&self, _observation: MarketDataObservation) -> GridPaperObservationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture {
         let intent = batch.intents()[0].clone();
         self.intents
@@ -846,7 +969,10 @@ async fn filled_level_reposts_the_reverse_side_one_interval_away() {
         vec![(Side::Buy, decimal("99")), (Side::Sell, decimal("100"))]
     );
     let snapshot = account.snapshot().await.unwrap();
-    assert_eq!(snapshot.reservations.len(), 2);
+    assert!(
+        snapshot.reservations.is_empty(),
+        "completed reverse repost must prune released reservations"
+    );
 }
 
 async fn wait_until(predicate: impl Fn() -> bool) {

@@ -13,6 +13,8 @@ use tokio::{
     time,
 };
 
+use crate::shutdown::{ShutdownSignalError, ShutdownSignalFuture, install_shutdown_signal};
+
 pub type TaskHostStopFuture<'a, Exit, Error> =
     Pin<Box<dyn Future<Output = Result<Exit, Error>> + Send + 'a>>;
 
@@ -63,6 +65,7 @@ pub enum TaskHostServeOutcome<Status, Exit> {
 pub enum TaskHostServeError<E> {
     Io(io::Error),
     Task(E),
+    Shutdown(ShutdownSignalError),
 }
 
 impl<E> std::fmt::Display for TaskHostServeError<E>
@@ -73,6 +76,9 @@ where
         match self {
             Self::Io(source) => write!(formatter, "task host control I/O failed: {source}"),
             Self::Task(source) => write!(formatter, "task host operation failed: {source}"),
+            Self::Shutdown(source) => {
+                write!(formatter, "task host shutdown handling failed: {source}")
+            }
         }
     }
 }
@@ -85,6 +91,7 @@ where
         match self {
             Self::Io(source) => Some(source),
             Self::Task(source) => Some(source),
+            Self::Shutdown(source) => Some(source),
         }
     }
 }
@@ -126,10 +133,76 @@ where
     FStatus: Fn(&H::Status) -> String,
     FStop: Fn(&H::Status, H::Exit) -> String,
 {
+    serve_host_with_shutdown(
+        host,
+        listener,
+        poll_interval,
+        render_status,
+        render_stop,
+        install_shutdown_signal().map_err(TaskHostServeError::Shutdown),
+    )
+    .await
+}
+
+pub(crate) async fn serve_host_with_shutdown<H, FStatus, FStop>(
+    host: &mut H,
+    listener: TcpListener,
+    poll_interval: Duration,
+    render_status: FStatus,
+    render_stop: FStop,
+    shutdown: Result<ShutdownSignalFuture, TaskHostServeError<H::Error>>,
+) -> Result<TaskHostServeOutcome<H::Status, H::Exit>, TaskHostServeError<H::Error>>
+where
+    H: TaskHost,
+    FStatus: Fn(&H::Status) -> String,
+    FStop: Fn(&H::Status, H::Exit) -> String,
+{
+    let mut shutdown = match shutdown {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            tracing::error!(
+                event = "task_host_signal_registration_failed",
+                "task host cannot guarantee graceful termination"
+            );
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        event = "task_host_ready",
+        "task host is accepting loopback control requests"
+    );
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                let exit = host.stop().await.map_err(TaskHostServeError::Task)?;
+            result = &mut shutdown => {
+                let signal = match result {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        tracing::error!(
+                            event = "task_host_signal_receive_failed",
+                            "task host lost its graceful-shutdown signal stream"
+                        );
+                        return Err(TaskHostServeError::Shutdown(error));
+                    }
+                };
+                tracing::info!(
+                    event = "task_host_shutdown_requested",
+                    signal = ?signal,
+                    "task host received an operating-system shutdown signal"
+                );
+                let exit = match host.stop().await {
+                    Ok(exit) => exit,
+                    Err(error) => {
+                        tracing::error!(
+                            event = "task_host_shutdown_failed",
+                            "task host failed to reach its bounded stop outcome"
+                        );
+                        return Err(TaskHostServeError::Task(error));
+                    }
+                };
+                tracing::info!(
+                    event = "task_host_shutdown_completed",
+                    "task host reached its graceful stop outcome"
+                );
                 return Ok(TaskHostServeOutcome::StopRequested(exit));
             }
             accepted = listener.accept() => {
@@ -143,6 +216,10 @@ where
             () = time::sleep(poll_interval) => {
                 let status = host.status();
                 if status.is_terminal() {
+                    tracing::info!(
+                        event = "task_host_terminal",
+                        "task host observed a terminal owner status"
+                    );
                     return Ok(TaskHostServeOutcome::Terminal(status));
                 }
             }
@@ -180,11 +257,31 @@ where
             Ok(None)
         }
         Ok(TaskHostControlCommand::Stop) => {
-            let exit = host.stop().await.map_err(TaskHostServeError::Task)?;
+            tracing::info!(
+                event = "task_host_stop_requested",
+                source = "loopback_control",
+                "task host received a local stop command"
+            );
+            let exit = match host.stop().await {
+                Ok(exit) => exit,
+                Err(error) => {
+                    tracing::error!(
+                        event = "task_host_shutdown_failed",
+                        source = "loopback_control",
+                        "task host failed to reach its bounded stop outcome"
+                    );
+                    return Err(TaskHostServeError::Task(error));
+                }
+            };
             let status = host.status();
             write_response(&mut stream, &render_stop(&status, exit))
                 .await
                 .map_err(TaskHostServeError::Io)?;
+            tracing::info!(
+                event = "task_host_shutdown_completed",
+                source = "loopback_control",
+                "task host reached its graceful stop outcome"
+            );
             Ok(Some(exit))
         }
         Err(message) => {
@@ -218,4 +315,125 @@ fn default_control_port(task_id: &str, history_path: &Path) -> u16 {
         hash = hash.wrapping_mul(PRIME);
     }
     BASE + u16::try_from(hash % u64::from(SPAN)).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shutdown::{ShutdownSignal, ShutdownSignalError, ShutdownSignalStage};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[derive(Clone, Debug)]
+    struct MockStatus;
+
+    impl TaskHostStatus for MockStatus {
+        fn is_terminal(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockHost {
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl MockHost {
+        fn new() -> Self {
+            Self {
+                stopped: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl TaskHost for MockHost {
+        type Status = MockStatus;
+        type Exit = &'static str;
+        type Error = io::Error;
+
+        fn status(&self) -> Self::Status {
+            MockStatus
+        }
+
+        fn stop(&mut self) -> TaskHostStopFuture<'_, Self::Exit, Self::Error> {
+            self.stopped.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok("stopped") })
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_shutdown_signal_requests_a_graceful_stop() {
+        let mut host = MockHost::new();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        let outcome = serve_host_with_shutdown(
+            &mut host,
+            listener,
+            Duration::from_secs(60),
+            |_| "status\n".to_owned(),
+            |_, exit| format!("exit={exit}\n"),
+            Ok(Box::pin(async { Ok(ShutdownSignal::CtrlC) })),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            TaskHostServeOutcome::StopRequested("stopped")
+        ));
+        assert!(host.stopped.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_sigterm_uses_the_same_graceful_stop_path() {
+        let mut host = MockHost::new();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        let outcome = serve_host_with_shutdown(
+            &mut host,
+            listener,
+            Duration::from_secs(60),
+            |_| "status\n".to_owned(),
+            |_, exit| format!("exit={exit}\n"),
+            Ok(Box::pin(async { Ok(ShutdownSignal::Sigterm) })),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            TaskHostServeOutcome::StopRequested("stopped")
+        ));
+        assert!(host.stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_registration_failure_is_typed_and_fail_closed() {
+        let mut host = MockHost::new();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        let error = serve_host_with_shutdown(
+            &mut host,
+            listener,
+            Duration::from_secs(60),
+            |_| "status\n".to_owned(),
+            |_, exit| format!("exit={exit}\n"),
+            Err(TaskHostServeError::Shutdown(ShutdownSignalError::register(
+                "SIGTERM",
+                io::Error::from(io::ErrorKind::PermissionDenied),
+            ))),
+        )
+        .await
+        .unwrap_err();
+
+        let TaskHostServeError::Shutdown(error) = error else {
+            panic!("expected a typed shutdown failure");
+        };
+        assert_eq!(error.signal(), "SIGTERM");
+        assert_eq!(error.stage(), ShutdownSignalStage::Register);
+        assert!(!host.stopped.load(Ordering::SeqCst));
+    }
 }

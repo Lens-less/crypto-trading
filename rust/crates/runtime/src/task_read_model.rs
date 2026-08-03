@@ -141,6 +141,7 @@ pub struct ReadOnlyTaskSourceView {
     pub phase: ReadOnlyTaskSourcePhase,
     pub health: ReadOnlyTaskSourceHealth,
     pub event_sequence: u64,
+    pub dropped_event_count: u64,
     pub consecutive_source_failures: u32,
     pub last_event_at: Option<DateTime<Utc>>,
     pub exit: Option<ReadOnlyTaskSourceExit>,
@@ -164,7 +165,7 @@ pub struct ReadOnlyTaskView {
     pub failure: Option<ReadOnlyTaskFailure>,
 }
 
-struct TaskProjectionBuilder {
+pub(crate) struct TaskProjectionBuilder {
     journal_id: Uuid,
     journal_head_sequence: Option<u64>,
     projection_status: ProjectionStatus,
@@ -173,7 +174,7 @@ struct TaskProjectionBuilder {
 }
 
 impl TaskProjectionBuilder {
-    const fn new(journal_id: Uuid) -> Self {
+    pub(crate) const fn new(journal_id: Uuid) -> Self {
         Self {
             journal_id,
             journal_head_sequence: None,
@@ -190,16 +191,13 @@ impl TaskProjectionBuilder {
         let mut cursor = None;
         loop {
             let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())?;
-            if let Some(event) = page.events().last() {
-                self.journal_head_sequence = Some(event.sequence());
-            }
             for event in page.events() {
-                self.apply_event(event)?;
+                self.observe_event(event)?;
             }
             match page.boundary() {
                 JournalPageBoundary::SnapshotEnd => break,
                 JournalPageBoundary::PartialTail { .. } => {
-                    self.projection_status = ProjectionStatus::Degraded;
+                    self.mark_partial_tail();
                     break;
                 }
                 JournalPageBoundary::PageLimit => {
@@ -217,14 +215,30 @@ impl TaskProjectionBuilder {
                 }
             }
         }
-        Ok(ReadOnlyTaskReadModel {
+        Ok(self.finish())
+    }
+
+    pub(crate) fn observe_event(
+        &mut self,
+        event: &OperationEventEnvelope,
+    ) -> Result<(), ReadModelError> {
+        self.journal_head_sequence = Some(event.sequence());
+        self.apply_event(event)
+    }
+
+    pub(crate) fn mark_partial_tail(&mut self) {
+        self.projection_status = ProjectionStatus::Degraded;
+    }
+
+    pub(crate) fn finish(self) -> ReadOnlyTaskReadModel {
+        ReadOnlyTaskReadModel {
             schema_version: READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION,
             journal_id: self.journal_id,
             journal_head_sequence: self.journal_head_sequence,
             projection_status: self.projection_status,
             tasks: self.tasks,
             invalid_event_count: self.invalid_event_count,
-        })
+        }
     }
 
     fn apply_event(&mut self, event: &OperationEventEnvelope) -> Result<(), ReadModelError> {
@@ -489,6 +503,7 @@ fn validate_fact_shape(
                         || source.phase != ReadOnlyTaskSourcePhase::Starting
                         || source.health != ReadOnlyTaskSourceHealth::Unknown
                         || source.event_sequence != 0
+                        || source.dropped_event_count != 0
                         || source.consecutive_source_failures != 0
                         || source.last_event_at.is_some()
                         || source.exit.is_some()
@@ -550,25 +565,45 @@ fn parse_sources(value: &Value) -> Result<Vec<ReadOnlyTaskSourceView>, ()> {
 
 fn parse_source(value: &Value) -> Result<ReadOnlyTaskSourceView, ()> {
     let source = object(value)?;
-    ensure_exact_fields(
-        source,
-        &[
-            "schema_version",
-            "task_id",
-            "source_id",
-            "phase",
-            "health",
-            "event_sequence",
-            "consecutive_source_failures",
-            "last_event_at",
-            "exit",
-        ],
-    )?;
-    if required_u64(source, "schema_version")?
-        != u64::from(crate::MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION)
-    {
-        return Err(());
-    }
+    let schema_version = required_u64(source, "schema_version")?;
+    let dropped_event_count = match schema_version {
+        1 => {
+            ensure_exact_fields(
+                source,
+                &[
+                    "schema_version",
+                    "task_id",
+                    "source_id",
+                    "phase",
+                    "health",
+                    "event_sequence",
+                    "consecutive_source_failures",
+                    "last_event_at",
+                    "exit",
+                ],
+            )?;
+            0
+        }
+        version if version == u64::from(crate::MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION) => {
+            ensure_exact_fields(
+                source,
+                &[
+                    "schema_version",
+                    "task_id",
+                    "source_id",
+                    "phase",
+                    "health",
+                    "event_sequence",
+                    "dropped_event_count",
+                    "consecutive_source_failures",
+                    "last_event_at",
+                    "exit",
+                ],
+            )?;
+            required_u64(source, "dropped_event_count")?
+        }
+        _ => return Err(()),
+    };
     let task_id = optional_uuid(required(source, "task_id")?)?;
     let source_id = required_text(source, "source_id")?;
     let phase = match required_text(source, "phase")?.as_str() {
@@ -602,6 +637,7 @@ fn parse_source(value: &Value) -> Result<ReadOnlyTaskSourceView, ()> {
         phase,
         health,
         event_sequence,
+        dropped_event_count,
         consecutive_source_failures,
         last_event_at,
         exit,
@@ -627,6 +663,7 @@ fn same_source_contract(
         && previous.iter().zip(next).all(|(previous, next)| {
             previous.source_id == next.source_id
                 && next.event_sequence >= previous.event_sequence
+                && next.dropped_event_count >= previous.dropped_event_count
                 && previous
                     .task_id
                     .is_none_or(|task_id| next.task_id == Some(task_id))

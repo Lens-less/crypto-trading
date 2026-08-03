@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     fmt,
+    future::Future,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
@@ -83,10 +84,12 @@ use crate::continuous_scanner::{
 };
 use crate::monitor::{
     ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor, ReplayMarketDataClock,
-    load_market_snapshot_replay,
+    freshness_policy_from_monitor_config, load_market_snapshot_replay,
 };
+use crate::shutdown::{ShutdownSignalFuture, install_shutdown_signal};
 use crate::task_host::{
-    TaskHostControlCommand, TaskHostServeOutcome, control_addr, query_control, serve_host,
+    TaskHostControlCommand, TaskHostServeOutcome, control_addr, query_control,
+    serve_host_with_shutdown,
 };
 use crate::testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TestnetLifecycleConfig, TestnetLifecycleObservation,
@@ -1452,6 +1455,26 @@ async fn run_testnet_soak_serve(args: &TestnetSoakArgs) -> Result<()> {
     serve_testnet_soak_task(args, control_port, config, probe).await
 }
 
+fn register_task_host_shutdown() -> Result<ShutdownSignalFuture> {
+    install_shutdown_signal()
+        .map_err(anyhow::Error::new)
+        .context("failed to pre-register task-host shutdown signals")
+}
+
+async fn start_after_shutdown_registration<T, Register, Start, StartFuture>(
+    register: Register,
+    start: Start,
+) -> Result<(ShutdownSignalFuture, T)>
+where
+    Register: FnOnce() -> Result<ShutdownSignalFuture>,
+    Start: FnOnce() -> StartFuture,
+    StartFuture: Future<Output = Result<T>>,
+{
+    let shutdown = register()?;
+    let task = start().await?;
+    Ok((shutdown, task))
+}
+
 async fn serve_testnet_soak_task<P>(
     args: &TestnetSoakArgs,
     control_port: u16,
@@ -1466,9 +1489,13 @@ where
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind testnet soak control socket on {address}"))?;
-    let mut task = TestnetSoakTask::start(config, probe, JsonlHistory::new(&args.history_path))
-        .await
-        .context("failed to start testnet soak task")?;
+    let (shutdown, mut task) =
+        start_after_shutdown_registration(register_task_host_shutdown, || async move {
+            TestnetSoakTask::start(config, probe, JsonlHistory::new(&args.history_path))
+                .await
+                .context("failed to start testnet soak task")
+        })
+        .await?;
 
     println!(
         "testnet soak task started: task_id={} control={} history={}",
@@ -1477,12 +1504,13 @@ where
         args.history_path.display()
     );
 
-    let outcome = serve_host(
+    let outcome = serve_host_with_shutdown(
         &mut task,
         listener,
         StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
         render_live_testnet_soak_status,
         render_live_testnet_soak_stop,
+        Ok(shutdown),
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("testnet soak control host failed"))?;
@@ -2090,13 +2118,9 @@ async fn run_monitor_replay(args: &MonitorArgs) -> Result<()> {
         None => bail!("monitor replay must contain at least one event"),
     };
     let clock = Arc::new(ReplayMarketDataClock::new(first_at));
-    let max_age_seconds = i64::try_from(monitor.data_timeout_seconds)
-        .context("monitor data timeout exceeds the runtime duration")?;
-    let max_age = Duration::try_seconds(max_age_seconds)
-        .context("monitor data timeout is outside the supported duration")?;
     let book = MarketDataBook::new(
         universe,
-        MarketFreshnessPolicy::new(max_age, Duration::seconds(1))?,
+        freshness_policy_from_monitor_config(&monitor)?,
         Arc::clone(&clock),
     );
     let mut read_monitor =
@@ -2179,13 +2203,9 @@ fn build_exact_pair_monitor(
     right: MarketInstrument,
 ) -> Result<ReadOnlyArbitrageMonitor> {
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()])?;
-    let max_age_seconds = i64::try_from(monitor.data_timeout_seconds)
-        .context("monitor data timeout exceeds the runtime duration")?;
-    let max_age = Duration::try_seconds(max_age_seconds)
-        .context("monitor data timeout is outside the supported duration")?;
     let book = MarketDataBook::new(
         universe,
-        MarketFreshnessPolicy::new(max_age, Duration::seconds(1))?,
+        freshness_policy_from_monitor_config(monitor)?,
         Arc::new(SystemMarketDataClock),
     );
     Ok(ReadOnlyArbitrageMonitor::new(
@@ -2282,16 +2302,22 @@ where
     L: MarketDataEventSource,
     R: MarketDataEventSource,
 {
-    let mut task = ContinuousMonitorTask::start_with_spread_history(
-        ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?,
-        read_monitor,
-        left_source,
-        right_source,
-        JsonlHistory::new(&args.history_path),
-        Some(SpreadHistoryWriter::new(&args.spread_history_path)),
-    )
-    .await
-    .context("failed to start continuous monitor task")?;
+    let task_config =
+        ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?;
+    let (shutdown, mut task) =
+        start_after_shutdown_registration(register_task_host_shutdown, || async move {
+            ContinuousMonitorTask::start_with_spread_history(
+                task_config,
+                read_monitor,
+                left_source,
+                right_source,
+                JsonlHistory::new(&args.history_path),
+                Some(SpreadHistoryWriter::new(&args.spread_history_path)),
+            )
+            .await
+            .context("failed to start continuous monitor task")
+        })
+        .await?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -2305,12 +2331,13 @@ where
         args.spread_history_path.display()
     );
 
-    let outcome = serve_host(
+    let outcome = serve_host_with_shutdown(
         &mut task,
         listener,
         StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
         render_live_monitor_status,
         render_live_monitor_stop,
+        Ok(shutdown),
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("monitor control host failed"))?;
@@ -2817,10 +2844,14 @@ async fn run_volume_maker_serve(args: &VolumeMakerArgs) -> Result<()> {
         task_config = task_config.with_target_volume(target_volume);
     }
 
-    let mut task = VolumeMakerPaperTask::start(task_config, source, account, history, executor)
-        .await
-        .map_err(anyhow::Error::new)
-        .context("failed to start continuous volume-maker task")?;
+    let (shutdown, mut task) =
+        start_after_shutdown_registration(register_task_host_shutdown, || async move {
+            VolumeMakerPaperTask::start(task_config, source, account, history, executor)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to start continuous volume-maker task")
+        })
+        .await?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -2833,12 +2864,13 @@ async fn run_volume_maker_serve(args: &VolumeMakerArgs) -> Result<()> {
         args.history_path.display()
     );
 
-    let outcome = serve_host(
+    let outcome = serve_host_with_shutdown(
         &mut task,
         listener,
         StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
         render_live_volume_maker_status,
         render_live_volume_maker_stop,
+        Ok(shutdown),
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("volume-maker control host failed"))?;
@@ -3130,20 +3162,20 @@ async fn run_price_alert_serve(args: &PriceAlertArgs) -> Result<()> {
     .map_err(anyhow::Error::new)
     .context("failed to build the price-alert runtime")?;
     let source = build_alert_serve_replay_source(replay_path, &config)?;
-    let mut task = ContinuousAlertTask::start(
-        ContinuousAlertTaskConfig::new(
-            task_id,
-            &config.exchange,
-            supervisor_config(args.shutdown_grace_ms)?,
-        )
-        .map_err(anyhow::Error::new)?,
-        runtime,
-        source,
-        history,
+    let task_config = ContinuousAlertTaskConfig::new(
+        task_id,
+        &config.exchange,
+        supervisor_config(args.shutdown_grace_ms)?,
     )
-    .await
-    .map_err(anyhow::Error::new)
-    .context("failed to start continuous price-alert task")?;
+    .map_err(anyhow::Error::new)?;
+    let (shutdown, mut task) =
+        start_after_shutdown_registration(register_task_host_shutdown, || async move {
+            ContinuousAlertTask::start(task_config, runtime, source, history)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to start continuous price-alert task")
+        })
+        .await?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -3156,12 +3188,13 @@ async fn run_price_alert_serve(args: &PriceAlertArgs) -> Result<()> {
         args.history_path.display()
     );
 
-    let outcome = serve_host(
+    let outcome = serve_host_with_shutdown(
         &mut task,
         listener,
         StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
         render_live_alert_status,
         render_live_alert_stop,
+        Ok(shutdown),
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("price-alert control host failed"))?;
@@ -3368,20 +3401,20 @@ async fn run_scanner_serve(args: &ScannerArgs) -> Result<()> {
         &instruments,
         "scanner",
     )?);
-    let mut task = ContinuousScannerTask::start(
-        ContinuousScannerTaskConfig::new(
-            task_id,
-            &config.exchange,
-            supervisor_config(args.shutdown_grace_ms)?,
-        )
-        .map_err(anyhow::Error::new)?,
-        runtime,
-        source,
-        history,
+    let task_config = ContinuousScannerTaskConfig::new(
+        task_id,
+        &config.exchange,
+        supervisor_config(args.shutdown_grace_ms)?,
     )
-    .await
-    .map_err(anyhow::Error::new)
-    .context("failed to start continuous scanner task")?;
+    .map_err(anyhow::Error::new)?;
+    let (shutdown, mut task) =
+        start_after_shutdown_registration(register_task_host_shutdown, || async move {
+            ContinuousScannerTask::start(task_config, runtime, source, history)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to start continuous scanner task")
+        })
+        .await?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -3394,12 +3427,13 @@ async fn run_scanner_serve(args: &ScannerArgs) -> Result<()> {
         args.history_path.display()
     );
 
-    let outcome = serve_host(
+    let outcome = serve_host_with_shutdown(
         &mut task,
         listener,
         StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
         render_live_scanner_status,
         render_live_scanner_stop,
+        Ok(shutdown),
     )
     .await
     .map_err(|error| anyhow::Error::new(error).context("scanner control host failed"))?;
@@ -5475,7 +5509,12 @@ fn monitor_schema_issues(document: &serde_yaml::Value, issues: &mut SchemaIssues
     unknown_keys(root, &["exchanges", "symbols", "health_check"], "", issues);
     match root.get(serde_yaml::Value::from("health_check")) {
         Some(value) => {
-            mapping_with_keys(value, &["data_timeout"], "health_check", issues);
+            mapping_with_keys(
+                value,
+                &["data_timeout", "max_pair_skew_ms"],
+                "health_check",
+                issues,
+            );
             if value.as_mapping().is_some_and(|mapping| {
                 !mapping.contains_key(serde_yaml::Value::from("data_timeout"))
             }) {
@@ -5628,7 +5667,10 @@ fn has_auth_fields(mapping: &serde_yaml::Mapping) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use chrono::{TimeZone, Utc};
     use crypto_trading_config::load_grid_config_from_str;
@@ -5656,6 +5698,7 @@ mod tests {
         collect_config_report, config_summary, execution_batch, execution_error_summary,
         finish_arbitrage_execution, finish_execution, inspect_config, paper_runtime_schema_issues,
         plan_grid_intents, receipt_summary, render_config_summary,
+        start_after_shutdown_registration,
     };
     use crypto_trading_config::reject_yaml_anchors_and_aliases;
 
@@ -5668,6 +5711,32 @@ mod tests {
             "crypto-trading-command-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn task_host_signal_registration_precedes_task_start() {
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let registration_steps = Arc::clone(&steps);
+        let start_steps = Arc::clone(&steps);
+
+        let (shutdown, started) = start_after_shutdown_registration(
+            move || {
+                registration_steps.lock().unwrap().push("registered");
+                Ok::<_, anyhow::Error>(Box::pin(async {
+                    Ok(crate::shutdown::ShutdownSignal::CtrlC)
+                }) as crate::shutdown::ShutdownSignalFuture)
+            },
+            move || async move {
+                start_steps.lock().unwrap().push("started");
+                Ok::<_, anyhow::Error>(true)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(started);
+        assert_eq!(*steps.lock().unwrap(), ["registered", "started"]);
+        drop(shutdown);
     }
 
     fn test_intent(exchange: &str) -> OrderIntent {

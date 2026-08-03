@@ -344,6 +344,24 @@ fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
+pub(crate) fn metadata_from_reqwest_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> RemoteFailureMetadata {
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after);
+    let server_time = headers
+        .get(reqwest::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_http_date);
+    RemoteFailureMetadata {
+        exchange_code: None,
+        retry_after,
+        server_time,
+    }
+}
+
 fn bounded_metadata_headers(
     headers: impl IntoIterator<Item = (String, String)>,
 ) -> Result<Vec<(String, String)>, ExchangeError> {

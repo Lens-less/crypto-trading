@@ -11,7 +11,8 @@ use crypto_trading_domain::{MarketType, OrderIntent, Price, Quantity, Side, Symb
 use crypto_trading_exchange::{
     ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeOperation,
     HyperliquidFundingRate, HyperliquidPublicEndpoint, HyperliquidPublicExchange,
-    MarketSubscription, ReconcileScope, TradingCommand, hyperliquid_usdt_symbol_catalog,
+    MarketSubscription, ReconcileScope, RemoteRetryAfter, TradingCommand,
+    hyperliquid_usdt_symbol_catalog,
 };
 use rust_decimal::Decimal;
 
@@ -69,6 +70,7 @@ fn documented_asset_context_fixture_maps_to_an_exact_perpetual_observation() {
         observation.funding.map(HyperliquidFundingRate::as_decimal),
         Some(decimal("0.0000125"))
     );
+    assert_eq!(observation.event_time, None);
 
     let negative =
         HyperliquidPublicExchange::parse_meta_and_asset_ctxs(FIXTURE, "ETH", received_at).unwrap();
@@ -374,7 +376,7 @@ async fn non_success_bodies_become_bounded_remote_failures() {
         read_full_info_request(&mut stream);
         let body = "rate limited ".repeat(100);
         let response = format!(
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 9\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
@@ -397,6 +399,10 @@ async fn non_success_bodies_become_bounded_remote_failures() {
                 && reason.len() <= 256
         ),
         "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        error.remote_failure_metadata().unwrap().retry_after,
+        Some(RemoteRetryAfter::Seconds(9))
     );
     server.join().unwrap();
 }

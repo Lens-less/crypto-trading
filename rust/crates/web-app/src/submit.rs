@@ -28,10 +28,10 @@ use crypto_trading_control_plane::{
 };
 use crypto_trading_web::{
     SettingsResponse, WebAccessPolicy, WebRequestRateLimiter, WebServerConfig,
-    add_security_headers, app_router_with_settings,
+    add_security_headers, app_router_with_settings, app_router_with_settings_and_shutdown,
 };
 use serde::Serialize;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 
 pub const MAX_TRUSTED_SUBMIT_BODY_BYTES: usize = 32 * 1024;
 const SUBMIT_HTTP_SCHEMA_VERSION: u16 = 1;
@@ -142,6 +142,53 @@ pub async fn bind_trusted_submit_app_with_settings(
     identity: TrustedSubmitIdentity,
     settings: SettingsResponse,
 ) -> Result<TrustedSubmitApplication> {
+    bind_trusted_submit_app_with_optional_shutdown(
+        port,
+        control_plane,
+        service,
+        bearer_token,
+        identity,
+        settings,
+        None,
+    )
+    .await
+}
+
+/// Binds the trusted application with metadata and a lifecycle signal for SSE drains.
+///
+/// # Errors
+///
+/// Returns the same bounded startup failures as [`bind_trusted_submit_app`].
+pub async fn bind_trusted_submit_app_with_settings_and_shutdown(
+    port: u16,
+    control_plane: Arc<ReadControlPlane>,
+    service: Arc<SubmitService>,
+    bearer_token: String,
+    identity: TrustedSubmitIdentity,
+    settings: SettingsResponse,
+    shutdown: watch::Receiver<bool>,
+) -> Result<TrustedSubmitApplication> {
+    bind_trusted_submit_app_with_optional_shutdown(
+        port,
+        control_plane,
+        service,
+        bearer_token,
+        identity,
+        settings,
+        Some(shutdown),
+    )
+    .await
+}
+
+async fn bind_trusted_submit_app_with_optional_shutdown(
+    port: u16,
+    control_plane: Arc<ReadControlPlane>,
+    service: Arc<SubmitService>,
+    bearer_token: String,
+    identity: TrustedSubmitIdentity,
+    settings: SettingsResponse,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<TrustedSubmitApplication> {
     let read_access = WebAccessPolicy::bearer(bearer_token.clone())
         .context("trusted submit requires a valid bearer token")?;
     let read_journal_id = control_plane
@@ -173,7 +220,17 @@ pub async fn bind_trusted_submit_app_with_settings(
     // inside `app_router_with_settings` and merging afterwards would leave
     // /api/v1/submit without the frame, referrer, and permissions headers
     // every other route carries.
-    let router = app_router_with_settings(control_plane, read_access, settings, rate_limiter)
+    let read_router = match shutdown {
+        Some(shutdown) => app_router_with_settings_and_shutdown(
+            control_plane,
+            read_access,
+            settings,
+            rate_limiter,
+            shutdown,
+        ),
+        None => app_router_with_settings(control_plane, read_access, settings, rate_limiter),
+    };
+    let router = read_router
         .merge(submit_router)
         .layer(middleware::from_fn(add_security_headers));
     Ok(TrustedSubmitApplication {

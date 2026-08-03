@@ -281,10 +281,9 @@ impl DurablePaperArbitrageSaga {
                     });
                 }
 
-                let committed = request.reservation.gross_notional()?;
                 let finalization = self
                     .account
-                    .commit(reservation.reservation_id, committed)
+                    .settle_execution(reservation.reservation_id, &receipts)
                     .await;
                 if let Err(source) = finalization {
                     return Err(PaperArbitrageSagaError::AccountFinalization {

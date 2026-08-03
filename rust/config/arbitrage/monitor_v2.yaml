@@ -85,6 +85,7 @@ performance:
 health_check:
   interval: 10                 # 健康检查间隔（秒）
   data_timeout: 30             # 数据超时时间（秒）
+  max_pair_skew_ms: 1000       # 跨场行情最大接收时间差（毫秒）
 
 # 历史记录配置（价差历史数据记录和图表化）
 spread_history:

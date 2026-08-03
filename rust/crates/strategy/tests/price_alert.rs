@@ -65,6 +65,55 @@ fn alert_strategy_emits_exact_limit_and_window_volatility_events_with_cooldowns(
 }
 
 #[test]
+fn volatility_baseline_falls_back_to_the_oldest_sample_inside_the_window() {
+    // Regression: the runtime prunes history to exactly the volatility window,
+    // so with real millisecond timestamps no retained sample sits at or before
+    // the window boundary. The strategy must measure against the oldest
+    // retained in-window sample instead of never firing.
+    let now = Utc.with_ymd_and_hms(2026, 7, 14, 0, 1, 0).unwrap();
+    let mut snapshot = MarketSnapshot::new(
+        "binance",
+        Symbol::new("BTCUSDT").unwrap(),
+        MarketType::Spot,
+        price("104.9"),
+        price("105.1"),
+        now,
+    )
+    .unwrap();
+    snapshot.last = Some(price("105"));
+    let strategy = AlertStrategy::new(AlertConfig {
+        upper_limit: None,
+        lower_limit: None,
+        volatility: Some(VolatilityAlertConfig {
+            window: Duration::seconds(60),
+            threshold_percent: decimal("4"),
+        }),
+        cooldown: Duration::zero(),
+    })
+    .unwrap();
+    let mut state = AlertState::default();
+    state
+        .record_price(now - Duration::milliseconds(59_700), price("100"))
+        .unwrap();
+    state
+        .record_price(now - Duration::milliseconds(29_300), price("102"))
+        .unwrap();
+
+    let alerts = strategy.evaluate(&state, &snapshot).unwrap();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].kind, AlertKind::VolatilityUp);
+    assert_eq!(alerts[0].change_percent, Some(decimal("5")));
+
+    // An empty history still yields no volatility baseline.
+    assert!(
+        strategy
+            .evaluate(&AlertState::default(), &snapshot)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn volatility_cooldown_is_shared_across_direction_changes() {
     let now = Utc.with_ymd_and_hms(2026, 7, 14, 0, 1, 0).unwrap();
     let snapshot = MarketSnapshot::new(

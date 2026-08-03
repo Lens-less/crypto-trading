@@ -14,15 +14,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
-    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, AccountRiskDirective,
-    AccountRiskError, DecisionRecord, ExecutionBatch, FileJournalSnapshotSource, HistoryError,
-    JournalReadError, JournalSnapshot, JournalSnapshotSource, JsonlHistory,
-    MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent, MarketDataEventSource,
-    MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
-    MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus, PaperAccountAuthority,
-    PaperAccountError, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
-    ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
+    AccountRiskDirective, AccountRiskError, DecisionRecord, ExecutionBatch,
+    FileJournalSnapshotSource, HistoryError, JournalReadError, JournalSnapshot,
+    JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent,
+    MarketDataEventSource, MarketDataObservation, MarketSupervisor, MarketSupervisorConfig,
+    MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
+    MarketSupervisorStatus, PaperAccountAuthority, PaperAccountError, PaperCostModel,
+    PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
+    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     GridDirective, GridFill, GridProtectionMachine, GridProtectionObservation,
@@ -37,6 +38,10 @@ use tokio::{
 
 use crate::{
     DurablePaperSingleLegSaga, PaperSingleLegRequest, PaperSingleLegSagaError,
+    paper_admission::{
+        PaperAdmissionCompensationError, discard_planned_admission as discard_shared_admission,
+        retain_cancelled_reservation,
+    },
     task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture},
 };
 
@@ -55,9 +60,22 @@ const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type GridPaperExecutionFuture =
     Pin<Box<dyn Future<Output = Result<Vec<TradingReceipt>, RuntimeError>> + Send + 'static>>;
+/// Boxed hook that applies one consumed market observation to an execution
+/// adapter before the owner evaluates crossings against it.
+pub type GridPaperObservationFuture =
+    Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'static>>;
 
 /// Minimal object-safe execution seam owned by the trusted task process.
 pub trait GridPaperExecutor: Send + Sync + 'static {
+    /// Applies one observation at consumer time.
+    ///
+    /// Live executors implement an explicit no-op. Replay executors use this
+    /// hook to prevent a fast source from advancing their paper book beyond
+    /// the event the owner is currently processing. Keeping the method
+    /// required makes a newly added replay executor choose its clock semantics
+    /// deliberately instead of silently inheriting live behavior.
+    fn observe_market(&self, observation: MarketDataObservation) -> GridPaperObservationFuture;
+
     fn execute(&self, batch: ExecutionBatch) -> GridPaperExecutionFuture;
 }
 
@@ -578,6 +596,19 @@ async fn run_owner(
                         .await;
                     }
                 };
+                if let MarketDataEvent::Observation(observation) = &event
+                    && let Err(error) = executor.observe_market(observation.clone()).await
+                {
+                    return fail_owner(
+                        &mut source,
+                        &history,
+                        &status_sender,
+                        &mut last_recorded_at,
+                        GridPaperTaskFailure::ExecutionFailed,
+                        GridPaperTaskError::Runtime(error),
+                    )
+                    .await;
+                }
                 // Durable account-risk close directives run first: a kill
                 // switch, a critically low balance, or an expired position
                 // clock stops the owner exactly like a protection exit.
@@ -881,7 +912,15 @@ async fn run_owner(
                             .await;
                         }
                         OperationOutcome::Cancelled(request) => {
-                            retain_cancelled_operation(saga.account(), &request).await;
+                            let _ = retain_cancelled_operation(
+                                saga.account(),
+                                None,
+                                "",
+                                None,
+                                &request,
+                                Utc::now(),
+                            )
+                            .await;
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
                             return fail_owner(
@@ -913,16 +952,12 @@ async fn run_owner(
                     // Entry-side crossings pass the account-level admission
                     // before any reservation exists; a durable rejection
                     // skips the crossing and keeps the owner alive.
-                    if let Some(risk) = config.account_risk.as_ref()
+                    let observed_at = observed.map_or_else(Utc::now, |(_, at)| at);
+                    let admission_ticket = if let Some(risk) = config.account_risk.as_ref()
                         && matches!(cross.side, GridFill::Buy)
                     {
-                        let observed_at = observed.map_or_else(Utc::now, |(_, at)| at);
                         match admit_grid_entry(risk, &config, &grid, &cross, observed_at).await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                completed_cross_count += 1;
-                                continue;
-                            }
+                            Ok(ticket) => ticket,
                             Err(error) => {
                                 let failure = error.failure_bucket();
                                 next.operation_count = operation_sequence;
@@ -938,11 +973,99 @@ async fn run_owner(
                                 .await;
                             }
                         }
+                    } else {
+                        None
+                    };
+                    if config.account_risk.is_some()
+                        && matches!(cross.side, GridFill::Buy)
+                        && admission_ticket.is_none()
+                    {
+                        completed_cross_count += 1;
+                        continue;
                     }
-                    operation_sequence = operation_sequence
-                        .checked_add(1)
-                        .ok_or(GridPaperTaskError::InvalidRequest)?;
-                    let request = build_operation(&config, &grid, cross, operation_sequence)?;
+                    if let Some(risk) = config.account_risk.as_ref()
+                        && matches!(cross.side, GridFill::Buy)
+                    {
+                        let Some(next_operation) = operation_sequence.checked_add(1) else {
+                            if let Err(error) = discard_planned_admission(
+                                Some(risk),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                observed_at,
+                            )
+                            .await
+                            {
+                                let failure = error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::InvalidRequest,
+                                GridPaperTaskError::InvalidRequest,
+                            )
+                            .await;
+                        };
+                        operation_sequence = next_operation;
+                    } else {
+                        operation_sequence = operation_sequence
+                            .checked_add(1)
+                            .ok_or(GridPaperTaskError::InvalidRequest)?;
+                    }
+                    let reservation_price =
+                        conservative_reservation_price(&event, cross.side, cross.trigger_price);
+                    let request = match build_operation(
+                        &config,
+                        &grid,
+                        cross,
+                        reservation_price,
+                        operation_sequence,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            if let Err(cancel_error) = discard_planned_admission(
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                observed_at,
+                            )
+                            .await
+                            {
+                                let failure = cancel_error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    cancel_error,
+                                )
+                                .await;
+                            }
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::InvalidRequest,
+                                error,
+                            )
+                            .await;
+                        }
+                    };
+                    let recovery_request = request.clone();
                     match run_operation(
                         &saga,
                         Arc::clone(&executor),
@@ -958,6 +1081,43 @@ async fn run_owner(
                             stop_after_operation |= stop_requested;
                         }
                         OperationOutcome::Terminal(Err(error), _) => {
+                            let needs_recovery = match retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                &recovery_request,
+                                observed_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        failure,
+                                        retain_error,
+                                    )
+                                    .await;
+                                }
+                            };
+                            if needs_recovery {
+                                next.operation_count = operation_sequence;
+                                status_sender.send_replace(next);
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    GridPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            }
                             let (failure, error) = classify_saga_error(error);
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
@@ -972,16 +1132,49 @@ async fn run_owner(
                             .await;
                         }
                         OperationOutcome::Cancelled(request) => {
-                            retain_cancelled_operation(saga.account(), &request).await;
+                            let needs_recovery = match retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                &request,
+                                observed_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        failure,
+                                        retain_error,
+                                    )
+                                    .await;
+                                }
+                            };
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
-                            return fail_owner(
+                            if needs_recovery {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    GridPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            }
+                            return stop_owner(
                                 &mut source,
                                 &history,
                                 &status_sender,
                                 &mut last_recorded_at,
-                                GridPaperTaskFailure::RecoveryRequired,
-                                GridPaperTaskError::RecoveryRequired,
+                                GridPaperTaskExit::StopRequested,
                             )
                             .await;
                         }
@@ -1123,22 +1316,33 @@ async fn run_operation(
 
 async fn retain_cancelled_operation(
     account: &PaperAccountAuthority,
+    risk: Option<&AccountRiskAuthority>,
+    owner_task_id: &str,
+    admission_ticket: Option<&AccountRiskAdmissionTicket>,
     request: &PaperSingleLegRequest,
-) {
-    let reservation_id = request.reservation().reservation_id();
-    let Ok(snapshot) = account.snapshot().await else {
-        return;
-    };
-    let Some(reservation) = snapshot
-        .reservations
-        .iter()
-        .find(|reservation| reservation.reservation_id == reservation_id)
-    else {
-        return;
-    };
-    if reservation.phase == PaperReservationPhase::Pending {
-        let _ = account.mark_uncertain(reservation_id).await;
-    }
+    now: DateTime<Utc>,
+) -> Result<bool, GridPaperTaskError> {
+    retain_cancelled_reservation(
+        account,
+        risk,
+        owner_task_id,
+        admission_ticket,
+        request.reservation().reservation_id(),
+        now,
+    )
+    .await
+    .map_err(GridPaperTaskError::from)
+}
+
+async fn discard_planned_admission(
+    risk: Option<&AccountRiskAuthority>,
+    task_id: &str,
+    ticket: Option<&AccountRiskAdmissionTicket>,
+    now: DateTime<Utc>,
+) -> Result<(), GridPaperTaskError> {
+    discard_shared_admission(risk, task_id, ticket, now)
+        .await
+        .map_err(GridPaperTaskError::from)
 }
 
 fn grid_crosses(
@@ -1220,7 +1424,7 @@ async fn admit_grid_entry(
     grid: &VirtualGrid,
     cross: &VirtualGridCross,
     observed_at: DateTime<Utc>,
-) -> Result<bool, GridPaperTaskError> {
+) -> Result<Option<AccountRiskAdmissionTicket>, GridPaperTaskError> {
     let notional = cross
         .trigger_price
         .as_decimal()
@@ -1238,8 +1442,8 @@ async fn admit_grid_entry(
         .await
         .map_err(GridPaperTaskError::AccountRisk)?
     {
-        AccountRiskAdmission::Admitted { .. } => Ok(true),
-        AccountRiskAdmission::Rejected(_) => Ok(false),
+        AccountRiskAdmission::Admitted { ticket, .. } => Ok(Some(ticket)),
+        AccountRiskAdmission::Rejected(_) => Ok(None),
     }
 }
 
@@ -1424,6 +1628,7 @@ fn build_operation(
     config: &GridPaperTaskConfig,
     grid: &VirtualGrid,
     cross: VirtualGridCross,
+    reservation_price: Price,
     operation_sequence: u64,
 ) -> Result<PaperSingleLegRequest, GridPaperTaskError> {
     let side = match cross.side {
@@ -1439,8 +1644,7 @@ fn build_operation(
         cross.trigger_price,
     );
     let batch = ExecutionBatch::planned(vec![intent.clone()])?;
-    let reserved_notional = cross
-        .trigger_price
+    let reserved_notional = reservation_price
         .as_decimal()
         .checked_mul(config.quantity.as_decimal())
         .map(Money::new)
@@ -1460,6 +1664,25 @@ fn build_operation(
     )?;
     PaperSingleLegRequest::new(grid.config().symbol.clone(), batch, reservation)
         .map_err(GridPaperTaskError::Saga)
+}
+
+fn conservative_reservation_price(
+    event: &MarketDataEvent,
+    side: GridFill,
+    trigger_price: Price,
+) -> Price {
+    let MarketDataEvent::Observation(observation) = event else {
+        return trigger_price;
+    };
+    let touch = match side {
+        GridFill::Buy => observation.snapshot.ask(),
+        GridFill::Sell => observation.snapshot.bid(),
+    };
+    if touch.as_decimal() > trigger_price.as_decimal() {
+        touch
+    } else {
+        trigger_price
+    }
 }
 
 async fn stop_owner(
@@ -1686,6 +1909,7 @@ fn placeholder_source_value(source_id: &str) -> Value {
         "phase": "starting",
         "health": "unknown",
         "event_sequence": 0,
+        "dropped_event_count": 0,
         "consecutive_source_failures": 0,
         "last_event_at": Value::Null,
         "exit": Value::Null,
@@ -1700,6 +1924,7 @@ fn source_status_value(status: &MarketSupervisorStatus) -> Value {
         "phase": source_phase_label(status.phase),
         "health": source_health_label(status.health),
         "event_sequence": status.event_sequence,
+        "dropped_event_count": status.dropped_event_count,
         "consecutive_source_failures": status.consecutive_source_failures,
         "last_event_at": status.last_event_at,
         "exit": status.exit.map(source_exit_label),
@@ -1830,6 +2055,16 @@ const fn classify_saga_error_ref(error: &PaperSingleLegSagaError) -> GridPaperTa
 impl From<PaperAccountError> for GridPaperTaskError {
     fn from(value: PaperAccountError) -> Self {
         Self::Account(value)
+    }
+}
+
+impl From<PaperAdmissionCompensationError> for GridPaperTaskError {
+    fn from(value: PaperAdmissionCompensationError) -> Self {
+        match value {
+            PaperAdmissionCompensationError::Account(error) => Self::Account(error),
+            PaperAdmissionCompensationError::AccountRisk(error) => Self::AccountRisk(error),
+            PaperAdmissionCompensationError::RecoveryRequired => Self::RecoveryRequired,
+        }
     }
 }
 

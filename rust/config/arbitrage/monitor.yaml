@@ -65,6 +65,10 @@ symbols:
   - ZORA-USDC-PERP
 
 # 套利阈值配置
+health_check:
+  data_timeout: 30
+  max_pair_skew_ms: 1000
+
 thresholds:
   price_spread: 0.005        # 价差阈值（0.5%）
   funding_rate: 0.0001       # 资金费率差阈值（0.01%）

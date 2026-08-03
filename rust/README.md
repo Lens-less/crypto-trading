@@ -3,7 +3,7 @@
 这是仓库唯一的当前运行项目。Rust 源码、当前配置、构建输出和运行数据都位于本目录；运行时不依赖 `../archive/python-legacy/` 中的任何文件。
 
 > [!WARNING]
-> **不得用于真实资金。** Live 适配器、连续运行、权威账户风控和多腿故障补偿尚未达到开放门槛；`--live` 即使带确认短语也会失败关闭。唯一具备下单权限的路径是 Binance **Testnet**，需要精确确认短语。Paper 结果不含手续费、资金费率、滑点、撮合队列优先级或跨进程持仓。本项目按原样提供，不含任何担保，也不构成投资建议。
+> **不得用于真实资金。** Live 适配器、真实交易所账户真值（equity、margin、持仓）和多腿故障补偿尚未达到开放门槛；`--live` 即使带确认短语也会失败关闭。唯一具备下单权限的路径是 Binance **Testnet**，需要精确确认短语。Paper 只计完全成交同步 taker 回执采用的配置手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。本项目按原样提供，不含任何担保，也不构成投资建议。
 > 项目定位、安装与部署见[仓库根 README](../README.md)。
 
 ## 能力矩阵
@@ -26,6 +26,8 @@
 | `scanner` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验 fail-closed scanner schema 后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 owner，评级排名与生命周期事实写入 journal，状态可降级到 journal 投影 |
 
 `grid` 和 `arbitrage` 的 one-shot 以及连续 Paper owner 都会先持久化计划/预留事实，再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。不确定结果不得直接重试，必须先按 journal 投影和权威对账处理。
+
+`research.indicators` 与 `research.backtest` 只标识 workspace 中存在的内部研究库；两者在 capability manifest 中均为 `Unavailable`。当前没有已出货二进制链接这些 crate，也没有受支持的 CLI 或 HTTP 入口。它们的单元/契约测试只证明库内算法约束，不代表 paper/live 等价、可执行生产策略或盈利能力。
 
 ## 快速验证
 
@@ -170,7 +172,7 @@ cargo run --locked -- testnet-soak --mode verify --help
 - 默认不授予外部写权限；当前外部下单路径仅限精确确认短语授权的 Binance Testnet lifecycle，Paper 写入口限于显式 one-shot 和 bearer-protected、严格 profile 匹配的 replay-backed owner；mainnet 始终关闭。
 - 不受支持的外部连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
 - 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、正的 `max_position_value`、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
-- `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；`equity` 与 `available_balance` 也尚未参与资金或保证金校验。它不代表跨进程仓位、账户资金、挂单风险 reservation、多腿补偿或真实账户风控已经完成。
+- `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；连续 Paper owner 另由 journal-backed `AccountRiskAuthority` 使用 settled equity、剩余 FIFO lot 敞口和 pending admission 执行余额、单币种/全局上限、暂停位与 kill switch 门禁。两层门禁都不读取真实交易所 equity、保证金、挂单或持仓，也不能跨不同 journal 自动合并风险。
 - Grid one-shot 仍只验证网格规划与 paper 挂单语义；连续 Grid/Arbitrage owner 另行使用 journal-backed `PaperAccountAuthority` 做 pending/uncertain/committed 预留。连续 Grid owner 可按配置启用纯策略网格保护（止损 > 本金保护 > 价格锁定 > 止盈 > 剥头皮），其指令写入 `grid_protection` journal 事实并只作用于 owner 自身的虚拟持仓。以上都不代表真实交易所权益、保证金、持仓真相或 live 风控已经完成。
 - 历史 Python 实现冻结在 `../archive/python-legacy/`，不得作为当前 Rust 入口。
 

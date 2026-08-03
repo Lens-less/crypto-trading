@@ -16,7 +16,7 @@ mod sha256;
 mod symbol;
 mod unsupported;
 
-pub use binance::BinancePublicExchange;
+pub use binance::{BinancePublicExchange, BinancePublicObservation};
 pub use binance_testnet::{
     BinanceHmacSha256Signer, BinanceRequestSigner, BinanceServerOrderRef, BinanceTestnetBalance,
     BinanceTestnetProtocol,

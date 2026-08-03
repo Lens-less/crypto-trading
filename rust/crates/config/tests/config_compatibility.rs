@@ -238,12 +238,16 @@ symbols: [BTC-USDC-PERP]
 thresholds:
   min_spread_pct: 0.125
   min_funding_rate_diff: "0.01"
+health_check:
+  data_timeout: 30
+  max_pair_skew_ms: 250
 future_monitor_section: { enabled: true }
 "#,
     )
     .unwrap();
     assert_eq!(monitor.exchanges, ["lighter", "backpack"]);
     assert_eq!(monitor.min_spread_pct, Decimal::from_str("0.125").unwrap());
+    assert_eq!(monitor.max_pair_skew_ms, 250);
 
     let arbitrage = load_arbitrage_config_from_str(
         r"
@@ -895,6 +899,9 @@ fn monitor_rejects_empty_universes_and_zero_intervals() {
         "exchanges: []\nsymbols: [BTC-USDC-PERP]\n",
         "exchanges: [lighter]\nsymbols: []\n",
         "exchanges: [lighter]\nsymbols: [BTC-USDC-PERP]\nperformance:\n  analysis_interval_ms: 0\n",
+        "exchanges: [lighter]\nsymbols: [BTC-USDC-PERP]\nhealth_check:\n  max_pair_skew_ms: 0\n",
+        "exchanges: [lighter]\nsymbols: [BTC-USDC-PERP]\nhealth_check:\n  data_timeout: 1\n  max_pair_skew_ms: 1001\n",
+        "exchanges: [lighter]\nsymbols: [BTC-USDC-PERP]\nhealth_check:\n  data_timeout: 120\n  max_pair_skew_ms: 60001\n",
     ] {
         assert!(load_monitor_config_from_str(yaml).is_err(), "{yaml}");
     }

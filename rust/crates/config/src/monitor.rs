@@ -9,6 +9,8 @@ use crate::{
     input::{parse_yaml, read_config_file},
 };
 
+const MAX_MONITOR_PAIR_SKEW_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorConfig {
     pub exchanges: Vec<String>,
@@ -22,6 +24,7 @@ pub struct MonitorConfig {
     pub ui_refresh_interval_ms: u64,
     pub health_check_interval: u64,
     pub data_timeout_seconds: u64,
+    pub max_pair_skew_ms: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -100,6 +103,8 @@ struct HealthCheck {
     interval: u64,
     #[serde(default = "default_data_timeout", alias = "data_timeout_seconds")]
     data_timeout: u64,
+    #[serde(default = "default_max_pair_skew_ms")]
+    max_pair_skew_ms: u64,
 }
 
 impl Default for HealthCheck {
@@ -107,6 +112,7 @@ impl Default for HealthCheck {
         Self {
             interval: default_health_interval(),
             data_timeout: default_data_timeout(),
+            max_pair_skew_ms: default_max_pair_skew_ms(),
         }
     }
 }
@@ -145,6 +151,10 @@ const fn default_health_interval() -> u64 {
 
 const fn default_data_timeout() -> u64 {
     30
+}
+
+const fn default_max_pair_skew_ms() -> u64 {
+    1_000
 }
 
 /// Loads an arbitrage-monitor configuration file.
@@ -204,12 +214,27 @@ pub fn load_monitor_config_from_str(yaml: &str) -> ConfigResult<MonitorConfig> {
         ),
         ("health_check.interval", raw.health_check.interval),
         ("health_check.data_timeout", raw.health_check.data_timeout),
+        (
+            "health_check.max_pair_skew_ms",
+            raw.health_check.max_pair_skew_ms,
+        ),
     ] {
         if value == 0 {
             return Err(ConfigError::Validation(format!(
                 "monitor {name} must be positive"
             )));
         }
+    }
+    if raw.health_check.max_pair_skew_ms > MAX_MONITOR_PAIR_SKEW_MS {
+        return Err(ConfigError::Validation(format!(
+            "monitor health_check.max_pair_skew_ms must not exceed {MAX_MONITOR_PAIR_SKEW_MS}"
+        )));
+    }
+    if raw.health_check.max_pair_skew_ms > raw.health_check.data_timeout.saturating_mul(1_000) {
+        return Err(ConfigError::Validation(
+            "monitor health_check.max_pair_skew_ms must not exceed health_check.data_timeout"
+                .to_owned(),
+        ));
     }
 
     Ok(MonitorConfig {
@@ -224,5 +249,6 @@ pub fn load_monitor_config_from_str(yaml: &str) -> ConfigResult<MonitorConfig> {
         ui_refresh_interval_ms: raw.performance.ui_refresh_interval_ms,
         health_check_interval: raw.health_check.interval,
         data_timeout_seconds: raw.health_check.data_timeout,
+        max_pair_skew_ms: raw.health_check.max_pair_skew_ms,
     })
 }

@@ -1,0 +1,16 @@
+[package]
+name = "crypto-trading-indicators"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic Decimal-based technical indicators and performance metrics."
+publish = false
+
+[dependencies]
+rust_decimal.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

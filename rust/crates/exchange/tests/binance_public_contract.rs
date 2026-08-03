@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use crypto_trading_domain::{MarketType, OrderIntent, Quantity, Side, Symbol};
 use crypto_trading_exchange::{
     BinancePublicExchange, ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode,
-    ExchangeOperation, MarketSubscription, ReconcileScope, TradingCommand,
+    ExchangeOperation, MarketSubscription, ReconcileScope, RemoteRetryAfter, TradingCommand,
 };
 use rust_decimal::Decimal;
 
@@ -48,6 +48,42 @@ fn official_book_ticker_fixture_maps_to_an_exact_spot_snapshot() {
         decimal("9.00000000")
     );
     assert_eq!(snapshot.timestamp, received_at);
+}
+
+#[test]
+fn optional_book_ticker_sequence_aliases_are_parsed_without_claiming_a_venue_event_time() {
+    let received_at = timestamp("2026-07-14T03:04:05Z");
+
+    let canonical = BinancePublicExchange::parse_book_ticker_observation(
+        br#"{
+            "symbol":"LTCBTC",
+            "bidPrice":"4.00000000",
+            "bidQty":"431.00000000",
+            "askPrice":"4.00000200",
+            "askQty":"9.00000000",
+            "updateId":123456
+        }"#,
+        received_at,
+    )
+    .unwrap();
+    assert_eq!(canonical.snapshot.timestamp, received_at);
+    assert_eq!(canonical.event_time, None);
+    assert_eq!(canonical.source_sequence, Some(123_456));
+
+    let alias = BinancePublicExchange::parse_book_ticker_observation(
+        br#"{
+            "symbol":"LTCBTC",
+            "bidPrice":"4.00000000",
+            "bidQty":"431.00000000",
+            "askPrice":"4.00000200",
+            "askQty":"9.00000000",
+            "u":123457
+        }"#,
+        received_at,
+    )
+    .unwrap();
+    assert_eq!(alias.source_sequence, Some(123_457));
+    assert_eq!(alias.event_time, None);
 }
 
 #[tokio::test]
@@ -197,6 +233,34 @@ async fn non_success_binance_json_errors_preserve_http_status_and_exchange_code(
         );
         server.join().unwrap();
     }
+}
+
+#[tokio::test]
+async fn binance_rate_limit_preserves_retry_after_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let body = r#"{"code":-1003,"msg":"too many requests"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+
+    let error = exchange
+        .fetch_snapshot(&Symbol::new("LTCBTC").unwrap())
+        .await
+        .unwrap_err();
+
+    let metadata = error.remote_failure_metadata().unwrap();
+    assert_eq!(metadata.exchange_code.as_deref(), Some("-1003"));
+    assert_eq!(metadata.retry_after, Some(RemoteRetryAfter::Seconds(7)));
+    server.join().unwrap();
 }
 
 #[tokio::test]

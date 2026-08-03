@@ -115,7 +115,7 @@ pub struct AlertOccurrenceView {
     pub deliveries: Vec<AlertDeliveryView>,
 }
 
-struct ProjectionBuilder {
+pub(crate) struct ProjectionBuilder {
     journal_id: Uuid,
     head_sequence: Option<u64>,
     boundary: JournalPageBoundary,
@@ -130,7 +130,7 @@ struct ProjectionBuilder {
 }
 
 impl ProjectionBuilder {
-    fn new(journal_id: Uuid) -> Self {
+    pub(crate) fn new(journal_id: Uuid) -> Self {
         Self {
             journal_id,
             head_sequence: None,
@@ -153,17 +153,12 @@ impl ProjectionBuilder {
         let mut cursor = None;
         loop {
             let page = LegacyJsonlJournalReader::read_page(snapshot, cursor.as_ref())?;
-            if let Some(event) = page.events().last() {
-                self.head_sequence = Some(event.sequence());
-            }
             for event in page.events() {
-                self.apply_event(event);
+                self.observe_event(event);
             }
-            self.boundary = page.boundary().clone();
+            self.observe_boundary(page.boundary());
             match page.boundary() {
-                JournalPageBoundary::SnapshotEnd => break,
-                JournalPageBoundary::PartialTail { .. } => {
-                    self.record_invalid();
+                JournalPageBoundary::SnapshotEnd | JournalPageBoundary::PartialTail { .. } => {
                     break;
                 }
                 JournalPageBoundary::PageLimit => {
@@ -181,7 +176,23 @@ impl ProjectionBuilder {
                 }
             }
         }
-        Ok(PriceAlertReadModel {
+        Ok(self.finish())
+    }
+
+    pub(crate) fn observe_event(&mut self, event: &OperationEventEnvelope) {
+        self.head_sequence = Some(event.sequence());
+        self.apply_event(event);
+    }
+
+    pub(crate) fn observe_boundary(&mut self, boundary: &JournalPageBoundary) {
+        self.boundary = boundary.clone();
+        if matches!(boundary, JournalPageBoundary::PartialTail { .. }) {
+            self.record_invalid();
+        }
+    }
+
+    pub(crate) fn finish(self) -> PriceAlertReadModel {
+        PriceAlertReadModel {
             schema_version: PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
             journal_id: self.journal_id,
             journal_head_sequence: self.head_sequence,
@@ -190,7 +201,7 @@ impl ProjectionBuilder {
             occurrences: self.occurrences,
             occurrences_truncated: self.truncated,
             invalid_event_count: self.invalid_event_count,
-        })
+        }
     }
 
     fn apply_event(&mut self, event: &OperationEventEnvelope) {

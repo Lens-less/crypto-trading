@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,7 @@ use uuid::Uuid;
 
 use crate::history::{
     MAX_HISTORY_CHAIN_BYTES, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_SEALED_SEGMENTS, SealedChainError,
-    inspect_sealed_segments, stable_history_path_for_read,
+    SealedSegment, inspect_sealed_segments, stable_history_path_for_read,
 };
 use crate::{
     AggregateRef, CursorError, EventContractError, JournalCursor, MAX_HISTORY_RECORD_BYTES,
@@ -35,6 +36,7 @@ const LEGACY_AGGREGATE_KIND: &str = "legacy_record";
 const CURSOR_ANCHOR_CHECKPOINT_INTERVAL_BYTES: usize = 256 * 1_024;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+const SLOW_JOURNAL_SNAPSHOT: Duration = Duration::from_millis(100);
 
 /// Immutable, bounded bytes captured from one append-only journal generation.
 #[derive(Clone, Debug)]
@@ -126,7 +128,8 @@ impl JournalSnapshotSource for MemoryJournalSnapshotSource {
 /// Sealed segments `<path>.1 ..= <path>.N` are read in sequence order before
 /// the active file, whose length is frozen before reading; appends completed
 /// after that metadata read are deliberately excluded. Byte offsets, event
-/// sequences, and cursor anchors are continuous across segment boundaries, so
+/// sequences, and cursor anchors are continuous across segment boundaries, and
+/// a rotation completing mid-capture is detected and the capture retried, so
 /// rotation is invisible to snapshot consumers. The caller supplies a durable
 /// generation ID; it must change when a journal is intentionally replaced.
 #[derive(Clone, Debug)]
@@ -157,7 +160,31 @@ impl FileJournalSnapshotSource {
 
 impl JournalSnapshotSource for FileJournalSnapshotSource {
     fn snapshot(&self) -> Result<JournalSnapshot, JournalReadError> {
-        JournalSnapshot::new(self.journal_id, read_chain_bytes(&self.path)?)
+        let started = Instant::now();
+        let result = read_chain_bytes(&self.path)
+            .and_then(|bytes| JournalSnapshot::new(self.journal_id, bytes));
+        let elapsed = started.elapsed();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        match &result {
+            Ok(snapshot) if elapsed >= SLOW_JOURNAL_SNAPSHOT => tracing::warn!(
+                journal_id = %self.journal_id,
+                snapshot_bytes = snapshot.len(),
+                elapsed_ms,
+                "journal snapshot capture exceeded the latency budget"
+            ),
+            Ok(snapshot) => tracing::debug!(
+                journal_id = %self.journal_id,
+                snapshot_bytes = snapshot.len(),
+                elapsed_ms,
+                "journal snapshot captured"
+            ),
+            Err(_) => tracing::warn!(
+                journal_id = %self.journal_id,
+                elapsed_ms,
+                "journal snapshot capture failed closed"
+            ),
+        }
+        result
     }
 }
 
@@ -168,9 +195,12 @@ impl JournalSnapshotSource for FileJournalSnapshotSource {
 /// before the active file, so replaying the stream is byte-for-byte identical
 /// to replaying a journal that was never rotated. A missing active file behind
 /// at least one sealed segment is the well-defined crash point between sealing
-/// and recreating the active file and reads as an empty tail. Every other
-/// inconsistency — segment gaps, empty, oversized, or unterminated sealed
-/// segments, or a chain past the segment or byte budget — fails closed.
+/// and recreating the active file and reads as an empty tail. A rotation that
+/// completes while the chain is being captured is detected by re-inspecting
+/// the sealed chain afterwards and the capture is retried, so a snapshot never
+/// silently omits a just-sealed segment. Every other inconsistency — segment
+/// gaps, empty, oversized, or unterminated sealed segments, or a chain past
+/// the segment or byte budget — fails closed.
 ///
 /// # Errors
 ///
@@ -180,11 +210,68 @@ pub fn read_journal_chain(path: impl AsRef<Path>) -> Result<Vec<u8>, JournalRead
     read_chain_bytes(&stable_history_path_for_read(path.as_ref()))
 }
 
+/// Bound on re-capturing a chain after a rotation landed mid-capture. Each
+/// retry requires the writer to fill and seal a whole active file inside the
+/// capture window, so the bound exists to guarantee termination rather than
+/// because exhaustion is expected.
+const MAX_CHAIN_CAPTURE_ATTEMPTS: usize = 3;
+
 fn read_chain_bytes(path: &Path) -> Result<Vec<u8>, JournalReadError> {
-    let sealed = inspect_sealed_segments(path)?;
+    let mut rotated_totals = (0u64, 0u64);
+    for _ in 0..MAX_CHAIN_CAPTURE_ATTEMPTS {
+        let sealed = inspect_sealed_segments(path)?;
+        let capture = capture_chain_once(path, &sealed)?;
+        // A writer can seal the active file into segment N+1 between the
+        // sealed-chain inspection and the active-file open; the capture would
+        // then hold segments 1..N plus the new active file with the
+        // just-sealed segment silently absent. Sealed segments are immutable,
+        // so any difference in the re-inspection proves a rotation landed
+        // mid-capture and the capture cannot be trusted.
+        let recheck = inspect_sealed_segments(path)?;
+        if !sealed_chains_match(&sealed, &recheck) {
+            rotated_totals = (sealed_chain_bytes(&sealed), sealed_chain_bytes(&recheck));
+            continue;
+        }
+        return match capture {
+            ChainCapture::Full(bytes) => Ok(bytes),
+            ChainCapture::MissingActive { bytes, source } => {
+                if sealed.is_empty() {
+                    Err(JournalReadError::Open(source))
+                } else {
+                    // Crash point between sealing and recreating the active
+                    // file: the sealed chain is the complete durable record;
+                    // the tail is empty.
+                    Ok(bytes)
+                }
+            }
+        };
+    }
+    Err(JournalReadError::SourceChanged {
+        expected_bytes: usize::try_from(rotated_totals.0).unwrap_or(usize::MAX),
+        actual_bytes: usize::try_from(rotated_totals.1).unwrap_or(usize::MAX),
+    })
+}
+
+/// One attempted capture of the chain described by `sealed` plus the active
+/// file; the caller must re-inspect the sealed chain before trusting it.
+enum ChainCapture {
+    /// Sealed segments plus the frozen active-file prefix.
+    Full(Vec<u8>),
+    /// Sealed segments with no active file behind them. The open error is
+    /// preserved so an entirely absent journal keeps its original error.
+    MissingActive {
+        bytes: Vec<u8>,
+        source: std::io::Error,
+    },
+}
+
+fn capture_chain_once(
+    path: &Path,
+    sealed: &[SealedSegment],
+) -> Result<ChainCapture, JournalReadError> {
     let mut bytes = Vec::new();
     let mut chain_bytes = 0u64;
-    for segment in &sealed {
+    for segment in sealed {
         chain_bytes = chain_bytes.saturating_add(segment.bytes);
         validate_chain_budget(chain_bytes)?;
         append_sealed_segment(&segment.path, segment.bytes, &mut bytes)?;
@@ -210,14 +297,30 @@ fn read_chain_bytes(path: &Path) -> Result<Vec<u8>, JournalReadError> {
             chain_bytes = chain_bytes.saturating_add(metadata.len());
             validate_chain_budget(chain_bytes)?;
             append_frozen_prefix(file, metadata.len(), &mut bytes)?;
+            Ok(ChainCapture::Full(bytes))
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound && !sealed.is_empty() => {
-            // Crash point between sealing and recreating the active file: the
-            // sealed chain is the complete durable record; the tail is empty.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ChainCapture::MissingActive { bytes, source })
         }
-        Err(source) => return Err(JournalReadError::Open(source)),
+        Err(source) => Err(JournalReadError::Open(source)),
     }
-    Ok(bytes)
+}
+
+/// Sealed segment paths are derived from their sequence numbers and segments
+/// are immutable once sealed, so length plus per-segment byte counts decide
+/// whether two inspections saw the same chain.
+fn sealed_chains_match(before: &[SealedSegment], after: &[SealedSegment]) -> bool {
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after)
+            .all(|(before, after)| before.bytes == after.bytes)
+}
+
+fn sealed_chain_bytes(segments: &[SealedSegment]) -> u64 {
+    segments
+        .iter()
+        .fold(0u64, |total, segment| total.saturating_add(segment.bytes))
 }
 
 fn append_sealed_segment(
@@ -555,6 +658,27 @@ fn parse_legacy_event(
     .map_err(|source| JournalReadError::EventContract { sequence, source })
 }
 
+pub(crate) fn event_from_decision_record(
+    journal_id: Uuid,
+    sequence: u64,
+    record: &crate::DecisionRecord,
+) -> Result<OperationEventEnvelope, JournalReadError> {
+    let line = serde_json::to_vec(record).map_err(|source| JournalReadError::MalformedRecord {
+        sequence,
+        offset: 0,
+        source,
+    })?;
+    let bytes = line.len().saturating_add(1);
+    if bytes > MAX_HISTORY_RECORD_BYTES {
+        return Err(JournalReadError::RecordTooLarge {
+            offset: 0,
+            bytes,
+            limit: MAX_HISTORY_RECORD_BYTES,
+        });
+    }
+    parse_legacy_event(journal_id, sequence, 0, &line)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyDecisionRecord {
@@ -724,4 +848,100 @@ pub enum JournalReadError {
     },
     #[error(transparent)]
     Cursor(#[from] CursorError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_journal_root(prefix: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_sealed_segment_path(active_path: &Path, sequence: u64) -> PathBuf {
+        let file_name = active_path.file_name().unwrap().to_string_lossy();
+        active_path.with_file_name(format!("{file_name}.{sequence}"))
+    }
+
+    #[test]
+    fn rotation_completed_during_capture_is_detected_and_the_read_retries() {
+        let root = temp_journal_root("journal-capture-race");
+        let path = root.join("journal.jsonl");
+        std::fs::write(&path, b"{\"sealed\":1}\n").unwrap();
+
+        // Freeze the reader's pre-capture view of the sealed chain, then let
+        // the writer rotate: the active file becomes segment 1 and a fresh
+        // active file continues the journal.
+        let stale = inspect_sealed_segments(&path).unwrap();
+        assert!(stale.is_empty());
+        std::fs::rename(&path, test_sealed_segment_path(&path, 1)).unwrap();
+        std::fs::write(&path, b"{\"active\":2}\n").unwrap();
+
+        // The stale capture reads the new active file and silently misses the
+        // just-sealed segment...
+        let capture = capture_chain_once(&path, &stale).unwrap();
+        let ChainCapture::Full(bytes) = capture else {
+            panic!("expected a full capture of the new active file");
+        };
+        assert_eq!(bytes, b"{\"active\":2}\n");
+        // ...which only the sealed-chain re-inspection can prove.
+        let recheck = inspect_sealed_segments(&path).unwrap();
+        assert!(!sealed_chains_match(&stale, &recheck));
+
+        // The composed read re-inspects, retries, and returns the whole chain.
+        assert_eq!(
+            read_chain_bytes(&path).unwrap(),
+            b"{\"sealed\":1}\n{\"active\":2}\n"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rotation_awaiting_the_recreated_active_file_is_detected_mid_capture() {
+        let root = temp_journal_root("journal-capture-race-gap");
+        let path = root.join("journal.jsonl");
+        std::fs::write(&path, b"{\"sealed\":1}\n").unwrap();
+
+        // The rename-to-recreate sub-window of rotation: the active file is
+        // already sealed as segment 1 and the fresh active file does not
+        // exist yet.
+        let stale = inspect_sealed_segments(&path).unwrap();
+        assert!(stale.is_empty());
+        std::fs::rename(&path, test_sealed_segment_path(&path, 1)).unwrap();
+
+        // Against the stale inspection this is indistinguishable from an
+        // absent journal; the re-inspection exposes the rotation.
+        let capture = capture_chain_once(&path, &stale).unwrap();
+        let ChainCapture::MissingActive { bytes, .. } = capture else {
+            panic!("expected the active file to be missing");
+        };
+        assert!(bytes.is_empty());
+        let recheck = inspect_sealed_segments(&path).unwrap();
+        assert!(!sealed_chains_match(&stale, &recheck));
+
+        // The retried read lands on the documented crash-point contract: the
+        // sealed chain is the complete durable record with an empty tail.
+        assert_eq!(read_chain_bytes(&path).unwrap(), b"{\"sealed\":1}\n");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_journal_keeps_its_not_found_open_error() {
+        let root = temp_journal_root("journal-capture-absent");
+        let path = root.join("journal.jsonl");
+
+        // Loaders distinguish a fresh journal from the crash point by this
+        // exact error; capture validation must not change it.
+        let error = read_chain_bytes(&path).unwrap_err();
+        assert!(matches!(
+            error,
+            JournalReadError::Open(source) if source.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

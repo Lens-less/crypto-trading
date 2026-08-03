@@ -5,12 +5,17 @@ use std::sync::{
 
 use crypto_trading_control_plane::{
     CONTROL_PLANE_EVENTS_SCHEMA_VERSION, CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION,
-    ControlPlaneEventsError, ReadControlPlane, ReadFailureKind,
+    ControlPlaneEventsError, ControlPlaneProjectionCacheStats, ControlPlaneReadError,
+    ControlPlaneSnapshotError, ReadControlPlane, ReadFailureKind,
 };
 use crypto_trading_runtime::{
-    CapabilityAccess, CapabilityEnvironment, CapabilityLevel, CursorError, ExecutionBatch,
-    ExecutionBatchState, JournalPageBoundary, JournalSnapshot, JournalSnapshotSource,
-    PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, ProjectionStatus,
+    AccountRiskProjectionError, AccountRiskReadModel, ArbitrageMonitorReadModel, CapabilityAccess,
+    CapabilityEnvironment, CapabilityLevel, CursorError, ExecutionBatch, ExecutionBatchState,
+    JournalPageBoundary, JournalSnapshot, JournalSnapshotSource, MAX_CURSOR_ANCHOR_SCAN_BYTES,
+    MAX_JOURNAL_PAGE_EVENTS, MemoryJournalSnapshotSource, OperatorReadModel,
+    PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PaperAccountReadModel,
+    PriceAlertReadModel, ProjectionStatus, ReadOnlyTaskReadModel, VirtualGridScannerReadModel,
+    project_control_plane_state,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -38,6 +43,14 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
     let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
 
     let first = control_plane.snapshot().unwrap();
+    assert_eq!(
+        control_plane.projection_cache_stats(),
+        ControlPlaneProjectionCacheStats {
+            hits: 0,
+            misses: 1,
+            stores: 1,
+        }
+    );
     let second = control_plane.snapshot().unwrap();
 
     assert_eq!(first, second);
@@ -76,6 +89,18 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
     assert_eq!(
         first.operator.batches[0].state,
         ExecutionBatchState::Completed
+    );
+    assert_eq!(
+        second.operator.batches[0].state,
+        ExecutionBatchState::Completed
+    );
+    assert_eq!(
+        control_plane.projection_cache_stats(),
+        ControlPlaneProjectionCacheStats {
+            hits: 1,
+            misses: 1,
+            stores: 1,
+        }
     );
 }
 
@@ -130,6 +155,147 @@ fn combined_read_uses_one_journal_generation_for_projection_and_watermark() {
     assert_eq!(read.snapshot.operator.head_sequence, Some(1));
     assert_eq!(read.snapshot.operator.batches.len(), 1);
     assert_eq!(read.snapshot.operator.batches[0].batch_id, batch.id());
+}
+
+#[test]
+fn cache_invalidates_on_append_and_reprojects_fresh_state() {
+    let first_batch = ExecutionBatch::new(fixed_uuid(31), Vec::new()).unwrap();
+    let second_batch = ExecutionBatch::new(fixed_uuid(32), Vec::new()).unwrap();
+    let source = MutableJournalSource::new(
+        fixed_uuid(8),
+        jsonl(&[execution_record(
+            "execution_planned",
+            &first_batch,
+            &planned_details(&first_batch),
+            "2026-07-24T00:00:00Z",
+        )]),
+    );
+    let writer = source.clone();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let first = control_plane.snapshot().unwrap();
+    writer.append(&execution_record(
+        "execution_planned",
+        &second_batch,
+        &planned_details(&second_batch),
+        "2026-07-24T00:00:01Z",
+    ));
+    let refreshed = control_plane.snapshot().unwrap();
+
+    assert_eq!(first.operator.head_sequence, Some(1));
+    assert_eq!(refreshed.operator.head_sequence, Some(2));
+    assert_eq!(refreshed.operator.batches.len(), 2);
+    assert_eq!(refreshed.operator.batches[1].batch_id, second_batch.id());
+    assert_eq!(
+        control_plane.projection_cache_stats(),
+        ControlPlaneProjectionCacheStats {
+            hits: 0,
+            misses: 2,
+            stores: 2,
+        }
+    );
+}
+
+#[test]
+fn cache_invalidates_on_equal_length_tampering() {
+    let original_batch = ExecutionBatch::new(fixed_uuid(41), Vec::new()).unwrap();
+    let replaced_batch = ExecutionBatch::new(fixed_uuid(42), Vec::new()).unwrap();
+    let original = execution_record(
+        "execution_planned",
+        &original_batch,
+        &planned_details(&original_batch),
+        "2026-07-24T00:00:00Z",
+    );
+    let replacement = execution_record(
+        "execution_planned",
+        &replaced_batch,
+        &planned_details(&replaced_batch),
+        "2026-07-24T00:00:00Z",
+    );
+    let original_bytes = jsonl(std::slice::from_ref(&original));
+    let replacement_bytes = jsonl(std::slice::from_ref(&replacement));
+    assert_eq!(original_bytes.len(), replacement_bytes.len());
+    let source = MutableJournalSource::new(fixed_uuid(9), original_bytes);
+    let writer = source.clone();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let first = control_plane.snapshot().unwrap();
+    writer.replace_snapshot(fixed_uuid(9), replacement_bytes);
+    let refreshed = control_plane.snapshot().unwrap();
+
+    assert_eq!(first.operator.batches.len(), 1);
+    assert_eq!(first.operator.batches[0].batch_id, original_batch.id());
+    assert_eq!(refreshed.operator.batches.len(), 1);
+    assert_eq!(refreshed.operator.batches[0].batch_id, replaced_batch.id());
+    assert_eq!(
+        control_plane.projection_cache_stats(),
+        ControlPlaneProjectionCacheStats {
+            hits: 0,
+            misses: 2,
+            stores: 2,
+        }
+    );
+}
+
+#[test]
+fn cache_invalidates_on_rotation_to_a_new_journal_generation() {
+    let original_batch = ExecutionBatch::new(fixed_uuid(51), Vec::new()).unwrap();
+    let rotated_batch = ExecutionBatch::new(fixed_uuid(52), Vec::new()).unwrap();
+    let source = MutableJournalSource::new(
+        fixed_uuid(10),
+        jsonl(&[execution_record(
+            "execution_planned",
+            &original_batch,
+            &planned_details(&original_batch),
+            "2026-07-24T00:00:00Z",
+        )]),
+    );
+    let writer = source.clone();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let first = control_plane.snapshot().unwrap();
+    writer.replace_snapshot(
+        fixed_uuid(11),
+        jsonl(&[execution_record(
+            "execution_planned",
+            &rotated_batch,
+            &planned_details(&rotated_batch),
+            "2026-07-24T00:00:00Z",
+        )]),
+    );
+    let rotated = control_plane.snapshot().unwrap();
+
+    assert_eq!(first.operator.batches[0].batch_id, original_batch.id());
+    assert_eq!(rotated.operator.batches[0].batch_id, rotated_batch.id());
+    assert_eq!(
+        control_plane.projection_cache_stats(),
+        ControlPlaneProjectionCacheStats {
+            hits: 0,
+            misses: 2,
+            stores: 2,
+        }
+    );
+}
+
+#[test]
+fn large_snapshots_outside_the_full_validation_window_never_hit_the_cache() {
+    let bytes = large_cache_bypass_bytes();
+    let source = MutableJournalSource::new(fixed_uuid(12), bytes.clone());
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let first = control_plane.snapshot().unwrap();
+    let second = control_plane.snapshot().unwrap();
+
+    assert_eq!(first, second);
+    assert!(bytes.len() > MAX_CURSOR_ANCHOR_SCAN_BYTES);
+    assert_eq!(
+        control_plane.projection_cache_stats(),
+        ControlPlaneProjectionCacheStats {
+            hits: 0,
+            misses: 2,
+            stores: 0,
+        }
+    );
 }
 
 #[test]
@@ -199,6 +365,19 @@ fn malformed_and_expired_cursors_never_restart_from_the_beginning() {
 }
 
 #[test]
+fn invalid_admission_ticket_maps_to_the_fail_closed_invalid_journal_kind() {
+    let snapshot_error = ControlPlaneSnapshotError::AccountRiskProjection(
+        AccountRiskProjectionError::InvalidAdmissionTicket,
+    );
+    let read_error = ControlPlaneReadError::AccountRiskProjection(
+        AccountRiskProjectionError::InvalidAdmissionTicket,
+    );
+
+    assert_eq!(snapshot_error.kind(), ReadFailureKind::InvalidJournal);
+    assert_eq!(read_error.kind(), ReadFailureKind::InvalidJournal);
+}
+
+#[test]
 fn partial_tail_is_reported_without_emitting_an_incomplete_event() {
     let mut bytes = jsonl(&[decision_record("hold", &json!({}), "2026-07-24T00:00:00Z")]);
     bytes.extend_from_slice(br#"{"timestamp":"2026-07-24T00:00:01Z""#);
@@ -214,9 +393,98 @@ fn partial_tail_is_reported_without_emitting_an_incomplete_event() {
     ));
 }
 
+#[test]
+fn multi_page_snapshot_matches_legacy_models_with_one_shared_state_replay() {
+    let source = multi_page_control_plane_source();
+    let expected = source.snapshot().unwrap();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let projection = project_control_plane_state(&expected).unwrap();
+    let stats = projection.stats;
+    let snapshot = control_plane.snapshot().unwrap();
+
+    assert_eq!(stats.state_page_reads, 2);
+    assert_eq!(
+        snapshot.schema_version,
+        CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION
+    );
+    assert_eq!(snapshot.capabilities, *control_plane.capabilities());
+    assert_eq!(
+        snapshot.operator,
+        OperatorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.monitor,
+        ArbitrageMonitorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.alerts,
+        PriceAlertReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.tasks,
+        ReadOnlyTaskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.scanner,
+        VirtualGridScannerReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.paper_accounts,
+        PaperAccountReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        snapshot.account_risk,
+        AccountRiskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+}
+
+#[test]
+fn multi_page_combined_read_keeps_events_separate_from_one_shared_state_replay() {
+    let source = multi_page_control_plane_source();
+    let expected = source.snapshot().unwrap();
+    let control_plane = ReadControlPlane::new(Arc::new(source)).unwrap();
+
+    let stats = project_control_plane_state(&expected).unwrap().stats;
+    let read = control_plane.snapshot_with_events_after(None).unwrap();
+
+    assert_eq!(stats.state_page_reads, 2);
+    assert_eq!(
+        read.snapshot.operator,
+        OperatorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.monitor,
+        ArbitrageMonitorReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.alerts,
+        PriceAlertReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.tasks,
+        ReadOnlyTaskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.scanner,
+        VirtualGridScannerReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.paper_accounts,
+        PaperAccountReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(
+        read.snapshot.account_risk,
+        AccountRiskReadModel::from_legacy_snapshot(&expected).unwrap()
+    );
+    assert_eq!(read.events.events.len(), MAX_JOURNAL_PAGE_EVENTS);
+    assert_eq!(read.events.events[0].sequence, 1);
+    assert_eq!(read.events.boundary, JournalPageBoundary::PageLimit);
+}
+
 #[derive(Clone)]
 struct MutableJournalSource {
-    journal_id: Uuid,
+    journal_id: Arc<RwLock<Uuid>>,
     bytes: Arc<RwLock<Vec<u8>>>,
     snapshot_count: Arc<AtomicUsize>,
 }
@@ -224,7 +492,7 @@ struct MutableJournalSource {
 impl MutableJournalSource {
     fn new(journal_id: Uuid, bytes: Vec<u8>) -> Self {
         Self {
-            journal_id,
+            journal_id: Arc::new(RwLock::new(journal_id)),
             bytes: Arc::new(RwLock::new(bytes)),
             snapshot_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -236,6 +504,11 @@ impl MutableJournalSource {
         bytes.push(b'\n');
     }
 
+    fn replace_snapshot(&self, journal_id: Uuid, bytes: Vec<u8>) {
+        *self.journal_id.write().unwrap() = journal_id;
+        *self.bytes.write().unwrap() = bytes;
+    }
+
     fn snapshot_count(&self) -> usize {
         self.snapshot_count.load(Ordering::SeqCst)
     }
@@ -244,7 +517,10 @@ impl MutableJournalSource {
 impl JournalSnapshotSource for MutableJournalSource {
     fn snapshot(&self) -> Result<JournalSnapshot, crypto_trading_runtime::JournalReadError> {
         self.snapshot_count.fetch_add(1, Ordering::SeqCst);
-        JournalSnapshot::new(self.journal_id, self.bytes.read().unwrap().clone())
+        JournalSnapshot::new(
+            *self.journal_id.read().unwrap(),
+            self.bytes.read().unwrap().clone(),
+        )
     }
 }
 
@@ -301,6 +577,46 @@ fn jsonl(records: &[Value]) -> Vec<u8> {
     for record in records {
         bytes.extend_from_slice(&serde_json::to_vec(record).unwrap());
         bytes.push(b'\n');
+    }
+    bytes
+}
+
+fn multi_page_control_plane_source() -> MemoryJournalSnapshotSource {
+    MemoryJournalSnapshotSource::new(multi_page_journal_id(), multi_page_control_plane_bytes())
+        .unwrap()
+}
+
+fn multi_page_control_plane_bytes() -> Vec<u8> {
+    let mut records = (0..260)
+        .map(|index| decision_record("hold", &json!({ "index": index }), "2026-07-24T00:00:00Z"))
+        .collect::<Vec<_>>();
+    records.extend(
+        include_str!("../../../fixtures/web-api/journal.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()),
+    );
+    jsonl(&records)
+}
+
+fn multi_page_journal_id() -> Uuid {
+    Uuid::parse_str("77777777-7777-4777-8777-777777777777").unwrap()
+}
+
+fn large_cache_bypass_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut index = 0usize;
+    while bytes.len() <= MAX_CURSOR_ANCHOR_SCAN_BYTES {
+        let record = decision_record(
+            "hold",
+            &json!({
+                "index": index,
+                "padding": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            }),
+            "2026-07-24T00:00:00Z",
+        );
+        bytes.extend_from_slice(&serde_json::to_vec(&record).unwrap());
+        bytes.push(b'\n');
+        index = index.saturating_add(1);
     }
     bytes
 }

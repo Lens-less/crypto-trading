@@ -3,8 +3,8 @@ use std::{
     future,
     str::FromStr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration as StdDuration,
 };
@@ -26,6 +26,7 @@ use crypto_trading_runtime::{
     JsonlHistory, MarketDataClock, MarketDataEvent, MarketDataObservation, MarketFreshnessPolicy,
     PriceAlertReadModel,
 };
+use crypto_trading_strategy::AlertKind;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -84,6 +85,108 @@ impl AlertNotificationAdapter for PendingAdapter {
 struct PanickingAdapter {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct BlockingFailureAdapter {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl AlertNotificationAdapter for BlockingFailureAdapter {
+    fn adapter_id(&self) -> &'static str {
+        "blocking-failure"
+    }
+
+    fn deliver(&mut self, _notification: AlertNotification) -> AlertNotificationFuture<'_> {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            Err(NotificationFailure::Rejected)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TerminalClockGate {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+impl TerminalClockGate {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            release: Condvar::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn block_if_armed(&self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.release.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct TerminalGateClock {
+    now: DateTime<Utc>,
+    gate: Arc<TerminalClockGate>,
+}
+
+impl MarketDataClock for TerminalGateClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.gate.block_if_armed();
+        self.now
+    }
+}
+
+#[derive(Debug)]
+struct ArmClockThenFailAdapter {
+    gate: Arc<TerminalClockGate>,
+}
+
+impl AlertNotificationAdapter for ArmClockThenFailAdapter {
+    fn adapter_id(&self) -> &'static str {
+        "arm-clock-then-fail"
+    }
+
+    fn deliver(&mut self, _notification: AlertNotification) -> AlertNotificationFuture<'_> {
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            gate.arm();
+            Err(NotificationFailure::Rejected)
+        })
+    }
 }
 
 impl AlertNotificationAdapter for PanickingAdapter {
@@ -226,6 +329,45 @@ async fn ready_samples_persist_occurrences_and_cooldown_suppresses_duplicates() 
         decision_count(&records, "price_alert_delivery_succeeded"),
         2
     );
+    remove_file(&path);
+}
+
+#[tokio::test]
+async fn volatility_alert_fires_without_a_sample_exactly_on_the_window_boundary() {
+    // Regression: the runtime prunes strategy history to exactly the
+    // volatility window before every evaluation, so with real millisecond
+    // timestamps no retained sample ever sits at or before the boundary and
+    // volatility alerts could never fire end-to-end. Every timestamp here
+    // carries a millisecond offset so nothing lands on the boundary.
+    let path = temp_path("alert-volatility-off-boundary");
+    let clock = Arc::new(TestClock::new(timestamp_ms(500)));
+    let mut runtime = journal_only_runtime(&volatility_config(0), Arc::clone(&clock), &path);
+
+    for (revision, offset_ms) in [(1_u64, 500_i64), (2, 30_700)] {
+        clock.set(timestamp_ms(offset_ms));
+        let report = runtime
+            .process(observation(revision, timestamp_ms(offset_ms), "100"))
+            .await
+            .unwrap();
+        assert!(report.occurrences.is_empty());
+    }
+
+    // At 61.3s the 60s window starts at 1.3s: the 0.5s sample is pruned and
+    // the 30.7s sample is strictly inside the window and must anchor the move.
+    clock.set(timestamp_ms(61_300));
+    let triggered = runtime
+        .process(observation(3, timestamp_ms(61_300), "105"))
+        .await
+        .unwrap();
+    assert_eq!(triggered.occurrences.len(), 1);
+    assert_eq!(triggered.occurrences[0].kind, AlertKind::VolatilityUp);
+    assert_eq!(
+        triggered.occurrences[0].change_percent,
+        Some(Decimal::from(5))
+    );
+
+    runtime.stop().await;
+    assert_eq!(decision_count(&records(&path), "price_alert_occurred"), 1);
     remove_file(&path);
 }
 
@@ -397,7 +539,7 @@ async fn local_and_deterministic_adapters_expose_typed_notices_and_bounded_failu
         .process(observation(2, timestamp(1), "106"))
         .await
         .unwrap();
-    runtime.stop().await;
+    assert_eq!(runtime.stop().await, NotificationDispatcherExit::Drained);
 
     assert_eq!(probe.deliveries().len(), 2);
     let status = runtime.notification_status();
@@ -411,6 +553,107 @@ async fn local_and_deterministic_adapters_expose_typed_notices_and_bounded_failu
         decision_count(&records(&path), "price_alert_delivery_failed"),
         2
     );
+    remove_file(&path);
+}
+
+#[tokio::test]
+async fn outcome_counters_require_a_durable_delivery_status() {
+    let path = temp_path("alert-status-persistence");
+    let backup = path.with_extension("durable-occurrence.jsonl");
+    let clock = Arc::new(TestClock::new(timestamp(0)));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let adapter = BlockingFailureAdapter {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let mut runtime = runtime(
+        &threshold_config(0),
+        clock,
+        &path,
+        vec![Box::new(adapter)],
+        dispatcher_config(1),
+    );
+
+    runtime
+        .process(observation(1, timestamp(0), "105"))
+        .await
+        .unwrap();
+    entered.notified().await;
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release.notify_one();
+
+    assert_eq!(runtime.stop().await, NotificationDispatcherExit::Drained);
+    let status = runtime.notification_status();
+    assert_eq!(status.failed, 0);
+    assert_eq!(status.delivered, 0);
+    assert_eq!(status.timed_out, 0);
+    assert_eq!(status.status_persistence_failures, 1);
+    let durable = records(&backup);
+    assert_eq!(decision_count(&durable, "price_alert_delivery_pending"), 1);
+    assert_eq!(decision_count(&durable, "price_alert_delivery_failed"), 0);
+
+    std::fs::remove_dir(&path).unwrap();
+    remove_file(&backup);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_abort_cannot_publish_an_unpersisted_delivery_outcome() {
+    let path = temp_path("alert-status-cancellation");
+    let gate = Arc::new(TerminalClockGate::new());
+    let clock = Arc::new(TerminalGateClock {
+        now: timestamp(0),
+        gate: Arc::clone(&gate),
+    });
+    let adapter = ArmClockThenFailAdapter {
+        gate: Arc::clone(&gate),
+    };
+    let mut runtime = runtime(
+        &threshold_config(0),
+        clock,
+        &path,
+        vec![Box::new(adapter)],
+        NotificationDispatcherConfig::new(
+            1,
+            StdDuration::from_millis(100),
+            StdDuration::from_nanos(1),
+        )
+        .unwrap(),
+    );
+
+    runtime
+        .process(observation(1, timestamp(0), "105"))
+        .await
+        .unwrap();
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while !gate.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must reach the pre-persistence clock boundary");
+
+    let stop = tokio::spawn(async move {
+        let exit = runtime.stop().await;
+        (runtime, exit)
+    });
+    tokio::time::sleep(StdDuration::from_millis(20)).await;
+    gate.release();
+    let (runtime, exit) = tokio::time::timeout(StdDuration::from_secs(1), stop)
+        .await
+        .expect("aborted worker must stop after the clock boundary is released")
+        .unwrap();
+
+    assert_eq!(exit, NotificationDispatcherExit::AbortedAfterGrace);
+    let status = runtime.notification_status();
+    assert_eq!(status.failed, 0);
+    assert_eq!(status.delivered, 0);
+    assert_eq!(status.timed_out, 0);
+    assert_eq!(status.status_persistence_failures, 0);
+    let durable = records(&path);
+    assert_eq!(decision_count(&durable, "price_alert_delivery_pending"), 1);
+    assert_eq!(decision_count(&durable, "price_alert_delivery_failed"), 0);
     remove_file(&path);
 }
 
@@ -474,7 +717,7 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
             && enqueue.state == NotificationEnqueueState::AdapterClosed
     }));
 
-    runtime.stop().await;
+    assert_eq!(runtime.stop().await, NotificationDispatcherExit::Drained);
     assert_eq!(probe.deliveries().len(), 3);
     assert_eq!(runtime.notification_status().worker_failures, 1);
     let journal_records = records(&path);
@@ -583,7 +826,7 @@ async fn delivery_facts_use_the_injected_clock_and_invalid_status_cannot_recover
         .process(observation(1, timestamp(0), "105"))
         .await
         .unwrap();
-    runtime.stop().await;
+    assert_eq!(runtime.stop().await, NotificationDispatcherExit::Drained);
 
     let mut records = records(&path);
     let delivered = records
@@ -742,13 +985,16 @@ async fn recovery_rejects_regressing_occurrence_time_transactionally() {
     remove_file(&path);
 }
 
-fn runtime(
+fn runtime<C>(
     config: &PriceAlertConfig,
-    clock: Arc<TestClock>,
+    clock: Arc<C>,
     path: &std::path::Path,
     adapters: Vec<Box<dyn AlertNotificationAdapter>>,
     dispatcher: NotificationDispatcherConfig,
-) -> PriceAlertRuntime {
+) -> PriceAlertRuntime
+where
+    C: MarketDataClock + 'static,
+{
     PriceAlertRuntime::new(
         config,
         MarketFreshnessPolicy::new(Duration::seconds(300), Duration::seconds(1)).unwrap(),
@@ -781,7 +1027,7 @@ fn dispatcher_config(capacity: usize) -> NotificationDispatcherConfig {
     NotificationDispatcherConfig::new(
         capacity,
         StdDuration::from_millis(100),
-        StdDuration::from_millis(200),
+        StdDuration::from_secs(5),
     )
     .unwrap()
 }
@@ -921,6 +1167,11 @@ fn price(value: &str) -> Price {
 
 fn timestamp(offset_seconds: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).single().unwrap() + Duration::seconds(offset_seconds)
+}
+
+fn timestamp_ms(offset_milliseconds: i64) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).single().unwrap()
+        + Duration::milliseconds(offset_milliseconds)
 }
 
 fn temp_path(label: &str) -> std::path::PathBuf {

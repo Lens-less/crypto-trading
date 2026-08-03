@@ -455,7 +455,11 @@ impl PaperExchange {
                 continue;
             }
             let intent = candidate.orders[index].intent.clone();
-            let Some(fill_price) = crossing_price(&intent, &candidate.snapshots[snapshot_index])?
+            let Some(fill_price) = crossing_price(
+                &intent,
+                &candidate.snapshots[snapshot_index],
+                FillRole::Maker,
+            )?
             else {
                 continue;
             };
@@ -683,7 +687,7 @@ impl PaperExchange {
             )));
         }
         let immediate_fill_price = snapshot_index
-            .map(|index| crossing_price(&intent, &state.snapshots[index]))
+            .map(|index| crossing_price(&intent, &state.snapshots[index], FillRole::Taker))
             .transpose()?
             .flatten();
         if intent.time_in_force == TimeInForce::PostOnly && immediate_fill_price.is_some() {
@@ -942,15 +946,28 @@ fn validate_intent(intent: &OrderIntent) -> Result<(), ExchangeError> {
     Ok(())
 }
 
+/// How an order meets the book when its crossing price is evaluated.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillRole {
+    /// The order arrives against the current book and executes at the touch.
+    Taker,
+    /// The order was already resting when the book moved through its level; a
+    /// maker executes at its own limit price and never receives the new touch,
+    /// which between snapshots can gap arbitrarily far past the level.
+    Maker,
+}
+
 fn crossing_price(
     intent: &OrderIntent,
     snapshot: &MarketSnapshot,
+    role: FillRole,
 ) -> Result<Option<Price>, ExchangeError> {
+    let touch = match intent.side {
+        Side::Buy => snapshot.ask(),
+        Side::Sell => snapshot.bid(),
+    };
     match intent.order_type {
-        OrderType::Market => Ok(Some(match intent.side {
-            Side::Buy => snapshot.ask(),
-            Side::Sell => snapshot.bid(),
-        })),
+        OrderType::Market => Ok(Some(touch)),
         OrderType::Limit => {
             let limit = intent
                 .price
@@ -959,9 +976,9 @@ fn crossing_price(
                 Side::Buy => limit >= snapshot.ask(),
                 Side::Sell => limit <= snapshot.bid(),
             };
-            Ok(crosses.then_some(match intent.side {
-                Side::Buy => snapshot.ask(),
-                Side::Sell => snapshot.bid(),
+            Ok(crosses.then_some(match role {
+                FillRole::Taker => touch,
+                FillRole::Maker => limit,
             }))
         }
     }
