@@ -27,7 +27,7 @@ fn no_scanner_record_is_an_explicit_unobserved_projection() {
 
 #[test]
 fn valid_ranking_projects_exact_order_metrics_and_safe_identity() {
-    let snapshot = snapshot(&[scanner_record("scan-1", &valid_rows(), 0)]);
+    let snapshot = snapshot(&[scanner_record_v2("scan-1", &valid_rows_v2(), 0)]);
 
     let model = VirtualGridScannerReadModel::from_legacy_snapshot(&snapshot).unwrap();
     let latest = model.latest.unwrap();
@@ -46,6 +46,19 @@ fn valid_ranking_projects_exact_order_metrics_and_safe_identity() {
     assert_eq!(latest.rows[0].instrument.market_type, MarketType::Spot);
     assert!(latest.rows[0].is_benchmark());
     assert_eq!(latest.rows[0].estimated_apr, "100");
+    assert_eq!(
+        latest.estimated_apr_kind,
+        crypto_trading_runtime::ScannerAprEstimateKindView::Heuristic
+    );
+    assert_eq!(latest.estimated_apr_assumptions.order_notional_usdc, "100");
+    assert_eq!(
+        latest.estimated_apr_assumptions.round_trip_fee_percent,
+        "0.2"
+    );
+    assert_eq!(
+        latest.rows[0].estimated_apr_kind,
+        crypto_trading_runtime::ScannerAprEstimateKindView::Heuristic
+    );
     assert_eq!(latest.rows[0].rating_grade.to_string(), "c");
     assert_eq!(latest.rows[0].rating_score, "50");
     assert_eq!(latest.rows[1].instrument.symbol, "ETH-USDC");
@@ -58,6 +71,30 @@ fn valid_ranking_projects_exact_order_metrics_and_safe_identity() {
             "{forbidden} leaked in {encoded}"
         );
     }
+}
+
+#[test]
+fn legacy_v1_ranking_projects_unknown_kind_and_legacy_apr_assumptions() {
+    let snapshot = snapshot(&[scanner_record_v1("scan-v1", &valid_rows_v1(), 0)]);
+
+    let model = VirtualGridScannerReadModel::from_legacy_snapshot(&snapshot).unwrap();
+    let latest = model.latest.unwrap();
+
+    assert_eq!(model.projection_status, ProjectionStatus::Complete);
+    assert_eq!(latest.run_id, "scan-v1");
+    assert_eq!(
+        latest.estimated_apr_kind,
+        crypto_trading_runtime::ScannerAprEstimateKindView::Unknown
+    );
+    assert_eq!(latest.estimated_apr_assumptions.order_notional_usdc, "10");
+    assert_eq!(
+        latest.estimated_apr_assumptions.round_trip_fee_percent,
+        "0.004"
+    );
+    assert_eq!(
+        latest.rows[0].estimated_apr_kind,
+        crypto_trading_runtime::ScannerAprEstimateKindView::Unknown
+    );
 }
 
 #[test]
@@ -81,7 +118,7 @@ fn checked_web_fixture_projects_three_ordered_rows() {
 
 #[test]
 fn crlf_is_accepted_without_changing_the_projection() {
-    let value = scanner_record("scan-crlf", &valid_rows(), 0);
+    let value = scanner_record_v2("scan-crlf", &valid_rows_v2(), 0);
     let lf = jsonl(std::slice::from_ref(&value));
     let crlf = String::from_utf8(lf.clone())
         .unwrap()
@@ -102,8 +139,8 @@ fn crlf_is_accepted_without_changing_the_projection() {
 
 #[test]
 fn malformed_scanner_fact_degrades_and_preserves_last_valid_ranking() {
-    let valid = scanner_record("scan-valid", &valid_rows(), 0);
-    let mut invalid = scanner_record("scan-invalid", &valid_rows(), 1);
+    let valid = scanner_record_v2("scan-valid", &valid_rows_v2(), 0);
+    let mut invalid = scanner_record_v2("scan-invalid", &valid_rows_v2(), 1);
     invalid["details"]["rows"][0]["rank"] = json!(2);
     let snapshot = snapshot(&[valid, invalid]);
 
@@ -116,7 +153,7 @@ fn malformed_scanner_fact_degrades_and_preserves_last_valid_ranking() {
 
 #[test]
 fn partial_tail_degrades_and_preserves_the_last_complete_ranking() {
-    let mut bytes = jsonl(&[scanner_record("scan-valid", &valid_rows(), 0)]);
+    let mut bytes = jsonl(&[scanner_record_v2("scan-valid", &valid_rows_v2(), 0)]);
     bytes.extend_from_slice(br#"{"timestamp":"2026-07-25T00:05:01Z""#);
     let snapshot = crypto_trading_runtime::JournalSnapshot::new(fixed_uuid(1), bytes).unwrap();
 
@@ -184,10 +221,28 @@ fn strict_schema_rejects_ambiguous_or_incoherent_rankings() {
                 value["details"]["rows"][0]["total_crosses"] = json!(5);
             }),
         ),
+        (
+            "v2 missing assumptions",
+            Box::new(|value| {
+                value["details"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("estimated_apr_assumptions");
+            }),
+        ),
+        (
+            "v2 missing row apr kind",
+            Box::new(|value| {
+                value["details"]["rows"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("estimated_apr_kind");
+            }),
+        ),
     ];
 
     for (name, mutate) in cases {
-        let mut value = scanner_record("scan-invalid", &valid_rows(), 0);
+        let mut value = scanner_record_v2("scan-invalid", &valid_rows_v2(), 0);
         mutate(&mut value);
         let model = VirtualGridScannerReadModel::from_legacy_snapshot(&snapshot(&[value])).unwrap();
         assert_eq!(
@@ -204,11 +259,11 @@ fn strict_schema_rejects_ambiguous_or_incoherent_rankings() {
 fn scanner_specific_row_bound_is_enforced_before_projection_allocation_grows() {
     let mut rows = Vec::new();
     for index in 0..=MAX_VIRTUAL_GRID_SCANNER_ROWS {
-        let mut row = standard_row(index + 1, &format!("S{index:03}-USDC"), "100", "c", "50");
+        let mut row = standard_row_v2(index + 1, &format!("S{index:03}-USDC"), "100", "c", "50");
         row["instrument"]["exchange"] = json!("fixture");
         rows.push(row);
     }
-    let mut value = scanner_record("scan-too-large", &rows, 0);
+    let mut value = scanner_record_v2("scan-too-large", &rows, 0);
     value["details"]["candidate_count"] = json!(MAX_VIRTUAL_GRID_SCANNER_ROWS + 1);
     value["details"]["eligible_count"] = json!(MAX_VIRTUAL_GRID_SCANNER_ROWS + 1);
     value["details"]["row_limit"] = json!(MAX_VIRTUAL_GRID_SCANNER_ROWS);
@@ -220,7 +275,34 @@ fn scanner_specific_row_bound_is_enforced_before_projection_allocation_grows() {
     assert!(model.latest.is_none());
 }
 
-fn scanner_record(run_id: &str, rows: &[Value], offset_seconds: i64) -> Value {
+fn scanner_record_v2(run_id: &str, rows: &[Value], offset_seconds: i64) -> Value {
+    let row_count = rows.len();
+    record(
+        "virtual_grid_scanner",
+        "scanner_ranked",
+        &json!({
+            "schema_version": 2,
+            "run_id": run_id,
+            "ranking_policy": "explicit_benchmark_then_apr_desc",
+            "apr_window_seconds": 300,
+            "estimated_apr_kind": "heuristic",
+            "estimated_apr_assumptions": {
+                "order_notional_usdc": "100",
+                "round_trip_fee_percent": "0.2",
+            },
+            "min_complete_cycles": 0,
+            "row_limit": 50,
+            "candidate_count": row_count,
+            "eligible_count": row_count,
+            "filtered_by_cycles_count": 0,
+            "truncated": false,
+            "rows": rows,
+        }),
+        offset_seconds,
+    )
+}
+
+fn scanner_record_v1(run_id: &str, rows: &[Value], offset_seconds: i64) -> Value {
     let row_count = rows.len();
     record(
         "virtual_grid_scanner",
@@ -242,20 +324,33 @@ fn scanner_record(run_id: &str, rows: &[Value], offset_seconds: i64) -> Value {
     )
 }
 
-fn valid_rows() -> Vec<Value> {
+fn valid_rows_v2() -> Vec<Value> {
     vec![
-        benchmark_row(1, "BTC-USDC", "100", "c", "50"),
-        standard_row(2, "ETH-USDC", "500", "s", "95"),
+        benchmark_row_v2(1, "BTC-USDC", "100", "c", "50"),
+        standard_row_v2(2, "ETH-USDC", "500", "s", "95"),
     ]
 }
 
-fn benchmark_row(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) -> Value {
-    let mut row = standard_row(rank, symbol, apr, grade, score);
+fn valid_rows_v1() -> Vec<Value> {
+    vec![
+        benchmark_row_v1(1, "BTC-USDC", "100", "c", "50"),
+        standard_row_v1(2, "ETH-USDC", "500", "s", "95"),
+    ]
+}
+
+fn benchmark_row_v2(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) -> Value {
+    let mut row = standard_row_v2(rank, symbol, apr, grade, score);
     row["priority"] = json!("benchmark");
     row
 }
 
-fn standard_row(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) -> Value {
+fn benchmark_row_v1(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) -> Value {
+    let mut row = standard_row_v1(rank, symbol, apr, grade, score);
+    row["priority"] = json!("benchmark");
+    row
+}
+
+fn standard_row_v2(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) -> Value {
     let cycles_per_hour = if apr == "100" { "4" } else { "10" };
     json!({
         "rank": rank,
@@ -286,11 +381,18 @@ fn standard_row(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) 
         "recent_five_minute_cycles": 2,
         "cycles_per_hour": cycles_per_hour,
         "estimated_apr": apr,
+        "estimated_apr_kind": "heuristic",
         "volume_24h_usdc": "1000000",
         "price_change_24h_percent": "2.5",
         "rating_grade": grade,
         "rating_score": score,
     })
+}
+
+fn standard_row_v1(rank: usize, symbol: &str, apr: &str, grade: &str, score: &str) -> Value {
+    let mut row = standard_row_v2(rank, symbol, apr, grade, score);
+    row.as_object_mut().unwrap().remove("estimated_apr_kind");
+    row
 }
 
 fn snapshot(records: &[Value]) -> crypto_trading_runtime::JournalSnapshot {

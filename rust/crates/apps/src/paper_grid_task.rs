@@ -6,12 +6,20 @@
 //! uncertain crossing cannot alias a later crossing.
 
 use std::{
-    error::Error, fmt, future::Future, io::ErrorKind, path::Path, pin::Pin, sync::Arc,
+    error::Error,
+    fmt,
+    future::Future,
+    io::ErrorKind,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side};
+use crypto_trading_domain::{
+    MarketSnapshot, MarketType, Money, OrderIntent, Price, Quantity, Side,
+};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
     AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
@@ -20,10 +28,10 @@ use crypto_trading_runtime::{
     JournalSnapshotSource, JsonlHistory, MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent,
     MarketDataEventSource, MarketDataObservation, MarketSupervisor, MarketSupervisorConfig,
     MarketSupervisorError, MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase,
-    MarketSupervisorStatus, PaperAccountAuthority, PaperAccountError, PaperCostModel,
-    PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
-    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    MarketSupervisorStatus, PaperAccountAuthority, PaperAccountError, PaperAccountOperationLease,
+    PaperAccountSnapshot, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
+    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
+    ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     GridDirective, GridFill, GridProtectionMachine, GridProtectionObservation,
@@ -34,6 +42,7 @@ use serde_json::{Value, json};
 use tokio::{
     sync::watch,
     task::{JoinError, JoinHandle},
+    time::{self, MissedTickBehavior},
 };
 
 use crate::{
@@ -56,6 +65,60 @@ const PROTECTION_RECORD_SCHEMA_VERSION: u16 = 1;
 const PROTECTION_APR_WINDOW_MINUTES: i64 = 10;
 const MAX_TASK_ID_BYTES: usize = 96;
 const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
+
+type ActiveOperationLeaseSlot = Arc<StdMutex<Option<PaperAccountOperationLease>>>;
+
+/// Registers an acquired account-operation lease in the task handle's
+/// synchronous handoff slot. Dropping this guard clears the slot before its
+/// own lease clone is released, so every early return preserves the same
+/// cleanup ordering without bespoke branch logic.
+struct RegisteredOperationLease {
+    lease: PaperAccountOperationLease,
+    active_slot: ActiveOperationLeaseSlot,
+}
+
+impl RegisteredOperationLease {
+    async fn acquire(
+        account: &PaperAccountAuthority,
+        active_slot: &ActiveOperationLeaseSlot,
+    ) -> Self {
+        let lease = account.acquire_operation_lease().await;
+        let replaced = active_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(lease.clone());
+        debug_assert!(
+            replaced.is_none(),
+            "one Grid owner cannot register overlapping account operations"
+        );
+        Self {
+            lease,
+            active_slot: Arc::clone(active_slot),
+        }
+    }
+
+    const fn lease(&self) -> &PaperAccountOperationLease {
+        &self.lease
+    }
+}
+
+impl Drop for RegisteredOperationLease {
+    fn drop(&mut self) {
+        self.active_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+fn clone_active_operation_lease(
+    active_slot: &ActiveOperationLeaseSlot,
+) -> Option<PaperAccountOperationLease> {
+    active_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
 
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type GridPaperExecutionFuture =
@@ -235,6 +298,7 @@ pub struct GridPaperTask {
     completion: Option<Result<GridPaperTaskExit, GridPaperTaskFailure>>,
     account: PaperAccountAuthority,
     history: JsonlHistory,
+    active_operation_lease: ActiveOperationLeaseSlot,
     shutdown_grace: Duration,
 }
 
@@ -268,6 +332,9 @@ impl GridPaperTask {
             return Err(GridPaperTaskError::InvalidSourceBinding);
         }
         let operation_sequence = recovery_preflight(&config.task_id, &account, &history).await?;
+        if config.account_risk.is_some() {
+            account.ensure_initialized().await?;
+        }
         let registered_at = Utc::now();
         history
             .append(&registered_record(
@@ -327,8 +394,10 @@ impl GridPaperTask {
         let task_status = status_sender.clone();
         let task_history = history.clone();
         let task_config = config.clone();
+        let active_operation_lease = Arc::new(StdMutex::new(None));
+        let owner_operation_lease = Arc::clone(&active_operation_lease);
         let join = tokio::spawn(async move {
-            run_owner(
+            Box::pin(run_owner(
                 task_config,
                 grid,
                 supervisor,
@@ -336,11 +405,12 @@ impl GridPaperTask {
                 executor,
                 task_history,
                 task_status,
+                owner_operation_lease,
                 stop_receiver,
                 cancel_receiver,
                 running_at,
                 operation_sequence,
-            )
+            ))
             .await
         });
 
@@ -353,6 +423,7 @@ impl GridPaperTask {
             completion: None,
             account,
             history,
+            active_operation_lease,
             shutdown_grace: config.supervisor.shutdown_grace(),
         })
     }
@@ -433,9 +504,22 @@ impl GridPaperTask {
         let result = if let Ok(joined) = tokio::time::timeout(deadline, &mut join).await {
             Self::map_join(joined)
         } else {
+            // Clone the active guard before aborting its owner. The shared
+            // lease keeps the account lane continuously exclusive while the
+            // owner future is dropped and external retention takes over.
+            let handoff_lease = clone_active_operation_lease(&self.active_operation_lease);
             join.abort();
             let _ = join.await;
-            self.retain_active_capacity().await;
+            let retention_lease = if let Some(lease) = handoff_lease {
+                lease
+            } else {
+                // No registered lease means the owner had not begun a new
+                // snapshot/reserve/executor sequence. The saga reserves before
+                // executor dispatch, so there is no crossed execution seam to
+                // hand off; acquire a fresh lane for the defensive scan.
+                self.account.acquire_operation_lease().await
+            };
+            self.retain_active_capacity(&retention_lease).await;
             self.record_external_failure(GridPaperTaskFailure::RecoveryRequired)
                 .await?;
             Err(GridPaperTaskError::ShutdownTimedOut)
@@ -461,13 +545,13 @@ impl GridPaperTask {
         });
     }
 
-    async fn retain_active_capacity(&self) {
-        let Ok(snapshot) = self.account.snapshot().await else {
+    async fn retain_active_capacity(&self, _operation_lease: &PaperAccountOperationLease) {
+        let Ok(snapshot) = self.account.decision_snapshot().await else {
             return;
         };
         let prefix = operation_prefix(&self.status().task_id);
         for reservation in snapshot.reservations.iter().filter(|reservation| {
-            reservation.task_id.starts_with(&prefix)
+            operation_task_belongs_to_owner(&reservation.task_id, &prefix)
                 && reservation.phase == PaperReservationPhase::Pending
         }) {
             let _ = self
@@ -528,6 +612,7 @@ async fn run_owner(
     executor: Arc<dyn GridPaperExecutor>,
     history: JsonlHistory,
     status_sender: watch::Sender<GridPaperTaskStatus>,
+    active_operation_lease: ActiveOperationLeaseSlot,
     mut stop: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
     mut last_recorded_at: DateTime<Utc>,
@@ -535,6 +620,10 @@ async fn run_owner(
 ) -> TaskResult {
     let mut protection = config.protection.clone();
     let mut last_protection: Option<ProtectionSignature> = None;
+    let mut last_observation: Option<(MarketSnapshot, DateTime<Utc>)> = None;
+    let mut risk_poll = time::interval(Duration::from_millis(250));
+    risk_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    risk_poll.tick().await;
     loop {
         let selected = tokio::select! {
             biased;
@@ -552,6 +641,7 @@ async fn run_owner(
                     continue;
                 }
             }
+            _ = risk_poll.tick(), if config.account_risk.is_some() => Selected::RiskPoll(Utc::now()),
             result = source.next_event() => Selected::Source(result),
         };
         match selected {
@@ -596,6 +686,11 @@ async fn run_owner(
                         .await;
                     }
                 };
+                let market_snapshot = match &event {
+                    MarketDataEvent::Observation(observation) => Some(observation.snapshot.clone()),
+                    MarketDataEvent::SourceGap { .. }
+                    | MarketDataEvent::SourceUnavailable { .. } => None,
+                };
                 if let MarketDataEvent::Observation(observation) = &event
                     && let Err(error) = executor.observe_market(observation.clone()).await
                 {
@@ -609,25 +704,34 @@ async fn run_owner(
                     )
                     .await;
                 }
+                if let (Some(snapshot), Some((_, observed_at))) =
+                    (market_snapshot.as_ref(), observed)
+                {
+                    last_observation = Some((snapshot.clone(), observed_at));
+                }
                 // Durable account-risk close directives run first: a kill
                 // switch, a critically low balance, or an expired position
                 // clock stops the owner exactly like a protection exit.
                 if let Some(risk) = config.account_risk.as_ref()
-                    && let Some((price, observed_at)) = observed
+                    && let Some((_, observed_at)) = observed
                 {
+                    let operation_lease =
+                        RegisteredOperationLease::acquire(saga.account(), &active_operation_lease)
+                            .await;
                     match account_risk_exit(
                         risk,
+                        saga.account(),
+                        operation_lease.lease(),
                         &config,
                         &grid,
                         &history,
-                        price,
+                        market_snapshot.as_ref(),
                         observed_at,
                         &mut last_recorded_at,
                     )
                     .await
                     {
-                        Ok(false) => {}
-                        Ok(true) => {
+                        Ok(AccountRiskExitAction::Stop) => {
                             return stop_owner(
                                 &mut source,
                                 &history,
@@ -636,6 +740,180 @@ async fn run_owner(
                                 GridPaperTaskExit::StopRequested,
                             )
                             .await;
+                        }
+                        Ok(AccountRiskExitAction::Continue) => drop(operation_lease),
+                        Ok(AccountRiskExitAction::Close {
+                            side,
+                            quantity,
+                            price,
+                        }) => {
+                            let Some(next_operation) = operation_sequence.checked_add(1) else {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    GridPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            };
+                            operation_sequence = next_operation;
+                            let Ok(request) = build_account_risk_close_operation(
+                                &config,
+                                &grid,
+                                side,
+                                quantity,
+                                price,
+                                operation_sequence,
+                            ) else {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    GridPaperTaskError::RecoveryRequired,
+                                )
+                                .await;
+                            };
+                            publish_operation_count(&status_sender, operation_sequence);
+                            if let Err(error) = publish_forced_close_plan(
+                                &history,
+                                &config,
+                                &grid,
+                                "risk-close",
+                                side,
+                                quantity,
+                                price,
+                                operation_sequence,
+                                &mut last_recorded_at,
+                            )
+                            .await
+                            {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::JournalUnavailable,
+                                    error,
+                                )
+                                .await;
+                            }
+                            match run_operation(
+                                &saga,
+                                Arc::clone(&executor),
+                                request,
+                                &mut stop,
+                                &mut cancel,
+                                operation_lease.lease(),
+                                OperationRunPolicy::forced_close(
+                                    &config.task_id,
+                                    config.supervisor.shutdown_grace(),
+                                ),
+                            )
+                            .await
+                            {
+                                OperationOutcome::Terminal(Ok(_), _) => {
+                                    let Ok(snapshot) = saga.account().decision_snapshot().await
+                                    else {
+                                        return fail_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            GridPaperTaskFailure::RecoveryRequired,
+                                            GridPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    };
+                                    if target_instrument_close_plan(&snapshot, &config, &grid)?
+                                        .is_some()
+                                    {
+                                        return fail_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            GridPaperTaskFailure::RecoveryRequired,
+                                            GridPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    }
+                                    if (risk
+                                        .record_position_closed(&config.task_id, observed_at)
+                                        .await)
+                                        .is_err()
+                                    {
+                                        return fail_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            GridPaperTaskFailure::RecoveryRequired,
+                                            GridPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    }
+                                    next.operation_count = operation_sequence;
+                                    status_sender.send_replace(next);
+                                    return stop_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskExit::StopRequested,
+                                    )
+                                    .await;
+                                }
+                                OperationOutcome::Cancelled(request)
+                                | OperationOutcome::TimedOut(request) => {
+                                    if let Err(retain_error) = retain_cancelled_operation(
+                                        saga.account(),
+                                        config.account_risk.as_ref(),
+                                        &config.task_id,
+                                        None,
+                                        &request,
+                                        observed_at,
+                                    )
+                                    .await
+                                    {
+                                        let failure = retain_error.failure_bucket();
+                                        return fail_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            failure,
+                                            retain_error,
+                                        )
+                                        .await;
+                                    }
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskFailure::RecoveryRequired,
+                                        GridPaperTaskError::RecoveryRequired,
+                                    )
+                                    .await;
+                                }
+                                OperationOutcome::Terminal(Err(_), _)
+                                | OperationOutcome::RiskInterrupted { .. }
+                                | OperationOutcome::RiskUnavailable(_) => {
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskFailure::RecoveryRequired,
+                                        GridPaperTaskError::RecoveryRequired,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         Err(error) => {
                             let failure = error.failure_bucket();
@@ -653,12 +931,23 @@ async fn run_owner(
                 }
                 // Protection arbitration runs before crossings are consumed so
                 // a frozen or resetting grid never silently consumes levels.
+                let mut protection_operation_lease = if observed.is_some() && protection.is_some() {
+                    Some(
+                        RegisteredOperationLease::acquire(saga.account(), &active_operation_lease)
+                            .await,
+                    )
+                } else {
+                    None
+                };
                 let directive = if let Some((price, observed_at)) = observed {
                     match protection_directive(
                         &mut protection,
                         &config,
                         &grid,
                         saga.account(),
+                        protection_operation_lease
+                            .as_ref()
+                            .map(RegisteredOperationLease::lease),
                         price,
                         observed_at,
                     )
@@ -825,6 +1114,41 @@ async fn run_owner(
                             .await;
                         }
                         last_recorded_at = recorded_at;
+                        if let Err(error) = close_target_instrument_position(
+                            &saga,
+                            Arc::clone(&executor),
+                            saga.account(),
+                            protection_operation_lease
+                                .as_ref()
+                                .map(RegisteredOperationLease::lease)
+                                .ok_or(GridPaperTaskError::RecoveryRequired)?,
+                            config.account_risk.as_ref(),
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            &config,
+                            &grid,
+                            market_snapshot.as_ref(),
+                            observed_at,
+                            &mut operation_sequence,
+                            &mut stop,
+                            &mut cancel,
+                            "protection-close",
+                        )
+                        .await
+                        {
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                error,
+                            )
+                            .await;
+                        }
+                        next.operation_count = operation_sequence;
+                        status_sender.send_replace(next.clone());
                         // This owner keeps no resting orders, so the reset
                         // analog of "cancel and rebuild" is a fresh virtual
                         // grid anchored at the observed price.
@@ -846,7 +1170,7 @@ async fn run_owner(
                         };
                         Vec::new()
                     }
-                    (GridDirective::ExitAll { .. }, Some((price, _))) => {
+                    (GridDirective::ExitAll { .. }, Some((price, observed_at))) => {
                         let recorded_at = Utc::now().max(last_recorded_at);
                         if let Err(error) = history
                             .append(&protection_record(
@@ -869,6 +1193,41 @@ async fn run_owner(
                             .await;
                         }
                         last_recorded_at = recorded_at;
+                        if let Err(error) = close_target_instrument_position(
+                            &saga,
+                            Arc::clone(&executor),
+                            saga.account(),
+                            protection_operation_lease
+                                .as_ref()
+                                .map(RegisteredOperationLease::lease)
+                                .ok_or(GridPaperTaskError::RecoveryRequired)?,
+                            config.account_risk.as_ref(),
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            &config,
+                            &grid,
+                            market_snapshot.as_ref(),
+                            observed_at,
+                            &mut operation_sequence,
+                            &mut stop,
+                            &mut cancel,
+                            "protection-close",
+                        )
+                        .await
+                        {
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                error,
+                            )
+                            .await;
+                        }
+                        next.operation_count = operation_sequence;
+                        status_sender.send_replace(next);
                         return stop_owner(
                             &mut source,
                             &history,
@@ -884,12 +1243,20 @@ async fn run_owner(
                 let mut completed_cross_count = 0_usize;
                 let mut stop_after_operation = false;
                 if let Some(request) = scalp_request {
+                    let operation_lease = protection_operation_lease
+                        .take()
+                        .ok_or(GridPaperTaskError::RecoveryRequired)?;
                     match run_operation(
                         &saga,
                         Arc::clone(&executor),
                         request,
                         &mut stop,
                         &mut cancel,
+                        operation_lease.lease(),
+                        OperationRunPolicy::monitored(
+                            config.account_risk.as_ref(),
+                            &config.task_id,
+                        ),
                     )
                     .await
                     {
@@ -911,16 +1278,89 @@ async fn run_owner(
                             )
                             .await;
                         }
-                        OperationOutcome::Cancelled(request) => {
-                            let _ = retain_cancelled_operation(
+                        OperationOutcome::Cancelled(request)
+                        | OperationOutcome::RiskUnavailable(request)
+                        | OperationOutcome::TimedOut(request) => {
+                            if let Err(retain_error) = retain_cancelled_operation(
                                 saga.account(),
-                                None,
-                                "",
+                                config.account_risk.as_ref(),
+                                &config.task_id,
                                 None,
                                 &request,
                                 Utc::now(),
                             )
+                            .await
+                            {
+                                let failure = retain_error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    retain_error,
+                                )
+                                .await;
+                            }
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                GridPaperTaskError::RecoveryRequired,
+                            )
                             .await;
+                        }
+                        OperationOutcome::RiskInterrupted {
+                            request,
+                            reason,
+                            detected_at,
+                        } => {
+                            if let Err(retain_error) = retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                None,
+                                &request,
+                                detected_at,
+                            )
+                            .await
+                            {
+                                let failure = retain_error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    retain_error,
+                                )
+                                .await;
+                            }
+                            if let Err(error) = publish_pending_risk_directive(
+                                &history,
+                                &config,
+                                &grid,
+                                market_snapshot.as_ref(),
+                                &reason,
+                                detected_at,
+                                &mut last_recorded_at,
+                            )
+                            .await
+                            {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::JournalUnavailable,
+                                    error,
+                                )
+                                .await;
+                            }
                             next.operation_count = operation_sequence;
                             status_sender.send_replace(next);
                             return fail_owner(
@@ -935,6 +1375,7 @@ async fn run_owner(
                         }
                     }
                 }
+                drop(protection_operation_lease);
                 for cross in crosses {
                     if *cancel.borrow() || *stop.borrow() {
                         next.operation_count = operation_sequence;
@@ -949,14 +1390,74 @@ async fn run_owner(
                         )
                         .await;
                     }
-                    // Entry-side crossings pass the account-level admission
-                    // before any reservation exists; a durable rejection
-                    // skips the crossing and keeps the owner alive.
+                    // Crossing classification uses the real target-instrument
+                    // net book, not the virtual grid's directional counts.
                     let observed_at = observed.map_or_else(Utc::now, |(_, at)| at);
+                    let order_side = match cross.side {
+                        GridFill::Buy => Side::Buy,
+                        GridFill::Sell => Side::Sell,
+                    };
+                    let operation_lease =
+                        RegisteredOperationLease::acquire(saga.account(), &active_operation_lease)
+                            .await;
+                    let account_snapshot =
+                        match operation_decision_snapshot(saga.account(), operation_lease.lease())
+                            .await
+                        {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                let failure = error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                        };
+                    match target_instrument_has_foreign_lots(&account_snapshot, &config, &grid) {
+                        Ok(false) => {}
+                        Ok(true) | Err(_) => {
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                GridPaperTaskError::RecoveryRequired,
+                            )
+                            .await;
+                        }
+                    }
+                    let current_side =
+                        match target_instrument_close_plan(&account_snapshot, &config, &grid) {
+                            Ok(Some((Side::Sell, _))) => Some(Side::Buy),
+                            Ok(Some((Side::Buy, _))) => Some(Side::Sell),
+                            Ok(None) => None,
+                            Err(error) => {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    error,
+                                )
+                                .await;
+                            }
+                        };
+                    let reduce_only = current_side.is_some_and(|side| side != order_side);
+                    let reservation_price =
+                        conservative_reservation_price(&event, cross.side, cross.trigger_price);
                     let admission_ticket = if let Some(risk) = config.account_risk.as_ref()
-                        && matches!(cross.side, GridFill::Buy)
+                        && !reduce_only
                     {
-                        match admit_grid_entry(risk, &config, &grid, &cross, observed_at).await {
+                        match admit_grid_entry(risk, &config, &grid, reservation_price, observed_at)
+                            .await
+                        {
                             Ok(ticket) => ticket,
                             Err(error) => {
                                 let failure = error.failure_bucket();
@@ -976,60 +1477,52 @@ async fn run_owner(
                     } else {
                         None
                     };
-                    if config.account_risk.is_some()
-                        && matches!(cross.side, GridFill::Buy)
-                        && admission_ticket.is_none()
-                    {
+                    if !reduce_only && config.account_risk.is_some() && admission_ticket.is_none() {
                         completed_cross_count += 1;
+                        drop(operation_lease);
                         continue;
                     }
-                    if let Some(risk) = config.account_risk.as_ref()
-                        && matches!(cross.side, GridFill::Buy)
-                    {
-                        let Some(next_operation) = operation_sequence.checked_add(1) else {
-                            if let Err(error) = discard_planned_admission(
+                    let Some(next_operation) = operation_sequence.checked_add(1) else {
+                        if !reduce_only
+                            && let Some(risk) = config.account_risk.as_ref()
+                            && let Err(error) = discard_planned_admission(
                                 Some(risk),
                                 &config.task_id,
                                 admission_ticket.as_ref(),
                                 observed_at,
                             )
                             .await
-                            {
-                                let failure = error.failure_bucket();
-                                return fail_owner(
-                                    &mut source,
-                                    &history,
-                                    &status_sender,
-                                    &mut last_recorded_at,
-                                    failure,
-                                    error,
-                                )
-                                .await;
-                            }
+                        {
+                            let failure = error.failure_bucket();
                             return fail_owner(
                                 &mut source,
                                 &history,
                                 &status_sender,
                                 &mut last_recorded_at,
-                                GridPaperTaskFailure::InvalidRequest,
-                                GridPaperTaskError::InvalidRequest,
+                                failure,
+                                error,
                             )
                             .await;
-                        };
-                        operation_sequence = next_operation;
-                    } else {
-                        operation_sequence = operation_sequence
-                            .checked_add(1)
-                            .ok_or(GridPaperTaskError::InvalidRequest)?;
-                    }
-                    let reservation_price =
-                        conservative_reservation_price(&event, cross.side, cross.trigger_price);
+                        }
+                        return fail_owner(
+                            &mut source,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            GridPaperTaskFailure::InvalidRequest,
+                            GridPaperTaskError::InvalidRequest,
+                        )
+                        .await;
+                    };
+                    operation_sequence = next_operation;
                     let request = match build_operation(
                         &config,
                         &grid,
                         cross,
+                        reduce_only,
                         reservation_price,
                         operation_sequence,
+                        config.account_risk.as_ref().zip(admission_ticket.as_ref()),
                     ) {
                         Ok(request) => request,
                         Err(error) => {
@@ -1072,6 +1565,11 @@ async fn run_owner(
                         request,
                         &mut stop,
                         &mut cancel,
+                        operation_lease.lease(),
+                        OperationRunPolicy::monitored(
+                            config.account_risk.as_ref(),
+                            &config.task_id,
+                        ),
                     )
                     .await
                     {
@@ -1178,7 +1676,102 @@ async fn run_owner(
                             )
                             .await;
                         }
+                        OperationOutcome::RiskInterrupted {
+                            request,
+                            reason,
+                            detected_at,
+                        } => {
+                            if let Err(retain_error) = retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                &request,
+                                detected_at,
+                            )
+                            .await
+                            {
+                                let failure = retain_error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    retain_error,
+                                )
+                                .await;
+                            }
+                            if let Err(error) = publish_pending_risk_directive(
+                                &history,
+                                &config,
+                                &grid,
+                                market_snapshot.as_ref(),
+                                &reason,
+                                detected_at,
+                                &mut last_recorded_at,
+                            )
+                            .await
+                            {
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::JournalUnavailable,
+                                    error,
+                                )
+                                .await;
+                            }
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                GridPaperTaskError::RecoveryRequired,
+                            )
+                            .await;
+                        }
+                        OperationOutcome::RiskUnavailable(request)
+                        | OperationOutcome::TimedOut(request) => {
+                            if let Err(retain_error) = retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                admission_ticket.as_ref(),
+                                &request,
+                                Utc::now(),
+                            )
+                            .await
+                            {
+                                let failure = retain_error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    retain_error,
+                                )
+                                .await;
+                            }
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                GridPaperTaskError::RecoveryRequired,
+                            )
+                            .await;
+                        }
                     }
+                    drop(operation_lease);
                     if stop_after_operation {
                         break;
                     }
@@ -1198,27 +1791,65 @@ async fn run_owner(
                     .await;
                 }
 
-                // A flat virtual position closes the owner-level risk clock.
+                // Close the owner-level risk clock only from its actual
+                // reservation-owned paper lots. Virtual crossing counters can
+                // be flat while an externally seeded or partially reduced lot
+                // is still open.
                 if let Some(risk) = config.account_risk.as_ref()
                     && cross_count > 0
-                    && grid.buy_crosses() == grid.sell_crosses()
                 {
-                    let closed_at = observed.map_or_else(Utc::now, |(_, at)| at);
-                    if let Err(error) = risk
-                        .record_position_closed(&config.task_id, closed_at)
-                        .await
-                    {
-                        next.operation_count = operation_sequence;
-                        status_sender.send_replace(next);
-                        return fail_owner(
-                            &mut source,
-                            &history,
-                            &status_sender,
-                            &mut last_recorded_at,
-                            GridPaperTaskFailure::AccountContract,
-                            GridPaperTaskError::AccountRisk(error),
-                        )
-                        .await;
+                    let account_snapshot = match saga.account().decision_snapshot().await {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::AccountContract,
+                                GridPaperTaskError::Account(error),
+                            )
+                            .await;
+                        }
+                    };
+                    let owner_flat =
+                        match target_instrument_close_plan(&account_snapshot, &config, &grid) {
+                            Ok(None) => true,
+                            Ok(Some(_)) => false,
+                            Err(error) => {
+                                next.operation_count = operation_sequence;
+                                status_sender.send_replace(next);
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskFailure::RecoveryRequired,
+                                    error,
+                                )
+                                .await;
+                            }
+                        };
+                    if owner_flat {
+                        let closed_at = observed.map_or_else(Utc::now, |(_, at)| at);
+                        if let Err(error) = risk
+                            .record_position_closed(&config.task_id, closed_at)
+                            .await
+                        {
+                            next.operation_count = operation_sequence;
+                            status_sender.send_replace(next);
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::AccountContract,
+                                GridPaperTaskError::AccountRisk(error),
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -1243,6 +1874,34 @@ async fn run_owner(
                 }
             }
             Selected::Source(Ok(None)) => {
+                let snapshot = match saga.account().decision_snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return fail_owner(
+                            &mut source,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            GridPaperTaskFailure::AccountContract,
+                            GridPaperTaskError::Account(error),
+                        )
+                        .await;
+                    }
+                };
+                match target_instrument_close_plan(&snapshot, &config, &grid) {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => {
+                        return fail_owner(
+                            &mut source,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            GridPaperTaskFailure::RecoveryRequired,
+                            GridPaperTaskError::RecoveryRequired,
+                        )
+                        .await;
+                    }
+                }
                 return stop_owner(
                     &mut source,
                     &history,
@@ -1263,6 +1922,277 @@ async fn run_owner(
                 )
                 .await;
             }
+            Selected::RiskPoll(polled_at) => {
+                if let Some((snapshot, _)) = last_observation.as_ref() {
+                    if let Some(risk) = config.account_risk.as_ref() {
+                        let operation_lease = RegisteredOperationLease::acquire(
+                            saga.account(),
+                            &active_operation_lease,
+                        )
+                        .await;
+                        match account_risk_exit(
+                            risk,
+                            saga.account(),
+                            operation_lease.lease(),
+                            &config,
+                            &grid,
+                            &history,
+                            Some(snapshot),
+                            polled_at,
+                            &mut last_recorded_at,
+                        )
+                        .await
+                        {
+                            Ok(AccountRiskExitAction::Stop) => {
+                                return stop_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    GridPaperTaskExit::StopRequested,
+                                )
+                                .await;
+                            }
+                            Ok(AccountRiskExitAction::Continue) => drop(operation_lease),
+                            Ok(AccountRiskExitAction::Close {
+                                side,
+                                quantity,
+                                price,
+                            }) => {
+                                let Some(next_operation) = operation_sequence.checked_add(1) else {
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskFailure::RecoveryRequired,
+                                        GridPaperTaskError::RecoveryRequired,
+                                    )
+                                    .await;
+                                };
+                                operation_sequence = next_operation;
+                                let Ok(request) = build_account_risk_close_operation(
+                                    &config,
+                                    &grid,
+                                    side,
+                                    quantity,
+                                    price,
+                                    operation_sequence,
+                                ) else {
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskFailure::RecoveryRequired,
+                                        GridPaperTaskError::RecoveryRequired,
+                                    )
+                                    .await;
+                                };
+                                publish_operation_count(&status_sender, operation_sequence);
+                                if let Err(error) = publish_forced_close_plan(
+                                    &history,
+                                    &config,
+                                    &grid,
+                                    "risk-close",
+                                    side,
+                                    quantity,
+                                    price,
+                                    operation_sequence,
+                                    &mut last_recorded_at,
+                                )
+                                .await
+                                {
+                                    return fail_owner(
+                                        &mut source,
+                                        &history,
+                                        &status_sender,
+                                        &mut last_recorded_at,
+                                        GridPaperTaskFailure::JournalUnavailable,
+                                        error,
+                                    )
+                                    .await;
+                                }
+                                match run_operation(
+                                    &saga,
+                                    Arc::clone(&executor),
+                                    request,
+                                    &mut stop,
+                                    &mut cancel,
+                                    operation_lease.lease(),
+                                    OperationRunPolicy::forced_close(
+                                        &config.task_id,
+                                        config.supervisor.shutdown_grace(),
+                                    ),
+                                )
+                                .await
+                                {
+                                    OperationOutcome::Terminal(Ok(_), _) => {
+                                        let Ok(snapshot) = saga.account().decision_snapshot().await
+                                        else {
+                                            return fail_owner(
+                                                &mut source,
+                                                &history,
+                                                &status_sender,
+                                                &mut last_recorded_at,
+                                                GridPaperTaskFailure::RecoveryRequired,
+                                                GridPaperTaskError::RecoveryRequired,
+                                            )
+                                            .await;
+                                        };
+                                        if target_instrument_close_plan(&snapshot, &config, &grid)?
+                                            .is_some()
+                                        {
+                                            return fail_owner(
+                                                &mut source,
+                                                &history,
+                                                &status_sender,
+                                                &mut last_recorded_at,
+                                                GridPaperTaskFailure::RecoveryRequired,
+                                                GridPaperTaskError::RecoveryRequired,
+                                            )
+                                            .await;
+                                        }
+                                        if (risk
+                                            .record_position_closed(&config.task_id, polled_at)
+                                            .await)
+                                            .is_err()
+                                        {
+                                            return fail_owner(
+                                                &mut source,
+                                                &history,
+                                                &status_sender,
+                                                &mut last_recorded_at,
+                                                GridPaperTaskFailure::RecoveryRequired,
+                                                GridPaperTaskError::RecoveryRequired,
+                                            )
+                                            .await;
+                                        }
+                                        return stop_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            GridPaperTaskExit::StopRequested,
+                                        )
+                                        .await;
+                                    }
+                                    OperationOutcome::Cancelled(request)
+                                    | OperationOutcome::TimedOut(request) => {
+                                        if let Err(retain_error) = retain_cancelled_operation(
+                                            saga.account(),
+                                            config.account_risk.as_ref(),
+                                            &config.task_id,
+                                            None,
+                                            &request,
+                                            polled_at,
+                                        )
+                                        .await
+                                        {
+                                            let failure = retain_error.failure_bucket();
+                                            return fail_owner(
+                                                &mut source,
+                                                &history,
+                                                &status_sender,
+                                                &mut last_recorded_at,
+                                                failure,
+                                                retain_error,
+                                            )
+                                            .await;
+                                        }
+                                        return fail_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            GridPaperTaskFailure::RecoveryRequired,
+                                            GridPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    }
+                                    OperationOutcome::Terminal(Err(_), _)
+                                    | OperationOutcome::RiskInterrupted { .. }
+                                    | OperationOutcome::RiskUnavailable(_) => {
+                                        return fail_owner(
+                                            &mut source,
+                                            &history,
+                                            &status_sender,
+                                            &mut last_recorded_at,
+                                            GridPaperTaskFailure::RecoveryRequired,
+                                            GridPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let failure = error.failure_bucket();
+                                return fail_owner(
+                                    &mut source,
+                                    &history,
+                                    &status_sender,
+                                    &mut last_recorded_at,
+                                    failure,
+                                    error,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                } else if let Some(risk) = config.account_risk.as_ref() {
+                    let operation_lease =
+                        RegisteredOperationLease::acquire(saga.account(), &active_operation_lease)
+                            .await;
+                    match account_risk_exit(
+                        risk,
+                        saga.account(),
+                        operation_lease.lease(),
+                        &config,
+                        &grid,
+                        &history,
+                        None,
+                        polled_at,
+                        &mut last_recorded_at,
+                    )
+                    .await
+                    {
+                        Ok(AccountRiskExitAction::Stop) => {
+                            return stop_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskExit::StopRequested,
+                            )
+                            .await;
+                        }
+                        Ok(AccountRiskExitAction::Continue) => drop(operation_lease),
+                        Ok(AccountRiskExitAction::Close { .. }) => {
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                GridPaperTaskFailure::RecoveryRequired,
+                                GridPaperTaskError::RecoveryRequired,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            let failure = error.failure_bucket();
+                            return fail_owner(
+                                &mut source,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1270,6 +2200,7 @@ async fn run_owner(
 enum Selected {
     Stop,
     Cancel,
+    RiskPoll(DateTime<Utc>),
     Source(Result<Option<MarketDataEvent>, MarketSupervisorError>),
 }
 
@@ -1279,6 +2210,48 @@ enum OperationOutcome {
         bool,
     ),
     Cancelled(PaperSingleLegRequest),
+    RiskInterrupted {
+        request: PaperSingleLegRequest,
+        reason: String,
+        detected_at: DateTime<Utc>,
+    },
+    RiskUnavailable(PaperSingleLegRequest),
+    TimedOut(PaperSingleLegRequest),
+}
+
+#[derive(Clone, Copy)]
+struct OperationRunPolicy<'a> {
+    risk: Option<&'a AccountRiskAuthority>,
+    owner_task_id: &'a str,
+    timeout: Option<Duration>,
+}
+
+impl<'a> OperationRunPolicy<'a> {
+    const fn monitored(risk: Option<&'a AccountRiskAuthority>, owner_task_id: &'a str) -> Self {
+        Self {
+            risk,
+            owner_task_id,
+            timeout: None,
+        }
+    }
+
+    const fn forced_close(owner_task_id: &'a str, timeout: Duration) -> Self {
+        Self {
+            risk: None,
+            owner_task_id,
+            timeout: Some(timeout),
+        }
+    }
+}
+
+enum AccountRiskExitAction {
+    Stop,
+    Continue,
+    Close {
+        side: Side,
+        quantity: Quantity,
+        price: Price,
+    },
 }
 
 async fn run_operation(
@@ -1287,12 +2260,25 @@ async fn run_operation(
     request: PaperSingleLegRequest,
     stop: &mut watch::Receiver<bool>,
     cancel: &mut watch::Receiver<bool>,
+    _operation_lease: &PaperAccountOperationLease,
+    policy: OperationRunPolicy<'_>,
 ) -> OperationOutcome {
     let cancel_request = request.clone();
     {
         let run = saga.run(request, move |batch| executor.execute(batch));
         tokio::pin!(run);
         let mut stop_requested = false;
+        let mut risk_poll = time::interval(Duration::from_millis(250));
+        risk_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        risk_poll.tick().await;
+        let deadline = async move {
+            if let Some(timeout) = policy.timeout {
+                time::sleep(timeout).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(deadline);
         loop {
             tokio::select! {
                 biased;
@@ -1306,12 +2292,54 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
+                _ = risk_poll.tick(), if policy.risk.is_some() => {
+                    let risk = policy.risk.expect("risk poll is guarded by is_some");
+                    match risk.directives(Utc::now()).await {
+                        Ok(directives) => {
+                            if let Some(reason) = account_risk_exit_reason(&directives, policy.owner_task_id) {
+                                break OperationOutcome::RiskInterrupted {
+                                    request: cancel_request,
+                                    reason,
+                                    detected_at: Utc::now(),
+                                };
+                            }
+                        }
+                        Err(_) => break OperationOutcome::RiskUnavailable(cancel_request),
+                    }
+                }
+                () = &mut deadline => {
+                    break OperationOutcome::TimedOut(cancel_request);
+                }
                 result = &mut run => {
                     break OperationOutcome::Terminal(result, stop_requested);
                 }
             }
         }
     }
+}
+
+/// Reads the decision snapshot while proving the caller owns the account
+/// operation lease and rejects any reservation whose execution outcome is not
+/// yet final. This is also the lease-handoff barrier after an externally
+/// aborted owner drops its in-flight guard before marking capacity uncertain.
+/// The durable saga reserves before invoking the executor, so a handoff
+/// snapshot with no active reservation proves that the aborted operation had
+/// not crossed the execution side-effect seam; terminal reservations are safe
+/// for the next owner to evaluate normally.
+async fn operation_decision_snapshot(
+    account: &PaperAccountAuthority,
+    _operation_lease: &PaperAccountOperationLease,
+) -> Result<PaperAccountSnapshot, GridPaperTaskError> {
+    let snapshot = account.decision_snapshot().await?;
+    if snapshot.reservations.iter().any(|reservation| {
+        matches!(
+            reservation.phase,
+            PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
+        )
+    }) {
+        return Err(GridPaperTaskError::RecoveryRequired);
+    }
+    Ok(snapshot)
 }
 
 async fn retain_cancelled_operation(
@@ -1383,24 +2411,30 @@ fn observation_view(
 
 /// Evaluates durable account-risk close directives at the observed instant.
 /// A demanded closure journals one bounded `account_risk` directive fact and
-/// reports `true`, so the owner stops exactly like a protection exit.
+/// either stops immediately on a flat book or returns the exact reduce-only
+/// close quantity to execute before stopping.
 #[allow(clippy::too_many_arguments)]
 async fn account_risk_exit(
     risk: &AccountRiskAuthority,
+    account: &PaperAccountAuthority,
+    operation_lease: &PaperAccountOperationLease,
     config: &GridPaperTaskConfig,
     grid: &VirtualGrid,
     history: &JsonlHistory,
-    price: Price,
+    market: Option<&MarketSnapshot>,
     observed_at: DateTime<Utc>,
     last_recorded_at: &mut DateTime<Utc>,
-) -> Result<bool, GridPaperTaskError> {
+) -> Result<AccountRiskExitAction, GridPaperTaskError> {
     let directives = risk
         .directives(observed_at)
         .await
         .map_err(GridPaperTaskError::AccountRisk)?;
     let Some(reason) = account_risk_exit_reason(&directives, &config.task_id) else {
-        return Ok(false);
+        return Ok(AccountRiskExitAction::Continue);
     };
+    let reference_price = market
+        .map(|snapshot| snapshot.last.unwrap_or_else(|| snapshot.mid_price()))
+        .map_or_else(|| "unavailable".to_owned(), |price| price.to_string());
     let recorded_at = Utc::now().max(*last_recorded_at);
     history
         .append(&account_risk_directive_record(
@@ -1408,13 +2442,23 @@ async fn account_risk_exit(
             "grid_paper",
             grid.config().symbol.as_str(),
             &reason,
-            &price.to_string(),
+            &reference_price,
             recorded_at,
         ))
         .await
         .map_err(GridPaperTaskError::Journal)?;
     *last_recorded_at = recorded_at;
-    Ok(true)
+    let snapshot = operation_decision_snapshot(account, operation_lease).await?;
+    let Some((side, quantity)) = target_instrument_close_plan(&snapshot, config, grid)? else {
+        return Ok(AccountRiskExitAction::Stop);
+    };
+    let market = market.ok_or(GridPaperTaskError::RecoveryRequired)?;
+    let price = marketable_close_price(market, side);
+    Ok(AccountRiskExitAction::Close {
+        side,
+        quantity,
+        price,
+    })
 }
 
 /// Admits one entry-side crossing through the account-level risk authority.
@@ -1422,11 +2466,10 @@ async fn admit_grid_entry(
     risk: &AccountRiskAuthority,
     config: &GridPaperTaskConfig,
     grid: &VirtualGrid,
-    cross: &VirtualGridCross,
+    reservation_price: Price,
     observed_at: DateTime<Utc>,
 ) -> Result<Option<AccountRiskAdmissionTicket>, GridPaperTaskError> {
-    let notional = cross
-        .trigger_price
+    let notional = reservation_price
         .as_decimal()
         .checked_mul(config.quantity.as_decimal())
         .map(Money::new)
@@ -1471,6 +2514,94 @@ pub(crate) fn account_risk_directive_record(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn forced_close_record(
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    trigger: &'static str,
+    side: Side,
+    quantity: Quantity,
+    price: Price,
+    operation_sequence: u64,
+    recorded_at: DateTime<Utc>,
+) -> DecisionRecord {
+    DecisionRecord {
+        timestamp: recorded_at,
+        strategy: "grid".to_owned(),
+        symbol: grid.config().symbol.as_str().to_owned(),
+        decision: "grid_forced_close_planned".to_owned(),
+        details: json!({
+            "schema_version": 1,
+            "task_id": config.task_id,
+            "task_kind": "grid_paper",
+            "trigger": trigger,
+            "side": match side { Side::Buy => "buy", Side::Sell => "sell" },
+            "quantity": quantity.to_string(),
+            "price": price.to_string(),
+            "operation_sequence": operation_sequence,
+            "operation_count": operation_sequence,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_forced_close_plan(
+    history: &JsonlHistory,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    trigger: &'static str,
+    side: Side,
+    quantity: Quantity,
+    price: Price,
+    operation_sequence: u64,
+    last_recorded_at: &mut DateTime<Utc>,
+) -> Result<(), GridPaperTaskError> {
+    let recorded_at = Utc::now().max(*last_recorded_at);
+    history
+        .append(&forced_close_record(
+            config,
+            grid,
+            trigger,
+            side,
+            quantity,
+            price,
+            operation_sequence,
+            recorded_at,
+        ))
+        .await
+        .map_err(GridPaperTaskError::Journal)?;
+    *last_recorded_at = recorded_at;
+    Ok(())
+}
+
+async fn publish_pending_risk_directive(
+    history: &JsonlHistory,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    market: Option<&MarketSnapshot>,
+    reason: &str,
+    detected_at: DateTime<Utc>,
+    last_recorded_at: &mut DateTime<Utc>,
+) -> Result<(), GridPaperTaskError> {
+    let price = market
+        .map(|snapshot| snapshot.last.unwrap_or_else(|| snapshot.mid_price()))
+        .map_or_else(|| "unavailable".to_owned(), |price| price.to_string());
+    let recorded_at = detected_at.max(*last_recorded_at);
+    history
+        .append(&account_risk_directive_record(
+            &config.task_id,
+            "grid_paper",
+            grid.config().symbol.as_str(),
+            reason,
+            &price,
+            recorded_at,
+        ))
+        .await
+        .map_err(GridPaperTaskError::Journal)?;
+    *last_recorded_at = recorded_at;
+    Ok(())
+}
+
 /// Extracts the first close demand that applies to this owner.
 pub(crate) fn account_risk_exit_reason(
     directives: &[AccountRiskDirective],
@@ -1492,13 +2623,15 @@ async fn protection_directive(
     config: &GridPaperTaskConfig,
     grid: &VirtualGrid,
     account: &PaperAccountAuthority,
+    operation_lease: Option<&PaperAccountOperationLease>,
     price: Price,
     observed_at: DateTime<Utc>,
 ) -> Result<GridDirective, GridPaperTaskError> {
     let Some(machine) = protection.as_mut() else {
         return Ok(GridDirective::Continue);
     };
-    let snapshot = account.snapshot().await?;
+    let operation_lease = operation_lease.ok_or(GridPaperTaskError::RecoveryRequired)?;
+    let snapshot = operation_decision_snapshot(account, operation_lease).await?;
     let current_collateral = snapshot
         .available
         .as_decimal()
@@ -1506,10 +2639,13 @@ async fn protection_directive(
         .and_then(|value| value.checked_add(snapshot.uncertain_reserved.as_decimal()))
         .and_then(|value| value.checked_add(snapshot.committed_exposure.as_decimal()))
         .ok_or(GridPaperTaskError::InvalidRequest)?;
-    let position_quantity = Decimal::from(grid.buy_crosses())
-        .checked_sub(Decimal::from(grid.sell_crosses()))
-        .and_then(|net| net.checked_mul(config.quantity.as_decimal()))
-        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    let position_quantity = match target_instrument_close_plan(&snapshot, config, grid)? {
+        Some((Side::Sell, quantity)) => quantity.as_decimal(),
+        Some((Side::Buy, quantity)) => Decimal::ZERO
+            .checked_sub(quantity.as_decimal())
+            .ok_or(GridPaperTaskError::InvalidRequest)?,
+        None => Decimal::ZERO,
+    };
     let recent_cycles = grid.recent_cycles_at(
         observed_at,
         ChronoDuration::minutes(PROTECTION_APR_WINDOW_MINUTES),
@@ -1613,6 +2749,274 @@ fn build_protection_operation(
         .map_err(GridPaperTaskError::Saga)
 }
 
+fn build_account_risk_close_operation(
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    side: Side,
+    quantity: Quantity,
+    price: Price,
+    operation_sequence: u64,
+) -> Result<PaperSingleLegRequest, GridPaperTaskError> {
+    build_target_instrument_close_operation(
+        config,
+        grid,
+        "risk-close",
+        side,
+        quantity,
+        price,
+        operation_sequence,
+    )
+}
+
+const fn marketable_close_price(snapshot: &MarketSnapshot, side: Side) -> Price {
+    match side {
+        Side::Buy => snapshot.ask(),
+        Side::Sell => snapshot.bid(),
+    }
+}
+
+fn build_target_instrument_close_operation(
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    idempotency_prefix: &str,
+    side: Side,
+    quantity: Quantity,
+    price: Price,
+    operation_sequence: u64,
+) -> Result<PaperSingleLegRequest, GridPaperTaskError> {
+    let mut intent = OrderIntent::limit(
+        config.exchange.clone(),
+        grid.config().symbol.clone(),
+        config.market_type,
+        side,
+        quantity,
+        price,
+    );
+    intent.reduce_only = true;
+    let batch = ExecutionBatch::planned(vec![intent.clone()])?;
+    let reserved_notional = price
+        .as_decimal()
+        .checked_mul(quantity.as_decimal())
+        .map(Money::new)
+        .ok_or(GridPaperTaskError::InvalidRequest)?;
+    let task_id = format!("{}/op/{operation_sequence:06}", config.task_id);
+    let idempotency_key = format!("{idempotency_prefix}:{operation_sequence:06}");
+    let reservation = PaperReservationRequest::planned(
+        task_id,
+        idempotency_key,
+        batch.id(),
+        config.cost_model,
+        vec![PaperReservationLeg::from_intent(
+            0,
+            &intent,
+            reserved_notional,
+        )?],
+    )?;
+    PaperSingleLegRequest::new(grid.config().symbol.clone(), batch, reservation)
+        .map_err(GridPaperTaskError::Saga)
+}
+
+fn target_instrument_close_plan(
+    snapshot: &PaperAccountSnapshot,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+) -> Result<Option<(Side, Quantity)>, GridPaperTaskError> {
+    let mut buy_quantity = Decimal::ZERO;
+    let mut sell_quantity = Decimal::ZERO;
+    let mut owner_matched = false;
+    let mut foreign_matched = false;
+    let owner_prefix = operation_prefix(&config.task_id);
+    for lot in &snapshot.open_lots {
+        if lot.exchange != config.exchange
+            || lot.symbol != grid.config().symbol
+            || lot.market_type != config.market_type
+        {
+            continue;
+        }
+        let mut reservations = snapshot
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.reservation_id == lot.source_reservation_id);
+        let Some(source) = reservations.next() else {
+            return Err(GridPaperTaskError::RecoveryRequired);
+        };
+        if reservations.next().is_some() {
+            return Err(GridPaperTaskError::RecoveryRequired);
+        }
+        if !operation_task_belongs_to_owner(&source.task_id, &owner_prefix) {
+            foreign_matched = true;
+            continue;
+        }
+        owner_matched = true;
+        match lot.side {
+            Side::Buy => {
+                buy_quantity = buy_quantity
+                    .checked_add(lot.remaining_quantity.as_decimal())
+                    .ok_or(GridPaperTaskError::RecoveryRequired)?;
+            }
+            Side::Sell => {
+                sell_quantity = sell_quantity
+                    .checked_add(lot.remaining_quantity.as_decimal())
+                    .ok_or(GridPaperTaskError::RecoveryRequired)?;
+            }
+        }
+    }
+    if owner_matched && foreign_matched {
+        // Paper reduce-only settlement consumes instrument lots FIFO. With a
+        // foreign lot in the same queue, no order can prove that it will
+        // reduce only this owner's exposure.
+        return Err(GridPaperTaskError::RecoveryRequired);
+    }
+    if !owner_matched {
+        return Ok(None);
+    }
+    let buy_open = buy_quantity > Decimal::ZERO;
+    let sell_open = sell_quantity > Decimal::ZERO;
+    if buy_open && sell_open {
+        return Err(GridPaperTaskError::RecoveryRequired);
+    }
+    if buy_open {
+        return Ok(Some((
+            Side::Sell,
+            Quantity::new(buy_quantity).map_err(|_| GridPaperTaskError::RecoveryRequired)?,
+        )));
+    }
+    if sell_open {
+        return Ok(Some((
+            Side::Buy,
+            Quantity::new(sell_quantity).map_err(|_| GridPaperTaskError::RecoveryRequired)?,
+        )));
+    }
+    Ok(None)
+}
+
+fn target_instrument_has_foreign_lots(
+    snapshot: &PaperAccountSnapshot,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+) -> Result<bool, GridPaperTaskError> {
+    let owner_prefix = operation_prefix(&config.task_id);
+    for lot in &snapshot.open_lots {
+        if lot.exchange != config.exchange
+            || lot.symbol != grid.config().symbol
+            || lot.market_type != config.market_type
+        {
+            continue;
+        }
+        let mut reservations = snapshot
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.reservation_id == lot.source_reservation_id);
+        let Some(source) = reservations.next() else {
+            return Err(GridPaperTaskError::RecoveryRequired);
+        };
+        if reservations.next().is_some() {
+            return Err(GridPaperTaskError::RecoveryRequired);
+        }
+        if !operation_task_belongs_to_owner(&source.task_id, &owner_prefix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn operation_task_belongs_to_owner(task_id: &str, owner_prefix: &str) -> bool {
+    task_id.strip_prefix(owner_prefix).is_some_and(|sequence| {
+        !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn close_target_instrument_position(
+    saga: &DurablePaperSingleLegSaga,
+    executor: Arc<dyn GridPaperExecutor>,
+    account: &PaperAccountAuthority,
+    operation_lease: &PaperAccountOperationLease,
+    risk: Option<&AccountRiskAuthority>,
+    history: &JsonlHistory,
+    status_sender: &watch::Sender<GridPaperTaskStatus>,
+    last_recorded_at: &mut DateTime<Utc>,
+    config: &GridPaperTaskConfig,
+    grid: &VirtualGrid,
+    market: Option<&MarketSnapshot>,
+    observed_at: DateTime<Utc>,
+    operation_sequence: &mut u64,
+    stop: &mut watch::Receiver<bool>,
+    cancel: &mut watch::Receiver<bool>,
+    idempotency_prefix: &'static str,
+) -> Result<bool, GridPaperTaskError> {
+    let snapshot = operation_decision_snapshot(account, operation_lease).await?;
+    let Some((side, quantity)) = target_instrument_close_plan(&snapshot, config, grid)? else {
+        return Ok(false);
+    };
+    let market = market.ok_or(GridPaperTaskError::RecoveryRequired)?;
+    let price = marketable_close_price(market, side);
+    let Some(next_operation) = operation_sequence.checked_add(1) else {
+        return Err(GridPaperTaskError::RecoveryRequired);
+    };
+    let request = build_target_instrument_close_operation(
+        config,
+        grid,
+        idempotency_prefix,
+        side,
+        quantity,
+        price,
+        next_operation,
+    )?;
+    *operation_sequence = next_operation;
+    publish_operation_count(status_sender, next_operation);
+    publish_forced_close_plan(
+        history,
+        config,
+        grid,
+        idempotency_prefix,
+        side,
+        quantity,
+        price,
+        next_operation,
+        last_recorded_at,
+    )
+    .await?;
+    match run_operation(
+        saga,
+        executor,
+        request,
+        stop,
+        cancel,
+        operation_lease,
+        OperationRunPolicy::forced_close(&config.task_id, config.supervisor.shutdown_grace()),
+    )
+    .await
+    {
+        OperationOutcome::Terminal(Ok(_), _) => {
+            let snapshot = account
+                .decision_snapshot()
+                .await
+                .map_err(GridPaperTaskError::Account)?;
+            if target_instrument_close_plan(&snapshot, config, grid)?.is_some() {
+                return Err(GridPaperTaskError::RecoveryRequired);
+            }
+            if let Some(risk) = risk
+                && risk
+                    .record_position_closed(&config.task_id, observed_at)
+                    .await
+                    .is_err()
+            {
+                return Err(GridPaperTaskError::RecoveryRequired);
+            }
+            Ok(true)
+        }
+        OperationOutcome::Cancelled(request) | OperationOutcome::TimedOut(request) => {
+            retain_cancelled_operation(account, risk, &config.task_id, None, &request, observed_at)
+                .await?;
+            Err(GridPaperTaskError::RecoveryRequired)
+        }
+        OperationOutcome::Terminal(Err(_), _)
+        | OperationOutcome::RiskInterrupted { .. }
+        | OperationOutcome::RiskUnavailable(_) => Err(GridPaperTaskError::RecoveryRequired),
+    }
+}
+
 /// Deduplication signature so steady-state directives journal once per change.
 #[derive(Clone, Debug, PartialEq)]
 enum ProtectionSignature {
@@ -1628,14 +3032,16 @@ fn build_operation(
     config: &GridPaperTaskConfig,
     grid: &VirtualGrid,
     cross: VirtualGridCross,
+    reduce_only: bool,
     reservation_price: Price,
     operation_sequence: u64,
+    account_risk_admission: Option<(&AccountRiskAuthority, &AccountRiskAdmissionTicket)>,
 ) -> Result<PaperSingleLegRequest, GridPaperTaskError> {
     let side = match cross.side {
         GridFill::Buy => Side::Buy,
         GridFill::Sell => Side::Sell,
     };
-    let intent = OrderIntent::limit(
+    let mut intent = OrderIntent::limit(
         config.exchange.clone(),
         grid.config().symbol.clone(),
         config.market_type,
@@ -1643,6 +3049,7 @@ fn build_operation(
         config.quantity,
         cross.trigger_price,
     );
+    intent.reduce_only = reduce_only;
     let batch = ExecutionBatch::planned(vec![intent.clone()])?;
     let reserved_notional = reservation_price
         .as_decimal()
@@ -1651,7 +3058,7 @@ fn build_operation(
         .ok_or(GridPaperTaskError::InvalidRequest)?;
     let task_id = format!("{}/op/{operation_sequence:06}", config.task_id);
     let idempotency_key = format!("grid:{operation_sequence:06}");
-    let reservation = PaperReservationRequest::planned(
+    let mut reservation = PaperReservationRequest::planned(
         task_id,
         idempotency_key,
         batch.id(),
@@ -1662,6 +3069,9 @@ fn build_operation(
             reserved_notional,
         )?],
     )?;
+    if let Some((risk, ticket)) = account_risk_admission {
+        reservation = reservation.with_account_risk_admission(risk.scope_id(), ticket)?;
+    }
     PaperSingleLegRequest::new(grid.config().symbol.clone(), batch, reservation)
         .map_err(GridPaperTaskError::Saga)
 }
@@ -1770,7 +3180,7 @@ async fn recovery_preflight(
     account: &PaperAccountAuthority,
     history: &JsonlHistory,
 ) -> Result<u64, GridPaperTaskError> {
-    let account_snapshot = account.snapshot().await?;
+    let account_snapshot = account.decision_snapshot().await?;
     if account_snapshot.projection_status != ProjectionStatus::Complete {
         return Err(GridPaperTaskError::RecoveryRequired);
     }
@@ -1788,7 +3198,7 @@ async fn recovery_preflight(
     for reservation in account_snapshot
         .reservations
         .iter()
-        .filter(|reservation| reservation.task_id.starts_with(&prefix))
+        .filter(|reservation| operation_task_belongs_to_owner(&reservation.task_id, &prefix))
     {
         if matches!(
             reservation.phase,
@@ -1840,6 +3250,15 @@ async fn durable_task_view(
 
 fn operation_prefix(task_id: &str) -> String {
     format!("{task_id}/op/")
+}
+
+fn publish_operation_count(
+    status_sender: &watch::Sender<GridPaperTaskStatus>,
+    operation_count: u64,
+) {
+    let mut status = status_sender.borrow().clone();
+    status.operation_count = operation_count;
+    status_sender.send_replace(status);
 }
 
 fn registered_record(task_id: &str, source_id: &str, recorded_at: DateTime<Utc>) -> DecisionRecord {

@@ -5,7 +5,10 @@
 //! [`ReadControlPlane`] and therefore cannot discover files or construct
 //! execution authority.
 
-use std::{env, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    env, error::Error as StdError, fmt, future::Future, net::SocketAddr, path::PathBuf, sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser};
@@ -27,7 +30,53 @@ mod paper_dispatcher;
 mod submit;
 
 const PAPER_WRITE_PRINCIPAL_ID: &str = "local-paper-operator";
-const APPLICATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Owner stop tasks enforce a 125s outer stop contract. The web process must
+/// honor at least that much cleanup budget so a valid 60s owner grace (with a
+/// 2x host stop deadline) is never truncated by the process wrapper itself.
+const OWNER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(125);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShutdownBudgets {
+    http_drain: Duration,
+    owner_cleanup: Duration,
+}
+
+impl ShutdownBudgets {
+    const DEFAULT: Self = Self {
+        http_drain: HTTP_DRAIN_TIMEOUT,
+        owner_cleanup: OWNER_CLEANUP_TIMEOUT,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebConfigurationError {
+    InvalidBearerEnvironmentName,
+    ReadApiBearerRequired,
+    PaperWritesRiskConfigRequired,
+    PaperWritesBearerRequired,
+}
+
+impl fmt::Display for WebConfigurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidBearerEnvironmentName => {
+                "--bearer-token-env must name a 1-128 byte ASCII environment variable using A-Z, 0-9, and _"
+            }
+            Self::ReadApiBearerRequired => {
+                "read control-plane routes require --bearer-token-env unless --allow-open-loopback-read-api is set"
+            }
+            Self::PaperWritesRiskConfigRequired => {
+                "trusted paper writes require --paper-account-risk-config"
+            }
+            Self::PaperWritesBearerRequired => {
+                "trusted paper writes require --bearer-token-env"
+            }
+        })
+    }
+}
+
+impl StdError for WebConfigurationError {}
 
 pub use paper_dispatcher::TrustedPaperSubmitDispatcher;
 pub use submit::{
@@ -56,11 +105,15 @@ pub struct Cli {
     #[arg(long, default_value_t = crypto_trading_web::DEFAULT_WEB_PORT)]
     pub port: u16,
 
-    /// Optional environment variable containing a 32-512 byte bearer token.
+    /// Environment variable containing a 32-512 byte bearer token.
     ///
     /// The token itself is never accepted as a command-line argument.
     #[arg(long, value_name = "ENV_NAME")]
     pub bearer_token_env: Option<String>,
+
+    /// Explicitly allow the legacy unauthenticated loopback read API.
+    #[arg(long, default_value_t = false)]
+    pub allow_open_loopback_read_api: bool,
 
     #[command(flatten)]
     pub paper_write: PaperWriteArgs,
@@ -113,9 +166,8 @@ pub struct PaperWriteArgs {
     #[arg(long, value_name = "MILLISECONDS")]
     pub paper_arbitrage_shutdown_grace_ms: Option<u64>,
 
-    /// Optional bounded YAML account-level risk limits shared by every
-    /// configured paper owner; absent limits stay disabled while durable
-    /// pause/kill-switch facts still gate admissions.
+    /// Bounded YAML account-level risk limits shared by every configured
+    /// paper owner. Required whenever trusted paper writes are enabled.
     #[arg(long, value_name = "PATH")]
     pub paper_account_risk_config: Option<PathBuf>,
 }
@@ -153,39 +205,29 @@ where
     let server = serve_with_shutdown(listener, router, wait_for_shutdown(shutdown_receiver));
     tokio::pin!(server);
     tokio::pin!(shutdown);
+    let shutdown_budgets = ShutdownBudgets::DEFAULT;
     tokio::select! {
         server_result = &mut server => {
             shutdown_sender.send_replace(true);
-            let deadline = tokio::time::Instant::now() + APPLICATION_SHUTDOWN_TIMEOUT;
             let shutdown_outcome = tokio::time::timeout_at(
-                deadline,
+                tokio::time::Instant::now() + shutdown_budgets.owner_cleanup,
                 shutdown_dispatcher(dispatcher),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("paper owner cleanup exceeded the application shutdown deadline"))?;
+            .map_err(|_| anyhow::anyhow!("paper owner cleanup exceeded the owner shutdown deadline"))?;
             validate_shutdown_outcome(shutdown_outcome)?;
             server_result.context("Web control-plane server stopped with an I/O error")
         }
         () = &mut shutdown => {
             tracing::info!(
                 event = "web_shutdown_started",
-                deadline_seconds = APPLICATION_SHUTDOWN_TIMEOUT.as_secs(),
+                http_drain_deadline_seconds = shutdown_budgets.http_drain.as_secs(),
+                owner_cleanup_deadline_seconds = shutdown_budgets.owner_cleanup.as_secs(),
                 "application quiescing began"
             );
             shutdown_sender.send_replace(true);
-            let deadline = tokio::time::Instant::now() + APPLICATION_SHUTDOWN_TIMEOUT;
-            let (server_result, dispatcher_result) = tokio::join!(
-                tokio::time::timeout_at(deadline, &mut server),
-                tokio::time::timeout_at(deadline, shutdown_dispatcher(dispatcher)),
-            );
-            let server_result = server_result.map_err(|_| {
-                anyhow::anyhow!("HTTP drain exceeded the application shutdown deadline")
-            })?;
-            let shutdown_outcome = dispatcher_result.map_err(|_| {
-                anyhow::anyhow!("paper owner cleanup exceeded the application shutdown deadline")
-            })?;
-            validate_shutdown_outcome(shutdown_outcome)?;
-            server_result.context("Web control-plane server stopped with an I/O error")?;
+            complete_graceful_shutdown(&mut server, shutdown_dispatcher(dispatcher), shutdown_budgets)
+                .await?;
             tracing::info!(
                 event = "web_shutdown_completed",
                 "HTTP drain and paper owner cleanup completed"
@@ -213,6 +255,30 @@ async fn shutdown_dispatcher(
         Some(dispatcher) => dispatcher.shutdown().await,
         None => SubmitDispatchOutcome::Applied,
     }
+}
+
+async fn complete_graceful_shutdown<Server, Cleanup>(
+    server: Server,
+    cleanup: Cleanup,
+    budgets: ShutdownBudgets,
+) -> Result<()>
+where
+    Server: Future<Output = std::io::Result<()>>,
+    Cleanup: Future<Output = SubmitDispatchOutcome>,
+{
+    let http_deadline = tokio::time::Instant::now() + budgets.http_drain;
+    let cleanup_deadline = tokio::time::Instant::now() + budgets.owner_cleanup;
+    let (server_result, cleanup_result) = tokio::join!(
+        tokio::time::timeout_at(http_deadline, server),
+        tokio::time::timeout_at(cleanup_deadline, cleanup),
+    );
+    let shutdown_outcome = cleanup_result
+        .map_err(|_| anyhow::anyhow!("paper owner cleanup exceeded the owner shutdown deadline"))?;
+    validate_shutdown_outcome(shutdown_outcome)?;
+    let server_result = server_result
+        .map_err(|_| anyhow::anyhow!("HTTP drain exceeded the application shutdown deadline"))?;
+    server_result.context("Web control-plane server stopped with an I/O error")?;
+    Ok(())
 }
 
 fn validate_shutdown_outcome(outcome: SubmitDispatchOutcome) -> Result<()> {
@@ -409,7 +475,10 @@ fn credential_pair_status(key_name: &str, secret_name: &str) -> CredentialConfig
 
 fn access_policy(cli: &Cli) -> Result<WebAccessPolicy> {
     let Some(name) = cli.bearer_token_env.as_deref() else {
-        return Ok(WebAccessPolicy::loopback_open());
+        if cli.allow_open_loopback_read_api {
+            return Ok(WebAccessPolicy::loopback_open());
+        }
+        return Err(WebConfigurationError::ReadApiBearerRequired.into());
     };
     validate_env_name(name)?;
     let token = env::var(name)
@@ -435,10 +504,13 @@ fn write_mode_config(cli: &Cli) -> Result<Option<WriteModeConfig>> {
         }
         return Ok(None);
     }
+    if cli.paper_write.paper_account_risk_config.is_none() {
+        return Err(WebConfigurationError::PaperWritesRiskConfigRequired.into());
+    }
     let bearer_env = cli
         .bearer_token_env
         .as_deref()
-        .context("trusted paper writes require --bearer-token-env")?;
+        .ok_or(WebConfigurationError::PaperWritesBearerRequired)?;
     let bearer_token = bearer_token_from_env(bearer_env)?;
     let identity = TrustedSubmitIdentity::paper_operator(PAPER_WRITE_PRINCIPAL_ID)
         .context("trusted paper write principal is invalid")?;
@@ -539,9 +611,7 @@ fn validate_env_name(name: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        bail!(
-            "--bearer-token-env must name a 1-128 byte ASCII environment variable using A-Z, 0-9, and _"
-        );
+        return Err(WebConfigurationError::InvalidBearerEnvironmentName.into());
     }
     Ok(())
 }
@@ -554,17 +624,18 @@ fn bearer_token_from_env(name: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use super::{
-        Cli, PAPER_WRITE_PRINCIPAL_ID, PaperWriteArgs, access_policy, prepare, runtime_settings,
-        write_mode_config,
+        Cli, PAPER_WRITE_PRINCIPAL_ID, PaperWriteArgs, ShutdownBudgets, WebConfigurationError,
+        access_policy, complete_graceful_shutdown, prepare, runtime_settings, write_mode_config,
     };
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use clap::Parser;
+    use crypto_trading_control_plane::SubmitDispatchOutcome;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -634,18 +705,56 @@ mod tests {
         .unwrap();
         cli.bearer_token_env = Some("mixed-Case".to_owned());
 
-        let error = access_policy(&cli).unwrap_err().to_string();
-        assert!(error.contains("ASCII environment variable"));
+        let error = access_policy(&cli).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WebConfigurationError>(),
+            Some(&WebConfigurationError::InvalidBearerEnvironmentName)
+        );
     }
 
     #[test]
-    fn write_mode_requires_a_bearer_env_name() {
+    fn read_api_requires_bearer_by_default() {
         let cli = Cli::try_parse_from([
             "crypto-trading-web",
             "--history-path",
             "fixture.jsonl",
             "--journal-id",
             JOURNAL_ID,
+        ])
+        .unwrap();
+
+        let error = access_policy(&cli).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WebConfigurationError>(),
+            Some(&WebConfigurationError::ReadApiBearerRequired)
+        );
+    }
+
+    #[test]
+    fn explicit_loopback_open_flag_preserves_legacy_read_only_mode() {
+        let cli = Cli::try_parse_from([
+            "crypto-trading-web",
+            "--history-path",
+            "fixture.jsonl",
+            "--journal-id",
+            JOURNAL_ID,
+            "--allow-open-loopback-read-api",
+        ])
+        .unwrap();
+
+        assert!(!access_policy(&cli).unwrap().authentication_required());
+    }
+
+    #[test]
+    fn write_mode_requires_an_explicit_account_risk_config() {
+        let cli = Cli::try_parse_from([
+            "crypto-trading-web",
+            "--history-path",
+            "fixture.jsonl",
+            "--journal-id",
+            JOURNAL_ID,
+            "--bearer-token-env",
+            "CRYPTO_TRADING_WEB_TOKEN",
             "--enable-paper-writes",
             "--paper-grid-task-id",
             "paper-grid-owner",
@@ -660,11 +769,87 @@ mod tests {
         ])
         .unwrap();
 
-        let error = match write_mode_config(&cli) {
-            Ok(_) => panic!("write mode without a bearer env name must fail"),
-            Err(error) => error.to_string(),
+        let Err(error) = write_mode_config(&cli) else {
+            panic!("write mode without an account risk config must fail");
         };
-        assert!(error.contains("require --bearer-token-env"));
+        assert_eq!(
+            error.downcast_ref::<WebConfigurationError>(),
+            Some(&WebConfigurationError::PaperWritesRiskConfigRequired)
+        );
+    }
+
+    #[test]
+    fn write_mode_requires_a_bearer_env_name() {
+        let cli = Cli::try_parse_from([
+            "crypto-trading-web",
+            "--history-path",
+            "fixture.jsonl",
+            "--journal-id",
+            JOURNAL_ID,
+            "--enable-paper-writes",
+            "--paper-account-risk-config",
+            "risk.yaml",
+            "--paper-grid-task-id",
+            "paper-grid-owner",
+            "--paper-grid-strategy-id",
+            "grid.strategy",
+            "--paper-grid-strategy-revision",
+            "grid.v1",
+            "--paper-grid-config",
+            "grid.yaml",
+            "--paper-grid-replay",
+            "grid.jsonl",
+        ])
+        .unwrap();
+
+        let Err(error) = write_mode_config(&cli) else {
+            panic!("write mode without a bearer env name must fail");
+        };
+        assert_eq!(
+            error.downcast_ref::<WebConfigurationError>(),
+            Some(&WebConfigurationError::PaperWritesBearerRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_allows_owner_cleanup_to_outlive_http_drain_budget() {
+        complete_graceful_shutdown(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                SubmitDispatchOutcome::Applied
+            },
+            ShutdownBudgets {
+                http_drain: Duration::from_millis(40),
+                owner_cleanup: Duration::from_millis(120),
+            },
+        )
+        .await
+        .expect("owner cleanup should use its own deadline budget");
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_fails_closed_when_owner_cleanup_exceeds_its_deadline() {
+        let error = complete_graceful_shutdown(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                SubmitDispatchOutcome::Applied
+            },
+            ShutdownBudgets {
+                http_drain: Duration::from_millis(40),
+                owner_cleanup: Duration::from_millis(50),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("owner shutdown deadline"));
     }
 
     #[test]
@@ -715,6 +900,7 @@ mod tests {
             journal_id: Uuid::parse_str(JOURNAL_ID).unwrap(),
             port: 0,
             bearer_token_env: None,
+            allow_open_loopback_read_api: true,
             paper_write: PaperWriteArgs::default(),
         };
 
@@ -767,6 +953,7 @@ mod tests {
             journal_id: Uuid::parse_str(JOURNAL_ID).unwrap(),
             port: 0,
             bearer_token_env: None,
+            allow_open_loopback_read_api: true,
             paper_write: PaperWriteArgs::default(),
         };
 

@@ -1,0 +1,11 @@
+# Shared fail-closed limits for the replay-backed paper owners.
+# Tune these values against the chosen initial paper balance and strategy sizes;
+# do not copy them into a real-money environment.
+max_symbol_exposure: "1000"
+max_total_exposure: "2000"
+min_balance_warning: "1000"
+min_balance_close_position: "500"
+max_position_duration_seconds: 86400
+max_daily_trades: 10000
+disabled_symbols: []
+high_risk_symbols: []

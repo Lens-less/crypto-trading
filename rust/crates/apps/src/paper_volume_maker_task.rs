@@ -18,12 +18,20 @@
 //!   replaced by the fail-closed saga/recovery discipline of this repository.
 
 use std::{
-    error::Error, fmt, future::Future, io::ErrorKind, path::Path, pin::Pin, sync::Arc,
+    error::Error,
+    fmt,
+    future::Future,
+    io::ErrorKind,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
-use crypto_trading_domain::{MarketSnapshot, Money, OrderIntent, Price, Quantity, Side, Symbol};
+use crypto_trading_domain::{
+    MarketSnapshot, MarketType, Money, OrderIntent, Price, Quantity, Side, Symbol,
+};
 use crypto_trading_exchange::TradingReceipt;
 use crypto_trading_runtime::{
     AccountRiskAdmission, AccountRiskAdmissionTicket, AccountRiskAuthority, AccountRiskCandidate,
@@ -32,9 +40,10 @@ use crypto_trading_runtime::{
     MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataEvent, MarketDataEventSource,
     MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
     MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus, PaperAccountAuthority,
-    PaperAccountError, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
-    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
-    ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
+    PaperAccountError, PaperAccountOperationLease, PaperAccountSnapshot, PaperCostModel,
+    PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
+    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
 };
 use crypto_trading_strategy::{
     StrategyError, StrategyMachine, VolumeMakerMode, VolumeMakerState, VolumeMakerStrategy,
@@ -44,7 +53,9 @@ use serde_json::{Value, json};
 use tokio::{
     sync::watch,
     task::{JoinError, JoinHandle},
+    time::{self, MissedTickBehavior},
 };
+use uuid::Uuid;
 
 use crate::{
     DurablePaperSingleLegSaga, PaperSingleLegRequest, PaperSingleLegRun, PaperSingleLegSagaError,
@@ -68,6 +79,9 @@ const TASK_KIND: &str = "volume_maker";
 const VOLUME_MAKER_STRATEGY: &str = "volume_maker";
 const MAX_TASK_ID_BYTES: usize = 96;
 const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
+const ACCOUNT_RISK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+type ActiveOperationLeaseSlot = Arc<StdMutex<Option<PaperAccountOperationLease>>>;
 
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type VolumeMakerPaperExecutionFuture =
@@ -272,6 +286,7 @@ pub struct VolumeMakerPaperTask {
     account: PaperAccountAuthority,
     history: JsonlHistory,
     shutdown_grace: Duration,
+    active_operation_lease: ActiveOperationLeaseSlot,
 }
 
 impl VolumeMakerPaperTask {
@@ -303,6 +318,9 @@ impl VolumeMakerPaperTask {
             return Err(VolumeMakerPaperTaskError::InvalidSourceBinding);
         }
         let operation_sequence = recovery_preflight(&config.task_id, &account, &history).await?;
+        if config.account_risk.is_some() {
+            account.ensure_initialized().await?;
+        }
         let registered_at = Utc::now();
         history
             .append(&registered_record(
@@ -362,10 +380,11 @@ impl VolumeMakerPaperTask {
         let (cancel, cancel_receiver) = watch::channel(false);
         let (status_sender, status) = watch::channel(initial);
         let task_status = status_sender.clone();
-        let task_history = history.clone();
-        let task_config = config.clone();
+        let (task_history, task_config) = (history.clone(), config.clone());
+        let active_operation_lease = Arc::new(StdMutex::new(None));
+        let owner_operation_lease = Arc::clone(&active_operation_lease);
         let join = tokio::spawn(async move {
-            run_owner(OwnerContext {
+            Box::pin(run_owner(OwnerContext {
                 config: task_config,
                 source: supervisor,
                 saga,
@@ -376,7 +395,8 @@ impl VolumeMakerPaperTask {
                 cancel: cancel_receiver,
                 last_recorded_at: running_at,
                 operation_sequence,
-            })
+                active_operation_lease: owner_operation_lease,
+            }))
             .await
         });
 
@@ -390,6 +410,7 @@ impl VolumeMakerPaperTask {
             account,
             history,
             shutdown_grace: config.supervisor.shutdown_grace(),
+            active_operation_lease,
         })
     }
 
@@ -469,9 +490,19 @@ impl VolumeMakerPaperTask {
         let result = if let Ok(joined) = tokio::time::timeout(deadline, &mut join).await {
             Self::map_join(joined)
         } else {
+            let handoff_lease = self
+                .active_operation_lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             join.abort();
             let _ = join.await;
-            self.retain_active_capacity().await;
+            let retention_lease = match handoff_lease {
+                Some(lease) => lease,
+                None => self.account.acquire_operation_lease().await,
+            };
+            self.retain_active_capacity(&retention_lease).await;
+            drop(retention_lease);
             self.record_external_failure(VolumeMakerPaperTaskFailure::RecoveryRequired)
                 .await?;
             Err(VolumeMakerPaperTaskError::ShutdownTimedOut)
@@ -500,13 +531,14 @@ impl VolumeMakerPaperTask {
         });
     }
 
-    async fn retain_active_capacity(&self) {
-        let Ok(snapshot) = self.account.snapshot().await else {
+    async fn retain_active_capacity(&self, _operation_lease: &PaperAccountOperationLease) {
+        let Ok(snapshot) = decision_account_snapshot(&self.account).await else {
             return;
         };
-        let prefix = operation_prefix(&self.status().task_id);
+        let owner_task_id = self.status().task_id;
         for reservation in snapshot.reservations.iter().filter(|reservation| {
-            reservation.task_id.starts_with(&prefix)
+            owner_operation_sequence(&owner_task_id, &reservation.task_id)
+                .is_ok_and(|sequence| sequence.is_some())
                 && reservation.phase == PaperReservationPhase::Pending
         }) {
             let _ = self
@@ -571,6 +603,7 @@ struct OpenPosition {
     side: Side,
     quantity: Quantity,
     open_price: Decimal,
+    source_reservation_id: Uuid,
 }
 
 /// One bounded per-hour statistics accumulator mirroring the legacy
@@ -628,6 +661,40 @@ struct OwnerContext {
     cancel: watch::Receiver<bool>,
     last_recorded_at: DateTime<Utc>,
     operation_sequence: u64,
+    active_operation_lease: ActiveOperationLeaseSlot,
+}
+
+struct RegisteredOperationLease {
+    _lease: PaperAccountOperationLease,
+    active: ActiveOperationLeaseSlot,
+}
+
+impl RegisteredOperationLease {
+    async fn acquire(context: &OwnerContext) -> Result<Self, VolumeMakerPaperTaskError> {
+        let lease = context.saga.account().acquire_operation_lease().await;
+        let mut active = context
+            .active_operation_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.is_some() {
+            return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+        }
+        *active = Some(lease.clone());
+        drop(active);
+        Ok(Self {
+            _lease: lease,
+            active: Arc::clone(&context.active_operation_lease),
+        })
+    }
+}
+
+impl Drop for RegisteredOperationLease {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -637,6 +704,10 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
     let mut bucket: Option<StatisticsBucket> = None;
     let mut total_volume = Decimal::ZERO;
     let mut next_cycle_at: Option<DateTime<Utc>> = None;
+    let mut last_snapshot: Option<MarketSnapshot> = None;
+    let mut risk_poll = time::interval(ACCOUNT_RISK_POLL_INTERVAL);
+    risk_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    risk_poll.tick().await;
     loop {
         let selected = tokio::select! {
             biased;
@@ -654,12 +725,14 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                     continue;
                 }
             }
+            _ = risk_poll.tick(), if context.config.account_risk.is_some() => Selected::RiskPoll(Utc::now()),
             result = context.source.next_event() => Selected::Source(result),
         };
         match selected {
             Selected::Cancel | Selected::Stop => {
                 return stop_owner(
                     &mut context,
+                    position,
                     bucket.take(),
                     VolumeMakerPaperTaskExit::StopRequested,
                 )
@@ -669,6 +742,7 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                 if *context.cancel.borrow() || *context.stop.borrow() {
                     return stop_owner(
                         &mut context,
+                        position,
                         bucket.take(),
                         VolumeMakerPaperTaskExit::StopRequested,
                     )
@@ -715,6 +789,7 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
 
                 // Hour rollover: flush the closed statistics bucket first so
                 // its fact precedes any operation of the new hour.
+                last_snapshot = Some(snapshot.clone());
                 let bucket_hour = hour_bucket(observed_at);
                 if let Some(current) = bucket
                     && current.hour_start < bucket_hour
@@ -731,29 +806,28 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                     }
                     bucket = None;
                 }
-                let stats = bucket.get_or_insert_with(|| StatisticsBucket::new(bucket_hour));
 
                 // Durable account-risk close directives run first: a kill
                 // switch, a critically low balance, or an expired position
                 // clock stops the owner exactly like a legacy emergency stop.
-                if context.config.account_risk.is_some() {
-                    match account_risk_exit(&mut context, &snapshot, observed_at).await {
-                        Ok(false) => {}
-                        Ok(true) => {
-                            return stop_owner(
-                                &mut context,
-                                bucket.take(),
-                                VolumeMakerPaperTaskExit::StopRequested,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            let failure = error.failure_bucket();
-                            return fail_owner(&mut context, failure, error).await;
-                        }
-                    }
+                if context.config.account_risk.is_some()
+                    && let Some(result) = handle_account_risk_directive(
+                        &mut context,
+                        &snapshot,
+                        observed_at,
+                        &mut position,
+                        &mut quote,
+                        &mut bucket,
+                        &mut total_volume,
+                        &mut next_cycle_at,
+                        &mut next,
+                    )
+                    .await
+                {
+                    return result;
                 }
 
+                let stats = bucket.get_or_insert_with(|| StatisticsBucket::new(bucket_hour));
                 let planned = match plan_operation(
                     &context.config,
                     position,
@@ -772,6 +846,45 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                         .await;
                     }
                 };
+
+                let operation_lease = if planned.is_some() {
+                    match RegisteredOperationLease::acquire(&context).await {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            return fail_owner(
+                                &mut context,
+                                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if planned.is_some() {
+                    let account = match decision_account_snapshot(context.saga.account()).await {
+                        Ok(account) => account,
+                        Err(error) => {
+                            return fail_owner(
+                                &mut context,
+                                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                error,
+                            )
+                            .await;
+                        }
+                    };
+                    if let Err(error) =
+                        validate_ordinary_operation_fifo(&account, &context.config, position)
+                    {
+                        return fail_owner(
+                            &mut context,
+                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                            error,
+                        )
+                        .await;
+                    }
+                }
 
                 let admitted = match planned {
                     Some(operation)
@@ -850,13 +963,14 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                         }
                     };
                     let recovery_request = request.clone();
-                    match run_operation(&mut context, request).await {
+                    match run_operation(&mut context, request, true).await {
                         OperationOutcome::Terminal(Ok(run), stop_requested) => {
                             stop_after_operation = stop_requested;
                             next.operation_count = context.operation_sequence;
                             match consume_run(
                                 &operation,
                                 &run,
+                                recovery_request.reservation().reservation_id(),
                                 &mut position,
                                 &mut quote,
                                 stats,
@@ -898,6 +1012,7 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                                         checkpoint(&mut context, &mut next).await?;
                                         return stop_owner(
                                             &mut context,
+                                            position,
                                             bucket.take(),
                                             VolumeMakerPaperTaskExit::BoundsReached,
                                         )
@@ -916,6 +1031,8 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                             }
                         }
                         OperationOutcome::Terminal(Err(error), _) => {
+                            next.operation_count = context.operation_sequence;
+                            context.status_sender.send_replace(next.clone());
                             let needs_recovery = match retain_cancelled_operation(
                                 context.saga.account(),
                                 context.config.account_risk.as_ref(),
@@ -933,8 +1050,6 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                                 }
                             };
                             if needs_recovery {
-                                next.operation_count = context.operation_sequence;
-                                context.status_sender.send_replace(next);
                                 return fail_owner(
                                     &mut context,
                                     VolumeMakerPaperTaskFailure::RecoveryRequired,
@@ -943,11 +1058,11 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                                 .await;
                             }
                             let (failure, error) = classify_saga_error(error);
-                            next.operation_count = context.operation_sequence;
-                            context.status_sender.send_replace(next);
                             return fail_owner(&mut context, failure, error).await;
                         }
                         OperationOutcome::Cancelled(request) => {
+                            next.operation_count = context.operation_sequence;
+                            context.status_sender.send_replace(next.clone());
                             let needs_recovery = match retain_cancelled_operation(
                                 context.saga.account(),
                                 context.config.account_risk.as_ref(),
@@ -964,8 +1079,6 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                                     return fail_owner(&mut context, failure, retain_error).await;
                                 }
                             };
-                            next.operation_count = context.operation_sequence;
-                            context.status_sender.send_replace(next);
                             if needs_recovery {
                                 return fail_owner(
                                     &mut context,
@@ -976,18 +1089,87 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                             }
                             return stop_owner(
                                 &mut context,
+                                position,
                                 bucket.take(),
                                 VolumeMakerPaperTaskExit::StopRequested,
                             )
                             .await;
                         }
+                        OperationOutcome::RiskInterrupted {
+                            request,
+                            observed_at: interrupted_at,
+                            reason,
+                        } => {
+                            next.operation_count = context.operation_sequence;
+                            context.status_sender.send_replace(next.clone());
+                            let needs_recovery = match retain_cancelled_operation(
+                                context.saga.account(),
+                                context.config.account_risk.as_ref(),
+                                &context.config.task_id,
+                                operation.admission_ticket.as_ref(),
+                                &request,
+                                interrupted_at,
+                            )
+                            .await
+                            {
+                                Ok(needs_recovery) => needs_recovery,
+                                Err(retain_error) => {
+                                    let failure = retain_error.failure_bucket();
+                                    return fail_owner(&mut context, failure, retain_error).await;
+                                }
+                            };
+                            match reason {
+                                Ok(reason) => {
+                                    if let Err(error) =
+                                        record_account_risk_exit(&mut context, &snapshot, &reason)
+                                            .await
+                                    {
+                                        let failure = error.failure_bucket();
+                                        return fail_owner(&mut context, failure, error).await;
+                                    }
+                                    if needs_recovery {
+                                        return fail_owner(
+                                            &mut context,
+                                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                            VolumeMakerPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    }
+                                    return stop_owner(
+                                        &mut context,
+                                        position,
+                                        bucket.take(),
+                                        VolumeMakerPaperTaskExit::StopRequested,
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    if needs_recovery {
+                                        return fail_owner(
+                                            &mut context,
+                                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                            VolumeMakerPaperTaskError::RecoveryRequired,
+                                        )
+                                        .await;
+                                    }
+                                    return fail_owner(
+                                        &mut context,
+                                        VolumeMakerPaperTaskFailure::AccountContract,
+                                        VolumeMakerPaperTaskError::AccountRisk(error),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                     }
                 }
 
+                drop(operation_lease);
                 checkpoint(&mut context, &mut next).await?;
                 if stop_after_operation {
                     return stop_owner(
                         &mut context,
+                        position,
                         bucket.take(),
                         VolumeMakerPaperTaskExit::StopRequested,
                     )
@@ -997,6 +1179,7 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
             Selected::Source(Ok(None)) => {
                 return stop_owner(
                     &mut context,
+                    position,
                     bucket.take(),
                     VolumeMakerPaperTaskExit::SourceEnded,
                 )
@@ -1010,6 +1193,36 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
                 )
                 .await;
             }
+            Selected::RiskPoll(polled_at) => {
+                if let Some(snapshot) = last_snapshot.as_ref() {
+                    let mut next = context.status_sender.borrow().clone();
+                    next.sources = vec![context.source.status()];
+                    if let Some(result) = handle_account_risk_directive(
+                        &mut context,
+                        snapshot,
+                        polled_at,
+                        &mut position,
+                        &mut quote,
+                        &mut bucket,
+                        &mut total_volume,
+                        &mut next_cycle_at,
+                        &mut next,
+                    )
+                    .await
+                    {
+                        return result;
+                    }
+                } else if let Some(result) = handle_account_risk_directive_without_snapshot(
+                    &mut context,
+                    polled_at,
+                    position,
+                    &mut bucket,
+                )
+                .await
+                {
+                    return result;
+                }
+            }
         }
     }
 }
@@ -1017,12 +1230,18 @@ async fn run_owner(mut context: OwnerContext) -> TaskResult {
 enum Selected {
     Stop,
     Cancel,
+    RiskPoll(DateTime<Utc>),
     Source(Result<Option<MarketDataEvent>, MarketSupervisorError>),
 }
 
 enum OperationOutcome {
     Terminal(Result<PaperSingleLegRun, PaperSingleLegSagaError>, bool),
     Cancelled(PaperSingleLegRequest),
+    RiskInterrupted {
+        request: PaperSingleLegRequest,
+        observed_at: DateTime<Utc>,
+        reason: Result<String, AccountRiskError>,
+    },
 }
 
 enum CycleProgress {
@@ -1033,9 +1252,17 @@ enum CycleProgress {
 async fn run_operation(
     context: &mut OwnerContext,
     request: PaperSingleLegRequest,
+    interrupt_on_account_risk: bool,
 ) -> OperationOutcome {
     let cancel_request = request.clone();
     let executor = Arc::clone(&context.executor);
+    let risk = context.config.account_risk.clone();
+    let owner_task_id = context.config.task_id.clone();
+    let mut risk_poll = time::interval(ACCOUNT_RISK_POLL_INTERVAL);
+    risk_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    risk_poll.tick().await;
+    let forced_close_deadline = time::sleep(context.config.supervisor.shutdown_grace());
+    tokio::pin!(forced_close_deadline);
     {
         let run = context
             .saga
@@ -1054,6 +1281,34 @@ async fn run_operation(
                     if stop_result.is_err() || *context.stop.borrow_and_update() {
                         stop_requested = true;
                     }
+                }
+                _ = risk_poll.tick(), if interrupt_on_account_risk && risk.is_some() => {
+                    let observed_at = Utc::now();
+                    let Some(risk) = risk.as_ref() else {
+                        continue;
+                    };
+                    let directives = risk.directives(observed_at).await;
+                    match directives {
+                        Ok(directives) => {
+                            if let Some(reason) = account_risk_exit_reason(&directives, &owner_task_id) {
+                                break OperationOutcome::RiskInterrupted {
+                                    request: cancel_request,
+                                    observed_at,
+                                    reason: Ok(reason),
+                                };
+                            }
+                        }
+                        Err(error) => {
+                            break OperationOutcome::RiskInterrupted {
+                                request: cancel_request,
+                                observed_at,
+                                reason: Err(error),
+                            };
+                        }
+                    }
+                }
+                () = &mut forced_close_deadline, if !interrupt_on_account_risk => {
+                    break OperationOutcome::Cancelled(cancel_request);
                 }
                 result = &mut run => {
                     break OperationOutcome::Terminal(result, stop_requested);
@@ -1120,17 +1375,26 @@ async fn account_risk_exit(
     context: &mut OwnerContext,
     snapshot: &MarketSnapshot,
     observed_at: DateTime<Utc>,
-) -> Result<bool, VolumeMakerPaperTaskError> {
+) -> Result<Option<String>, VolumeMakerPaperTaskError> {
     let Some(risk) = context.config.account_risk.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
     let directives = risk
         .directives(observed_at)
         .await
         .map_err(VolumeMakerPaperTaskError::AccountRisk)?;
     let Some(reason) = account_risk_exit_reason(&directives, &context.config.task_id) else {
-        return Ok(false);
+        return Ok(None);
     };
+    record_account_risk_exit(context, snapshot, &reason).await?;
+    Ok(Some(reason))
+}
+
+async fn record_account_risk_exit(
+    context: &mut OwnerContext,
+    snapshot: &MarketSnapshot,
+    reason: &str,
+) -> Result<(), VolumeMakerPaperTaskError> {
     let recorded_at = Utc::now().max(context.last_recorded_at);
     context
         .history
@@ -1138,14 +1402,488 @@ async fn account_risk_exit(
             &context.config.task_id,
             TASK_KIND,
             context.config.symbol().as_str(),
-            &reason,
+            reason,
             &snapshot.mid_price().to_string(),
             recorded_at,
         ))
         .await
         .map_err(VolumeMakerPaperTaskError::Journal)?;
     context.last_recorded_at = recorded_at;
-    Ok(true)
+    Ok(())
+}
+
+fn account_risk_close_operation(
+    position: OpenPosition,
+    snapshot: &MarketSnapshot,
+    exchange: String,
+    symbol: Symbol,
+    market_type: MarketType,
+) -> PlannedOperation {
+    let (side, reference_price) = match position.side {
+        Side::Buy => (Side::Sell, snapshot.bid()),
+        Side::Sell => (Side::Buy, snapshot.ask()),
+    };
+    let mut intent = OrderIntent::market(exchange, symbol, market_type, side, position.quantity);
+    intent.reduce_only = true;
+    PlannedOperation {
+        intent,
+        kind: PlannedKind::Close,
+        reference_price,
+        admission_ticket: None,
+    }
+}
+
+fn target_instrument_position(
+    account: &PaperAccountSnapshot,
+    config: &VolumeMakerPaperTaskConfig,
+) -> Result<Option<OpenPosition>, VolumeMakerPaperTaskError> {
+    let ownership = target_instrument_ownership(account, config)?;
+    if ownership.owned.is_some() && ownership.has_external {
+        // FIFO reduction cannot prove that a close would consume only this
+        // owner's lot while another owner shares the exact instrument.
+        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+    }
+    Ok(ownership.owned)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TargetInstrumentOwnership {
+    owned: Option<OpenPosition>,
+    has_external: bool,
+}
+
+fn target_instrument_ownership(
+    account: &PaperAccountSnapshot,
+    config: &VolumeMakerPaperTaskConfig,
+) -> Result<TargetInstrumentOwnership, VolumeMakerPaperTaskError> {
+    let mut owned = None;
+    let mut has_external = false;
+    for lot in account.open_lots.iter().filter(|lot| {
+        lot.exchange == config.exchange()
+            && lot.symbol == *config.symbol()
+            && lot.market_type == config.strategy.config().market_type
+    }) {
+        let reservation = account
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == lot.source_reservation_id)
+            .ok_or(VolumeMakerPaperTaskError::RecoveryRequired)?;
+        if owner_operation_sequence(config.task_id(), &reservation.task_id)?.is_some() {
+            let position = OpenPosition {
+                side: lot.side,
+                quantity: lot.remaining_quantity,
+                open_price: lot.entry_price.as_decimal(),
+                source_reservation_id: lot.source_reservation_id,
+            };
+            if owned.replace(position).is_some() {
+                return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+            }
+        } else {
+            has_external = true;
+        }
+    }
+    Ok(TargetInstrumentOwnership {
+        owned,
+        has_external,
+    })
+}
+
+fn validate_ordinary_operation_fifo(
+    account: &PaperAccountSnapshot,
+    config: &VolumeMakerPaperTaskConfig,
+    expected: Option<OpenPosition>,
+) -> Result<(), VolumeMakerPaperTaskError> {
+    validate_account_operation_barrier(account)?;
+    let ownership = target_instrument_ownership(account, config)?;
+    if ownership.has_external
+        || expected.map(|open| (open.side, open.quantity, open.source_reservation_id))
+            != ownership
+                .owned
+                .map(|open| (open.side, open.quantity, open.source_reservation_id))
+    {
+        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+fn validate_account_operation_barrier(
+    account: &PaperAccountSnapshot,
+) -> Result<(), VolumeMakerPaperTaskError> {
+    if account.reservations.iter().any(|reservation| {
+        matches!(
+            reservation.phase,
+            PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
+        )
+    }) {
+        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+fn owner_operation_sequence(
+    owner_task_id: &str,
+    operation_task_id: &str,
+) -> Result<Option<u64>, VolumeMakerPaperTaskError> {
+    let Some(suffix) = operation_task_id
+        .strip_prefix(owner_task_id)
+        .and_then(|suffix| suffix.strip_prefix("/op/"))
+    else {
+        return Ok(None);
+    };
+    if suffix.is_empty() || suffix.len() > 20 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+    }
+    suffix
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| VolumeMakerPaperTaskError::RecoveryRequired)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn handle_account_risk_directive(
+    context: &mut OwnerContext,
+    snapshot: &MarketSnapshot,
+    observed_at: DateTime<Utc>,
+    position: &mut Option<OpenPosition>,
+    quote: &mut Option<StandingQuote>,
+    bucket: &mut Option<StatisticsBucket>,
+    total_volume: &mut Decimal,
+    next_cycle_at: &mut Option<DateTime<Utc>>,
+    next: &mut VolumeMakerPaperTaskStatus,
+) -> Option<TaskResult> {
+    match account_risk_exit(context, snapshot, observed_at).await {
+        Ok(None) => None,
+        Ok(Some(_reason)) => {
+            let _operation_lease = match RegisteredOperationLease::acquire(context).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return Some(
+                        fail_owner(
+                            context,
+                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                            error,
+                        )
+                        .await,
+                    );
+                }
+            };
+            let account = match decision_account_snapshot(context.saga.account()).await {
+                Ok(account) => account,
+                Err(error) => {
+                    return Some(
+                        fail_owner(
+                            context,
+                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                            error,
+                        )
+                        .await,
+                    );
+                }
+            };
+            if let Err(error) = validate_account_operation_barrier(&account) {
+                return Some(
+                    fail_owner(
+                        context,
+                        VolumeMakerPaperTaskFailure::RecoveryRequired,
+                        error,
+                    )
+                    .await,
+                );
+            }
+            let actual = match target_instrument_position(&account, &context.config) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    return Some(
+                        fail_owner(
+                            context,
+                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                            error,
+                        )
+                        .await,
+                    );
+                }
+            };
+            let expected = *position;
+            if expected.map(|open| (open.side, open.quantity, open.source_reservation_id))
+                != actual.map(|open| (open.side, open.quantity, open.source_reservation_id))
+            {
+                return Some(
+                    fail_owner(
+                        context,
+                        VolumeMakerPaperTaskFailure::RecoveryRequired,
+                        VolumeMakerPaperTaskError::RecoveryRequired,
+                    )
+                    .await,
+                );
+            }
+            if let Some(open) = actual {
+                *position = Some(open);
+                let stats =
+                    bucket.get_or_insert_with(|| StatisticsBucket::new(hour_bucket(observed_at)));
+                let operation = account_risk_close_operation(
+                    open,
+                    snapshot,
+                    context.config.exchange().to_owned(),
+                    context.config.symbol().clone(),
+                    context.config.strategy.config().market_type,
+                );
+                let Some(next_operation) = context.operation_sequence.checked_add(1) else {
+                    return Some(
+                        fail_owner(
+                            context,
+                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                            VolumeMakerPaperTaskError::RecoveryRequired,
+                        )
+                        .await,
+                    );
+                };
+                context.operation_sequence = next_operation;
+                let Ok(request) = build_request(&context.config, &operation, next_operation) else {
+                    next.operation_count = context.operation_sequence;
+                    context.status_sender.send_replace(next.clone());
+                    return Some(
+                        fail_owner(
+                            context,
+                            VolumeMakerPaperTaskFailure::RecoveryRequired,
+                            VolumeMakerPaperTaskError::RecoveryRequired,
+                        )
+                        .await,
+                    );
+                };
+                let recovery_request = request.clone();
+                match run_operation(context, request, false).await {
+                    OperationOutcome::Terminal(Ok(run), _) => {
+                        next.operation_count = context.operation_sequence;
+                        match consume_run(
+                            &operation,
+                            &run,
+                            recovery_request.reservation().reservation_id(),
+                            position,
+                            quote,
+                            stats,
+                            total_volume,
+                        ) {
+                            Ok(CycleProgress::CycleCompleted) => {
+                                let Some(completed_cycles) =
+                                    next.completed_cycle_count.checked_add(1)
+                                else {
+                                    next.operation_count = context.operation_sequence;
+                                    context.status_sender.send_replace(next.clone());
+                                    return Some(
+                                        fail_owner(
+                                            context,
+                                            VolumeMakerPaperTaskFailure::InvalidRequest,
+                                            VolumeMakerPaperTaskError::InvalidRequest,
+                                        )
+                                        .await,
+                                    );
+                                };
+                                next.completed_cycle_count = completed_cycles;
+                                *next_cycle_at = observed_at
+                                    .checked_add_signed(
+                                        ChronoDuration::from_std(context.config.cycle_interval)
+                                            .unwrap_or(ChronoDuration::MAX),
+                                    )
+                                    .or(Some(DateTime::<Utc>::MAX_UTC));
+                                if let Some(risk) = context.config.account_risk.as_ref()
+                                    && let Err(error) = risk
+                                        .record_position_closed(
+                                            &context.config.task_id,
+                                            observed_at,
+                                        )
+                                        .await
+                                {
+                                    context.status_sender.send_replace(next.clone());
+                                    return Some(
+                                        fail_owner(
+                                            context,
+                                            VolumeMakerPaperTaskFailure::AccountContract,
+                                            VolumeMakerPaperTaskError::AccountRisk(error),
+                                        )
+                                        .await,
+                                    );
+                                }
+                                if let Err(error) = checkpoint(context, next).await {
+                                    let failure = error.failure_bucket();
+                                    return Some(fail_owner(context, failure, error).await);
+                                }
+                                Some(
+                                    stop_owner(
+                                        context,
+                                        *position,
+                                        bucket.take(),
+                                        VolumeMakerPaperTaskExit::StopRequested,
+                                    )
+                                    .await,
+                                )
+                            }
+                            Ok(CycleProgress::None) | Err(_) => {
+                                next.operation_count = context.operation_sequence;
+                                context.status_sender.send_replace(next.clone());
+                                Some(
+                                    fail_owner(
+                                        context,
+                                        VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                        VolumeMakerPaperTaskError::RecoveryRequired,
+                                    )
+                                    .await,
+                                )
+                            }
+                        }
+                    }
+                    OperationOutcome::Terminal(Err(_), _) => {
+                        next.operation_count = context.operation_sequence;
+                        context.status_sender.send_replace(next.clone());
+                        if let Err(retain_error) = retain_cancelled_operation(
+                            context.saga.account(),
+                            context.config.account_risk.as_ref(),
+                            &context.config.task_id,
+                            None,
+                            &recovery_request,
+                            observed_at,
+                        )
+                        .await
+                        {
+                            let failure = retain_error.failure_bucket();
+                            return Some(fail_owner(context, failure, retain_error).await);
+                        }
+                        Some(
+                            fail_owner(
+                                context,
+                                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                VolumeMakerPaperTaskError::RecoveryRequired,
+                            )
+                            .await,
+                        )
+                    }
+                    OperationOutcome::Cancelled(request)
+                    | OperationOutcome::RiskInterrupted { request, .. } => {
+                        next.operation_count = context.operation_sequence;
+                        context.status_sender.send_replace(next.clone());
+                        if let Err(retain_error) = retain_cancelled_operation(
+                            context.saga.account(),
+                            context.config.account_risk.as_ref(),
+                            &context.config.task_id,
+                            None,
+                            &request,
+                            observed_at,
+                        )
+                        .await
+                        {
+                            let failure = retain_error.failure_bucket();
+                            return Some(fail_owner(context, failure, retain_error).await);
+                        }
+                        Some(
+                            fail_owner(
+                                context,
+                                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                                VolumeMakerPaperTaskError::RecoveryRequired,
+                            )
+                            .await,
+                        )
+                    }
+                }
+            } else {
+                Some(
+                    stop_owner(
+                        context,
+                        *position,
+                        bucket.take(),
+                        VolumeMakerPaperTaskExit::StopRequested,
+                    )
+                    .await,
+                )
+            }
+        }
+        Err(error) => {
+            let failure = error.failure_bucket();
+            Some(fail_owner(context, failure, error).await)
+        }
+    }
+}
+
+async fn handle_account_risk_directive_without_snapshot(
+    context: &mut OwnerContext,
+    observed_at: DateTime<Utc>,
+    position: Option<OpenPosition>,
+    bucket: &mut Option<StatisticsBucket>,
+) -> Option<TaskResult> {
+    let risk = context.config.account_risk.as_ref()?;
+    let directives = match risk.directives(observed_at).await {
+        Ok(directives) => directives,
+        Err(error) => {
+            return Some(
+                fail_owner(
+                    context,
+                    VolumeMakerPaperTaskFailure::AccountContract,
+                    VolumeMakerPaperTaskError::AccountRisk(error),
+                )
+                .await,
+            );
+        }
+    };
+    let _reason = account_risk_exit_reason(&directives, &context.config.task_id)?;
+    let _operation_lease = match RegisteredOperationLease::acquire(context).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return Some(
+                fail_owner(
+                    context,
+                    VolumeMakerPaperTaskFailure::RecoveryRequired,
+                    error,
+                )
+                .await,
+            );
+        }
+    };
+    let account = match decision_account_snapshot(context.saga.account()).await {
+        Ok(account) => account,
+        Err(error) => {
+            return Some(
+                fail_owner(
+                    context,
+                    VolumeMakerPaperTaskFailure::RecoveryRequired,
+                    error,
+                )
+                .await,
+            );
+        }
+    };
+    let actual = match target_instrument_position(&account, &context.config) {
+        Ok(actual) => actual,
+        Err(error) => {
+            return Some(
+                fail_owner(
+                    context,
+                    VolumeMakerPaperTaskFailure::RecoveryRequired,
+                    error,
+                )
+                .await,
+            );
+        }
+    };
+    if position.map(|open| (open.side, open.quantity, open.source_reservation_id))
+        != actual.map(|open| (open.side, open.quantity, open.source_reservation_id))
+        || actual.is_some()
+    {
+        return Some(
+            fail_owner(
+                context,
+                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                VolumeMakerPaperTaskError::RecoveryRequired,
+            )
+            .await,
+        );
+    }
+    Some(
+        stop_owner(
+            context,
+            position,
+            bucket.take(),
+            VolumeMakerPaperTaskExit::StopRequested,
+        )
+        .await,
+    )
 }
 
 /// Decides what this observation executes, consuming the strategy plan.
@@ -1339,6 +2077,16 @@ fn build_request(
             reserved_notional,
         )?],
     )?;
+    let reservation = match (
+        operation.admission_ticket.as_ref(),
+        config.account_risk.as_ref(),
+    ) {
+        (Some(ticket), Some(risk)) => {
+            reservation.with_account_risk_admission(risk.scope_id(), ticket)?
+        }
+        (None, _) => reservation,
+        (Some(_), None) => return Err(VolumeMakerPaperTaskError::InvalidRequest),
+    };
     PaperSingleLegRequest::new(config.symbol().clone(), batch, reservation)
         .map_err(VolumeMakerPaperTaskError::Saga)
 }
@@ -1347,6 +2095,7 @@ fn build_request(
 fn consume_run(
     operation: &PlannedOperation,
     run: &PaperSingleLegRun,
+    source_reservation_id: Uuid,
     position: &mut Option<OpenPosition>,
     quote: &mut Option<StandingQuote>,
     stats: &mut StatisticsBucket,
@@ -1361,6 +2110,7 @@ fn consume_run(
                         side: operation.intent.side,
                         quantity: operation.intent.quantity,
                         open_price: fill_price,
+                        source_reservation_id,
                     });
                     *quote = None;
                     Ok(CycleProgress::None)
@@ -1514,9 +2264,43 @@ async fn append_statistics(
 
 async fn stop_owner(
     context: &mut OwnerContext,
+    position: Option<OpenPosition>,
     bucket: Option<StatisticsBucket>,
     requested_exit: VolumeMakerPaperTaskExit,
 ) -> TaskResult {
+    let account = match decision_account_snapshot(context.saga.account()).await {
+        Ok(account) => account,
+        Err(error) => {
+            return fail_owner(
+                context,
+                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                error,
+            )
+            .await;
+        }
+    };
+    let actual = match target_instrument_position(&account, &context.config) {
+        Ok(actual) => actual,
+        Err(error) => {
+            return fail_owner(
+                context,
+                VolumeMakerPaperTaskFailure::RecoveryRequired,
+                error,
+            )
+            .await;
+        }
+    };
+    if position.map(|open| (open.side, open.quantity, open.source_reservation_id))
+        != actual.map(|open| (open.side, open.quantity, open.source_reservation_id))
+        || actual.is_some()
+    {
+        return fail_owner(
+            context,
+            VolumeMakerPaperTaskFailure::RecoveryRequired,
+            VolumeMakerPaperTaskError::RecoveryRequired,
+        )
+        .await;
+    }
     // Mirror the legacy export-on-stop: the final partial bucket becomes one
     // durable statistics fact before the lifecycle stops.
     if let Some(bucket) = bucket
@@ -1612,39 +2396,19 @@ async fn recovery_preflight(
     account: &PaperAccountAuthority,
     history: &JsonlHistory,
 ) -> Result<u64, VolumeMakerPaperTaskError> {
-    let account_snapshot = account.snapshot().await?;
-    if account_snapshot.projection_status != ProjectionStatus::Complete {
-        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
-    }
-    if account_snapshot.reservations.iter().any(|reservation| {
-        reservation
-            .reconciliation
-            .as_ref()
-            .is_some_and(|record| record.outcome == PaperReconciliationOutcome::Failed)
-    }) {
-        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
-    }
+    let account_snapshot = decision_account_snapshot(account).await?;
 
-    let prefix = operation_prefix(task_id);
     let mut last_operation = 0_u64;
-    for reservation in account_snapshot
-        .reservations
-        .iter()
-        .filter(|reservation| reservation.task_id.starts_with(&prefix))
-    {
+    for reservation in &account_snapshot.reservations {
+        let Some(sequence) = owner_operation_sequence(task_id, &reservation.task_id)? else {
+            continue;
+        };
         if matches!(
             reservation.phase,
             PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
         ) {
             return Err(VolumeMakerPaperTaskError::RecoveryRequired);
         }
-        let suffix = reservation
-            .task_id
-            .strip_prefix(&prefix)
-            .unwrap_or_default();
-        let sequence = suffix
-            .parse::<u64>()
-            .map_err(|_| VolumeMakerPaperTaskError::RecoveryRequired)?;
         last_operation = last_operation.max(sequence);
     }
 
@@ -1654,6 +2418,27 @@ async fn recovery_preflight(
         return Err(VolumeMakerPaperTaskError::RecoveryRequired);
     }
     Ok(last_operation)
+}
+
+async fn decision_account_snapshot(
+    account: &PaperAccountAuthority,
+) -> Result<PaperAccountSnapshot, VolumeMakerPaperTaskError> {
+    let snapshot = account
+        .decision_snapshot()
+        .await
+        .map_err(|_| VolumeMakerPaperTaskError::RecoveryRequired)?;
+    if snapshot.projection_status != ProjectionStatus::Complete
+        || snapshot.invalid_event_count != 0
+        || snapshot.reservations.iter().any(|reservation| {
+            reservation
+                .reconciliation
+                .as_ref()
+                .is_some_and(|record| record.outcome == PaperReconciliationOutcome::Failed)
+        })
+    {
+        return Err(VolumeMakerPaperTaskError::RecoveryRequired);
+    }
+    Ok(snapshot)
 }
 
 async fn durable_task_view(
@@ -1678,10 +2463,6 @@ async fn durable_task_view(
         return Err(VolumeMakerPaperTaskError::RecoveryRequired);
     }
     Ok(model.tasks.into_iter().find(|task| task.task_id == task_id))
-}
-
-fn operation_prefix(task_id: &str) -> String {
-    format!("{task_id}/op/")
 }
 
 fn registered_record(task_id: &str, source_id: &str, recorded_at: DateTime<Utc>) -> DecisionRecord {

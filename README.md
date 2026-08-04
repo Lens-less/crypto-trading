@@ -46,9 +46,9 @@
 | `grid` | 校验网格配置 | 可用 | 不可用 | 不可用 | 仅在同时提供 `--once --price` 时模拟 resting paper orders |
 | `arbitrage` | 校验套利与 monitor 配置 | 可用 | 不可用 | 不可用 | 要求显式双边价格、四侧盘口数量；`strategy_key` 是配置选择器，可与腿 symbol 不同，但腿仍需通过全局白名单和正的 `max_position_value` 风险门禁 |
 | `paper grid`／`paper arbitrage` | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；完全成交的同步 taker 回执会写入精确 FIFO lot、手续费、已实现 PnL 与 settled equity，reduce-only 平仓额度在 reserve 与 settle 两处校验；Grid owner 会把配置启用的纯策略网格保护指令写成 `grid_protection` journal 事实并映射为受限 paper 动作；Arbitrage owner 可选 spread-history 自然价差门控，资金费率缺失时标注 `funding_degraded`；两个 owner 的开仓在 reservation 前都要通过 journal-backed 账户风控，拒绝会写成 `account_risk_rejected` 事实 |
-| `paper risk` | 可通过 `--paper-account-risk-config` 加载可选限额（缺省全部禁用） | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝、owner 消费 close 指令后停止 |
+| `paper risk` | `--enable-paper-writes` 时必须提供 `--paper-account-risk-config` 共享限额 | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝，owner 会在有可信缓存盘口时以 reduce-only 平仓后停止；缺少盘口或平仓不完整时进入 `RecoveryRequired`，不得伪装为正常停止 |
 | `monitor` | 可解析并校验 | 不可用 | 可用（只读 replay / `--live` 轮询） | 不可用 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 一样失败关闭）；`--live` 可显式选用真实免凭证公开轮询双源（仅限 binance+hyperliquid 精确对：Binance 现货 bookTicker + Hyperliquid 永续 asset contexts，后者附每小时资金费率只读侧通道）；两端 REST 响应均显式标记本地接收时间来源，保留可用的 venue sequence，并拒绝超出配置 skew 的跨所配对；轮询仍非实时，自动恢复仍未开放 |
-| `volume-maker` | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve/status/stop` 运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式吃盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源仍未开放 |
+| `volume-maker` | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式吃盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源仍未开放 |
 | `price-alert` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
 | `scanner` | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
 
@@ -185,6 +185,12 @@ crypto-trading scanner [OPTIONS]
 crypto-trading config-check <PATHS>... [--json]
 ```
 
+> [!IMPORTANT]
+> `monitor` / `volume-maker` / `price-alert` / `scanner` / `testnet-soak` 的
+> `serve|status|stop` loopback control host 现在要求环境变量
+> `CRYPTO_TRADING_TASK_CONTROL_TOKEN`。该值不会出现在命令行参数里，且必须是
+> 32-512 字节的可打印非空白 ASCII secret；缺失、长度不符或 token 不匹配都会失败关闭。
+
 ## Binance Testnet lifecycle
 
 `testnet-lifecycle` 是显式授权、journal-first 的 Binance Testnet
@@ -231,6 +237,7 @@ asset 余额必须为零，且 settlement asset 的可用余额必须等于该 r
 ```powershell
 $env:BINANCE_API_KEY = "..."
 $env:BINANCE_API_SECRET = "..."
+$env:CRYPTO_TRADING_TASK_CONTROL_TOKEN = "<32-512 byte generated secret>"
 
 $taskId = "binance-testnet-24h"
 $history = "var/history/binance-testnet-24h.jsonl"
@@ -307,9 +314,11 @@ Windows 对应文件为 `target\release\crypto-trading.exe`。
 
 ## Web 控制面
 
-除了 CLI，仓库还交付一个**只读**的本地操作台 `crypto-trading-web`。它把同一份
-journal 投影成人类可读的视图：授权状态、行情新鲜度、adapter 健康、批次计划与结果、
-未恢复的执行状态。它**没有任何写路由**，因此无法通过浏览器构造交易权限。
+除了 CLI，仓库还交付一个默认只读、默认 bearer 保护的本地操作台
+`crypto-trading-web`。它把同一份 journal 投影成人类可读的视图：授权状态、可取得的
+运行信号、批次计划与结果、未恢复的执行状态。只有显式启用
+`--enable-paper-writes`、加载受限 replay profile 和账户风控配置后，才会开放
+loopback-only 的受信 Paper submit 路由；它没有 testnet/mainnet 写权限。
 
 设计规范见 [`docs/design-system.md`](docs/design-system.md)。操作台前端是 `frontend/` 下的
 React + Vite + TypeScript 应用；`pnpm build` 产出的 `frontend/dist/` 在编译期由

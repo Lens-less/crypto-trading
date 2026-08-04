@@ -997,7 +997,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Paper],
                 CapabilityAccess::PaperTrading,
             ),
-            "Validated volume-maker configuration plus a recoverable replay-backed paper owner: virtual maker quotes and imbalance market cycles become independent single-leg reservations with reduce-only closes, account-risk admission, durable hourly statistics facts, and a CLI validate/serve/status/stop task host.",
+            "Validated volume-maker configuration plus a recoverable replay-backed paper owner: serve requires an explicit account-risk configuration; virtual maker quotes and imbalance market cycles become independent single-leg reservations with reduce-only closes, account-risk admission, durable hourly statistics facts, and a CLI validate/serve/status/stop task host.",
             &[
                 "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the volume-maker task host, and no testnet/mainnet order authority is implied.",
                 "The owner keeps no resting orders: limit-mode quotes are virtual and execute only when a later observation crosses them, so legacy post-only resting semantics are simulated, not reproduced; each serve run plans a fresh paper account generation and restart on a foreign generation fails closed.",

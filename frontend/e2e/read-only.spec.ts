@@ -16,7 +16,11 @@ const BADGE_LABELS = ["已连接 · 仅通知", "重连中", "通知不可用"];
 let backend: Backend;
 
 test.beforeAll(async () => {
-  backend = await startBackend({ port: PORT, historyPath: WEB_API_JOURNAL });
+  backend = await startBackend({
+    port: PORT,
+    historyPath: WEB_API_JOURNAL,
+    extraArgs: ["--allow-open-loopback-read-api"],
+  });
 });
 
 test.afterAll(async () => {

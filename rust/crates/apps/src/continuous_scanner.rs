@@ -16,6 +16,7 @@ use crypto_trading_runtime::{
     MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError, MarketSupervisorExit,
     MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
 };
+use crypto_trading_strategy::AprEstimateAssumptions;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tokio::{
@@ -46,6 +47,7 @@ pub struct ScannerCandidateSpec {
     pub instrument: MarketInstrument,
     pub grid_width_percent: Decimal,
     pub grid_interval_percent: Decimal,
+    pub apr_estimate_assumptions: AprEstimateAssumptions,
     pub volume_24h_usdc: Decimal,
     pub price_change_24h_percent: Option<Decimal>,
     pub benchmark: bool,
@@ -78,6 +80,7 @@ struct CandidateState {
 pub struct ScannerReplayRuntime {
     run_id: String,
     apr_window_seconds: u32,
+    apr_estimate_assumptions: AprEstimateAssumptions,
     min_complete_cycles: u64,
     row_limit: usize,
     total_observations: usize,
@@ -95,6 +98,7 @@ impl ScannerReplayRuntime {
     pub fn new(
         run_id: impl Into<String>,
         apr_window_seconds: u32,
+        apr_estimate_assumptions: AprEstimateAssumptions,
         min_complete_cycles: u64,
         row_limit: usize,
         specs: Vec<ScannerCandidateSpec>,
@@ -108,6 +112,7 @@ impl ScannerReplayRuntime {
             run_id.clone(),
             DateTime::<Utc>::UNIX_EPOCH,
             apr_window_seconds,
+            apr_estimate_assumptions,
             min_complete_cycles,
             row_limit,
             probe,
@@ -116,6 +121,7 @@ impl ScannerReplayRuntime {
         Ok(Self {
             run_id,
             apr_window_seconds,
+            apr_estimate_assumptions,
             min_complete_cycles,
             row_limit,
             total_observations: 0,
@@ -224,6 +230,7 @@ impl ScannerReplayRuntime {
             self.run_id.clone(),
             evaluated_at,
             self.apr_window_seconds,
+            self.apr_estimate_assumptions,
             self.min_complete_cycles,
             self.row_limit,
             candidates,

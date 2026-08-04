@@ -103,6 +103,9 @@ async fn fixture_journal_projects_cleanly_and_populates_every_read_model() {
     assert_eq!(system["projection_status"], "complete");
     assert_eq!(system["journal_id"], FIXTURE_JOURNAL_ID);
     assert_eq!(system["warning_count"], 0);
+    assert_eq!(system["kill_switch"], "normal");
+    assert_eq!(system["market_data_freshness"], "not_available");
+    assert_eq!(system["adapter_health"], "normal");
 
     let monitor = get_json(&app, "/api/v1/monitor").await;
     assert_eq!(monitor["projection_status"], "complete");

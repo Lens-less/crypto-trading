@@ -25,6 +25,10 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_crypto-trading")
 }
 
+fn control_token() -> &'static str {
+    "0123456789abcdef0123456789abcdef"
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -104,6 +108,7 @@ fn monitor_live_serve_polls_both_loopback_venues_and_stops_cleanly() {
     let stop = loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "monitor",
                 "--mode",
@@ -169,6 +174,7 @@ fn monitor_live_serve_refuses_a_non_binance_hyperliquid_pair() {
 
     let output = Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "monitor",
             "--mode",
@@ -202,6 +208,7 @@ fn spawn_live_serve(spec: &LiveServeSpec<'_>) -> ChildGuard {
     ChildGuard(Some(
         Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "monitor",
                 "--mode",
@@ -275,6 +282,7 @@ fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
     loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "monitor",
                 "--mode",

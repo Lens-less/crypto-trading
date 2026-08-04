@@ -14,6 +14,11 @@ function scanView(overrides: Partial<VirtualGridScanView> = {}): VirtualGridScan
     run_id: "run-1",
     ranking_policy: "explicit_benchmark_then_apr_desc",
     apr_window_seconds: 3600,
+    estimated_apr_kind: "heuristic",
+    estimated_apr_assumptions: {
+      order_notional_usdc: "100",
+      round_trip_fee_percent: "0.2",
+    },
     min_complete_cycles: 2,
     row_limit: 128,
     candidate_count: 3,

@@ -16,6 +16,8 @@ pub enum ConfigError {
     Yaml(#[from] serde_yaml::Error),
     #[error("invalid configuration: {0}")]
     Validation(String),
+    #[error("missing required configuration field: {path}")]
+    MissingRequiredField { path: &'static str },
     #[error("environment variable {key} must be an unsigned integer")]
     InvalidEnvironmentNumber { key: String },
 }

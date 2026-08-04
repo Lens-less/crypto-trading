@@ -10,13 +10,13 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
-    future::Future,
+    future::{Future, pending},
     io::ErrorKind,
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -36,16 +36,18 @@ use crypto_trading_runtime::{
     MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MarketDataError, MarketDataEvent,
     MarketDataEventSource, MarketSupervisor, MarketSupervisorConfig, MarketSupervisorError,
     MarketSupervisorExit, MarketSupervisorHealth, MarketSupervisorPhase, MarketSupervisorStatus,
-    ObservedMarketPair, PaperAccountAuthority, PaperAccountError, PaperAccountSnapshot,
-    PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg, PaperReservationPhase,
-    PaperReservationRequest, ProjectionStatus, ReadModelError, ReadOnlyTaskKind, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskView, RuntimeError,
-    SpreadHistoryReadModel, SpreadHistorySampleView, read_journal_chain,
+    ObservedMarketPair, PaperAccountAuthority, PaperAccountError, PaperAccountOperationLease,
+    PaperAccountSnapshot, PaperCostModel, PaperReconciliationOutcome, PaperReservationLeg,
+    PaperReservationPhase, PaperReservationRequest, ProjectionStatus, ReadModelError,
+    ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
+    ReadOnlyTaskView, RuntimeError, SpreadHistoryReadModel, SpreadHistorySampleView,
+    read_journal_chain,
 };
 use crypto_trading_strategy::{
-    AccountRiskSnapshot, ArbitrageDecision, ArbitrageDecisionKind, ArbitrageState,
-    ArbitrageStrategy, HistoryDecisionKind, HistoryDecisionMachine, PairStrategyMachine,
-    RiskDecision, RiskEngine, RiskLimits, RiskRejection, SpreadSample, StrategyError,
+    AccountRiskSnapshot, ArbitrageDecision, ArbitrageDecisionKind, ArbitrageDirection,
+    ArbitrageState, ArbitrageStrategy, HistoryDecisionKind, HistoryDecisionMachine,
+    PairStrategyMachine, RiskDecision, RiskEngine, RiskLimits, RiskRejection, SpreadQuote,
+    SpreadSample, StrategyError,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -77,6 +79,8 @@ const TASK_STRATEGY: &str = "read_only_task";
 const TASK_SYMBOL: &str = "control-plane";
 const MAX_TASK_ID_BYTES: usize = 96;
 const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
+const ACCOUNT_RISK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const ACCOUNT_RISK_INFLIGHT_GRACE: Duration = Duration::from_millis(500);
 
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type ArbitragePaperExecutionFuture =
@@ -273,6 +277,7 @@ pub struct ArbitragePaperTask {
     account: PaperAccountAuthority,
     history: JsonlHistory,
     shutdown_grace: Duration,
+    active_operation_lease: ActiveOperationLease,
 }
 
 impl ArbitragePaperTask {
@@ -314,6 +319,9 @@ impl ArbitragePaperTask {
         let source_ids = [left_source_id, right_source_id];
         let operation_sequence =
             recovery_preflight(&config.task_id, &source_ids, &account, &history).await?;
+        if config.account_risk.is_some() {
+            account.ensure_initialized().await?;
+        }
 
         if let Some(path) = config.spread_history_path.clone()
             && let Some(machine) = config.history_decision.as_mut()
@@ -387,6 +395,8 @@ impl ArbitragePaperTask {
         let task_status = status_sender.clone();
         let task_history = history.clone();
         let task_config = config.clone();
+        let active_operation_lease = Arc::new(StdMutex::new(None));
+        let task_active_operation_lease = Arc::clone(&active_operation_lease);
         let join = tokio::spawn(async move {
             Box::pin(run_owner(
                 task_config,
@@ -401,6 +411,7 @@ impl ArbitragePaperTask {
                 cancel_receiver,
                 running_at,
                 operation_sequence,
+                task_active_operation_lease,
             ))
             .await
         });
@@ -415,6 +426,7 @@ impl ArbitragePaperTask {
             account,
             history,
             shutdown_grace: config.supervisor.shutdown_grace(),
+            active_operation_lease,
         })
     }
 
@@ -449,6 +461,9 @@ impl ArbitragePaperTask {
             return Err(ArbitragePaperTaskError::TaskCancelled);
         };
         let result = Self::map_join(join.await);
+        if let Some(operation_lease) = clone_active_operation_lease(&self.active_operation_lease) {
+            self.retain_active_capacity(Some(operation_lease)).await;
+        }
         self.store_completion(&result);
         result
     }
@@ -492,11 +507,21 @@ impl ArbitragePaperTask {
         };
         let deadline = self.shutdown_grace.saturating_mul(2);
         let result = if let Ok(joined) = tokio::time::timeout(deadline, &mut join).await {
-            Self::map_join(joined)
+            let result = Self::map_join(joined);
+            if let Some(operation_lease) =
+                clone_active_operation_lease(&self.active_operation_lease)
+            {
+                self.retain_active_capacity(Some(operation_lease)).await;
+            }
+            result
         } else {
+            // Clone the registered lease before aborting the owner. Its
+            // in-flight Drop only signals child cancellation; this clone keeps
+            // the lane closed through external Pending -> Uncertain retention.
+            let operation_lease = clone_active_operation_lease(&self.active_operation_lease);
             join.abort();
             let _ = join.await;
-            self.retain_active_capacity().await;
+            self.retain_active_capacity(operation_lease).await;
             self.record_external_failure(ArbitragePaperTaskFailure::RecoveryRequired)
                 .await?;
             Err(ArbitragePaperTaskError::ShutdownTimedOut)
@@ -525,20 +550,32 @@ impl ArbitragePaperTask {
         });
     }
 
-    async fn retain_active_capacity(&self) {
-        let Ok(snapshot) = self.account.snapshot().await else {
+    async fn retain_active_capacity(&self, operation_lease: Option<PaperAccountOperationLease>) {
+        let operation_lease = match operation_lease
+            .or_else(|| clone_active_operation_lease(&self.active_operation_lease))
+        {
+            Some(operation_lease) => operation_lease,
+            None => self.account.acquire_operation_lease().await,
+        };
+        let Ok(snapshot) = account_decision_snapshot(&self.account).await else {
             return;
         };
         let prefix = operation_prefix(&self.status().task_id);
         for reservation in snapshot.reservations.iter().filter(|reservation| {
-            reservation.task_id.starts_with(&prefix)
+            owner_operation_sequence(&reservation.task_id, &prefix).is_some()
                 && reservation.phase == PaperReservationPhase::Pending
         }) {
-            let _ = self
+            if self
                 .account
                 .mark_uncertain(reservation.reservation_id)
-                .await;
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
+        clear_active_operation_lease(&self.active_operation_lease);
+        drop(operation_lease);
     }
 
     async fn record_external_failure(
@@ -582,7 +619,38 @@ impl Drop for ArbitragePaperTask {
 }
 
 type TaskResult = Result<ArbitragePaperTaskExit, ArbitragePaperTaskError>;
-type OperationJoinResult = Result<Result<PaperArbitrageRun, PaperArbitrageSagaError>, JoinError>;
+type OperationRunResult = Result<PaperArbitrageRun, PaperArbitrageSagaError>;
+type OperationJoinResult = Result<(OperationRunResult, PaperAccountOperationLease), JoinError>;
+type ActiveOperationLease = Arc<StdMutex<Option<PaperAccountOperationLease>>>;
+
+fn register_active_operation_lease(
+    active: &ActiveOperationLease,
+    lease: &PaperAccountOperationLease,
+) -> Result<(), ArbitragePaperTaskError> {
+    let mut slot = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_some() {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    *slot = Some(lease.clone());
+    Ok(())
+}
+
+fn clone_active_operation_lease(
+    active: &ActiveOperationLease,
+) -> Option<PaperAccountOperationLease> {
+    active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn clear_active_operation_lease(active: &ActiveOperationLease) {
+    *active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
 
 #[derive(Debug)]
 struct InFlightOperation {
@@ -590,11 +658,11 @@ struct InFlightOperation {
     decision: ArbitrageDecision,
     admission_ticket: Option<AccountRiskAdmissionTicket>,
     execution_started: Arc<AtomicBool>,
-    join: Option<JoinHandle<Result<PaperArbitrageRun, PaperArbitrageSagaError>>>,
+    join: Option<JoinHandle<(OperationRunResult, PaperAccountOperationLease)>>,
 }
 
 impl InFlightOperation {
-    fn join_mut(&mut self) -> &mut JoinHandle<Result<PaperArbitrageRun, PaperArbitrageSagaError>> {
+    fn join_mut(&mut self) -> &mut JoinHandle<(OperationRunResult, PaperAccountOperationLease)> {
         self.join
             .as_mut()
             .expect("an in-flight arbitrage operation always owns its join handle")
@@ -626,6 +694,7 @@ struct PlannedOperation {
     decision: ArbitrageDecision,
     pair: ObservedMarketPair,
     admission_ticket: Option<AccountRiskAdmissionTicket>,
+    operation_lease: PaperAccountOperationLease,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -642,12 +711,34 @@ async fn run_owner(
     mut cancel: watch::Receiver<bool>,
     mut last_recorded_at: DateTime<Utc>,
     mut operation_sequence: u64,
+    active_operation_lease: ActiveOperationLease,
 ) -> TaskResult {
-    let mut state = ArbitrageState::default();
+    let mut state = match restore_state_from_account(saga.account(), &config.task_id).await {
+        Ok(state) => state,
+        Err(error) => {
+            let failure = error.failure_bucket();
+            return fail_owner(
+                &mut left,
+                &mut right,
+                &history,
+                &status_sender,
+                &mut last_recorded_at,
+                failure,
+                error,
+            )
+            .await;
+        }
+    };
     let mut in_flight: Option<InFlightOperation> = None;
     let mut pending_opportunity = false;
     let mut history_machine = config.history_decision.clone();
     let mut latest_history_sample: Option<SpreadSample> = None;
+    let mut last_exact_pair: Option<ObservedMarketPair> = None;
+    let mut account_risk_poll = config.account_risk.as_ref().map(|_| {
+        let mut interval = tokio::time::interval(ACCOUNT_RISK_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    });
 
     loop {
         let selected = if let Some(operation) = in_flight.as_mut() {
@@ -667,6 +758,13 @@ async fn run_owner(
                         continue;
                     }
                 }
+                () = async {
+                    if let Some(interval) = account_risk_poll.as_mut() {
+                        interval.tick().await;
+                    } else {
+                        pending::<()>().await;
+                    }
+                } => Selected::AccountRiskPoll,
                 result = operation.join_mut() => Selected::Operation(result),
                 result = left.next_event() => Selected::Left(result),
                 result = right.next_event() => Selected::Right(result),
@@ -688,6 +786,13 @@ async fn run_owner(
                         continue;
                     }
                 }
+                () = async {
+                    if let Some(interval) = account_risk_poll.as_mut() {
+                        interval.tick().await;
+                    } else {
+                        pending::<()>().await;
+                    }
+                } => Selected::AccountRiskPoll,
                 result = left.next_event() => Selected::Left(result),
                 result = right.next_event() => Selected::Right(result),
             }
@@ -708,7 +813,89 @@ async fn run_owner(
                     saga.account(),
                     config.account_risk.as_ref(),
                     &config.task_id,
+                    config.cost_model,
+                    &saga,
+                    Arc::clone(&executor),
+                    None,
+                    &mut operation_sequence,
                     &mut state,
+                    &active_operation_lease,
+                )
+                .await;
+            }
+            Selected::AccountRiskPoll => {
+                let Some(risk) = config.account_risk.as_ref() else {
+                    continue;
+                };
+                let directive_decision = match handle_account_risk_directive(
+                    risk,
+                    &config.task_id,
+                    monitor.legs().0.symbol.as_str(),
+                    &history,
+                    Utc::now(),
+                    &mut last_recorded_at,
+                    &state,
+                    last_exact_pair.clone(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if let Err(abort_error) = abort_inflight(
+                            &mut in_flight,
+                            saga.account(),
+                            config.account_risk.as_ref(),
+                            &config.task_id,
+                        )
+                        .await
+                        {
+                            let failure = abort_error.failure_bucket();
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                abort_error,
+                            )
+                            .await;
+                        }
+                        let failure = error.failure_bucket();
+                        return fail_owner(
+                            &mut left,
+                            &mut right,
+                            &history,
+                            &status_sender,
+                            &mut last_recorded_at,
+                            failure,
+                            error,
+                        )
+                        .await;
+                    }
+                };
+                let Some(directive_close_pair) = directive_decision else {
+                    continue;
+                };
+                return stop_owner(
+                    &mut left,
+                    &mut right,
+                    &history,
+                    &status_sender,
+                    &mut last_recorded_at,
+                    ArbitragePaperTaskExit::StopRequested,
+                    in_flight.take(),
+                    false,
+                    saga.account(),
+                    config.account_risk.as_ref(),
+                    &config.task_id,
+                    config.cost_model,
+                    &saga,
+                    Arc::clone(&executor),
+                    directive_close_pair,
+                    &mut operation_sequence,
+                    &mut state,
+                    &active_operation_lease,
                 )
                 .await;
             }
@@ -716,35 +903,41 @@ async fn run_owner(
                 let operation = in_flight
                     .take()
                     .ok_or(ArbitragePaperTaskError::TaskCancelled)?;
-                if let Err(operation_error) =
-                    complete_operation(result, &operation.decision, &mut state)
-                {
-                    let error = match retain_cancelled_operation(
-                        saga.account(),
-                        config.account_risk.as_ref(),
-                        &config.task_id,
-                        operation.admission_ticket.as_ref(),
-                        &operation.request,
-                        Utc::now(),
-                    )
-                    .await
-                    {
-                        Ok(false) => operation_error,
-                        Ok(true) => ArbitragePaperTaskError::RecoveryRequired,
-                        Err(error) => error,
+                let operation_lease =
+                    match complete_operation(result, &operation.decision, &mut state) {
+                        Ok(operation_lease) => operation_lease,
+                        Err(operation_error) => {
+                            let error = match retain_cancelled_operation(
+                                saga.account(),
+                                config.account_risk.as_ref(),
+                                &config.task_id,
+                                operation.admission_ticket.as_ref(),
+                                &operation.request,
+                                Utc::now(),
+                            )
+                            .await
+                            {
+                                Ok(false) => operation_error,
+                                Ok(true) => ArbitragePaperTaskError::RecoveryRequired,
+                                Err(error) => error,
+                            };
+                            let (failure, error) = classify_operation_error(error);
+                            return fail_owner(
+                                &mut left,
+                                &mut right,
+                                &history,
+                                &status_sender,
+                                &mut last_recorded_at,
+                                failure,
+                                error,
+                            )
+                            .await;
+                        }
                     };
-                    let (failure, error) = classify_operation_error(error);
-                    return fail_owner(
-                        &mut left,
-                        &mut right,
-                        &history,
-                        &status_sender,
-                        &mut last_recorded_at,
-                        failure,
-                        error,
-                    )
-                    .await;
-                }
+                // Settlement is durable and any cancellation compensation is
+                // complete, so the next coalesced plan may take the account
+                // operation lane without recursively waiting on this owner.
+                drop(operation);
                 // A flat strategy position closes the owner-level risk clock.
                 if let Some(risk) = config.account_risk.as_ref()
                     && state.position_quantity.is_zero()
@@ -763,6 +956,8 @@ async fn run_owner(
                     )
                     .await;
                 }
+                clear_active_operation_lease(&active_operation_lease);
+                drop(operation_lease);
                 if pending_opportunity && !*stop.borrow() && !*cancel.borrow() {
                     pending_opportunity = false;
                     let gate_open = match history_gate(
@@ -792,6 +987,7 @@ async fn run_owner(
                         saga.account(),
                         &state,
                         &mut operation_sequence,
+                        &active_operation_lease,
                     )
                     .await
                     {
@@ -910,6 +1106,9 @@ async fn run_owner(
                         .await;
                     }
                 };
+                if let Some(pair) = current_exact_pair(&monitor) {
+                    last_exact_pair = Some(pair);
+                }
                 let is_opportunity = matches!(
                     monitor_event.outcome,
                     ArbitrageMonitorOutcome::Opportunity { .. }
@@ -1085,8 +1284,19 @@ async fn run_owner(
                 // Durable account-risk close directives stop the owner
                 // fail-closed before any further opportunity is planned.
                 if let Some(risk) = config.account_risk.as_ref() {
-                    let directives = match risk.directives(monitor_event.recorded_at).await {
-                        Ok(directives) => directives,
+                    let directive_decision = match handle_account_risk_directive(
+                        risk,
+                        &config.task_id,
+                        monitor.legs().0.symbol.as_str(),
+                        &history,
+                        monitor_event.recorded_at,
+                        &mut last_recorded_at,
+                        &state,
+                        last_exact_pair.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
                         Err(error) => {
                             if let Err(abort_error) = abort_inflight(
                                 &mut in_flight,
@@ -1108,63 +1318,20 @@ async fn run_owner(
                                 )
                                 .await;
                             }
+                            let failure = error.failure_bucket();
                             return fail_owner(
                                 &mut left,
                                 &mut right,
                                 &history,
                                 &status_sender,
                                 &mut last_recorded_at,
-                                ArbitragePaperTaskFailure::AccountContract,
-                                ArbitragePaperTaskError::AccountRisk(error),
+                                failure,
+                                error,
                             )
                             .await;
                         }
                     };
-                    if let Some(reason) = account_risk_exit_reason(&directives, &config.task_id) {
-                        let directive_recorded_at = Utc::now().max(last_recorded_at);
-                        if let Err(error) = history
-                            .append(&account_risk_directive_record(
-                                &config.task_id,
-                                "arbitrage_paper",
-                                monitor.legs().0.symbol.as_str(),
-                                &reason,
-                                "",
-                                directive_recorded_at,
-                            ))
-                            .await
-                        {
-                            if let Err(abort_error) = abort_inflight(
-                                &mut in_flight,
-                                saga.account(),
-                                config.account_risk.as_ref(),
-                                &config.task_id,
-                            )
-                            .await
-                            {
-                                let failure = abort_error.failure_bucket();
-                                return fail_owner(
-                                    &mut left,
-                                    &mut right,
-                                    &history,
-                                    &status_sender,
-                                    &mut last_recorded_at,
-                                    failure,
-                                    abort_error,
-                                )
-                                .await;
-                            }
-                            return fail_owner(
-                                &mut left,
-                                &mut right,
-                                &history,
-                                &status_sender,
-                                &mut last_recorded_at,
-                                ArbitragePaperTaskFailure::JournalUnavailable,
-                                ArbitragePaperTaskError::Journal(error),
-                            )
-                            .await;
-                        }
-                        last_recorded_at = directive_recorded_at;
+                    if let Some(directive_close_pair) = directive_decision {
                         return stop_owner(
                             &mut left,
                             &mut right,
@@ -1177,7 +1344,13 @@ async fn run_owner(
                             saga.account(),
                             config.account_risk.as_ref(),
                             &config.task_id,
+                            config.cost_model,
+                            &saga,
+                            Arc::clone(&executor),
+                            directive_close_pair,
+                            &mut operation_sequence,
                             &mut state,
+                            &active_operation_lease,
                         )
                         .await;
                     }
@@ -1211,6 +1384,7 @@ async fn run_owner(
                         saga.account(),
                         &state,
                         &mut operation_sequence,
+                        &active_operation_lease,
                     )
                     .await
                     {
@@ -1271,7 +1445,13 @@ async fn run_owner(
                     saga.account(),
                     config.account_risk.as_ref(),
                     &config.task_id,
+                    config.cost_model,
+                    &saga,
+                    Arc::clone(&executor),
+                    None,
+                    &mut operation_sequence,
                     &mut state,
+                    &active_operation_lease,
                 )
                 .await;
             }
@@ -1314,9 +1494,57 @@ async fn run_owner(
 enum Selected {
     Stop,
     Cancel,
+    AccountRiskPoll,
     Left(Result<Option<MarketDataEvent>, MarketSupervisorError>),
     Right(Result<Option<MarketDataEvent>, MarketSupervisorError>),
     Operation(OperationJoinResult),
+}
+
+fn current_exact_pair(monitor: &ReadOnlyArbitrageMonitor) -> Option<ObservedMarketPair> {
+    let (left_leg, right_leg) = monitor.legs();
+    monitor.book().current_pair(left_leg, right_leg).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_account_risk_directive(
+    risk: &AccountRiskAuthority,
+    task_id: &str,
+    symbol: &str,
+    history: &JsonlHistory,
+    observed_at: DateTime<Utc>,
+    last_recorded_at: &mut DateTime<Utc>,
+    state: &ArbitrageState,
+    last_exact_pair: Option<ObservedMarketPair>,
+) -> Result<Option<Option<ObservedMarketPair>>, ArbitragePaperTaskError> {
+    let directives = risk
+        .directives(observed_at)
+        .await
+        .map_err(ArbitragePaperTaskError::AccountRisk)?;
+    let Some(reason) = account_risk_exit_reason(&directives, task_id) else {
+        return Ok(None);
+    };
+    let directive_recorded_at = Utc::now().max(*last_recorded_at);
+    history
+        .append(&account_risk_directive_record(
+            task_id,
+            "arbitrage_paper",
+            symbol,
+            &reason,
+            "",
+            directive_recorded_at,
+        ))
+        .await
+        .map_err(ArbitragePaperTaskError::Journal)?;
+    *last_recorded_at = directive_recorded_at;
+    if !state.position_quantity.is_zero() && last_exact_pair.is_none() {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    // Preserve the exact cached pair even when the pre-operation state is
+    // flat. An opening saga may already be executing while `state` still
+    // reflects its pre-operation position; shutdown reprojects the durable
+    // account after draining that saga and uses this pair to close any raced
+    // exposure.
+    Ok(Some(last_exact_pair))
 }
 
 async fn plan_latest_operation(
@@ -1325,6 +1553,7 @@ async fn plan_latest_operation(
     account: &PaperAccountAuthority,
     state: &ArbitrageState,
     operation_sequence: &mut u64,
+    active_operation_lease: &ActiveOperationLease,
 ) -> Result<Option<PlannedOperation>, ArbitragePaperTaskError> {
     let (left_leg, right_leg) = monitor.legs();
     let pair = monitor.book().current_pair(left_leg, right_leg)?;
@@ -1334,48 +1563,33 @@ async fn plan_latest_operation(
     if decision.intents.is_empty() {
         return Ok(None);
     }
-    // Opening exposure passes the durable account-level admission before any
-    // reservation exists; a recorded rejection skips the opportunity while
-    // reducing decisions stay exempt so risk can always be closed out.
-    let mut admission_ticket = None;
-    if let Some(risk) = config.account_risk.as_ref()
-        && matches!(
-            decision.kind,
-            ArbitrageDecisionKind::Open | ArbitrageDecisionKind::Increase
-        )
-    {
-        let markets = [pair.left.clone(), pair.right.clone()];
-        let mut notional = Decimal::ZERO;
-        for intent in &decision.intents {
-            let market = matching_market(intent, &markets)?;
-            let execution_price = intent.price.unwrap_or_else(|| match intent.side {
-                Side::Buy => market.ask(),
-                Side::Sell => market.bid(),
-            });
-            notional = execution_price
-                .as_decimal()
-                .checked_mul(intent.quantity.as_decimal())
-                .and_then(|value| notional.checked_add(value))
-                .ok_or(ArbitragePaperTaskError::InvalidRequest)?;
-        }
-        let candidate = AccountRiskCandidate::new(
-            config.task_id.clone(),
-            decision.intents[0].symbol.as_str(),
-            Money::new(notional),
-        )
-        .map_err(ArbitragePaperTaskError::AccountRisk)?;
-        match risk
-            .admit(&candidate, pair.observed_at)
-            .await
-            .map_err(ArbitragePaperTaskError::AccountRisk)?
-        {
-            AccountRiskAdmission::Admitted { ticket, .. } => admission_ticket = Some(ticket),
-            AccountRiskAdmission::Rejected(_) => return Ok(None),
-        }
-    }
-    let account_snapshot = match account.snapshot().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
+    // Serialize the complete account operation lane before admission or any
+    // account-derived decision. The lease follows the plan into the in-flight
+    // saga and is released only after settlement or cancellation retention.
+    let operation_lease = account.acquire_operation_lease().await;
+    register_active_operation_lease(active_operation_lease, &operation_lease)?;
+    let result = async {
+        // Opening exposure passes the durable account-level admission before any
+        // reservation exists; a recorded rejection skips the opportunity while
+        // reducing decisions stay exempt so risk can always be closed out.
+        let admission_ticket = match admit_planned_operation(config, &pair, &decision).await? {
+            PlannedOperationAdmission::Proceed(ticket) => ticket,
+            PlannedOperationAdmission::Rejected => return Ok(None),
+        };
+        let account_snapshot = match account_decision_snapshot(account).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                discard_planned_admission(
+                    config.account_risk.as_ref(),
+                    &config.task_id,
+                    admission_ticket.as_ref(),
+                    pair.observed_at,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let Some(next_sequence) = operation_sequence.checked_add(1) else {
             discard_planned_admission(
                 config.account_risk.as_ref(),
                 &config.task_id,
@@ -1383,46 +1597,94 @@ async fn plan_latest_operation(
                 pair.observed_at,
             )
             .await?;
-            return Err(error.into());
-        }
-    };
-    let Some(next_sequence) = operation_sequence.checked_add(1) else {
-        discard_planned_admission(
-            config.account_risk.as_ref(),
-            &config.task_id,
+            return Err(ArbitragePaperTaskError::InvalidRequest);
+        };
+        let request = match build_operation(
+            config,
+            &pair,
+            state,
+            &account_snapshot,
+            &decision,
             admission_ticket.as_ref(),
-            pair.observed_at,
-        )
-        .await?;
-        return Err(ArbitragePaperTaskError::InvalidRequest);
+            next_sequence,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                discard_planned_admission(
+                    config.account_risk.as_ref(),
+                    &config.task_id,
+                    admission_ticket.as_ref(),
+                    pair.observed_at,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        *operation_sequence = next_sequence;
+        Ok(Some(PlannedOperation {
+            request,
+            decision,
+            pair,
+            admission_ticket,
+            operation_lease,
+        }))
     };
-    let request = match build_operation(
-        config,
-        &pair,
-        state,
-        &account_snapshot,
-        &decision,
-        next_sequence,
+    let result = result.await;
+    if !matches!(result.as_ref(), Ok(Some(_))) {
+        clear_active_operation_lease(active_operation_lease);
+    }
+    result
+}
+
+enum PlannedOperationAdmission {
+    Proceed(Option<AccountRiskAdmissionTicket>),
+    Rejected,
+}
+
+async fn admit_planned_operation(
+    config: &ArbitragePaperTaskConfig,
+    pair: &ObservedMarketPair,
+    decision: &ArbitrageDecision,
+) -> Result<PlannedOperationAdmission, ArbitragePaperTaskError> {
+    let Some(risk) = config.account_risk.as_ref() else {
+        return Ok(PlannedOperationAdmission::Proceed(None));
+    };
+    if !matches!(
+        decision.kind,
+        ArbitrageDecisionKind::Open | ArbitrageDecisionKind::Increase
     ) {
-        Ok(request) => request,
-        Err(error) => {
-            discard_planned_admission(
-                config.account_risk.as_ref(),
-                &config.task_id,
-                admission_ticket.as_ref(),
-                pair.observed_at,
-            )
-            .await?;
-            return Err(error);
+        return Ok(PlannedOperationAdmission::Proceed(None));
+    }
+    let markets = [pair.left.clone(), pair.right.clone()];
+    let mut notional = Decimal::ZERO;
+    for intent in &decision.intents {
+        let market = matching_market(intent, &markets)?;
+        let execution_price = intent.price.unwrap_or_else(|| match intent.side {
+            Side::Buy => market.ask(),
+            Side::Sell => market.bid(),
+        });
+        notional = execution_price
+            .as_decimal()
+            .checked_mul(intent.quantity.as_decimal())
+            .and_then(|value| notional.checked_add(value))
+            .ok_or(ArbitragePaperTaskError::InvalidRequest)?;
+    }
+    let candidate = AccountRiskCandidate::new(
+        config.task_id.clone(),
+        decision.intents[0].symbol.as_str(),
+        Money::new(notional),
+    )
+    .map_err(ArbitragePaperTaskError::AccountRisk)?;
+    match risk
+        .admit(&candidate, pair.observed_at)
+        .await
+        .map_err(ArbitragePaperTaskError::AccountRisk)?
+    {
+        AccountRiskAdmission::Admitted { ticket, .. } => {
+            Ok(PlannedOperationAdmission::Proceed(Some(ticket)))
         }
-    };
-    *operation_sequence = next_sequence;
-    Ok(Some(PlannedOperation {
-        request,
-        decision,
-        pair,
-        admission_ticket,
-    }))
+        AccountRiskAdmission::Rejected(_) => Ok(PlannedOperationAdmission::Rejected),
+    }
 }
 
 /// Applies the optional history ("natural spread") gate: without the mode
@@ -1559,9 +1821,16 @@ fn build_operation(
     state: &ArbitrageState,
     account: &PaperAccountSnapshot,
     decision: &ArbitrageDecision,
+    admission_ticket: Option<&AccountRiskAdmissionTicket>,
     operation_sequence: u64,
 ) -> Result<PaperArbitrageRequest, ArbitragePaperTaskError> {
     if account.projection_status != ProjectionStatus::Complete
+        || account.reservations.iter().any(|reservation| {
+            matches!(
+                reservation.phase,
+                PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
+            )
+        })
         || account.reservations.iter().any(|reservation| {
             reservation
                 .reconciliation
@@ -1577,6 +1846,7 @@ fn build_operation(
     {
         return Err(ArbitragePaperTaskError::InvalidRequest);
     }
+    ensure_operation_fifo_isolation(account, &config.task_id, &decision.intents)?;
     let positions = strategy_positions(state, pair)?;
     let account_risk = AccountRiskSnapshot {
         equity: account.initial_available,
@@ -1628,8 +1898,153 @@ fn build_operation(
         config.cost_model,
         legs,
     )?;
+    let reservation = if let Some(ticket) = admission_ticket {
+        let risk = config
+            .account_risk
+            .as_ref()
+            .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+        reservation.with_account_risk_admission(risk.scope_id(), ticket)?
+    } else {
+        reservation
+    };
     PaperArbitrageRequest::new(decision.intents[0].symbol.clone(), batch, reservation)
         .map_err(ArbitragePaperTaskError::Saga)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_forced_close_operation(
+    task_id: &str,
+    cost_model: PaperCostModel,
+    pair: &ObservedMarketPair,
+    state: &ArbitrageState,
+    account: &PaperAccountSnapshot,
+    operation_sequence: u64,
+    operation_lease: PaperAccountOperationLease,
+) -> Result<PlannedOperation, ArbitragePaperTaskError> {
+    if account.projection_status != ProjectionStatus::Complete
+        || account.reservations.iter().any(|reservation| {
+            matches!(
+                reservation.phase,
+                PaperReservationPhase::Pending | PaperReservationPhase::Uncertain
+            )
+        })
+        || account.reservations.iter().any(|reservation| {
+            reservation
+                .reconciliation
+                .as_ref()
+                .is_some_and(|record| record.outcome == PaperReconciliationOutcome::Failed)
+        })
+    {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    let direction = state
+        .direction
+        .as_ref()
+        .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+    let quantity = Quantity::new(state.position_quantity)
+        .map_err(|_| ArbitragePaperTaskError::RecoveryRequired)?;
+    let original_buy = matching_snapshot(
+        direction.buy_exchange.as_str(),
+        &direction.buy_symbol,
+        direction.buy_market_type,
+        pair,
+    )?;
+    let original_sell = matching_snapshot(
+        direction.sell_exchange.as_str(),
+        &direction.sell_symbol,
+        direction.sell_market_type,
+        pair,
+    )?;
+    let mut buy_to_cover = OrderIntent::limit(
+        original_sell.exchange().to_owned(),
+        original_sell.symbol.clone(),
+        original_sell.market_type,
+        Side::Buy,
+        quantity,
+        original_sell.ask(),
+    );
+    buy_to_cover.reduce_only = true;
+    let mut sell_long = OrderIntent::limit(
+        original_buy.exchange().to_owned(),
+        original_buy.symbol.clone(),
+        original_buy.market_type,
+        Side::Sell,
+        quantity,
+        original_buy.bid(),
+    );
+    sell_long.reduce_only = true;
+    let intents = vec![buy_to_cover, sell_long];
+    let markets = [pair.left.clone(), pair.right.clone()];
+    validate_liquidity(&intents, &markets)?;
+
+    let buy_price = original_buy.ask();
+    let sell_price = original_sell.bid();
+    let absolute = sell_price
+        .as_decimal()
+        .checked_sub(buy_price.as_decimal())
+        .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+    let percent = absolute
+        .checked_div(buy_price.as_decimal())
+        .and_then(|value| value.checked_mul(Decimal::ONE_HUNDRED))
+        .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+    let decision = ArbitrageDecision {
+        kind: ArbitrageDecisionKind::Reduce,
+        segment: 0,
+        target_quantity: Decimal::ZERO,
+        delta_quantity: state.position_quantity,
+        spread: SpreadQuote {
+            buy_exchange: direction.buy_exchange.clone(),
+            sell_exchange: direction.sell_exchange.clone(),
+            buy_symbol: direction.buy_symbol.clone(),
+            sell_symbol: direction.sell_symbol.clone(),
+            buy_market_type: direction.buy_market_type,
+            sell_market_type: direction.sell_market_type,
+            buy_price,
+            sell_price,
+            absolute,
+            percent,
+        },
+        direction: None,
+        intents,
+    };
+    let batch = ExecutionBatch::planned(decision.intents.clone())?;
+    let legs = batch
+        .intents()
+        .iter()
+        .enumerate()
+        .map(|(index, intent)| {
+            let market = matching_market(intent, &markets)?;
+            let execution_price = intent.price.unwrap_or_else(|| match intent.side {
+                Side::Buy => market.ask(),
+                Side::Sell => market.bid(),
+            });
+            let notional = execution_price
+                .as_decimal()
+                .checked_mul(intent.quantity.as_decimal())
+                .map(Money::new)
+                .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+            PaperReservationLeg::from_intent(index, intent, notional)
+                .map_err(ArbitragePaperTaskError::Account)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation_task_id = format!("{task_id}/op/{operation_sequence:06}");
+    let idempotency_key = format!("arbitrage:{operation_sequence:06}");
+    let reservation = PaperReservationRequest::planned(
+        operation_task_id,
+        idempotency_key,
+        batch.id(),
+        cost_model,
+        legs,
+    )?;
+    let request = PaperArbitrageRequest::new(direction.buy_symbol.clone(), batch, reservation)
+        .map_err(ArbitragePaperTaskError::Saga)?;
+    Ok(PlannedOperation {
+        request,
+        decision,
+        pair: pair.clone(),
+        admission_ticket: None,
+        operation_lease,
+    })
 }
 
 fn strategy_positions(
@@ -1753,6 +2168,22 @@ fn matching_market<'a>(
         .ok_or(ArbitragePaperTaskError::InvalidRequest)
 }
 
+fn matching_snapshot<'a>(
+    exchange: &str,
+    symbol: &Symbol,
+    market_type: MarketType,
+    pair: &'a ObservedMarketPair,
+) -> Result<&'a MarketSnapshot, ArbitragePaperTaskError> {
+    [&pair.left, &pair.right]
+        .into_iter()
+        .find(|market| {
+            market.exchange() == exchange
+                && market.symbol == *symbol
+                && market.market_type == market_type
+        })
+        .ok_or(ArbitragePaperTaskError::RecoveryRequired)
+}
+
 fn start_operation(
     saga: &DurablePaperArbitrageSaga,
     executor: Arc<dyn ArbitragePaperExecutor>,
@@ -1763,14 +2194,17 @@ fn start_operation(
     let saga = saga.clone();
     let request_for_task = planned.request;
     let pair = planned.pair;
+    let operation_lease = planned.operation_lease;
     let execution_started = Arc::new(AtomicBool::new(false));
     let task_execution_started = Arc::clone(&execution_started);
     let join = tokio::spawn(async move {
-        saga.run(request_for_task, move |batch| {
-            task_execution_started.store(true, Ordering::Release);
-            executor.execute(batch, pair)
-        })
-        .await
+        let result = saga
+            .run(request_for_task, move |batch| {
+                task_execution_started.store(true, Ordering::Release);
+                executor.execute(batch, pair)
+            })
+            .await;
+        (result, operation_lease)
     });
     InFlightOperation {
         request,
@@ -1785,17 +2219,17 @@ fn complete_operation(
     result: OperationJoinResult,
     decision: &ArbitrageDecision,
     state: &mut ArbitrageState,
-) -> Result<(), ArbitragePaperTaskError> {
+) -> Result<PaperAccountOperationLease, ArbitragePaperTaskError> {
     match result {
-        Ok(Ok(PaperArbitrageRun::Completed { .. })) => {
+        Ok((Ok(PaperArbitrageRun::Completed { .. }), operation_lease)) => {
             state.position_quantity = decision.target_quantity;
             state.direction.clone_from(&decision.direction);
-            Ok(())
+            Ok(operation_lease)
         }
-        Ok(Ok(PaperArbitrageRun::AlreadyCompleted { .. })) => {
+        Ok((Ok(PaperArbitrageRun::AlreadyCompleted { .. }), _operation_lease)) => {
             Err(ArbitragePaperTaskError::RecoveryRequired)
         }
-        Ok(Err(error)) => Err(ArbitragePaperTaskError::Saga(error)),
+        Ok((Err(error), _operation_lease)) => Err(ArbitragePaperTaskError::Saga(error)),
         Err(error) if error.is_panic() => Err(ArbitragePaperTaskError::TaskPanicked),
         Err(_) => Err(ArbitragePaperTaskError::TaskCancelled),
     }
@@ -1869,8 +2303,15 @@ async fn stop_owner(
     account: &PaperAccountAuthority,
     risk: Option<&AccountRiskAuthority>,
     owner_task_id: &str,
+    cost_model: PaperCostModel,
+    saga: &DurablePaperArbitrageSaga,
+    executor: Arc<dyn ArbitragePaperExecutor>,
+    directive_close_pair: Option<ObservedMarketPair>,
+    operation_sequence: &mut u64,
     state: &mut ArbitrageState,
+    active_operation_lease: &ActiveOperationLease,
 ) -> TaskResult {
+    let directive_shutdown = directive_close_pair.is_some();
     let mut cancelled_reservation_needs_recovery = false;
     if let Some(active) = operation.as_mut()
         && (cancel_requested || !active.execution_started())
@@ -1901,6 +2342,7 @@ async fn stop_owner(
                 .await;
             }
         };
+        clear_active_operation_lease(active_operation_lease);
         operation = None;
     }
 
@@ -2069,23 +2511,290 @@ async fn stop_owner(
                 .await;
             }
         } else {
-            let result = operation.join_mut().await;
+            let result = if directive_shutdown
+                || matches!(requested_exit, ArbitragePaperTaskExit::SourceEnded)
+            {
+                let Ok(result) =
+                    tokio::time::timeout(ACCOUNT_RISK_INFLIGHT_GRACE, operation.join_mut()).await
+                else {
+                    operation.abort().await;
+                    let _retention = retain_cancelled_operation(
+                        account,
+                        risk,
+                        owner_task_id,
+                        operation.admission_ticket.as_ref(),
+                        &operation.request,
+                        Utc::now(),
+                    )
+                    .await;
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        ArbitragePaperTaskFailure::RecoveryRequired,
+                        ArbitragePaperTaskError::RecoveryRequired,
+                    )
+                    .await;
+                };
+                result
+            } else {
+                operation.join_mut().await
+            };
             let _ = operation.join.take();
-            if let Err(error) = complete_operation(result, &operation.decision, state) {
-                let (failure, error) = classify_operation_error(error);
+            let operation_lease = match complete_operation(result, &operation.decision, state) {
+                Ok(operation_lease) => operation_lease,
+                Err(_) if directive_shutdown => {
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        ArbitragePaperTaskFailure::RecoveryRequired,
+                        ArbitragePaperTaskError::RecoveryRequired,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let (failure, error) = classify_operation_error(error);
+                    return fail_owner(
+                        left,
+                        right,
+                        history,
+                        status_sender,
+                        last_recorded_at,
+                        failure,
+                        error,
+                    )
+                    .await;
+                }
+            };
+            if let Some(risk) = risk
+                && state.position_quantity.is_zero()
+                && let Err(error) = risk.record_position_closed(owner_task_id, Utc::now()).await
+            {
                 return fail_owner(
                     left,
                     right,
                     history,
                     status_sender,
                     last_recorded_at,
-                    failure,
+                    ArbitragePaperTaskFailure::AccountContract,
+                    ArbitragePaperTaskError::AccountRisk(error),
+                )
+                .await;
+            }
+            clear_active_operation_lease(active_operation_lease);
+            drop(operation_lease);
+        }
+    }
+
+    // A risk-directed close reprojects and settles under one account-wide
+    // lease. The drained opening operation above has already dropped its own
+    // lease, so this acquisition cannot recursively wait on the same owner.
+    let mut directive_operation_lease = None;
+    if directive_shutdown {
+        let operation_lease = account.acquire_operation_lease().await;
+        if register_active_operation_lease(active_operation_lease, &operation_lease).is_err() {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
+        }
+        directive_operation_lease = Some(operation_lease);
+    }
+    if directive_shutdown || matches!(requested_exit, ArbitragePaperTaskExit::SourceEnded) {
+        *state = match restore_state_from_account(account, owner_task_id).await {
+            Ok(restored) => restored,
+            Err(_) => {
+                return fail_owner(
+                    left,
+                    right,
+                    history,
+                    status_sender,
+                    last_recorded_at,
+                    ArbitragePaperTaskFailure::RecoveryRequired,
+                    ArbitragePaperTaskError::RecoveryRequired,
+                )
+                .await;
+            }
+        };
+    }
+    if matches!(requested_exit, ArbitragePaperTaskExit::SourceEnded)
+        && !state.position_quantity.is_zero()
+    {
+        return fail_owner(
+            left,
+            right,
+            history,
+            status_sender,
+            last_recorded_at,
+            ArbitragePaperTaskFailure::RecoveryRequired,
+            ArbitragePaperTaskError::RecoveryRequired,
+        )
+        .await;
+    }
+
+    if let Some(pair) = directive_close_pair
+        && !state.position_quantity.is_zero()
+    {
+        let Some(operation_lease) = directive_operation_lease.take() else {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
+        };
+        let account_snapshot = match account_decision_snapshot(account).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return fail_owner(
+                    left,
+                    right,
+                    history,
+                    status_sender,
+                    last_recorded_at,
+                    error.failure_bucket(),
                     error,
                 )
                 .await;
             }
+        };
+        let Some(next_sequence) = operation_sequence.checked_add(1) else {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
+        };
+        let Ok(planned) = build_forced_close_operation(
+            owner_task_id,
+            cost_model,
+            &pair,
+            state,
+            &account_snapshot,
+            next_sequence,
+            operation_lease,
+        ) else {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
+        };
+        *operation_sequence = next_sequence;
+        publish_operation_count(status_sender, *operation_sequence);
+        let mut close_operation = start_operation(saga, executor, planned);
+        let Ok(result) =
+            tokio::time::timeout(ACCOUNT_RISK_INFLIGHT_GRACE, close_operation.join_mut()).await
+        else {
+            close_operation.abort().await;
+            let _retention = retain_cancelled_operation(
+                account,
+                risk,
+                owner_task_id,
+                close_operation.admission_ticket.as_ref(),
+                &close_operation.request,
+                Utc::now(),
+            )
+            .await;
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
+        };
+        let _ = close_operation.join.take();
+        let Ok(close_operation_lease) =
+            complete_operation(result, &close_operation.decision, state)
+        else {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
+        };
+        *state = match restore_state_from_account(account, owner_task_id).await {
+            Ok(restored) => restored,
+            Err(_) => {
+                return fail_owner(
+                    left,
+                    right,
+                    history,
+                    status_sender,
+                    last_recorded_at,
+                    ArbitragePaperTaskFailure::RecoveryRequired,
+                    ArbitragePaperTaskError::RecoveryRequired,
+                )
+                .await;
+            }
+        };
+        if !state.position_quantity.is_zero() {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::RecoveryRequired,
+                ArbitragePaperTaskError::RecoveryRequired,
+            )
+            .await;
         }
+        if let Some(risk) = risk
+            && let Err(error) = risk.record_position_closed(owner_task_id, Utc::now()).await
+        {
+            return fail_owner(
+                left,
+                right,
+                history,
+                status_sender,
+                last_recorded_at,
+                ArbitragePaperTaskFailure::AccountContract,
+                ArbitragePaperTaskError::AccountRisk(error),
+            )
+            .await;
+        }
+        clear_active_operation_lease(active_operation_lease);
+        drop(close_operation_lease);
     }
+    if directive_operation_lease.is_some() {
+        clear_active_operation_lease(active_operation_lease);
+    }
+    drop(directive_operation_lease);
 
     if matches!(left_exit, MarketSupervisorExit::ShutdownTimedOut)
         || matches!(right_exit, MarketSupervisorExit::ShutdownTimedOut)
@@ -2160,26 +2869,14 @@ async fn recovery_preflight(
     account: &PaperAccountAuthority,
     history: &JsonlHistory,
 ) -> Result<u64, ArbitragePaperTaskError> {
-    let account_snapshot = account.snapshot().await?;
-    if account_snapshot.projection_status != ProjectionStatus::Complete {
-        return Err(ArbitragePaperTaskError::RecoveryRequired);
-    }
-    if account_snapshot.reservations.iter().any(|reservation| {
-        reservation
-            .reconciliation
-            .as_ref()
-            .is_some_and(|record| record.outcome == PaperReconciliationOutcome::Failed)
-    }) {
-        return Err(ArbitragePaperTaskError::RecoveryRequired);
-    }
+    let account_snapshot = account_decision_snapshot(account).await?;
 
     let prefix = operation_prefix(task_id);
     let mut last_operation = 0_u64;
-    for reservation in account_snapshot
-        .reservations
-        .iter()
-        .filter(|reservation| reservation.task_id.starts_with(&prefix))
-    {
+    for reservation in &account_snapshot.reservations {
+        let Some(sequence) = owner_operation_sequence(&reservation.task_id, &prefix) else {
+            continue;
+        };
         if matches!(
             reservation.phase,
             PaperReservationPhase::Pending
@@ -2188,13 +2885,6 @@ async fn recovery_preflight(
         ) {
             return Err(ArbitragePaperTaskError::RecoveryRequired);
         }
-        let suffix = reservation
-            .task_id
-            .strip_prefix(&prefix)
-            .unwrap_or_default();
-        let sequence = suffix
-            .parse::<u64>()
-            .map_err(|_| ArbitragePaperTaskError::RecoveryRequired)?;
         last_operation = last_operation.max(sequence);
     }
 
@@ -2211,6 +2901,150 @@ async fn recovery_preflight(
         }
     }
     Ok(last_operation)
+}
+
+fn lot_source_is_owned_by(
+    snapshot: &PaperAccountSnapshot,
+    source_reservation_id: Uuid,
+    owner_prefix: &str,
+) -> Result<bool, ArbitragePaperTaskError> {
+    let mut sources = snapshot
+        .reservations
+        .iter()
+        .filter(|reservation| reservation.reservation_id == source_reservation_id);
+    let Some(source) = sources.next() else {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    };
+    if sources.next().is_some() {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    let owned = owner_operation_sequence(&source.task_id, owner_prefix).is_some();
+    if owned && source.phase != PaperReservationPhase::Committed {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    Ok(owned)
+}
+
+fn ensure_operation_fifo_isolation(
+    snapshot: &PaperAccountSnapshot,
+    owner_task_id: &str,
+    intents: &[OrderIntent],
+) -> Result<(), ArbitragePaperTaskError> {
+    let owner_prefix = operation_prefix(owner_task_id);
+    for intent in intents {
+        for lot in &snapshot.open_lots {
+            let same_exact_instrument = lot.exchange == intent.exchange
+                && lot.symbol == intent.symbol
+                && lot.market_type == intent.market_type;
+            if same_exact_instrument
+                && !lot_source_is_owned_by(snapshot, lot.source_reservation_id, &owner_prefix)?
+            {
+                // Exact paper settlement owns one global FIFO namespace per
+                // instrument. Even a same-side foreign lot would leave the
+                // tasks mixed and make a later close owner-ambiguous.
+                return Err(ArbitragePaperTaskError::RecoveryRequired);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn restore_state_from_account(
+    account: &PaperAccountAuthority,
+    owner_task_id: &str,
+) -> Result<ArbitrageState, ArbitragePaperTaskError> {
+    let snapshot = account_decision_snapshot(account).await?;
+    let owner_prefix = operation_prefix(owner_task_id);
+    let mut owned_lots = Vec::new();
+    let mut foreign_lots = Vec::new();
+    for lot in &snapshot.open_lots {
+        if lot_source_is_owned_by(&snapshot, lot.source_reservation_id, &owner_prefix)? {
+            owned_lots.push(lot);
+        } else {
+            foreign_lots.push(lot);
+        }
+    }
+    if owned_lots.is_empty() {
+        return Ok(ArbitrageState::default());
+    }
+    let buy_lot = owned_lots
+        .iter()
+        .find(|lot| lot.side == Side::Buy)
+        .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+    let sell_lot = owned_lots
+        .iter()
+        .find(|lot| lot.side == Side::Sell)
+        .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+    let mut buy_quantity = Decimal::ZERO;
+    let mut sell_quantity = Decimal::ZERO;
+    for lot in &owned_lots {
+        let reference = match lot.side {
+            Side::Buy => {
+                buy_quantity = buy_quantity
+                    .checked_add(lot.remaining_quantity.as_decimal())
+                    .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+                buy_lot
+            }
+            Side::Sell => {
+                sell_quantity = sell_quantity
+                    .checked_add(lot.remaining_quantity.as_decimal())
+                    .ok_or(ArbitragePaperTaskError::RecoveryRequired)?;
+                sell_lot
+            }
+        };
+        if lot.exchange != reference.exchange
+            || lot.symbol != reference.symbol
+            || lot.market_type != reference.market_type
+        {
+            return Err(ArbitragePaperTaskError::RecoveryRequired);
+        }
+    }
+    if buy_lot.symbol != sell_lot.symbol
+        || buy_quantity != sell_quantity
+        || buy_quantity <= Decimal::ZERO
+        || buy_lot.exchange == sell_lot.exchange
+    {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    if foreign_lots.iter().any(|foreign| {
+        [buy_lot, sell_lot].into_iter().any(|owned| {
+            foreign.exchange == owned.exchange
+                && foreign.symbol == owned.symbol
+                && foreign.market_type == owned.market_type
+                && foreign.side == owned.side
+        })
+    }) {
+        // Exact paper settlement consumes matching lots FIFO without an owner
+        // discriminator. When another owner shares either close queue, no
+        // reduce-only order can prove it will touch only this owner's lot.
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    Ok(ArbitrageState {
+        position_quantity: buy_quantity,
+        direction: Some(ArbitrageDirection {
+            buy_exchange: buy_lot.exchange.clone(),
+            sell_exchange: sell_lot.exchange.clone(),
+            buy_symbol: buy_lot.symbol.clone(),
+            sell_symbol: sell_lot.symbol.clone(),
+            buy_market_type: buy_lot.market_type,
+            sell_market_type: sell_lot.market_type,
+        }),
+    })
+}
+
+async fn account_decision_snapshot(
+    account: &PaperAccountAuthority,
+) -> Result<PaperAccountSnapshot, ArbitragePaperTaskError> {
+    let snapshot = account.decision_snapshot().await?;
+    if snapshot.reservations.iter().any(|reservation| {
+        reservation
+            .reconciliation
+            .as_ref()
+            .is_some_and(|record| record.outcome == PaperReconciliationOutcome::Failed)
+    }) {
+        return Err(ArbitragePaperTaskError::RecoveryRequired);
+    }
+    Ok(snapshot)
 }
 
 async fn durable_task_view(
@@ -2294,6 +3128,14 @@ fn source_statuses(
 
 fn operation_prefix(task_id: &str) -> String {
     format!("{task_id}/op/")
+}
+
+fn owner_operation_sequence(task_id: &str, owner_prefix: &str) -> Option<u64> {
+    let sequence = task_id.strip_prefix(owner_prefix)?;
+    if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    sequence.parse::<u64>().ok()
 }
 
 fn registered_record(

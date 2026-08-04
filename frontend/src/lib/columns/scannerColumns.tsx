@@ -63,7 +63,7 @@ export const scannerColumns: ColumnDef<VirtualGridScanRowView>[] = [
   },
   {
     id: "apr",
-    header: "APR / Rating",
+    header: "APR 估算 / Rating",
     numeric: true,
     cell: (row) => (
       <span className="block space-y-1">

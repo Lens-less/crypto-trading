@@ -38,6 +38,13 @@ cargo audit --file Cargo.lock
 cargo deny --manifest-path Cargo.toml check bans licenses sources
 ```
 
+`rust/.cargo/audit.toml` contains one time-bounded exception for
+`RUSTSEC-2026-0235`. It is acceptable only while CI proves that `rkyv` is absent
+from the workspace's all-targets/all-features dependency graph. The audit job
+expires that exception on 2026-11-04; enabling any `rust_decimal`/`rkyv`
+integration requires removing the exception or upgrading to a patched `rkyv`
+line first.
+
 Then the deployment surface:
 
 ```bash

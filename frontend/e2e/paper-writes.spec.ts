@@ -36,6 +36,8 @@ test.beforeAll(async () => {
       "--bearer-token-env",
       TOKEN_ENV,
       "--enable-paper-writes",
+      "--paper-account-risk-config",
+      join(REPO_ROOT, "rust", "config", "paper", "account-risk.example.yaml"),
       "--paper-grid-task-id",
       GRID_TASK_ID,
       "--paper-grid-strategy-id",

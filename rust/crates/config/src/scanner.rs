@@ -24,6 +24,7 @@ const MAX_SCANNER_CONFIG_EXCHANGE_BYTES: usize = 128;
 pub struct ScannerConfig {
     pub exchange: String,
     pub apr_window_seconds: u32,
+    pub apr_estimate: ScannerAprEstimateConfig,
     pub min_complete_cycles: u64,
     pub row_limit: usize,
     pub symbols: Vec<ScannerSymbolConfig>,
@@ -34,6 +35,13 @@ impl ScannerConfig {
     pub fn enabled_symbols(&self) -> impl Iterator<Item = &ScannerSymbolConfig> {
         self.symbols.iter().filter(|symbol| symbol.enabled)
     }
+}
+
+/// Explicit assumptions used only for the scanner's heuristic APR estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScannerAprEstimateConfig {
+    pub order_notional_usdc: Decimal,
+    pub round_trip_fee_percent: Decimal,
 }
 
 /// One exact scanner candidate: market identity plus virtual-grid geometry.
@@ -68,6 +76,8 @@ struct RawScanControls {
     #[serde(default = "default_apr_window_seconds")]
     apr_window_seconds: u32,
     #[serde(default)]
+    apr_estimate: Option<RawScannerAprEstimate>,
+    #[serde(default)]
     min_complete_cycles: u64,
     #[serde(default = "default_row_limit")]
     row_limit: usize,
@@ -77,6 +87,7 @@ impl Default for RawScanControls {
     fn default() -> Self {
         Self {
             apr_window_seconds: default_apr_window_seconds(),
+            apr_estimate: None,
             min_complete_cycles: 0,
             row_limit: default_row_limit(),
         }
@@ -103,6 +114,12 @@ struct RawScannerSymbol {
 struct RawScannerGrid {
     width_percent: Decimal,
     interval_percent: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawScannerAprEstimate {
+    order_notional_usdc: Decimal,
+    round_trip_fee_percent: Decimal,
 }
 
 const fn yes() -> bool {
@@ -163,6 +180,19 @@ pub fn load_scanner_config_from_str(yaml: &str) -> ConfigResult<ScannerConfig> {
             "scanner row_limit must be within 1..={MAX_SCANNER_CONFIG_ROW_LIMIT}"
         )));
     }
+    let apr_estimate = scan.apr_estimate.ok_or(ConfigError::MissingRequiredField {
+        path: "scanner.scan.apr_estimate",
+    })?;
+    if apr_estimate.order_notional_usdc <= Decimal::ZERO {
+        return Err(ConfigError::Validation(
+            "scanner scan.apr_estimate.order_notional_usdc must be positive".to_owned(),
+        ));
+    }
+    if apr_estimate.round_trip_fee_percent < Decimal::ZERO {
+        return Err(ConfigError::Validation(
+            "scanner scan.apr_estimate.round_trip_fee_percent must not be negative".to_owned(),
+        ));
+    }
     if raw.scanner.symbols.is_empty() {
         return Err(ConfigError::Validation(
             "scanner requires at least one symbol".to_owned(),
@@ -199,6 +229,10 @@ pub fn load_scanner_config_from_str(yaml: &str) -> ConfigResult<ScannerConfig> {
     Ok(ScannerConfig {
         exchange,
         apr_window_seconds: scan.apr_window_seconds,
+        apr_estimate: ScannerAprEstimateConfig {
+            order_notional_usdc: apr_estimate.order_notional_usdc,
+            round_trip_fee_percent: apr_estimate.round_trip_fee_percent,
+        },
         min_complete_cycles: scan.min_complete_cycles,
         row_limit: scan.row_limit,
         symbols,

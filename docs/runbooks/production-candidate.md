@@ -418,7 +418,9 @@ deploy/journal-backup-restore-drill.sh \
 
 Archive the emitted backup path, checksum manifest, restore directory,
 `system.json`, and verifier log with the release evidence. The restored copy is
-never moved over the live journal.
+never moved over the live journal. The drill starts its short-lived verifier
+with the explicit `--allow-open-loopback-read-api` escape hatch; normal operator
+control-plane deployments remain bearer-protected by default.
 
 ## Promotion and rollback
 

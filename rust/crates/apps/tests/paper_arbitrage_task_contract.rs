@@ -13,26 +13,30 @@ use chrono::{Duration, TimeZone, Utc};
 use crypto_trading_cli::{
     ArbitragePaperExecutionFuture, ArbitragePaperExecutor, ArbitragePaperMarketEventFuture,
     ArbitragePaperTask, ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
-    ArbitragePaperTaskFailure, ArbitragePaperTaskPhase,
+    ArbitragePaperTaskFailure, ArbitragePaperTaskPhase, DurablePaperArbitrageSaga,
+    PaperArbitrageRequest,
     monitor::{ReadOnlyArbitrageMonitor, ReplayMarketDataClock},
 };
 use crypto_trading_config::{
     ArbitrageConfig, ArbitrageHistoryDecisionConfig, ArbitrageSymbolConfig,
 };
 use crypto_trading_domain::{
-    MarketSnapshot, MarketType, Money, Order, OrderStatus, Price, Quantity, Symbol,
+    MarketSnapshot, MarketType, Money, Order, OrderIntent, OrderStatus, Price, Quantity, Side,
+    Symbol,
 };
 use crypto_trading_exchange::{SubmissionDisposition, TradingReceipt};
 use crypto_trading_runtime::{
-    AccountRiskAuthority, ExecutionBatch, JsonlHistory, MarketDataBook, MarketDataEvent,
-    MarketDataEventFuture, MarketDataEventSource, MarketDataObservation, MarketFreshnessPolicy,
-    MarketInstrument, MarketSupervisorConfig, MarketUniverse, ObservedMarketPair,
-    PaperAccountAuthority, PaperAccountConfig, PaperCostModel, PaperReconciliationEvidence,
-    PaperReconciliationProof, PaperReservationPhase, ReadOnlyTaskFailure, ReadOnlyTaskKind,
+    AccountRiskAuthority, DecisionRecord, ExecutionBatch, JsonlHistory, MarketDataBook,
+    MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketDataObservation,
+    MarketFreshnessPolicy, MarketInstrument, MarketSupervisorConfig, MarketUniverse,
+    ObservedMarketPair, PaperAccountAuthority, PaperAccountConfig, PaperCostModel,
+    PaperReconciliationEvidence, PaperReconciliationProof, PaperReservationLeg,
+    PaperReservationPhase, PaperReservationRequest, ReadOnlyTaskFailure, ReadOnlyTaskKind,
     ReadOnlyTaskPhase, ReadOnlyTaskRecovery, SpreadHistoryRecord, SpreadHistoryWriter,
 };
 use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
 use rust_decimal::Decimal;
+use serde_json::json;
 use tokio::sync::{Semaphore, mpsc};
 
 fn decimal(value: &str) -> Decimal {
@@ -150,6 +154,99 @@ fn account_with_available(
     (account, history, path)
 }
 
+async fn seed_open_pair(task_id: &str, account: &PaperAccountAuthority, history: &JsonlHistory) {
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config(task_id, StdDuration::from_secs(30)),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(
+        task.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+}
+
+async fn seed_legacy_open_pair_without_owner_lease(
+    task_id: &str,
+    account: &PaperAccountAuthority,
+    history: &JsonlHistory,
+) {
+    let intents = vec![
+        OrderIntent::limit(
+            "left",
+            symbol(),
+            MarketType::Perpetual,
+            Side::Buy,
+            quantity("1"),
+            price("100"),
+        ),
+        OrderIntent::limit(
+            "right",
+            symbol(),
+            MarketType::Perpetual,
+            Side::Sell,
+            quantity("1"),
+            price("101.5"),
+        ),
+    ];
+    let batch = ExecutionBatch::planned(intents).unwrap();
+    let legs = batch
+        .intents()
+        .iter()
+        .enumerate()
+        .map(|(index, intent)| {
+            let notional = intent
+                .price
+                .unwrap()
+                .as_decimal()
+                .checked_mul(intent.quantity.as_decimal())
+                .map(Money::new)
+                .unwrap();
+            PaperReservationLeg::from_intent(index, intent, notional).unwrap()
+        })
+        .collect();
+    let reservation = PaperReservationRequest::planned(
+        task_id,
+        format!("legacy-seed:{task_id}"),
+        batch.id(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        legs,
+    )
+    .unwrap();
+    let request = PaperArbitrageRequest::new(symbol(), batch, reservation).unwrap();
+    DurablePaperArbitrageSaga::new(account.clone(), history.clone())
+        .unwrap()
+        .run(request, |batch| async move {
+            Ok(filled_receipts(batch.intents().iter().enumerate()))
+        })
+        .await
+        .unwrap();
+}
+
 fn observation(
     exchange: &str,
     bid: &str,
@@ -158,6 +255,25 @@ fn observation(
     at: chrono::DateTime<Utc>,
 ) -> MarketDataEvent {
     observation_with_depth(exchange, bid, ask, revision, at, "20")
+}
+
+async fn send_open_opportunity(
+    left: &mpsc::Sender<MarketDataEvent>,
+    right: &mpsc::Sender<MarketDataEvent>,
+) {
+    left.send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
 }
 
 fn observation_with_depth(
@@ -220,6 +336,26 @@ impl MarketDataEventSource for ChannelSource {
     }
 }
 
+fn filled_receipts<'a>(
+    intents: impl IntoIterator<Item = (usize, &'a crypto_trading_domain::OrderIntent)>,
+) -> Vec<TradingReceipt> {
+    intents
+        .into_iter()
+        .map(|(index, intent)| TradingReceipt::Submitted {
+            order: Order {
+                id: format!("paper-{index}-{}", intent.client_order_id),
+                intent: intent.clone(),
+                filled_quantity: intent.quantity,
+                average_fill_price: intent.price,
+                status: OrderStatus::Filled,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            disposition: SubmissionDisposition::Filled,
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct FillExecutor {
     calls: AtomicUsize,
@@ -231,6 +367,7 @@ struct GatedFillExecutor {
     calls: AtomicUsize,
     permits: Arc<Semaphore>,
     pairs: Arc<Mutex<Vec<ObservedMarketPair>>>,
+    intents: Arc<Mutex<Vec<Vec<crypto_trading_domain::OrderIntent>>>>,
 }
 
 impl Default for GatedFillExecutor {
@@ -239,6 +376,7 @@ impl Default for GatedFillExecutor {
             calls: AtomicUsize::new(0),
             permits: Arc::new(Semaphore::new(0)),
             pairs: Arc::new(Mutex::new(Vec::new())),
+            intents: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -246,6 +384,13 @@ impl Default for GatedFillExecutor {
 impl GatedFillExecutor {
     fn release_one(&self) {
         self.permits.add_permits(1);
+    }
+
+    fn recorded_intents(&self) -> Vec<Vec<crypto_trading_domain::OrderIntent>> {
+        self.intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -262,29 +407,18 @@ impl ArbitragePaperExecutor for GatedFillExecutor {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let permits = Arc::clone(&self.permits);
         let pairs = Arc::clone(&self.pairs);
+        let intents = Arc::clone(&self.intents);
         Box::pin(async move {
             permits.acquire_owned().await.unwrap().forget();
             pairs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(pair);
-            Ok(batch
-                .intents()
-                .iter()
-                .enumerate()
-                .map(|(index, intent)| TradingReceipt::Submitted {
-                    order: Order {
-                        id: format!("paper-{index}-{}", intent.client_order_id),
-                        intent: intent.clone(),
-                        filled_quantity: intent.quantity,
-                        average_fill_price: intent.price,
-                        status: OrderStatus::Filled,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                    },
-                    disposition: SubmissionDisposition::Filled,
-                })
-                .collect())
+            intents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(batch.intents().to_vec());
+            Ok(filled_receipts(batch.intents().iter().enumerate()))
         })
     }
 }
@@ -329,24 +463,70 @@ impl ArbitragePaperExecutor for FillExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(pair);
+        Box::pin(async move { Ok(filled_receipts(batch.intents().iter().enumerate())) })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScriptedOutcome {
+    FillAll,
+    FillCount(usize),
+}
+
+#[derive(Debug)]
+struct ScriptedExecutor {
+    calls: AtomicUsize,
+    outcomes: Mutex<Vec<ScriptedOutcome>>,
+    intents: Mutex<Vec<Vec<crypto_trading_domain::OrderIntent>>>,
+}
+
+impl ScriptedExecutor {
+    fn new(outcomes: Vec<ScriptedOutcome>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            outcomes: Mutex::new(outcomes),
+            intents: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn recorded_intents(&self) -> Vec<Vec<crypto_trading_domain::OrderIntent>> {
+        self.intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ArbitragePaperExecutor for ScriptedExecutor {
+    fn observe_market_event(&self, _event: MarketDataEvent) -> ArbitragePaperMarketEventFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn execute(
+        &self,
+        batch: ExecutionBatch,
+        pair: ObservedMarketPair,
+    ) -> ArbitragePaperExecutionFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let outcome = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(0);
+        let recorded = batch.intents().to_vec();
+        self.intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(recorded);
+        let _ = pair;
         Box::pin(async move {
-            Ok(batch
-                .intents()
-                .iter()
-                .enumerate()
-                .map(|(index, intent)| TradingReceipt::Submitted {
-                    order: Order {
-                        id: format!("paper-{index}-{}", intent.client_order_id),
-                        intent: intent.clone(),
-                        filled_quantity: intent.quantity,
-                        average_fill_price: intent.price,
-                        status: OrderStatus::Filled,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                    },
-                    disposition: SubmissionDisposition::Filled,
-                })
-                .collect())
+            let receipts = match outcome {
+                ScriptedOutcome::FillAll => filled_receipts(batch.intents().iter().enumerate()),
+                ScriptedOutcome::FillCount(count) => {
+                    filled_receipts(batch.intents().iter().enumerate().take(count))
+                }
+            };
+            Ok(receipts)
         })
     }
 }
@@ -458,6 +638,44 @@ fn account_risk_authority(
         AccountRiskPolicy::new(limits).unwrap(),
     )
     .unwrap()
+}
+
+fn assert_open_admission_binding_and_unbound_forced_close(body: &str) {
+    let records = body
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let reservations = records
+        .iter()
+        .filter(|record| record["decision"] == "paper_account_reserved")
+        .collect::<Vec<_>>();
+    assert_eq!(reservations.len(), 2);
+    assert_eq!(
+        reservations[0]["details"]["request"]["risk_scope_id"],
+        "paper"
+    );
+    assert!(
+        reservations[0]["details"]["request"]["risk_admission_ticket_id"]
+            .as_str()
+            .is_some_and(|ticket| !ticket.is_empty())
+    );
+    assert!(
+        reservations[1]["details"]["request"]["risk_scope_id"].is_null(),
+        "the forced reduce-only close must not consume a new risk admission"
+    );
+    assert!(
+        reservations[1]["details"]["request"]["risk_admission_ticket_id"].is_null(),
+        "the forced reduce-only close must remain unbound"
+    );
+    let stopped_index = records
+        .iter()
+        .rposition(|record| record["decision"] == "task_stopped")
+        .unwrap();
+    let forced_close_index = records
+        .iter()
+        .rposition(|record| record["decision"] == "paper_account_reserved")
+        .unwrap();
+    assert!(forced_close_index < stopped_index);
 }
 
 #[tokio::test]
@@ -577,10 +795,44 @@ async fn engaged_kill_switch_stops_the_arbitrage_owner_before_any_entry() {
         .await
         .unwrap();
     let executor = Arc::new(FillExecutor::default());
-    let (left_source, left_sender) = ChannelSource::new("left");
+    let (left_source, _left_sender) = ChannelSource::new("left");
     let (right_source, _right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
         task_config("arbitrage:risk-kill", StdDuration::from_secs(30)).with_account_risk(risk),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_directive_exit\""));
+    assert!(body.contains("kill_switch:operator drill"));
+}
+
+#[tokio::test]
+async fn kill_switch_during_a_blocked_open_reprojects_and_closes_the_raced_position() {
+    let (account, history, path) = account("account-risk-kill-raced-open");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(GatedFillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-raced-open", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
         monitor(),
         left_source,
         right_source,
@@ -595,16 +847,1163 @@ async fn engaged_kill_switch_stops_the_arbitrage_owner_before_any_entry() {
         .send(observation("left", "99", "100", 1, base_time()))
         .await
         .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    assert!(
+        account.snapshot().await.unwrap().open_lots.is_empty(),
+        "the owner state is still flat while the opening execution is blocked"
+    );
+
+    risk.engage_kill_switch("raced open drill", base_time() + Duration::seconds(2))
+        .await
+        .unwrap();
+    wait_until(|| {
+        std::fs::read_to_string(&path).is_ok_and(|body| {
+            body.contains("\"decision\":\"account_risk_directive_exit\"")
+                && body.contains("kill_switch:raced open drill")
+        })
+    })
+    .await;
+
+    executor.release_one();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 2).await;
+    executor.release_one();
 
     assert_eq!(
-        task.wait().await.unwrap(),
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap(),
         ArbitragePaperTaskExit::StopRequested
     );
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Stopped);
+    assert_eq!(task.status().operation_count, 2);
+    let recorded = executor.recorded_intents();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded[0].iter().all(|intent| !intent.reduce_only));
+    assert!(recorded[1].iter().all(|intent| intent.reduce_only));
+    let snapshot = account.snapshot().await.unwrap();
+    assert!(snapshot.reservations.is_empty());
+    assert!(snapshot.open_lots.is_empty());
+
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(
+        body.rfind("\"decision\":\"paper_account_reserved\"")
+            .unwrap()
+            < body.rfind("\"decision\":\"task_stopped\"").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn kill_switch_treats_lookalike_foreign_pair_lots_as_flat_and_never_closes_them() {
+    let (account, history, _) = account("account-risk-foreign-lots");
+    let foreign_executor = Arc::new(FillExecutor::default());
+    let (foreign_left, foreign_left_sender) = ChannelSource::new("left");
+    let (foreign_right, foreign_right_sender) = ChannelSource::new("right");
+    let mut foreign = ArbitragePaperTask::start(
+        task_config("arbitrage:isolated/op/foreign", StdDuration::from_secs(30)),
+        monitor(),
+        foreign_left,
+        foreign_right,
+        account.clone(),
+        history.clone(),
+        foreign_executor.clone(),
+    )
+    .await
+    .unwrap();
+    foreign_left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    foreign_right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| foreign_executor.calls.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(
+        foreign.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    let before = account.snapshot().await.unwrap();
+    assert_eq!(before.open_lots.len(), 2);
+
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let isolated_executor = Arc::new(FillExecutor::default());
+    let (isolated_left, isolated_left_sender) = ChannelSource::new("left");
+    let (isolated_right, isolated_right_sender) = ChannelSource::new("right");
+    let mut isolated = ArbitragePaperTask::start(
+        task_config("arbitrage:isolated", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        monitor(),
+        isolated_left,
+        isolated_right,
+        account.clone(),
+        history,
+        isolated_executor.clone(),
+    )
+    .await
+    .unwrap();
+    isolated_left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    isolated_right_sender
+        .send(observation(
+            "right",
+            "100",
+            "101",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| isolated.status().processed_event_count == 2).await;
+
+    risk.engage_kill_switch(
+        "foreign isolation drill",
+        base_time() + Duration::seconds(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(StdDuration::from_secs(2), isolated.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    assert_eq!(isolated_executor.calls.load(Ordering::SeqCst), 0);
+    let after = account.snapshot().await.unwrap();
+    assert_eq!(after.open_lots, before.open_lots);
+}
+
+#[tokio::test]
+async fn ordinary_operation_refuses_to_fifo_net_a_foreign_reverse_pair() {
+    let (account, history, path) = account("foreign-reverse-fifo-isolation");
+    let foreign_executor = Arc::new(FillExecutor::default());
+    let (foreign_left, foreign_left_sender) = ChannelSource::new("left");
+    let (foreign_right, foreign_right_sender) = ChannelSource::new("right");
+    let mut foreign = ArbitragePaperTask::start(
+        task_config("arbitrage:foreign-reverse", StdDuration::from_secs(30)),
+        monitor(),
+        foreign_left,
+        foreign_right,
+        account.clone(),
+        history.clone(),
+        foreign_executor.clone(),
+    )
+    .await
+    .unwrap();
+    foreign_left_sender
+        .send(observation("left", "101.5", "102", 1, base_time()))
+        .await
+        .unwrap();
+    foreign_right_sender
+        .send(observation(
+            "right",
+            "99",
+            "100",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| foreign_executor.calls.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(
+        foreign.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    let foreign_snapshot = account.snapshot().await.unwrap();
+    assert_eq!(foreign_snapshot.open_lots.len(), 2);
+
+    let isolated_executor = Arc::new(FillExecutor::default());
+    let (isolated_left, isolated_left_sender) = ChannelSource::new("left");
+    let (isolated_right, isolated_right_sender) = ChannelSource::new("right");
+    let mut isolated = ArbitragePaperTask::start(
+        task_config("arbitrage:isolated-entry", StdDuration::from_secs(30)),
+        monitor(),
+        isolated_left,
+        isolated_right,
+        account.clone(),
+        history,
+        isolated_executor.clone(),
+    )
+    .await
+    .unwrap();
+    isolated_left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    isolated_right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), isolated.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(isolated.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        isolated.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(isolated_executor.calls.load(Ordering::SeqCst), 0);
+    let after = account.snapshot().await.unwrap();
+    assert_eq!(after.open_lots, foreign_snapshot.open_lots);
+    assert!(
+        !after
+            .reservations
+            .iter()
+            .any(|reservation| { reservation.task_id == "arbitrage:isolated-entry/op/000001" })
+    );
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+}
+
+#[tokio::test]
+async fn ordinary_operation_refuses_to_mix_with_a_foreign_same_direction_pair() {
+    let (account, history, path) = account("foreign-same-direction-isolation");
+    seed_open_pair("arbitrage:foreign-same-direction", &account, &history).await;
+    let foreign_snapshot = account.snapshot().await.unwrap();
+    assert_eq!(foreign_snapshot.open_lots.len(), 2);
+
+    let isolated_executor = Arc::new(FillExecutor::default());
+    let (isolated_left, isolated_left_sender) = ChannelSource::new("left");
+    let (isolated_right, isolated_right_sender) = ChannelSource::new("right");
+    let mut isolated = ArbitragePaperTask::start(
+        task_config(
+            "arbitrage:isolated-same-direction",
+            StdDuration::from_secs(30),
+        ),
+        monitor(),
+        isolated_left,
+        isolated_right,
+        account.clone(),
+        history,
+        isolated_executor.clone(),
+    )
+    .await
+    .unwrap();
+    isolated_left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    isolated_right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), isolated.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(isolated.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        isolated.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(isolated_executor.calls.load(Ordering::SeqCst), 0);
+    let after = account.snapshot().await.unwrap();
+    assert_eq!(after.open_lots, foreign_snapshot.open_lots);
+    assert!(!after.reservations.iter().any(|reservation| {
+        reservation.task_id == "arbitrage:isolated-same-direction/op/000001"
+    }));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+}
+
+#[tokio::test]
+async fn concurrent_owners_recheck_fifo_isolation_after_the_operation_lease() {
+    let (first_account, history, _) = account("shared-operation-lease");
+    let second_account = PaperAccountAuthority::new(
+        first_account.journal_id(),
+        history.clone(),
+        PaperAccountConfig::new("paper-arbitrage", Money::new(decimal("100000"))).unwrap(),
+    )
+    .unwrap();
+
+    let first_executor = Arc::new(GatedFillExecutor::default());
+    let (first_left, first_left_sender) = ChannelSource::new("left");
+    let (first_right, first_right_sender) = ChannelSource::new("right");
+    let mut first = ArbitragePaperTask::start(
+        task_config("arbitrage:lease-first", StdDuration::from_secs(30)),
+        monitor(),
+        first_left,
+        first_right,
+        first_account.clone(),
+        history.clone(),
+        first_executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    let second_executor = Arc::new(FillExecutor::default());
+    let (second_left, second_left_sender) = ChannelSource::new("left");
+    let (second_right, second_right_sender) = ChannelSource::new("right");
+    let mut second = ArbitragePaperTask::start(
+        task_config("arbitrage:lease-second", StdDuration::from_secs(30)),
+        monitor(),
+        second_left,
+        second_right,
+        second_account,
+        history,
+        second_executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    send_open_opportunity(&first_left_sender, &first_right_sender).await;
+    wait_until(|| first_executor.calls.load(Ordering::SeqCst) == 1).await;
+
+    send_open_opportunity(&second_left_sender, &second_right_sender).await;
+    wait_until(|| second.status().processed_event_count == 2).await;
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.status().phase, ArbitragePaperTaskPhase::Running);
+    let while_first_is_pending = first_account.snapshot().await.unwrap();
+    assert!(while_first_is_pending.open_lots.is_empty());
+    assert!(
+        while_first_is_pending
+            .reservations
+            .iter()
+            .any(|reservation| {
+                reservation.task_id == "arbitrage:lease-first/op/000001"
+                    && reservation.phase == PaperReservationPhase::Pending
+            })
+    );
+    assert!(
+        !while_first_is_pending
+            .reservations
+            .iter()
+            .any(|reservation| reservation.task_id == "arbitrage:lease-second/op/000001")
+    );
+
+    first_executor.release_one();
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), second.wait())
+            .await
+            .expect("the waiting owner must resume after the first operation releases its lease")
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(second.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        second.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        first.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    let settled = first_account.snapshot().await.unwrap();
+    assert_eq!(settled.open_lots.len(), 2);
+    assert!(
+        !settled
+            .reservations
+            .iter()
+            .any(|reservation| reservation.task_id == "arbitrage:lease-second/op/000001")
+    );
+}
+
+#[tokio::test]
+async fn timeout_abort_keeps_a_queued_owner_out_until_pending_is_uncertain() {
+    let (first_account, history, _) = account("timeout-operation-lease-handoff");
+    let second_account = PaperAccountAuthority::new(
+        first_account.journal_id(),
+        history.clone(),
+        PaperAccountConfig::new("paper-arbitrage", Money::new(decimal("100000"))).unwrap(),
+    )
+    .unwrap();
+    let first_executor = Arc::new(PendingExecutor::default());
+    let (first_left, first_left_sender) = ChannelSource::new("left");
+    let (first_right, first_right_sender) = ChannelSource::new("right");
+    let mut first = ArbitragePaperTask::start(
+        task_config(
+            "arbitrage:timeout-lease-first",
+            StdDuration::from_millis(50),
+        ),
+        monitor(),
+        first_left,
+        first_right,
+        first_account.clone(),
+        history.clone(),
+        first_executor.clone(),
+    )
+    .await
+    .unwrap();
+    let second_executor = Arc::new(FillExecutor::default());
+    let (second_left, second_left_sender) = ChannelSource::new("left");
+    let (second_right, second_right_sender) = ChannelSource::new("right");
+    let mut second = ArbitragePaperTask::start(
+        task_config("arbitrage:timeout-lease-second", StdDuration::from_secs(30)),
+        monitor(),
+        second_left,
+        second_right,
+        second_account,
+        history,
+        second_executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    send_open_opportunity(&first_left_sender, &first_right_sender).await;
+    wait_until(|| first_executor.calls.load(Ordering::SeqCst) == 1).await;
+    send_open_opportunity(&second_left_sender, &second_right_sender).await;
+    wait_until(|| second.status().processed_event_count == 2).await;
+    tokio::time::sleep(StdDuration::from_millis(25)).await;
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        first.stop().await.unwrap_err(),
+        ArbitragePaperTaskError::ShutdownTimedOut
+    ));
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), second.wait())
+            .await
+            .expect("the queued owner must recheck after timeout retention")
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(second_executor.calls.load(Ordering::SeqCst), 0);
+    let snapshot = first_account.snapshot().await.unwrap();
+    assert!(snapshot.reservations.iter().any(|reservation| {
+        reservation.task_id == "arbitrage:timeout-lease-first/op/000001"
+            && reservation.phase == PaperReservationPhase::Uncertain
+    }));
+    assert!(
+        !snapshot.reservations.iter().any(|reservation| {
+            reservation.task_id == "arbitrage:timeout-lease-second/op/000001"
+        })
+    );
+}
+
+#[tokio::test]
+async fn kill_switch_fails_recovery_before_close_when_owned_and_foreign_pair_lots_coexist() {
+    let (account, history, _) = account("account-risk-mixed-owner-lots");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let owner_executor = Arc::new(FillExecutor::default());
+    let (owner_left, owner_left_sender) = ChannelSource::new("left");
+    let (owner_right, owner_right_sender) = ChannelSource::new("right");
+    let mut owner = ArbitragePaperTask::start(
+        task_config("arbitrage:owned", StdDuration::from_secs(30)).with_account_risk(risk.clone()),
+        monitor(),
+        owner_left,
+        owner_right,
+        account.clone(),
+        history.clone(),
+        owner_executor.clone(),
+    )
+    .await
+    .unwrap();
+    owner_left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    owner_right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| owner_executor.calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if account.snapshot().await.unwrap().open_lots.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Simulate a legacy/cross-process writer that predates the process-local
+    // owner lease, so recovery still proves it will not flatten mixed lots.
+    seed_legacy_open_pair_without_owner_lease("arbitrage:foreign/op/000001", &account, &history)
+        .await;
+    let before_kill = account.snapshot().await.unwrap();
+    assert_eq!(before_kill.open_lots.len(), 4);
+
+    risk.engage_kill_switch("mixed ownership drill", base_time() + Duration::seconds(2))
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), owner.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(owner.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        owner.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(owner_executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        account.snapshot().await.unwrap().open_lots,
+        before_kill.open_lots
+    );
+}
+
+#[tokio::test]
+async fn source_end_with_owned_exposure_is_durable_recovery_required() {
+    let (account, history, path) = account("source-end-owned-exposure");
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:eof-owned", StdDuration::from_secs(30)),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    drop(left_sender);
+    drop(right_sender);
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(account.snapshot().await.unwrap().open_lots.len(), 2);
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+    assert!(!body.contains("\"exit\":\"source_ended\",\"failure\":null"));
+}
+
+#[tokio::test]
+async fn source_end_with_only_foreign_exposure_stops_cleanly_without_closing_it() {
+    let (account, history, _) = account("source-end-foreign-exposure");
+    seed_open_pair("arbitrage:eof-foreign", &account, &history).await;
+    let before = account.snapshot().await.unwrap();
+    assert_eq!(before.open_lots.len(), 2);
+
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:eof-isolated", StdDuration::from_secs(30)),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    drop(left_sender);
+    drop(right_sender);
+
+    assert_eq!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        ArbitragePaperTaskExit::SourceEnded
+    );
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Stopped);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    assert_eq!(
+        account.snapshot().await.unwrap().open_lots,
+        before.open_lots
+    );
+}
+
+#[tokio::test]
+async fn kill_switch_bounds_a_permanently_pending_execution_and_requires_recovery() {
+    let (account, history, path) = account("account-risk-pending-kill");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(PendingExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:pending-kill", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+
+    risk.engage_kill_switch(
+        "pending execution drill",
+        base_time() + Duration::seconds(2),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .expect("kill processing must have a bounded response")
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    let snapshot = account.snapshot().await.unwrap();
+    assert!(snapshot.open_lots.is_empty());
+    assert!(snapshot.reservations.iter().any(|reservation| {
+        reservation.task_id == "arbitrage:pending-kill/op/000001"
+            && reservation.phase == PaperReservationPhase::Uncertain
+    }));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"paper_account_uncertain\""));
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+    assert!(!body.contains("\"decision\":\"task_stopped\""));
+}
+
+#[tokio::test]
+async fn kill_switch_bounds_a_permanently_pending_forced_close_and_requires_recovery() {
+    let (account, history, path) = account("account-risk-pending-forced-close");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(GatedFillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:pending-forced-close", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    executor.release_one();
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if account.snapshot().await.unwrap().open_lots.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    risk.engage_kill_switch(
+        "pending forced close drill",
+        base_time() + Duration::seconds(2),
+    )
+    .await
+    .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 2).await;
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .expect("forced-close execution must have a bounded response")
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(task.status().operation_count, 2);
+    let snapshot = account.snapshot().await.unwrap();
+    assert_eq!(snapshot.open_lots.len(), 2);
+    assert!(snapshot.reservations.iter().any(|reservation| {
+        reservation.task_id == "arbitrage:pending-forced-close/op/000002"
+            && reservation.phase == PaperReservationPhase::Uncertain
+    }));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"paper_account_uncertain\""));
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+    assert!(!body.contains("\"decision\":\"task_stopped\""));
+}
+
+#[tokio::test]
+async fn engaged_kill_switch_closes_an_existing_position_reduce_only_before_stopping() {
+    let (account, history, path) = account("account-risk-close-open-position");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(ScriptedExecutor::new(vec![
+        ScriptedOutcome::FillAll,
+        ScriptedOutcome::FillAll,
+    ]));
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-close", StdDuration::from_secs(30)).with_account_risk(risk),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        loop {
+            if !account.snapshot().await.unwrap().open_lots.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    risk.engage_kill_switch("operator drill", base_time() + Duration::seconds(2))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+
+    let recorded = executor.recorded_intents();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded[1].iter().all(|intent| intent.reduce_only));
+    assert!(
+        recorded[1]
+            .iter()
+            .any(|intent| intent.side == crypto_trading_domain::Side::Buy)
+    );
+    assert!(
+        recorded[1]
+            .iter()
+            .any(|intent| intent.side == crypto_trading_domain::Side::Sell)
+    );
+
+    let snapshot = account.snapshot().await.unwrap();
+    assert!(snapshot.reservations.is_empty());
+    assert!(snapshot.open_lots.is_empty());
+
+    let risk_state = risk.state().await.unwrap();
+    assert!(risk_state.open_positions.is_empty());
+
+    let replay_account = PaperAccountAuthority::new(
+        account.journal_id(),
+        history.clone(),
+        PaperAccountConfig::new("paper-arbitrage", Money::new(decimal("100000"))).unwrap(),
+    )
+    .unwrap();
+    let replay_snapshot = replay_account.snapshot().await.unwrap();
+    assert!(replay_snapshot.reservations.is_empty());
+    assert!(replay_snapshot.open_lots.is_empty());
+
     let body = std::fs::read_to_string(path).unwrap();
     assert!(body.contains("\"decision\":\"account_risk_directive_exit\""));
     assert!(body.contains("kill_switch:operator drill"));
+    assert_open_admission_binding_and_unbound_forced_close(&body);
+    assert_eq!(task.status().operation_count, 2);
+}
+
+#[tokio::test]
+async fn engaged_kill_switch_with_partial_close_fails_recovery_required_instead_of_clean_stop() {
+    let (account, history, path) = account("account-risk-close-partial");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(ScriptedExecutor::new(vec![
+        ScriptedOutcome::FillAll,
+        ScriptedOutcome::FillCount(1),
+    ]));
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-close-partial", StdDuration::from_secs(30))
+            .with_account_risk(risk.clone()),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        loop {
+            if !account.snapshot().await.unwrap().open_lots.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    risk.engage_kill_switch("operator drill", base_time() + Duration::seconds(2))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+
+    let snapshot = account.snapshot().await.unwrap();
+    assert!(!snapshot.open_lots.is_empty());
+    assert!(
+        snapshot
+            .reservations
+            .iter()
+            .any(|reservation| reservation.phase == PaperReservationPhase::Uncertain)
+    );
+
+    let risk_state = risk.state().await.unwrap();
+    assert!(!risk_state.open_positions.is_empty());
+
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_directive_exit\""));
+    assert!(body.contains("\"decision\":\"execution_incomplete\""));
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+}
+
+#[tokio::test]
+async fn kill_switch_without_cached_pair_ignores_a_foreign_owner_position() {
+    let (account, history, path) = account("account-risk-restart-no-pair");
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut first = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-seed", StdDuration::from_secs(30)),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+
+    assert_eq!(
+        first.stop().await.unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    let foreign_snapshot = account.snapshot().await.unwrap();
+    assert!(!foreign_snapshot.open_lots.is_empty());
+
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    risk.engage_kill_switch("restart drill", base_time() + Duration::seconds(2))
+        .await
+        .unwrap();
+    let (restart_left, _restart_left_sender) = ChannelSource::new("left");
+    let (restart_right, _restart_right_sender) = ChannelSource::new("right");
+    let mut restart = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-restart", StdDuration::from_secs(30)).with_account_risk(risk),
+        monitor(),
+        restart_left,
+        restart_right,
+        account.clone(),
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(StdDuration::from_secs(2), restart.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        ArbitragePaperTaskExit::StopRequested
+    );
+    assert_eq!(restart.status().phase, ArbitragePaperTaskPhase::Stopped);
+    let durable = restart.durable_status().await.unwrap();
+    assert_eq!(durable.phase, ReadOnlyTaskPhase::Stopped);
+    assert_eq!(
+        account.snapshot().await.unwrap().open_lots,
+        foreign_snapshot.open_lots
+    );
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"account_risk_directive_exit\""));
+    assert!(body.contains("\"decision\":\"task_stopped\""));
+}
+
+#[tokio::test]
+async fn malformed_account_risk_fact_during_poll_fails_owner_durably() {
+    let (account, history, path) = account("account-risk-poll-malformed");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let (left_source, _left_sender) = ChannelSource::new("left");
+    let (right_source, _right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:risk-poll-malformed", StdDuration::from_secs(30))
+            .with_account_risk(risk),
+        monitor(),
+        left_source,
+        right_source,
+        account,
+        history.clone(),
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap();
+
+    history
+        .append(&DecisionRecord {
+            timestamp: base_time(),
+            strategy: "account_risk".to_owned(),
+            symbol: "paper".to_owned(),
+            decision: "account_risk_kill_switch_engaged".to_owned(),
+            details: json!({"malformed": true}),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::AccountRisk(_)
+    ));
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::AccountContract)
+    );
+    let durable = task.durable_status().await.unwrap();
+    assert_eq!(durable.phase, ReadOnlyTaskPhase::Failed);
+    assert_eq!(durable.failure, Some(ReadOnlyTaskFailure::AccountContract));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"task_failed\""));
+    assert!(body.contains("\"failure\":\"account_contract\""));
+}
+
+#[tokio::test]
+async fn malformed_account_risk_during_pending_execution_is_retained_uncertain_for_recovery() {
+    let (account, history, path) = account("account-risk-poll-malformed-inflight");
+    let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
+    let executor = Arc::new(PendingExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config(
+            "arbitrage:risk-poll-malformed-inflight",
+            StdDuration::from_secs(30),
+        )
+        .with_account_risk(risk),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+    wait_until(|| executor.calls.load(Ordering::SeqCst) == 1).await;
+    history
+        .append(&DecisionRecord {
+            timestamp: base_time() + Duration::seconds(2),
+            strategy: "account_risk".to_owned(),
+            symbol: "paper".to_owned(),
+            decision: "account_risk_kill_switch_engaged".to_owned(),
+            details: json!({"malformed": true}),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .expect("risk projection failure must stop an in-flight owner promptly")
+            .unwrap_err(),
+        ArbitragePaperTaskError::RecoveryRequired
+    ));
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::RecoveryRequired)
+    );
+    let snapshot = account.snapshot().await.unwrap();
+    assert!(snapshot.open_lots.is_empty());
+    assert!(snapshot.reservations.iter().any(|reservation| {
+        reservation.task_id == "arbitrage:risk-poll-malformed-inflight/op/000001"
+            && reservation.phase == PaperReservationPhase::Uncertain
+    }));
+    let body = std::fs::read_to_string(path).unwrap();
+    assert!(body.contains("\"decision\":\"paper_account_uncertain\""));
+    assert!(body.contains("\"failure\":\"recovery_required\""));
+    assert!(!body.contains("\"decision\":\"task_stopped\""));
 }
 
 #[tokio::test]
@@ -851,6 +2250,71 @@ async fn stop_timeout_is_durably_recovery_required_and_retains_pending_capacity(
         std::fs::read_to_string(path).unwrap().lines().count(),
         records_before
     );
+}
+
+#[tokio::test]
+async fn degraded_account_projection_is_never_used_to_plan_an_operation() {
+    let (account, history, _) = account("degraded-decision-snapshot");
+    let executor = Arc::new(FillExecutor::default());
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config("arbitrage:degraded-decision", StdDuration::from_secs(30)),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history.clone(),
+        executor.clone(),
+    )
+    .await
+    .unwrap();
+
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    wait_until(|| task.status().processed_event_count == 1).await;
+    history
+        .append(&DecisionRecord {
+            timestamp: base_time() + Duration::milliseconds(500),
+            strategy: "paper_account".to_owned(),
+            symbol: "paper-arbitrage".to_owned(),
+            decision: "paper_account_reserved".to_owned(),
+            details: json!({"schema_version": 1}),
+        })
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(StdDuration::from_secs(2), task.wait())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        ArbitragePaperTaskError::Account(_)
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(task.status().phase, ArbitragePaperTaskPhase::Failed);
+    assert_eq!(
+        task.status().failure,
+        Some(ArbitragePaperTaskFailure::AccountContract)
+    );
+    let snapshot = account.snapshot().await.unwrap();
+    assert_ne!(
+        snapshot.projection_status,
+        crypto_trading_runtime::ProjectionStatus::Complete
+    );
+    assert!(snapshot.reservations.is_empty());
 }
 
 #[tokio::test]

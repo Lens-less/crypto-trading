@@ -152,10 +152,33 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+      - name: Prove the temporary rkyv exception is unreachable
+        working-directory: rust
+        shell: bash
+        run: |
+          exception_expires="2026-11-04"
+          if [[ "$(date -u +%F)" > "${exception_expires}" ]]; then
+            echo "RUSTSEC-2026-0235 exception expired on ${exception_expires}; remove or re-review it."
+            exit 1
+          fi
+
+          dependency_tree="$(cargo +stable tree --workspace --target all --all-features --locked --prefix none)"
+          active_rkyv="$(grep -E '^rkyv v' <<< "${dependency_tree}" || true)"
+          if [[ -n "${active_rkyv}" ]]; then
+            echo "rkyv entered the active workspace graph; RUSTSEC-2026-0235 may not be ignored."
+            echo "${active_rkyv}"
+            exit 1
+          fi
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: rust
+          # Keep in sync with rust/.cargo/audit.toml; the reachability and
+          # expiry guard above must pass before this exception is accepted.
+          ignore: RUSTSEC-2026-0235
 
   supply-chain:
     name: License, ban, and source policy
@@ -214,6 +237,7 @@ jobs:
             --port 8787 \
             --bearer-token-env CRYPTO_TRADING_WEB_TOKEN \
             --enable-paper-writes \
+            --paper-account-risk-config /etc/crypto-trading/paper/account-risk.example.yaml \
             --paper-grid-task-id paper-grid-owner \
             --paper-grid-strategy-id grid.strategy \
             --paper-grid-strategy-revision grid.v1 \

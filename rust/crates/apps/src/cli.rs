@@ -470,6 +470,9 @@ pub struct VolumeMakerArgs {
     /// Append paper volume-maker facts to this JSONL journal.
     #[arg(long, default_value = "var/history/volume-maker.jsonl")]
     pub history_path: PathBuf,
+    /// Bounded account-level limits required by paper volume-maker serve mode.
+    #[arg(long, value_name = "PATH")]
+    pub paper_account_risk_config: Option<PathBuf>,
     #[arg(long)]
     pub debug: bool,
     /// Local loopback control port override used by volume-maker serve/status/stop.

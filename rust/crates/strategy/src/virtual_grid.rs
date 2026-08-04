@@ -11,6 +11,44 @@ const MAX_VIRTUAL_GRID_LEVELS: u32 = 10_000;
 const MAX_VIRTUAL_GRID_CYCLE_EVENTS: usize = 100_000;
 const MAX_APR_WINDOW_SECONDS: i64 = 366 * 24 * 60 * 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AprEstimateAssumptions {
+    pub order_notional_usdc: Decimal,
+    pub round_trip_fee_percent: Decimal,
+}
+
+impl AprEstimateAssumptions {
+    pub const LEGACY_ORDER_NOTIONAL_USDC: Decimal = Decimal::TEN;
+    pub const LEGACY_ROUND_TRIP_FEE_PERCENT: Decimal = Decimal::from_parts(4, 0, 0, false, 3);
+
+    pub const fn legacy_defaults() -> Self {
+        Self {
+            order_notional_usdc: Self::LEGACY_ORDER_NOTIONAL_USDC,
+            round_trip_fee_percent: Self::LEGACY_ROUND_TRIP_FEE_PERCENT,
+        }
+    }
+
+    /// Validates the bounded inputs used by the heuristic APR estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrategyError::InvalidConfig`] when the order notional is
+    /// non-positive or the assumed round-trip fee is negative.
+    pub fn validate(self) -> Result<Self, StrategyError> {
+        if self.order_notional_usdc <= Decimal::ZERO {
+            return Err(StrategyError::InvalidConfig(
+                "APR order notional must be positive",
+            ));
+        }
+        if self.round_trip_fee_percent < Decimal::ZERO {
+            return Err(StrategyError::InvalidConfig(
+                "APR round-trip fee must not be negative",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualGridConfig {
     pub symbol: Symbol,
@@ -442,6 +480,28 @@ impl VirtualGrid {
         now: DateTime<Utc>,
         window: Duration,
     ) -> Result<Decimal, StrategyError> {
+        self.calculate_apr_at_with_assumptions(
+            now,
+            window,
+            AprEstimateAssumptions::legacy_defaults(),
+        )
+    }
+
+    /// Calculates rolling-window annualized return at `now` with explicit
+    /// heuristic assumptions for order notional and round-trip fees.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrategyError::InvalidConfig`] for a non-positive or
+    /// unrepresentably small window, invalid assumptions, or propagates APR
+    /// validation errors.
+    pub fn calculate_apr_at_with_assumptions(
+        &mut self,
+        now: DateTime<Utc>,
+        window: Duration,
+        assumptions: AprEstimateAssumptions,
+    ) -> Result<Decimal, StrategyError> {
+        let assumptions = assumptions.validate()?;
         if window <= Duration::zero() {
             return Err(StrategyError::InvalidConfig("APR window must be positive"));
         }
@@ -504,10 +564,11 @@ impl VirtualGrid {
             .ok_or(StrategyError::InvalidFinancialValue(
                 "virtual grid cycles per hour",
             ))?;
-        let estimated_apr = AprCalculator::annualized(
+        let estimated_apr = AprCalculator::annualized_with_assumptions(
             self.config.grid_interval_percent,
             self.config.grid_width_percent,
             cycles_per_hour,
+            assumptions,
         )?;
         self.cycles_per_hour = cycles_per_hour;
         self.estimated_apr = estimated_apr;
@@ -644,8 +705,6 @@ impl VirtualGrid {
 pub struct AprCalculator;
 
 impl AprCalculator {
-    pub const ORDER_VALUE_USDC: Decimal = Decimal::TEN;
-    pub const FEE_RATE_PERCENT: Decimal = Decimal::from_parts(4, 0, 0, false, 3);
     pub const HOURS_PER_YEAR: Decimal = Decimal::from_parts(8_760, 0, 0, false, 0);
 
     /// Calculates annualized APR using the legacy scanner formula.
@@ -659,6 +718,27 @@ impl AprCalculator {
         grid_width_percent: Decimal,
         cycles_per_hour: Decimal,
     ) -> Result<Decimal, StrategyError> {
+        Self::annualized_with_assumptions(
+            grid_interval_percent,
+            grid_width_percent,
+            cycles_per_hour,
+            AprEstimateAssumptions::legacy_defaults(),
+        )
+    }
+
+    /// Calculates annualized APR with explicit heuristic assumptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrategyError::InvalidConfig`] when width/interval are not
+    /// positive, the cycle rate is negative, or assumptions are invalid.
+    pub fn annualized_with_assumptions(
+        grid_interval_percent: Decimal,
+        grid_width_percent: Decimal,
+        cycles_per_hour: Decimal,
+        assumptions: AprEstimateAssumptions,
+    ) -> Result<Decimal, StrategyError> {
+        let assumptions = assumptions.validate()?;
         if grid_interval_percent <= Decimal::ZERO {
             return Err(StrategyError::InvalidConfig(
                 "APR grid interval must be positive",
@@ -675,7 +755,7 @@ impl AprCalculator {
             ));
         }
         let net_profit_rate = grid_interval_percent
-            .checked_sub(Self::FEE_RATE_PERCENT)
+            .checked_sub(assumptions.round_trip_fee_percent)
             .ok_or(StrategyError::InvalidFinancialValue("APR net profit rate"))?;
         if net_profit_rate <= Decimal::ZERO {
             return Ok(Decimal::ZERO);
@@ -698,12 +778,33 @@ impl AprCalculator {
         grid_width_percent: Decimal,
         grid_interval_percent: Decimal,
     ) -> Result<Decimal, StrategyError> {
+        Self::total_capital_with_assumptions(
+            grid_width_percent,
+            grid_interval_percent,
+            AprEstimateAssumptions::legacy_defaults(),
+        )
+    }
+
+    /// Calculates capital allocated across every configured grid interval with
+    /// explicit heuristic assumptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrategyError::InvalidConfig`] when width or interval is not
+    /// positive or assumptions are invalid.
+    pub fn total_capital_with_assumptions(
+        grid_width_percent: Decimal,
+        grid_interval_percent: Decimal,
+        assumptions: AprEstimateAssumptions,
+    ) -> Result<Decimal, StrategyError> {
+        let assumptions = assumptions.validate()?;
         if grid_width_percent <= Decimal::ZERO || grid_interval_percent <= Decimal::ZERO {
             return Err(StrategyError::InvalidConfig(
                 "capital grid width and interval must be positive",
             ));
         }
-        Self::ORDER_VALUE_USDC
+        assumptions
+            .order_notional_usdc
             .checked_mul(grid_width_percent)
             .and_then(|value| value.checked_div(grid_interval_percent))
             .ok_or(StrategyError::InvalidFinancialValue(
@@ -718,15 +819,35 @@ impl AprCalculator {
     /// Returns [`StrategyError::InvalidFinancialValue`] when the result cannot
     /// be represented by [`Decimal`].
     pub fn profit_per_cycle(grid_interval_percent: Decimal) -> Result<Decimal, StrategyError> {
+        Self::profit_per_cycle_with_assumptions(
+            grid_interval_percent,
+            AprEstimateAssumptions::legacy_defaults(),
+        )
+    }
+
+    /// Calculates the heuristic profit for one completed virtual-grid cycle
+    /// with explicit assumptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrategyError::InvalidConfig`] when assumptions are invalid
+    /// and [`StrategyError::InvalidFinancialValue`] when the result cannot be
+    /// represented by [`Decimal`].
+    pub fn profit_per_cycle_with_assumptions(
+        grid_interval_percent: Decimal,
+        assumptions: AprEstimateAssumptions,
+    ) -> Result<Decimal, StrategyError> {
+        let assumptions = assumptions.validate()?;
         let net_rate = grid_interval_percent
-            .checked_sub(Self::FEE_RATE_PERCENT)
+            .checked_sub(assumptions.round_trip_fee_percent)
             .ok_or(StrategyError::InvalidFinancialValue(
                 "virtual grid net cycle rate",
             ))?;
         if net_rate <= Decimal::ZERO {
             Ok(Decimal::ZERO)
         } else {
-            Self::ORDER_VALUE_USDC
+            assumptions
+                .order_notional_usdc
                 .checked_mul(net_rate)
                 .and_then(|value| value.checked_div(Decimal::ONE_HUNDRED))
                 .ok_or(StrategyError::InvalidFinancialValue(

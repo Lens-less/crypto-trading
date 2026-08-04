@@ -25,8 +25,9 @@ use axum::{
 use crypto_trading_control_plane::{
     AccountRiskReadModel, ArbitrageMonitorReadModel, CapabilityManifest, ControlPlaneEventsPage,
     ControlPlaneSnapshot, ExecutionBatchState, OperatorReadModel, PaperAccountReadModel,
-    PriceAlertReadModel, ProjectionStatus, ReadControlPlane, ReadFailureKind,
-    ReadOnlyTaskReadModel, RecoveryDirective, ReleaseStage, VirtualGridScannerReadModel,
+    PriceAlertReadModel, ProjectionStatus, ReadControlPlane, ReadFailureKind, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
+    RecoveryDirective, ReleaseStage, VirtualGridScannerReadModel,
 };
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
@@ -884,6 +885,8 @@ impl SystemResponse {
             .iter()
             .filter(|batch| batch.state == ExecutionBatchState::Conflict)
             .count();
+        let kill_switch = summarize_kill_switch(&snapshot.account_risk);
+        let adapter_health = summarize_adapter_health(&snapshot.tasks);
         Self {
             schema_version: API_SCHEMA_VERSION,
             product_version: snapshot.capabilities.product_version,
@@ -902,10 +905,63 @@ impl SystemResponse {
                 batches: snapshot.operator.batches_truncated,
                 warnings: snapshot.operator.warnings_truncated,
             },
-            kill_switch: OperationalSignal::NotAvailable,
+            kill_switch,
             market_data_freshness: OperationalSignal::NotAvailable,
-            adapter_health: OperationalSignal::NotAvailable,
+            adapter_health,
         }
+    }
+}
+
+fn summarize_kill_switch(account_risk: &AccountRiskReadModel) -> OperationalSignal {
+    if account_risk.projection_status != ProjectionStatus::Complete
+        || account_risk.invalid_event_count != 0
+    {
+        return OperationalSignal::Degraded;
+    }
+    if account_risk
+        .scopes
+        .iter()
+        .any(|scope| scope.kill_switch_engaged)
+    {
+        return OperationalSignal::Engaged;
+    }
+    if account_risk.scopes.is_empty() {
+        OperationalSignal::NotAvailable
+    } else {
+        OperationalSignal::Normal
+    }
+}
+
+fn summarize_adapter_health(tasks: &ReadOnlyTaskReadModel) -> OperationalSignal {
+    if tasks.projection_status != ProjectionStatus::Complete || tasks.invalid_event_count != 0 {
+        return OperationalSignal::Degraded;
+    }
+    if tasks.tasks.iter().any(|task| {
+        task.phase == ReadOnlyTaskPhase::Failed
+            || (task.phase == ReadOnlyTaskPhase::Stopped
+                && task.recovery == ReadOnlyTaskRecovery::Investigate)
+    }) {
+        return OperationalSignal::Degraded;
+    }
+
+    let mut observed_healthy = false;
+    for source in tasks.tasks.iter().flat_map(|task| task.sources.iter()) {
+        if source.phase == ReadOnlyTaskSourcePhase::Failed
+            || source.health == ReadOnlyTaskSourceHealth::Degraded
+        {
+            return OperationalSignal::Degraded;
+        }
+        if source.phase == ReadOnlyTaskSourcePhase::Running
+            && source.health == ReadOnlyTaskSourceHealth::Healthy
+        {
+            observed_healthy = true;
+        }
+    }
+
+    if observed_healthy {
+        OperationalSignal::Normal
+    } else {
+        OperationalSignal::NotAvailable
     }
 }
 
@@ -918,6 +974,9 @@ pub enum AccessScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationalSignal {
+    Normal,
+    Engaged,
+    Degraded,
     NotAvailable,
 }
 

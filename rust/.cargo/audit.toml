@@ -1,0 +1,8 @@
+# RUSTSEC-2026-0235 affects rkyv's archive validation. rkyv 0.7.46 is present
+# only as an inactive optional dependency of rust_decimal; no workspace target
+# enables it. The audit CI job independently proves that no rkyv package is in
+# the all-targets/all-features graph and expires this exception on 2026-11-04.
+# Remove this exception as soon as rust_decimal no longer records rkyv 0.7 in
+# Cargo.lock, or before enabling any rust_decimal rkyv integration.
+[advisories]
+ignore = ["RUSTSEC-2026-0235"]

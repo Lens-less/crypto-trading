@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -19,6 +20,7 @@ use crypto_trading_runtime::{
     PaperReservationPhase, PaperReservationRequest, ProjectionStatus,
 };
 use rust_decimal::Decimal;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 fn decimal(value: &str) -> Decimal {
@@ -235,6 +237,34 @@ fn reconciliation_mismatch_proof(
         .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_authorities_initialize_starting_balance_exactly_once() {
+    let path = temp_path("durable-initialization");
+    let journal_id = Uuid::new_v4();
+    let config = PaperAccountConfig::new("paper-main", money("1000")).unwrap();
+    let first_authority =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config.clone()).unwrap();
+    let second_authority =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config.clone()).unwrap();
+
+    let (first, second) = tokio::join!(
+        first_authority.ensure_initialized(),
+        second_authority.ensure_initialized()
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.available, money("1000"));
+    assert!(first.reservations.is_empty());
+
+    let reopened =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&path), config).unwrap();
+    assert_eq!(reopened.ensure_initialized().await.unwrap(), first);
+    let records = std::fs::read_to_string(path).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    assert!(records.contains("\"decision\":\"paper_account_initialized\""));
 }
 
 #[tokio::test]
@@ -1499,5 +1529,135 @@ async fn assert_two_spellings_share_capacity(
          left={left:?} right={right:?}"
     );
 
+    std::fs::remove_dir_all(directory).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operation_lease_is_shared_across_authorities_and_path_aliases() {
+    let directory =
+        std::env::temp_dir().join(format!("crypto-trading-op-lease-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let direct = directory.join("paper-account.jsonl");
+    let alias = directory.join(".").join("paper-account.jsonl");
+    let journal_id = Uuid::new_v4();
+    let config = PaperAccountConfig::new("paper-main", money("1000")).unwrap();
+    let first =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&direct), config.clone()).unwrap();
+    let second = PaperAccountAuthority::new(journal_id, JsonlHistory::new(&alias), config).unwrap();
+
+    let first_lease = first.acquire_operation_lease().await;
+    let initialized = first.ensure_initialized().await.unwrap();
+    assert_eq!(initialized.available, money("1000"));
+    assert!(
+        timeout(Duration::from_millis(100), second.acquire_operation_lease())
+            .await
+            .is_err(),
+        "the second authority should block while the first lease is held"
+    );
+
+    drop(first_lease);
+
+    let second_lease = timeout(Duration::from_secs(1), second.acquire_operation_lease())
+        .await
+        .expect("the second authority should acquire the lease after release");
+    let second_snapshot = second.decision_snapshot().await.unwrap();
+    assert_eq!(second_snapshot.available, money("1000"));
+    drop(second_lease);
+
+    std::fs::remove_dir_all(directory).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloned_operation_lease_keeps_the_account_lane_locked_until_last_drop() {
+    let directory =
+        std::env::temp_dir().join(format!("crypto-trading-op-lease-clone-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let direct = directory.join("paper-account.jsonl");
+    let alias = directory.join(".").join("paper-account.jsonl");
+    let journal_id = Uuid::new_v4();
+    let config = PaperAccountConfig::new("paper-main", money("1000")).unwrap();
+    let first =
+        PaperAccountAuthority::new(journal_id, JsonlHistory::new(&direct), config.clone()).unwrap();
+    let second = PaperAccountAuthority::new(journal_id, JsonlHistory::new(&alias), config).unwrap();
+
+    let first_lease = first.acquire_operation_lease().await;
+    let cloned_lease = first_lease.clone();
+    drop(first_lease);
+
+    assert!(
+        timeout(Duration::from_millis(100), second.acquire_operation_lease())
+            .await
+            .is_err(),
+        "dropping the original clone must not release the shared account lane"
+    );
+
+    drop(cloned_lease);
+
+    let second_lease = timeout(Duration::from_secs(1), second.acquire_operation_lease())
+        .await
+        .expect("the account lane should unlock after the last clone drops");
+    drop(second_lease);
+
+    std::fs::remove_dir_all(directory).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operation_leases_for_different_journals_do_not_block_each_other() {
+    let directory = std::env::temp_dir().join(format!(
+        "crypto-trading-op-lease-distinct-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let first_path = directory.join("paper-account-a.jsonl");
+    let second_path = directory.join("paper-account-b.jsonl");
+    let config = PaperAccountConfig::new("paper-main", money("1000")).unwrap();
+    let first = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&first_path),
+        config.clone(),
+    )
+    .unwrap();
+    let second =
+        PaperAccountAuthority::new(Uuid::new_v4(), JsonlHistory::new(&second_path), config)
+            .unwrap();
+
+    let first_lease = first.acquire_operation_lease().await;
+    let second_lease = timeout(Duration::from_millis(100), second.acquire_operation_lease())
+        .await
+        .expect("distinct journals should not share an operation lease");
+
+    drop(second_lease);
+    drop(first_lease);
+    std::fs::remove_dir_all(directory).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operation_leases_for_different_accounts_in_one_journal_do_not_block_each_other() {
+    let directory = std::env::temp_dir().join(format!(
+        "crypto-trading-op-lease-multi-account-{}",
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("paper-account.jsonl");
+    let first = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let second = PaperAccountAuthority::new(
+        Uuid::new_v4(),
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-alt", money("1000")).unwrap(),
+    )
+    .unwrap();
+
+    let first_lease = first.acquire_operation_lease().await;
+    let second_lease = timeout(Duration::from_millis(100), second.acquire_operation_lease())
+        .await
+        .expect("same journal but different accounts should not share an operation lease");
+
+    drop(second_lease);
+    drop(first_lease);
     std::fs::remove_dir_all(directory).ok();
 }

@@ -4,6 +4,7 @@ import {
   capabilityManifestSchema,
   healthResponseSchema,
   systemResponseSchema,
+  virtualGridScannerReadModelSchema,
 } from "./api-types";
 
 describe("healthResponseSchema", () => {
@@ -39,6 +40,9 @@ describe("systemResponseSchema", () => {
     journal_id: "journal-8f3a",
     live_trading_enabled: false,
     head_sequence: 42,
+    kill_switch: "normal",
+    market_data_freshness: "not_available",
+    adapter_health: "degraded",
   };
 
   it("接受最小 /system 形态(窄校验)", () => {
@@ -71,6 +75,28 @@ describe("systemResponseSchema", () => {
     const { journal_id: _journalId, ...withoutJournal } = valid;
     expect(systemResponseSchema.safeParse(withoutJournal).success).toBe(false);
   });
+
+  it("接受受控 operational signals", () => {
+    for (const signal of ["normal", "engaged", "degraded", "not_available"]) {
+      expect(
+        systemResponseSchema.safeParse({
+          ...valid,
+          kill_switch: signal,
+          market_data_freshness: signal,
+          adapter_health: signal,
+        }).success,
+      ).toBe(true);
+    }
+  });
+
+  it("拒绝未知 operational signal", () => {
+    expect(
+      systemResponseSchema.safeParse({
+        ...valid,
+        adapter_health: "healthy",
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("capabilityManifestSchema", () => {
@@ -96,6 +122,45 @@ describe("capabilityManifestSchema", () => {
       capabilityManifestSchema.safeParse({ ...valid, release_stage: "live" })
         .success,
     ).toBe(false);
+  });
+});
+
+describe("virtualGridScannerReadModelSchema", () => {
+  const valid = {
+    schema_version: 1,
+    journal_id: "journal-scanner",
+    projection_status: "complete",
+    latest: {
+      run_id: "run-1",
+      estimated_apr_kind: "heuristic",
+      estimated_apr_assumptions: {
+        order_notional_usdc: "100",
+        round_trip_fee_percent: "0.2",
+      },
+      rows: [{ rank: 1, estimated_apr_kind: "heuristic" }],
+    },
+    invalid_event_count: 0,
+  };
+
+  it("要求 scanner 明示启发式 APR 及其假设", () => {
+    expect(virtualGridScannerReadModelSchema.safeParse(valid).success).toBe(true);
+    const { estimated_apr_assumptions: _assumptions, ...latest } = valid.latest;
+    expect(
+      virtualGridScannerReadModelSchema.safeParse({ ...valid, latest }).success,
+    ).toBe(false);
+  });
+
+  it("兼容旧版 v1 恢复出的 unknown APR 类型，但仍要求显式假设", () => {
+    expect(
+      virtualGridScannerReadModelSchema.safeParse({
+        ...valid,
+        latest: {
+          ...valid.latest,
+          estimated_apr_kind: "unknown",
+          rows: [{ rank: 1, estimated_apr_kind: "unknown" }],
+        },
+      }).success,
+    ).toBe(true);
   });
 });
 

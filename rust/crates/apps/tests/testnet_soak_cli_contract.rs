@@ -15,6 +15,10 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_crypto-trading")
 }
 
+fn control_token() -> &'static str {
+    "0123456789abcdef0123456789abcdef"
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -59,6 +63,7 @@ fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
     loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "testnet-soak",
                 "--mode",
@@ -132,6 +137,7 @@ fn serve_without_credentials_fails_before_writing_a_started_fact() {
     let history = temp_path("testnet-soak-missing-creds", "jsonl");
     let output = Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "testnet-soak",
             "--mode",
@@ -169,6 +175,7 @@ fn serve_with_a_busy_control_port_fails_before_writing_a_started_fact() {
     let control_port = occupied.local_addr().unwrap().port();
     let output = Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "testnet-soak",
             "--mode",
@@ -207,6 +214,7 @@ fn serve_status_and_stop_work_with_the_hidden_fixture_probe() {
     let mut child = ChildGuard(Some(
         Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "testnet-soak",
                 "--mode",
@@ -247,6 +255,7 @@ fn serve_status_and_stop_work_with_the_hidden_fixture_probe() {
     let stop = loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "testnet-soak",
                 "--mode",
@@ -338,6 +347,7 @@ fn verify_exits_nonzero_before_the_twenty_four_hour_policy_is_met() {
 
     let output = Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "testnet-soak",
             "--mode",
@@ -428,6 +438,7 @@ fn verify_accepts_full_production_sample_coverage() {
 
     let output = Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "testnet-soak",
             "--mode",

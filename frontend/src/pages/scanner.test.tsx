@@ -33,6 +33,7 @@ function row(overrides: Partial<VirtualGridScanRowView> = {}): VirtualGridScanRo
     recent_five_minute_cycles: 1,
     cycles_per_hour: "0.45",
     estimated_apr: "12.5",
+    estimated_apr_kind: "heuristic",
     volume_24h_usdc: "1000000",
     rating_grade: "s",
     rating_score: "91.2",
@@ -56,6 +57,11 @@ function model(
       run_id: "run-7",
       ranking_policy: "explicit_benchmark_then_apr_desc",
       apr_window_seconds: 3600,
+      estimated_apr_kind: "heuristic",
+      estimated_apr_assumptions: {
+        order_notional_usdc: "100",
+        round_trip_fee_percent: "0.2",
+      },
       min_complete_cycles: 2,
       row_limit: 128,
       candidate_count: 4,
@@ -91,27 +97,61 @@ afterEach(() => {
 });
 
 describe("/scanner", () => {
-  it("渲染排行表:行数据、等宽数字 APR 与排行政策说明", async () => {
+  it("渲染排行、APR 假设和回放免责声明，不把指标当成实盘信号", async () => {
     stubScanner(model());
     renderWithQueryClient(<ScannerPage />);
     await waitFor(() => {
       expect(screen.getByText("BTCUSDT")).toBeTruthy();
     });
     expect(
-      screen.getByRole("region", { name: "确定性虚拟网格排行明细,可横向滚动" }),
+      screen.getByRole("region", { name: "确定性虚拟网格排行明细，可横向滚动" }),
     ).toBeTruthy();
-    // APR 数值必须落在等宽 tabular 语境(.numeric)。
     const apr = screen.getByText("12.5%");
     expect(apr.className).toContain("numeric");
     expect(
-      screen.getByText(/benchmark 是展示优先级,不是评分加成/),
+      screen.getByText(/benchmark 只是展示优先级，不是评分加成/),
     ).toBeTruthy();
+    expect(screen.getByText("启发式估算 / Heuristic estimate")).toBeTruthy();
+    expect(screen.getByText(/每格名义 100 USDC · 往返费率 0.2%/)).toBeTruthy();
     expect(
-      screen.getByText(/不证明行情仍然新鲜,也不是投资建议/),
+      screen.getByRole("columnheader", { name: "APR 估算 / Rating" }),
     ).toBeTruthy();
+    expect(screen.getByText(/APR 估算不代表可交易收益/)).toBeTruthy();
+    expect(screen.getByText(/不构成投资建议/)).toBeTruthy();
   });
 
-  it("评级徽章遵守安全语义分离:S/D 都不使用安全色,只用中性/强调色", async () => {
+  it("兼容旧版 v1 unknown APR，并明确展示恢复公式而非启发式标签", async () => {
+    stubScanner(
+      model({
+        latest: {
+          ...model().latest!,
+          estimated_apr_kind: "unknown",
+          estimated_apr_assumptions: {
+            order_notional_usdc: "10",
+            round_trip_fee_percent: "0.004",
+          },
+          rows: [row({ estimated_apr_kind: "unknown" })],
+        },
+      }),
+    );
+    renderWithQueryClient(<ScannerPage />);
+    await waitFor(() => {
+      expect(
+        screen.getByText("未知（旧版 v1 恢复） / Unknown (restored from legacy v1)"),
+      ).toBeTruthy();
+    });
+    expect(
+      screen.getByText(/旧版记录未显式声明APR类型，按v1固定公式恢复：10 USDC \/ 0.004%/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        /Legacy record omitted explicit APR kind; restored with the fixed v1 formula: 10 USDC \/ 0.004%/,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("启发式估算 / Heuristic estimate")).toBeNull();
+  });
+
+  it("评级徽章保持中性语义，不把 S/D 误导成安全状态", async () => {
     stubScanner(model());
     renderWithQueryClient(<ScannerPage />);
     await waitFor(() => {
@@ -129,11 +169,10 @@ describe("/scanner", () => {
     const dBadge = screen
       .getAllByTestId("scanner-grade")
       .find((badge) => badge.getAttribute("data-grade") === "d");
-    // D 级同样不是危险状态:中性呈现。
     expect(dBadge?.className).toContain("text-muted-foreground");
   });
 
-  it("degraded 投影:danger 横幅 + 保留最后有效历史排行(行仍可见)", async () => {
+  it("degraded 投影保留最后有效历史排行，但明确不是当前结果", async () => {
     stubScanner(model({ projection_status: "degraded" }));
     renderWithQueryClient(<ScannerPage />);
     await waitFor(() => {
@@ -143,7 +182,7 @@ describe("/scanner", () => {
     expect(screen.getByText("ETHUSDT")).toBeTruthy();
   });
 
-  it("truncated 排行:窗口化横幅陈述展示范围", async () => {
+  it("truncated 排行显示截断横幅，并说明只展示部分候选", async () => {
     const truncated = model();
     truncated.latest = { ...truncated.latest!, truncated: true, eligible_count: 9 };
     stubScanner(truncated);
@@ -153,7 +192,7 @@ describe("/scanner", () => {
     });
   });
 
-  it("空态:latest=null 时说明查过哪个事实来源,不伪装健康", async () => {
+  it("latest=null 时明确说明只检查过 read model，不伪装健康状态", async () => {
     stubScanner(model({ latest: null }));
     renderWithQueryClient(<ScannerPage />);
     await waitFor(() => {

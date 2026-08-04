@@ -13,6 +13,7 @@ use crypto_trading_domain::{MarketType, Price, Symbol};
 use crypto_trading_runtime::{
     JournalSnapshot, JsonlHistory, MarketInstrument, ProjectionStatus, VirtualGridScannerReadModel,
 };
+use crypto_trading_strategy::AprEstimateAssumptions;
 use rust_decimal::Decimal;
 use serde_json::Value;
 
@@ -94,7 +95,7 @@ async fn scan_metrics_match_virtual_grid_apr_and_rating_contract() {
     );
     assert_eq!(
         row.estimated_apr(),
-        Decimal::from_str_exact("20939.904000000000000000000009").unwrap()
+        Decimal::from_str_exact("16819.200000000000000000000007").unwrap()
     );
     assert_eq!(row.rating_grade().to_string(), "s");
     assert_eq!(row.rating_score(), Decimal::from(95));
@@ -108,13 +109,27 @@ async fn scan_metrics_match_virtual_grid_apr_and_rating_contract() {
     assert_eq!(record["strategy"], "virtual_grid_scanner");
     assert_eq!(record["symbol"], "control-plane");
     assert_eq!(record["decision"], "scanner_ranked");
+    assert_eq!(record["details"]["schema_version"], 2);
     assert_eq!(
         record["details"]["ranking_policy"],
         "explicit_benchmark_then_apr_desc"
     );
+    assert_eq!(record["details"]["estimated_apr_kind"], "heuristic");
+    assert_eq!(
+        record["details"]["estimated_apr_assumptions"]["order_notional_usdc"],
+        "100"
+    );
+    assert_eq!(
+        record["details"]["estimated_apr_assumptions"]["round_trip_fee_percent"],
+        "0.2"
+    );
     assert_eq!(
         record["details"]["rows"][0]["estimated_apr"],
-        "20939.904000000000000000000009"
+        "16819.200000000000000000000007"
+    );
+    assert_eq!(
+        record["details"]["rows"][0]["estimated_apr_kind"],
+        "heuristic"
     );
     let encoded = serde_json::to_string(record).unwrap();
     for forbidden in [
@@ -253,6 +268,7 @@ fn invalid_replay_shape_fails_before_any_journal_can_be_selected() {
         "duplicate",
         timestamp(300),
         300,
+        apr_estimate_assumptions(),
         0,
         10,
         vec![
@@ -270,6 +286,7 @@ fn invalid_replay_shape_fails_before_any_journal_can_be_selected() {
         "future",
         timestamp(1),
         300,
+        apr_estimate_assumptions(),
         0,
         10,
         vec![
@@ -324,6 +341,7 @@ fn request(
         run_id,
         timestamp(300),
         300,
+        apr_estimate_assumptions(),
         min_complete_cycles,
         row_limit,
         candidates,
@@ -369,6 +387,13 @@ fn observation(sequence: u64, price: &str, offset_seconds: i64) -> VirtualGridSc
 
 fn instrument(symbol: &str) -> MarketInstrument {
     MarketInstrument::new("fixture", Symbol::new(symbol).unwrap(), MarketType::Spot).unwrap()
+}
+
+fn apr_estimate_assumptions() -> AprEstimateAssumptions {
+    AprEstimateAssumptions {
+        order_notional_usdc: Decimal::from(100),
+        round_trip_fee_percent: Decimal::new(2, 1),
+    }
 }
 
 fn row_symbols(report: &crypto_trading_cli::scanner::VirtualGridScanReport) -> Vec<&str> {

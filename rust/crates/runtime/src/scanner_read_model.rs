@@ -15,6 +15,10 @@ use crate::{
 pub const VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION: u16 = 1;
 /// Maximum rows retained from one complete ranking fact.
 pub const MAX_VIRTUAL_GRID_SCANNER_ROWS: usize = 128;
+const LEGACY_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION: u64 = 1;
+const CURRENT_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION: u64 = 2;
+const LEGACY_ESTIMATED_APR_ORDER_NOTIONAL_USDC: &str = "10";
+const LEGACY_ESTIMATED_APR_ROUND_TRIP_FEE_PERCENT: &str = "0.004";
 
 const SCANNER_STRATEGY: &str = "virtual_grid_scanner";
 const SCANNER_SYMBOL: &str = "control-plane";
@@ -27,7 +31,7 @@ const MAX_SCANNER_TEXT_BYTES: usize = 128;
 const MAX_DECIMAL_TEXT_BYTES: usize = 64;
 const MAX_GRID_COUNT: u64 = 10_000;
 
-const DETAILS_FIELDS: &[&str] = &[
+const DETAILS_FIELDS_V1: &[&str] = &[
     "schema_version",
     "run_id",
     "ranking_policy",
@@ -40,7 +44,22 @@ const DETAILS_FIELDS: &[&str] = &[
     "truncated",
     "rows",
 ];
-const ROW_FIELDS: &[&str] = &[
+const DETAILS_FIELDS_V2: &[&str] = &[
+    "schema_version",
+    "run_id",
+    "ranking_policy",
+    "apr_window_seconds",
+    "estimated_apr_kind",
+    "estimated_apr_assumptions",
+    "min_complete_cycles",
+    "row_limit",
+    "candidate_count",
+    "eligible_count",
+    "filtered_by_cycles_count",
+    "truncated",
+    "rows",
+];
+const ROW_FIELDS_V1: &[&str] = &[
     "rank",
     "activity",
     "priority",
@@ -65,6 +84,37 @@ const ROW_FIELDS: &[&str] = &[
     "recent_five_minute_cycles",
     "cycles_per_hour",
     "estimated_apr",
+    "volume_24h_usdc",
+    "price_change_24h_percent",
+    "rating_grade",
+    "rating_score",
+];
+const ROW_FIELDS_V2: &[&str] = &[
+    "rank",
+    "activity",
+    "priority",
+    "instrument",
+    "started_at",
+    "last_observed_at",
+    "observation_count",
+    "last_observation_sequence",
+    "current_price",
+    "lower_price",
+    "upper_price",
+    "pending_buy_price",
+    "pending_sell_price",
+    "grid_width_percent",
+    "grid_interval_percent",
+    "grid_count",
+    "running_seconds",
+    "buy_crosses",
+    "sell_crosses",
+    "total_crosses",
+    "complete_cycles",
+    "recent_five_minute_cycles",
+    "cycles_per_hour",
+    "estimated_apr",
+    "estimated_apr_kind",
     "volume_24h_usdc",
     "price_change_24h_percent",
     "rating_grade",
@@ -139,6 +189,20 @@ impl fmt::Display for ScannerRatingGradeView {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerAprEstimateKindView {
+    Unknown,
+    Heuristic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScannerAprEstimateAssumptionsView {
+    pub order_notional_usdc: String,
+    pub round_trip_fee_percent: String,
+}
+
 /// Exact market identity copied from a validated scanner row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,6 +240,7 @@ pub struct VirtualGridScanRowView {
     pub recent_five_minute_cycles: usize,
     pub cycles_per_hour: String,
     pub estimated_apr: String,
+    pub estimated_apr_kind: ScannerAprEstimateKindView,
     pub volume_24h_usdc: String,
     pub price_change_24h_percent: Option<String>,
     pub rating_grade: ScannerRatingGradeView,
@@ -198,6 +263,8 @@ pub struct VirtualGridScanView {
     pub run_id: String,
     pub ranking_policy: String,
     pub apr_window_seconds: u32,
+    pub estimated_apr_kind: ScannerAprEstimateKindView,
+    pub estimated_apr_assumptions: ScannerAprEstimateAssumptionsView,
     pub min_complete_cycles: u64,
     pub row_limit: usize,
     pub candidate_count: usize,
@@ -323,6 +390,8 @@ fn parse_scanner_event(event: &OperationEventEnvelope) -> Result<Option<VirtualG
             value,
             index.saturating_add(1),
             event.recorded_at(),
+            header.record_schema_version,
+            header.estimated_apr_kind,
             header.min_complete_cycles,
         )?;
         let identity = (
@@ -348,6 +417,8 @@ fn parse_scanner_event(event: &OperationEventEnvelope) -> Result<Option<VirtualG
         run_id: header.run_id,
         ranking_policy: RANKING_POLICY.to_owned(),
         apr_window_seconds: header.apr_window_seconds,
+        estimated_apr_kind: header.estimated_apr_kind,
+        estimated_apr_assumptions: header.estimated_apr_assumptions,
         min_complete_cycles: header.min_complete_cycles,
         row_limit: header.row_limit,
         candidate_count: header.candidate_count,
@@ -359,8 +430,11 @@ fn parse_scanner_event(event: &OperationEventEnvelope) -> Result<Option<VirtualG
 }
 
 struct ParsedScanHeader {
+    record_schema_version: u64,
     run_id: String,
     apr_window_seconds: u32,
+    estimated_apr_kind: ScannerAprEstimateKindView,
+    estimated_apr_assumptions: ScannerAprEstimateAssumptionsView,
     min_complete_cycles: u64,
     row_limit: usize,
     candidate_count: usize,
@@ -370,16 +444,29 @@ struct ParsedScanHeader {
 }
 
 fn parse_scan_header(details: &Map<String, Value>) -> Result<ParsedScanHeader, ()> {
-    exact_fields(details, DETAILS_FIELDS)?;
-    if required_u64(details, "schema_version")?
-        != u64::from(VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION)
-    {
-        return Err(());
+    let record_schema_version = required_u64(details, "schema_version")?;
+    match record_schema_version {
+        LEGACY_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => exact_fields(details, DETAILS_FIELDS_V1)?,
+        CURRENT_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => {
+            exact_fields(details, DETAILS_FIELDS_V2)?;
+        }
+        _ => return Err(()),
     }
     let run_id = required_text(details, "run_id")?;
     if !valid_identifier(&run_id) || required_text(details, "ranking_policy")? != RANKING_POLICY {
         return Err(());
     }
+    let (estimated_apr_kind, estimated_apr_assumptions) = match record_schema_version {
+        LEGACY_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => (
+            ScannerAprEstimateKindView::Unknown,
+            legacy_apr_estimate_assumptions(),
+        ),
+        CURRENT_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => (
+            parse_apr_estimate_kind(&required_text(details, "estimated_apr_kind")?)?,
+            parse_apr_estimate_assumptions(required(details, "estimated_apr_assumptions")?)?,
+        ),
+        _ => return Err(()),
+    };
     let apr_window_seconds = required_u64(details, "apr_window_seconds")?;
     if apr_window_seconds == 0 || apr_window_seconds > MAX_SCANNER_WINDOW_SECONDS {
         return Err(());
@@ -408,8 +495,11 @@ fn parse_scan_header(details: &Map<String, Value>) -> Result<ParsedScanHeader, (
         return Err(());
     }
     Ok(ParsedScanHeader {
+        record_schema_version,
         run_id,
         apr_window_seconds: u32::try_from(apr_window_seconds).map_err(|_| ())?,
+        estimated_apr_kind,
+        estimated_apr_assumptions,
         min_complete_cycles: required_u64(details, "min_complete_cycles")?,
         row_limit,
         candidate_count,
@@ -419,14 +509,21 @@ fn parse_scan_header(details: &Map<String, Value>) -> Result<ParsedScanHeader, (
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_row(
     value: &Value,
     expected_rank: usize,
     recorded_at: DateTime<Utc>,
+    record_schema_version: u64,
+    expected_apr_kind: ScannerAprEstimateKindView,
     min_complete_cycles: u64,
 ) -> Result<VirtualGridScanRowView, ()> {
     let row = object(value)?;
-    exact_fields(row, ROW_FIELDS)?;
+    match record_schema_version {
+        LEGACY_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => exact_fields(row, ROW_FIELDS_V1)?,
+        CURRENT_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => exact_fields(row, ROW_FIELDS_V2)?,
+        _ => return Err(()),
+    }
     if required_text(row, "activity")? != "active" {
         return Err(());
     }
@@ -478,6 +575,16 @@ fn parse_row(
 
     let cycles_per_hour = nonnegative_decimal(row, "cycles_per_hour")?;
     let estimated_apr = nonnegative_decimal(row, "estimated_apr")?;
+    let estimated_apr_kind = match record_schema_version {
+        LEGACY_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => ScannerAprEstimateKindView::Unknown,
+        CURRENT_VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION => {
+            parse_apr_estimate_kind(&required_text(row, "estimated_apr_kind")?)?
+        }
+        _ => return Err(()),
+    };
+    if estimated_apr_kind != expected_apr_kind {
+        return Err(());
+    }
     let volume_24h_usdc = nonnegative_decimal(row, "volume_24h_usdc")?;
     let price_change_24h_percent = optional_decimal(row, "price_change_24h_percent")?;
     let rating_grade = parse_grade(&required_text(row, "rating_grade")?)?;
@@ -514,6 +621,7 @@ fn parse_row(
         recent_five_minute_cycles,
         cycles_per_hour: cycles_per_hour.text,
         estimated_apr: estimated_apr.text,
+        estimated_apr_kind,
         volume_24h_usdc: volume_24h_usdc.text,
         price_change_24h_percent,
         rating_grade,
@@ -647,6 +755,35 @@ fn parse_grade(value: &str) -> Result<ScannerRatingGradeView, ()> {
         "d" => Ok(ScannerRatingGradeView::D),
         _ => Err(()),
     }
+}
+
+fn parse_apr_estimate_kind(value: &str) -> Result<ScannerAprEstimateKindView, ()> {
+    match value {
+        "unknown" => Ok(ScannerAprEstimateKindView::Unknown),
+        "heuristic" => Ok(ScannerAprEstimateKindView::Heuristic),
+        _ => Err(()),
+    }
+}
+
+fn legacy_apr_estimate_assumptions() -> ScannerAprEstimateAssumptionsView {
+    ScannerAprEstimateAssumptionsView {
+        order_notional_usdc: LEGACY_ESTIMATED_APR_ORDER_NOTIONAL_USDC.to_owned(),
+        round_trip_fee_percent: LEGACY_ESTIMATED_APR_ROUND_TRIP_FEE_PERCENT.to_owned(),
+    }
+}
+
+fn parse_apr_estimate_assumptions(value: &Value) -> Result<ScannerAprEstimateAssumptionsView, ()> {
+    let assumptions = object(value)?;
+    exact_fields(
+        assumptions,
+        &["order_notional_usdc", "round_trip_fee_percent"],
+    )?;
+    let order_notional_usdc = positive_decimal(assumptions, "order_notional_usdc")?;
+    let round_trip_fee_percent = nonnegative_decimal(assumptions, "round_trip_fee_percent")?;
+    Ok(ScannerAprEstimateAssumptionsView {
+        order_notional_usdc: order_notional_usdc.text,
+        round_trip_fee_percent: round_trip_fee_percent.text,
+    })
 }
 
 struct ParsedDecimal {

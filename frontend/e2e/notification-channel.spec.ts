@@ -17,7 +17,11 @@ test.afterEach(async () => {
 });
 
 test("后端消失徽标降级,重启后自动恢复", async ({ page }) => {
-  backend = await startBackend({ port: PORT, historyPath: WEB_API_JOURNAL });
+  backend = await startBackend({
+    port: PORT,
+    historyPath: WEB_API_JOURNAL,
+    extraArgs: ["--allow-open-loopback-read-api"],
+  });
   await page.goto(`${backend.baseUrl}/overview`);
 
   const label = page
@@ -30,6 +34,10 @@ test("后端消失徽标降级,重启后自动恢复", async ({ page }) => {
   await expect(label).toHaveText("通知不可用", { timeout: 45_000 });
 
   // 同端口重启:下一次退避重连自动恢复,页面不刷新。
-  backend = await startBackend({ port: PORT, historyPath: WEB_API_JOURNAL });
+  backend = await startBackend({
+    port: PORT,
+    historyPath: WEB_API_JOURNAL,
+    extraArgs: ["--allow-open-loopback-read-api"],
+  });
   await expect(label).toHaveText("已连接 · 仅通知", { timeout: 90_000 });
 });

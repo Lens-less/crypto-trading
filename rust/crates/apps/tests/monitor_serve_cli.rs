@@ -10,6 +10,10 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_crypto-trading")
 }
 
+fn control_token() -> &'static str {
+    "0123456789abcdef0123456789abcdef"
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -26,6 +30,7 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
     let mut child = ChildGuard(Some(
         Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "monitor",
                 "--mode",
@@ -74,6 +79,7 @@ fn monitor_serve_process_can_start_report_status_and_stop() {
     let stop = loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "monitor",
                 "--mode",
@@ -142,6 +148,7 @@ fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
     loop {
         let output = Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "monitor",
                 "--mode",
@@ -163,6 +170,183 @@ fn wait_for_status(task_id: &str, history: &Path, control_port: u16) -> Output {
         assert!(std::time::Instant::now() < deadline, "{output:?}");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn monitor_serve_fails_closed_without_a_control_token() {
+    let task_id = format!("monitor-serve-no-token-{}", std::process::id());
+    let history = temp_path("monitor-serve-no-token-history", "jsonl");
+    let spread_history = temp_path("monitor-serve-no-token-spread-history", "jsonl");
+    let control_port = free_port();
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .env_remove("CRYPTO_TRADING_TASK_CONTROL_TOKEN")
+        .args([
+            "monitor",
+            "--mode",
+            "serve",
+            "--config",
+            "config/arbitrage/paper-monitor-eth.yaml",
+            "--replay",
+            "fixtures/m3-monitor-replay.jsonl",
+            "--task-id",
+            task_id.as_str(),
+            "--history-path",
+            history.to_str().unwrap(),
+            "--spread-history-path",
+            spread_history.to_str().unwrap(),
+            "--control-port",
+            &control_port.to_string(),
+            "--control-poll-interval-ms",
+            "25",
+            "--shutdown-grace-ms",
+            "30000",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("CRYPTO_TRADING_TASK_CONTROL_TOKEN"),
+        "{stderr}"
+    );
+    assert!(
+        !history.exists(),
+        "serve should fail before writing history"
+    );
+    assert!(
+        !spread_history.exists(),
+        "serve should fail before writing spread history"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn monitor_status_and_stop_require_the_matching_control_token() {
+    let task_id = format!("monitor-serve-auth-{}", std::process::id());
+    let history = temp_path("monitor-serve-auth-history", "jsonl");
+    let spread_history = temp_path("monitor-serve-auth-spread-history", "jsonl");
+    let control_port = free_port();
+    let mut child = ChildGuard(Some(
+        Command::new(binary())
+            .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
+            .args([
+                "monitor",
+                "--mode",
+                "serve",
+                "--config",
+                "config/arbitrage/paper-monitor-eth.yaml",
+                "--replay",
+                "fixtures/m3-monitor-replay.jsonl",
+                "--task-id",
+                task_id.as_str(),
+                "--history-path",
+                history.to_str().unwrap(),
+                "--spread-history-path",
+                spread_history.to_str().unwrap(),
+                "--control-port",
+                &control_port.to_string(),
+                "--control-poll-interval-ms",
+                "25",
+                "--shutdown-grace-ms",
+                "30000",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+
+    let _ = wait_for_status(&task_id, &history, control_port);
+
+    for token in [None, Some("fedcba9876543210fedcba9876543210")] {
+        let mut status = Command::new(binary());
+        status.current_dir(repo_root());
+        match token {
+            Some(token) => {
+                status.env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", token);
+            }
+            None => {
+                status.env_remove("CRYPTO_TRADING_TASK_CONTROL_TOKEN");
+            }
+        }
+        let status = status
+            .args([
+                "monitor",
+                "--mode",
+                "status",
+                "--task-id",
+                task_id.as_str(),
+                "--history-path",
+                history.to_str().unwrap(),
+                "--control-port",
+                &control_port.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!status.status.success(), "{status:?}");
+        let stderr = String::from_utf8(status.stderr).unwrap();
+        assert!(
+            stderr.contains("CRYPTO_TRADING_TASK_CONTROL_TOKEN")
+                || stderr.contains("control token was rejected"),
+            "{stderr}"
+        );
+
+        let mut stop = Command::new(binary());
+        stop.current_dir(repo_root());
+        match token {
+            Some(token) => {
+                stop.env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", token);
+            }
+            None => {
+                stop.env_remove("CRYPTO_TRADING_TASK_CONTROL_TOKEN");
+            }
+        }
+        let stop = stop
+            .args([
+                "monitor",
+                "--mode",
+                "stop",
+                "--task-id",
+                task_id.as_str(),
+                "--history-path",
+                history.to_str().unwrap(),
+                "--control-port",
+                &control_port.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!stop.status.success(), "{stop:?}");
+        let stderr = String::from_utf8(stop.stderr).unwrap();
+        assert!(
+            stderr.contains("CRYPTO_TRADING_TASK_CONTROL_TOKEN")
+                || stderr.contains("control token was rejected"),
+            "{stderr}"
+        );
+    }
+
+    let stop = Command::new(binary())
+        .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
+        .args([
+            "monitor",
+            "--mode",
+            "stop",
+            "--task-id",
+            task_id.as_str(),
+            "--history-path",
+            history.to_str().unwrap(),
+            "--control-port",
+            &control_port.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(stop.status.success(), "{stop:?}");
+
+    let _ = wait_with_output(child.0.take().unwrap(), Duration::from_secs(30));
 }
 
 fn wait_with_output(mut child: Child, timeout: Duration) -> Output {

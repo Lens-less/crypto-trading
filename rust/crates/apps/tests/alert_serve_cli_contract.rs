@@ -10,6 +10,10 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_crypto-trading")
 }
 
+fn control_token() -> &'static str {
+    "0123456789abcdef0123456789abcdef"
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -25,6 +29,7 @@ fn price_alert_serve_process_can_start_report_status_and_stop() {
     let mut child = ChildGuard(Some(
         Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "price-alert",
                 "--mode",
@@ -166,6 +171,7 @@ fn retry_until_success(attempt: impl Fn() -> Output) -> Output {
 fn run_control(mode: &str, task_id: &str, history: &Path, control_port: u16) -> Output {
     Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "price-alert",
             "--mode",

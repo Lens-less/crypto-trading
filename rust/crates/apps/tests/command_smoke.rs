@@ -1356,6 +1356,7 @@ fn config_check_recognizes_every_supported_schema() {
             "config/volume_maker/backpack_btc_volume_maker.yaml",
             "config/price_alert/binance_alert.yaml",
             "config/scanner/binance_scanner.yaml",
+            "config/paper/account-risk.example.yaml",
             "config/symbol_conversion.yaml",
             "config/exchanges/paradex_config.example.yaml",
             "--json",
@@ -1372,6 +1373,7 @@ fn config_check_recognizes_every_supported_schema() {
         "volume-maker",
         "price-alert",
         "scanner",
+        "account-risk",
         "symbol-conversion",
         "exchange-auth",
     ] {
@@ -1420,7 +1422,7 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
     assert!(output.status.success(), "{output:?}");
     let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let summaries = summaries.as_array().unwrap();
-    assert_eq!(summaries.len(), 61, "{summaries:#?}");
+    assert_eq!(summaries.len(), 62, "{summaries:#?}");
     for summary in summaries {
         assert!(summary["parseable"].is_boolean(), "{summary}");
         assert!(summary["executable"].is_boolean(), "{summary}");
@@ -1475,6 +1477,13 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
         false,
         "parse-only",
         "unavailable",
+    );
+    assert_status(
+        entry("config/paper/account-risk.example.yaml"),
+        true,
+        false,
+        "strict",
+        "paper-companion",
     );
     assert_status(
         entry("config/exchanges/paradex_config.example.yaml"),

@@ -30,8 +30,8 @@ pub use input::{read_bounded_config, reject_yaml_anchors_and_aliases};
 pub use monitor::{MonitorConfig, load_monitor_config, load_monitor_config_from_str};
 pub use scanner::{
     MAX_SCANNER_CONFIG_APR_WINDOW_SECONDS, MAX_SCANNER_CONFIG_ROW_LIMIT,
-    MAX_SCANNER_CONFIG_SYMBOLS, ScannerConfig, ScannerSymbolConfig, load_scanner_config,
-    load_scanner_config_from_str,
+    MAX_SCANNER_CONFIG_SYMBOLS, ScannerAprEstimateConfig, ScannerConfig, ScannerSymbolConfig,
+    load_scanner_config, load_scanner_config_from_str,
 };
 pub use supporting::{
     PriceAlertConfig, PriceAlertSymbolConfig, PriceThresholdConfig, VolatilityAlertConfig,

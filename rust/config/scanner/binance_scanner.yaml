@@ -1,7 +1,8 @@
 # ====================================
 # 虚拟网格扫描器配置文件
 # ====================================
-# 功能：离线回放历史价格，评估虚拟网格 APR 并输出 S/A/B/C/D 评级排名。
+# 功能：离线回放历史价格，评估虚拟网格 heuristic APR 并输出
+# S/A/B/C/D 评级排名。
 # 该扫描器只读：没有下单权限，也不连接实时行情源。
 
 scanner:
@@ -11,6 +12,10 @@ scanner:
   # 扫描与评级参数
   scan:
     apr_window_seconds: 360      # APR 滚动窗口（秒）
+    # 仅用于 heuristic APR；不是成交承诺或可实现收益率。
+    apr_estimate:
+      order_notional_usdc: "100"        # 假设每格订单名义金额
+      round_trip_fee_percent: "0.2"     # 一次完整买卖循环的总费率
     min_complete_cycles: 0       # 非 benchmark 符号进入排名所需的最小完整循环数
     row_limit: 50                # 单次扫描持久化的最大排名行数
 

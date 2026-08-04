@@ -128,6 +128,8 @@ const TOKEN_LABELS = new Map<string, string>([
   // submit 回执
   ["applied", "已写入"],
   // 系统运行信号
+  ["normal", "正常"],
+  ["engaged", "已触发"],
   ["not_available", "暂不可用"],
 ]);
 

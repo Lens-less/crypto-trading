@@ -82,6 +82,158 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
 }
 
 #[tokio::test]
+async fn system_endpoint_projects_operational_signals_from_risk_and_task_health() {
+    let journal_id = fixed_uuid(1);
+    let bytes = jsonl(&[
+        json!({
+            "timestamp": "2026-07-25T00:00:00Z",
+            "strategy": "read_only_task",
+            "symbol": "control-plane",
+            "decision": "task_registered",
+            "details": {
+                "schema_version": 1,
+                "task_id": "arb-btc-usdt",
+                "task_kind": "arbitrage_monitor",
+                "phase": "registered",
+                "processed_event_count": 0,
+                "sources": [
+                    task_source(&Value::Null, "left", "starting", "unknown", 0),
+                    task_source(&Value::Null, "right", "starting", "unknown", 0),
+                ],
+                "exit": Value::Null,
+                "failure": Value::Null,
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:01:00Z",
+            "strategy": "read_only_task",
+            "symbol": "control-plane",
+            "decision": "task_running",
+            "details": {
+                "schema_version": 1,
+                "task_id": "arb-btc-usdt",
+                "task_kind": "arbitrage_monitor",
+                "phase": "running",
+                "processed_event_count": 2,
+                "sources": [
+                    task_source(&json!("00000000-0000-0000-0000-000000000301"), "left", "running", "healthy", 1),
+                    task_source(&json!("00000000-0000-0000-0000-000000000302"), "right", "running", "healthy", 1),
+                ],
+                "exit": Value::Null,
+                "failure": Value::Null,
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:02:00Z",
+            "strategy": "account_risk",
+            "symbol": "paper",
+            "decision": "account_risk_admitted",
+            "details": {
+                "kind": "admitted",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "task_id": "paper-grid-btc",
+                "symbol": "BTC-USDT",
+                "notional": "100",
+                "utc_date": "2026-07-25",
+                "recorded_at": "2026-07-25T00:02:00Z",
+                "warnings": []
+            }
+        }),
+    ]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.oneshot(get("/api/v1/system")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let system = response_json(response).await;
+    assert_eq!(system["kill_switch"], "normal");
+    assert_eq!(system["market_data_freshness"], "not_available");
+    assert_eq!(system["adapter_health"], "normal");
+}
+
+#[tokio::test]
+async fn system_endpoint_fails_closed_when_risk_or_task_projection_is_degraded() {
+    let journal_id = fixed_uuid(1);
+    let bytes = jsonl(&[
+        json!({
+            "timestamp": "2026-07-25T00:00:00Z",
+            "strategy": "read_only_task",
+            "symbol": "control-plane",
+            "decision": "task_registered",
+            "details": {
+                "schema_version": 1,
+                "task_id": "arb-btc-usdt",
+                "task_kind": "arbitrage_monitor",
+                "phase": "registered",
+                "processed_event_count": 0,
+                "sources": [
+                    task_source(&Value::Null, "left", "starting", "unknown", 0),
+                    task_source(&Value::Null, "right", "starting", "unknown", 0),
+                ],
+                "exit": Value::Null,
+                "failure": Value::Null,
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:01:00Z",
+            "strategy": "read_only_task",
+            "symbol": "control-plane",
+            "decision": "task_running",
+            "details": {
+                "schema_version": 1,
+                "task_id": "arb-btc-usdt",
+                "task_kind": "arbitrage_monitor",
+                "phase": "running",
+                "processed_event_count": 2,
+                "sources": [
+                    task_source(&json!("00000000-0000-0000-0000-000000000301"), "left", "running", "healthy", 1),
+                    task_source(&json!("00000000-0000-0000-0000-000000000302"), "right", "running", "degraded", 1),
+                ],
+                "exit": Value::Null,
+                "failure": Value::Null,
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:02:00Z",
+            "strategy": "account_risk",
+            "symbol": "paper",
+            "decision": "account_risk_kill_switch_engaged",
+            "details": {
+                "kind": "kill_switch_engaged",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "reason": "operator drill",
+                "recorded_at": "2026-07-25T00:02:00Z"
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-25T00:03:00Z",
+            "strategy": "account_risk",
+            "symbol": "paper",
+            "decision": "account_risk_paused",
+            "details": {
+                "kind": "paused",
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "scope_id": "paper",
+                "reason": 7,
+                "recorded_at": "2026-07-25T00:03:00Z"
+            }
+        }),
+    ]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.oneshot(get("/api/v1/system")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let system = response_json(response).await;
+    assert_eq!(system["kill_switch"], "degraded");
+    assert_eq!(system["market_data_freshness"], "not_available");
+    assert_eq!(system["adapter_health"], "degraded");
+}
+
+#[tokio::test]
 async fn monitor_endpoint_exposes_only_the_bounded_read_model() {
     let bytes = jsonl(&[json!({
         "timestamp": "2026-07-24T00:00:00Z",
@@ -310,6 +462,7 @@ async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
         "recent_five_minute_cycles": 2,
         "cycles_per_hour": "10",
         "estimated_apr": "500",
+        "estimated_apr_kind": "heuristic",
         "volume_24h_usdc": "1000000",
         "price_change_24h_percent": null,
         "rating_grade": "s",
@@ -321,10 +474,15 @@ async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
         "symbol": "control-plane",
         "decision": "scanner_ranked",
         "details": {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": "scan-web",
             "ranking_policy": "explicit_benchmark_then_apr_desc",
             "apr_window_seconds": 300,
+            "estimated_apr_kind": "heuristic",
+            "estimated_apr_assumptions": {
+                "order_notional_usdc": "100",
+                "round_trip_fee_percent": "0.2",
+            },
             "min_complete_cycles": 0,
             "row_limit": 50,
             "candidate_count": 1,
@@ -343,11 +501,20 @@ async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
     let scanner = response_json(response).await;
     assert_eq!(scanner["projection_status"], "complete");
     assert_eq!(scanner["latest"]["run_id"], "scan-web");
+    assert_eq!(scanner["latest"]["estimated_apr_kind"], "heuristic");
+    assert_eq!(
+        scanner["latest"]["estimated_apr_assumptions"]["round_trip_fee_percent"],
+        "0.2"
+    );
     assert_eq!(
         scanner["latest"]["rows"][0]["instrument"]["symbol"],
         "BTC-USDC"
     );
     assert_eq!(scanner["latest"]["rows"][0]["estimated_apr"], "500");
+    assert_eq!(
+        scanner["latest"]["rows"][0]["estimated_apr_kind"],
+        "heuristic"
+    );
     let encoded = serde_json::to_string(&scanner).unwrap();
     for forbidden in ["orders", "intents", "api_key", "authorization", "secret"] {
         assert!(
@@ -367,6 +534,84 @@ async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
         .await
         .unwrap();
     assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn scanner_endpoint_preserves_legacy_v1_unknown_apr_semantics() {
+    let scanner_row = json!({
+        "rank": 1,
+        "activity": "active",
+        "priority": "benchmark",
+        "instrument": {
+            "exchange": "fixture",
+            "symbol": "BTC-USDC",
+            "market_type": "spot",
+        },
+        "started_at": "2026-07-25T00:00:00Z",
+        "last_observed_at": "2026-07-25T00:04:00Z",
+        "observation_count": 5,
+        "last_observation_sequence": 5,
+        "current_price": "100",
+        "lower_price": "95",
+        "upper_price": "105",
+        "pending_buy_price": "99",
+        "pending_sell_price": "101",
+        "grid_width_percent": "10",
+        "grid_interval_percent": "1",
+        "grid_count": 10,
+        "running_seconds": 300,
+        "buy_crosses": 2,
+        "sell_crosses": 2,
+        "total_crosses": 4,
+        "complete_cycles": 2,
+        "recent_five_minute_cycles": 2,
+        "cycles_per_hour": "10",
+        "estimated_apr": "500",
+        "volume_24h_usdc": "1000000",
+        "price_change_24h_percent": null,
+        "rating_grade": "s",
+        "rating_score": "95",
+    });
+    let bytes = jsonl(&[json!({
+        "timestamp": "2026-07-25T00:05:00Z",
+        "strategy": "virtual_grid_scanner",
+        "symbol": "control-plane",
+        "decision": "scanner_ranked",
+        "details": {
+            "schema_version": 1,
+            "run_id": "scan-web-v1",
+            "ranking_policy": "explicit_benchmark_then_apr_desc",
+            "apr_window_seconds": 300,
+            "min_complete_cycles": 0,
+            "row_limit": 50,
+            "candidate_count": 1,
+            "eligible_count": 1,
+            "filtered_by_cycles_count": 0,
+            "truncated": false,
+            "rows": [scanner_row],
+        },
+    })]);
+    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
+
+    let response = app.clone().oneshot(get("/api/v1/scanner")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let scanner = response_json(response).await;
+    assert_eq!(scanner["projection_status"], "complete");
+    assert_eq!(scanner["latest"]["run_id"], "scan-web-v1");
+    assert_eq!(scanner["latest"]["estimated_apr_kind"], "unknown");
+    assert_eq!(
+        scanner["latest"]["estimated_apr_assumptions"]["order_notional_usdc"],
+        "10"
+    );
+    assert_eq!(
+        scanner["latest"]["estimated_apr_assumptions"]["round_trip_fee_percent"],
+        "0.004"
+    );
+    assert_eq!(
+        scanner["latest"]["rows"][0]["estimated_apr_kind"],
+        "unknown"
+    );
 }
 
 #[tokio::test]

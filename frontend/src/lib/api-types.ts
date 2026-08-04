@@ -53,7 +53,11 @@ export const healthResponseSchema = z.looseObject({
 
 export type ProjectionStatus = "complete" | "windowed" | "degraded";
 export type ReleaseStage = "paper-only";
-export type OperationalSignal = "not_available";
+export type OperationalSignal =
+  | "normal"
+  | "engaged"
+  | "degraded"
+  | "not_available";
 
 export interface ProjectionTruncation {
   batches: boolean;
@@ -86,6 +90,14 @@ export const systemResponseSchema = z.looseObject({
   journal_id: z.string(),
   live_trading_enabled: z.boolean(),
   head_sequence: z.number().nullable(),
+  kill_switch: z.enum(["normal", "engaged", "degraded", "not_available"]),
+  market_data_freshness: z.enum([
+    "normal",
+    "engaged",
+    "degraded",
+    "not_available",
+  ]),
+  adapter_health: z.enum(["normal", "engaged", "degraded", "not_available"]),
 });
 
 /* -------------------------------------------------- GET /api/v1/capabilities */
@@ -533,6 +545,17 @@ export type ScannerPriority = "benchmark" | "standard";
 /** 评级是估算证据,不是安全状态;呈现时用中性/强调色而非安全色。 */
 export type ScannerRatingGrade = "s" | "a" | "b" | "c" | "d";
 
+/**
+ * heuristic = 新版记录显式声明的启发式估算;
+ * unknown = 旧版 v1 记录未声明类型,后端按固定公式恢复,仍然不是可交易收益。
+ */
+export type ScannerAprEstimateKind = "heuristic" | "unknown";
+
+export interface ScannerAprEstimateAssumptions {
+  order_notional_usdc: string;
+  round_trip_fee_percent: string;
+}
+
 export interface ScannerInstrumentView {
   exchange: string;
   symbol: string;
@@ -564,6 +587,7 @@ export interface VirtualGridScanRowView {
   recent_five_minute_cycles: number;
   cycles_per_hour: string;
   estimated_apr: string;
+  estimated_apr_kind: ScannerAprEstimateKind;
   volume_24h_usdc: string;
   price_change_24h_percent: string | null;
   rating_grade: ScannerRatingGrade;
@@ -577,6 +601,8 @@ export interface VirtualGridScanView {
   run_id: string;
   ranking_policy: string;
   apr_window_seconds: number;
+  estimated_apr_kind: ScannerAprEstimateKind;
+  estimated_apr_assumptions: ScannerAprEstimateAssumptions;
   min_complete_cycles: number;
   row_limit: number;
   candidate_count: number;
@@ -602,7 +628,17 @@ export const virtualGridScannerReadModelSchema = z.looseObject({
   latest: z.nullable(
     z.looseObject({
       run_id: z.string(),
-      rows: z.array(z.looseObject({ rank: z.number() })),
+      estimated_apr_kind: z.enum(["heuristic", "unknown"]),
+      estimated_apr_assumptions: z.looseObject({
+        order_notional_usdc: z.string(),
+        round_trip_fee_percent: z.string(),
+      }),
+      rows: z.array(
+        z.looseObject({
+          rank: z.number(),
+          estimated_apr_kind: z.enum(["heuristic", "unknown"]),
+        }),
+      ),
     }),
   ),
   invalid_event_count: z.number(),

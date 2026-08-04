@@ -11,12 +11,14 @@ use std::{cmp::Ordering, fmt};
 use chrono::{DateTime, Duration, Utc};
 use crypto_trading_domain::Price;
 use crypto_trading_runtime::{DecisionRecord, HistoryError, JsonlHistory, MarketInstrument};
-use crypto_trading_strategy::{Rating, RatingGrade, StrategyError, VirtualGrid, VirtualGridConfig};
+use crypto_trading_strategy::{
+    AprEstimateAssumptions, Rating, RatingGrade, StrategyError, VirtualGrid, VirtualGridConfig,
+};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 /// Stable schema version for one durable scanner ranking fact.
-pub const VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION: u16 = 1;
+pub const VIRTUAL_GRID_SCAN_RECORD_SCHEMA_VERSION: u16 = 2;
 /// Maximum exact instruments evaluated by one bounded scan.
 pub const MAX_VIRTUAL_GRID_SCAN_CANDIDATES: usize = 128;
 /// Maximum price observations accepted for one instrument.
@@ -33,6 +35,7 @@ const SCANNER_STRATEGY: &str = "virtual_grid_scanner";
 const SCANNER_SYMBOL: &str = "control-plane";
 const SCANNER_DECISION: &str = "scanner_ranked";
 const RANKING_POLICY: &str = "explicit_benchmark_then_apr_desc";
+const ESTIMATED_APR_KIND: &str = "heuristic";
 const RECENT_WINDOW_SECONDS: i64 = 5 * 60;
 
 /// Explicit display priority replacing the legacy symbol-substring heuristic.
@@ -234,6 +237,7 @@ pub struct VirtualGridScanRequest {
     run_id: String,
     evaluated_at: DateTime<Utc>,
     apr_window_seconds: u32,
+    apr_estimate_assumptions: AprEstimateAssumptions,
     min_complete_cycles: u64,
     row_limit: usize,
     candidates: Vec<VirtualGridScanCandidate>,
@@ -251,6 +255,7 @@ impl VirtualGridScanRequest {
         run_id: impl Into<String>,
         evaluated_at: DateTime<Utc>,
         apr_window_seconds: u32,
+        apr_estimate_assumptions: AprEstimateAssumptions,
         min_complete_cycles: u64,
         row_limit: usize,
         candidates: Vec<VirtualGridScanCandidate>,
@@ -270,6 +275,9 @@ impl VirtualGridScanRequest {
                 seconds: apr_window_seconds,
             });
         }
+        apr_estimate_assumptions
+            .validate()
+            .map_err(VirtualGridScannerError::Strategy)?;
         if !(1..=MAX_VIRTUAL_GRID_SCAN_ROWS).contains(&row_limit) {
             return Err(VirtualGridScannerError::InvalidRowLimit {
                 rows: row_limit,
@@ -331,6 +339,7 @@ impl VirtualGridScanRequest {
             run_id: normalized_run_id.to_owned(),
             evaluated_at,
             apr_window_seconds,
+            apr_estimate_assumptions,
             min_complete_cycles,
             row_limit,
             candidates,
@@ -443,6 +452,7 @@ pub struct VirtualGridScanReport {
     pub run_id: String,
     pub evaluated_at: DateTime<Utc>,
     pub apr_window_seconds: u32,
+    pub apr_estimate_assumptions: AprEstimateAssumptions,
     pub min_complete_cycles: u64,
     pub row_limit: usize,
     pub candidate_count: usize,
@@ -464,6 +474,11 @@ impl VirtualGridScanReport {
                 "run_id": self.run_id,
                 "ranking_policy": RANKING_POLICY,
                 "apr_window_seconds": self.apr_window_seconds,
+                "estimated_apr_kind": ESTIMATED_APR_KIND,
+                "estimated_apr_assumptions": {
+                    "order_notional_usdc": decimal_text(self.apr_estimate_assumptions.order_notional_usdc),
+                    "round_trip_fee_percent": decimal_text(self.apr_estimate_assumptions.round_trip_fee_percent),
+                },
                 "min_complete_cycles": self.min_complete_cycles,
                 "row_limit": self.row_limit,
                 "candidate_count": self.candidate_count,
@@ -498,8 +513,12 @@ impl DeterministicVirtualGridScanner {
         let mut rows = Vec::with_capacity(candidate_count);
         let mut filtered_by_cycles_count = 0_usize;
         for candidate in request.candidates {
-            let row =
-                evaluate_candidate(candidate, request.evaluated_at, request.apr_window_seconds)?;
+            let row = evaluate_candidate(
+                candidate,
+                request.evaluated_at,
+                request.apr_window_seconds,
+                request.apr_estimate_assumptions,
+            )?;
             if row.complete_cycles < request.min_complete_cycles && !row.is_benchmark() {
                 filtered_by_cycles_count = filtered_by_cycles_count.saturating_add(1);
             } else {
@@ -518,6 +537,7 @@ impl DeterministicVirtualGridScanner {
             run_id: request.run_id,
             evaluated_at: request.evaluated_at,
             apr_window_seconds: request.apr_window_seconds,
+            apr_estimate_assumptions: request.apr_estimate_assumptions,
             min_complete_cycles: request.min_complete_cycles,
             row_limit: request.row_limit,
             candidate_count,
@@ -538,6 +558,7 @@ fn evaluate_candidate(
     candidate: VirtualGridScanCandidate,
     evaluated_at: DateTime<Utc>,
     apr_window_seconds: u32,
+    apr_estimate_assumptions: AprEstimateAssumptions,
 ) -> Result<VirtualGridScanRow, VirtualGridScannerError> {
     let first = candidate.observations.first().ok_or_else(|| {
         VirtualGridScannerError::MissingObservations {
@@ -559,9 +580,10 @@ fn evaluate_candidate(
         grid.update_price_at(observation.price, observation.observed_at)
             .map_err(VirtualGridScannerError::Strategy)?;
     }
-    grid.calculate_apr_at(
+    grid.calculate_apr_at_with_assumptions(
         evaluated_at,
         Duration::seconds(i64::from(apr_window_seconds)),
+        apr_estimate_assumptions,
     )
     .map_err(VirtualGridScannerError::Strategy)?;
     let last = candidate.observations.last().ok_or_else(|| {
@@ -652,6 +674,7 @@ fn row_value(row: &VirtualGridScanRow) -> Value {
         "recent_five_minute_cycles": row.recent_five_minute_cycles,
         "cycles_per_hour": decimal_text(row.cycles_per_hour),
         "estimated_apr": decimal_text(row.estimated_apr),
+        "estimated_apr_kind": ESTIMATED_APR_KIND,
         "volume_24h_usdc": decimal_text(row.volume_24h_usdc),
         "price_change_24h_percent": row.price_change_24h_percent.map(decimal_text),
         "rating_grade": row.rating_grade.to_string(),

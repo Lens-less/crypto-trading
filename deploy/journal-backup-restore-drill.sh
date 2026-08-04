@@ -79,7 +79,8 @@ log="$restore_dir/verifier.log"
 "$web_binary" \
     --history-path "$restored" \
     --journal-id "$journal_id" \
-    --port "$drill_port" >"$log" 2>&1 &
+    --port "$drill_port" \
+    --allow-open-loopback-read-api >"$log" 2>&1 &
 verifier_pid=$!
 
 cleanup() {

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 use crypto_trading_control_plane::{CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION, ReadControlPlane};
@@ -69,10 +71,15 @@ fn scanner_record(run_id: &str) -> Value {
         "virtual_grid_scanner",
         "scanner_ranked",
         &json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run_id,
             "ranking_policy": "explicit_benchmark_then_apr_desc",
             "apr_window_seconds": 300,
+            "estimated_apr_kind": "heuristic",
+            "estimated_apr_assumptions": {
+                "order_notional_usdc": "100",
+                "round_trip_fee_percent": "0.2",
+            },
             "min_complete_cycles": 0,
             "row_limit": 50,
             "candidate_count": 1,
@@ -108,6 +115,7 @@ fn scanner_record(run_id: &str) -> Value {
                 "recent_five_minute_cycles": 2,
                 "cycles_per_hour": "10",
                 "estimated_apr": "500",
+                "estimated_apr_kind": "heuristic",
                 "volume_24h_usdc": "1000000",
                 "price_change_24h_percent": null,
                 "rating_grade": "s",

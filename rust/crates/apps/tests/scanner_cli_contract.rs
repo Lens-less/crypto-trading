@@ -15,6 +15,10 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_crypto-trading")
 }
 
+fn control_token() -> &'static str {
+    "0123456789abcdef0123456789abcdef"
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -34,6 +38,7 @@ fn scanner_serve_process_ranks_the_replay_and_stops_through_the_control_host() {
     let mut child = ChildGuard(Some(
         Command::new(binary())
             .current_dir(repo_root())
+            .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
             .args([
                 "scanner",
                 "--mode",
@@ -166,9 +171,13 @@ fn assert_deterministic_ranking_and_projections(history: &Path, task_id: &str) {
     }
     // Two complete 99000<->100000 cycles inside one exact 360-second window.
     for fact in [
+        "\"schema_version\":2",
         "\"rating_grade\":\"s\"",
         "\"rating_score\":\"95\"",
-        "\"estimated_apr\":\"17449.92\"",
+        "\"estimated_apr\":\"14016\"",
+        "\"estimated_apr_kind\":\"heuristic\"",
+        "\"order_notional_usdc\":\"100\"",
+        "\"round_trip_fee_percent\":\"0.2\"",
         "\"cycles_per_hour\":\"20\"",
         "\"complete_cycles\":2",
         "\"ranking_policy\":\"explicit_benchmark_then_apr_desc\"",
@@ -187,7 +196,12 @@ fn assert_deterministic_ranking_and_projections(history: &Path, task_id: &str) {
     assert_eq!(latest.run_id, task_id);
     assert_eq!(latest.rows.len(), 1);
     assert!(latest.rows[0].is_benchmark());
-    assert_eq!(latest.rows[0].estimated_apr, "17449.92");
+    assert_eq!(latest.estimated_apr_assumptions.order_notional_usdc, "100");
+    assert_eq!(
+        latest.estimated_apr_assumptions.round_trip_fee_percent,
+        "0.2"
+    );
+    assert_eq!(latest.rows[0].estimated_apr, "14016");
     let tasks = ReadOnlyTaskReadModel::from_legacy_snapshot(&snapshot).unwrap();
     assert_eq!(tasks.projection_status, ProjectionStatus::Complete);
     assert_eq!(tasks.tasks.len(), 1);
@@ -211,6 +225,7 @@ fn retry_until_success(attempt: impl Fn() -> Output) -> Output {
 fn run_control(mode: &str, task_id: &str, history: &Path, control_port: u16) -> Output {
     Command::new(binary())
         .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .args([
             "scanner",
             "--mode",

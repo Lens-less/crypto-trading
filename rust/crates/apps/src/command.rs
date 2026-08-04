@@ -14,8 +14,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use crypto_trading_config::{
     ArbitrageConfig, GridConfig, MonitorConfig, PriceAlertConfig, ScannerConfig,
-    load_arbitrage_config_from_str, load_exchange_auth_from_str, load_grid_config_from_str,
-    load_monitor_config_from_str, load_price_alert_config_from_str, load_scanner_config_from_str,
+    load_account_risk_config, load_account_risk_config_from_str, load_arbitrage_config_from_str,
+    load_exchange_auth_from_str, load_grid_config_from_str, load_monitor_config_from_str,
+    load_price_alert_config_from_str, load_scanner_config_from_str,
     load_symbol_conversions_from_str, load_volume_maker_config_from_str, read_bounded_config,
 };
 use crypto_trading_control_plane::{
@@ -46,9 +47,9 @@ use crypto_trading_runtime::{
     SpreadHistoryWriter, SystemMarketDataClock, current_capability_manifest, read_journal_chain,
 };
 use crypto_trading_strategy::{
-    AccountRiskSnapshot, ArbitrageDecision, ArbitrageState, ArbitrageStrategy, GridPlanner,
-    GridState, GridStrategy, PairStrategyMachine, RiskDecision, RiskEngine, RiskLimits,
-    StrategyMachine, VolumeMakerStrategy,
+    AccountRiskSnapshot, AprEstimateAssumptions, ArbitrageDecision, ArbitrageState,
+    ArbitrageStrategy, GridPlanner, GridState, GridStrategy, PairStrategyMachine, RiskDecision,
+    RiskEngine, RiskLimits, StrategyMachine, VolumeMakerStrategy,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -88,8 +89,8 @@ use crate::monitor::{
 };
 use crate::shutdown::{ShutdownSignalFuture, install_shutdown_signal};
 use crate::task_host::{
-    TaskHostControlCommand, TaskHostServeOutcome, control_addr, query_control,
-    serve_host_with_shutdown,
+    TaskHostControlCommand, TaskHostControlError, TaskHostServeOutcome, control_addr,
+    ensure_control_token_configured, query_control, serve_host_with_shutdown,
 };
 use crate::testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TestnetLifecycleConfig, TestnetLifecycleObservation,
@@ -115,7 +116,7 @@ use crate::paper_volume_maker_task::{
 };
 use crypto_trading_config::VolumeMakerConfig;
 use crypto_trading_runtime::{AccountRiskAuthority, PaperCostModel};
-use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
+use crypto_trading_strategy::AccountRiskPolicy;
 use rust_decimal::prelude::ToPrimitive;
 
 /// Runs one parsed CLI command.
@@ -140,6 +141,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Scanner(args) => run_scanner(&args).await,
         Command::Paper(args) => run_paper(args).await,
     }
+}
+
+fn control_host_unavailable(error: &TaskHostControlError) -> bool {
+    matches!(error, TaskHostControlError::Io(_))
 }
 
 fn run_capabilities(args: &CapabilitiesArgs) -> Result<()> {
@@ -1484,6 +1489,9 @@ async fn serve_testnet_soak_task<P>(
 where
     P: TestnetSoakProbe,
 {
+    ensure_control_token_configured()
+        .map_err(anyhow::Error::new)
+        .context("testnet-soak serve requires a valid loopback control token")?;
     let task_id = args.task_id.as_str();
     let address = control_addr(task_id, &args.history_path, Some(control_port));
     let listener = tokio::net::TcpListener::bind(address)
@@ -1537,9 +1545,16 @@ where
 
 async fn run_testnet_soak_status(args: &TestnetSoakArgs) -> Result<()> {
     let address = control_addr(&args.task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Status).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("testnet soak control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     print!(
         "{}",
@@ -1553,9 +1568,16 @@ async fn run_testnet_soak_status(args: &TestnetSoakArgs) -> Result<()> {
 
 async fn run_testnet_soak_stop(args: &TestnetSoakArgs) -> Result<()> {
     let address = control_addr(&args.task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Stop).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("testnet soak control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     let projected = project_testnet_soak_status(&args.history_path, &args.task_id)?;
     if matches!(projected.phase.as_str(), "stopped" | "failed") {
@@ -2302,6 +2324,9 @@ where
     L: MarketDataEventSource,
     R: MarketDataEventSource,
 {
+    ensure_control_token_configured()
+        .map_err(anyhow::Error::new)
+        .context("monitor serve requires a valid loopback control token")?;
     let task_config =
         ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?;
     let (shutdown, mut task) =
@@ -2362,9 +2387,16 @@ async fn run_monitor_status(args: &MonitorArgs) -> Result<()> {
         .as_deref()
         .context("monitor status mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Status).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("monitor control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     print!(
         "{}",
@@ -2383,9 +2415,16 @@ async fn run_monitor_stop(args: &MonitorArgs) -> Result<()> {
         .as_deref()
         .context("monitor stop mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Stop).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("monitor control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     let projected = project_task_status(&args.history_path, task_id, MONITOR_TASK_PROJECTION)?;
     if projected.phase == "stopped" || projected.phase == "failed" {
@@ -2756,6 +2795,24 @@ async fn run_volume_maker_serve(args: &VolumeMakerArgs) -> Result<()> {
         .task_id
         .as_deref()
         .context("volume-maker serve mode requires --task-id")?;
+    let account_risk_config_path = args
+        .paper_account_risk_config
+        .as_ref()
+        .context("volume-maker serve mode requires --paper-account-risk-config")?;
+    let account_risk_config =
+        load_account_risk_config(account_risk_config_path).with_context(|| {
+            format!(
+                "failed to load volume-maker account risk config {}",
+                account_risk_config_path.display()
+            )
+        })?;
+    let account_risk_policy =
+        AccountRiskPolicy::try_from(&account_risk_config).with_context(|| {
+            format!(
+                "failed to validate volume-maker account risk config {}",
+                account_risk_config_path.display()
+            )
+        })?;
     let history = JsonlHistory::new(&args.history_path);
 
     let instrument =
@@ -2817,7 +2874,7 @@ async fn run_volume_maker_serve(args: &VolumeMakerArgs) -> Result<()> {
         account.journal_id(),
         history.clone(),
         VOLUME_MAKER_ACCOUNT_RISK_SCOPE,
-        AccountRiskPolicy::new(AccountRiskLimits::default()).map_err(anyhow::Error::new)?,
+        account_risk_policy,
     )
     .map_err(anyhow::Error::new)
     .context("failed to build the volume-maker account-risk authority")?;
@@ -2844,6 +2901,9 @@ async fn run_volume_maker_serve(args: &VolumeMakerArgs) -> Result<()> {
         task_config = task_config.with_target_volume(target_volume);
     }
 
+    ensure_control_token_configured()
+        .map_err(anyhow::Error::new)
+        .context("volume-maker serve requires a valid loopback control token")?;
     let (shutdown, mut task) =
         start_after_shutdown_registration(register_task_host_shutdown, || async move {
             VolumeMakerPaperTask::start(task_config, source, account, history, executor)
@@ -2898,9 +2958,16 @@ async fn run_volume_maker_status(args: &VolumeMakerArgs) -> Result<()> {
         .as_deref()
         .context("volume-maker status mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Status).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("volume-maker control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     print!(
         "{}",
@@ -2919,9 +2986,16 @@ async fn run_volume_maker_stop(args: &VolumeMakerArgs) -> Result<()> {
         .as_deref()
         .context("volume-maker stop mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Stop).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("volume-maker control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     let projected = project_task_status(&args.history_path, task_id, VOLUME_MAKER_TASK_PROJECTION)?;
     if projected.phase == "stopped" || projected.phase == "failed" {
@@ -3168,6 +3242,9 @@ async fn run_price_alert_serve(args: &PriceAlertArgs) -> Result<()> {
         supervisor_config(args.shutdown_grace_ms)?,
     )
     .map_err(anyhow::Error::new)?;
+    ensure_control_token_configured()
+        .map_err(anyhow::Error::new)
+        .context("price-alert serve requires a valid loopback control token")?;
     let (shutdown, mut task) =
         start_after_shutdown_registration(register_task_host_shutdown, || async move {
             ContinuousAlertTask::start(task_config, runtime, source, history)
@@ -3219,9 +3296,16 @@ async fn run_price_alert_status(args: &PriceAlertArgs) -> Result<()> {
         .as_deref()
         .context("price-alert status mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Status).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("price-alert control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     print!(
         "{}",
@@ -3240,9 +3324,16 @@ async fn run_price_alert_stop(args: &PriceAlertArgs) -> Result<()> {
         .as_deref()
         .context("price-alert stop mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Stop).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("price-alert control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     let projected = project_task_status(&args.history_path, task_id, PRICE_ALERT_TASK_PROJECTION)?;
     if projected.phase == "stopped" || projected.phase == "failed" {
@@ -3387,6 +3478,10 @@ async fn run_scanner_serve(args: &ScannerArgs) -> Result<()> {
     let runtime = ScannerReplayRuntime::new(
         task_id,
         config.apr_window_seconds,
+        AprEstimateAssumptions {
+            order_notional_usdc: config.apr_estimate.order_notional_usdc,
+            round_trip_fee_percent: config.apr_estimate.round_trip_fee_percent,
+        },
         config.min_complete_cycles,
         config.row_limit,
         specs,
@@ -3407,6 +3502,9 @@ async fn run_scanner_serve(args: &ScannerArgs) -> Result<()> {
         supervisor_config(args.shutdown_grace_ms)?,
     )
     .map_err(anyhow::Error::new)?;
+    ensure_control_token_configured()
+        .map_err(anyhow::Error::new)
+        .context("scanner serve requires a valid loopback control token")?;
     let (shutdown, mut task) =
         start_after_shutdown_registration(register_task_host_shutdown, || async move {
             ContinuousScannerTask::start(task_config, runtime, source, history)
@@ -3458,9 +3556,16 @@ async fn run_scanner_status(args: &ScannerArgs) -> Result<()> {
         .as_deref()
         .context("scanner status mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Status).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Status).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("scanner control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     print!(
         "{}",
@@ -3479,9 +3584,16 @@ async fn run_scanner_stop(args: &ScannerArgs) -> Result<()> {
         .as_deref()
         .context("scanner stop mode requires --task-id")?;
     let address = control_addr(task_id, &args.history_path, args.control_port);
-    if let Ok(response) = query_control(address, TaskHostControlCommand::Stop).await {
-        print!("{response}");
-        return Ok(());
+    match query_control(address, TaskHostControlCommand::Stop).await {
+        Ok(response) => {
+            print!("{response}");
+            return Ok(());
+        }
+        Err(error) if !control_host_unavailable(&error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("scanner control request failed for {address}")));
+        }
+        Err(_) => {}
     }
     let projected = project_task_status(&args.history_path, task_id, SCANNER_TASK_PROJECTION)?;
     if projected.phase == "stopped" || projected.phase == "failed" {
@@ -3505,6 +3617,10 @@ fn scanner_candidate_specs(config: &ScannerConfig) -> Result<Vec<ScannerCandidat
             )?,
             grid_width_percent: symbol.grid_width_percent,
             grid_interval_percent: symbol.grid_interval_percent,
+            apr_estimate_assumptions: AprEstimateAssumptions {
+                order_notional_usdc: config.apr_estimate.order_notional_usdc,
+                round_trip_fee_percent: config.apr_estimate.round_trip_fee_percent,
+            },
             volume_24h_usdc: symbol.volume_24h_usdc,
             price_change_24h_percent: symbol.price_change_24h_percent,
             benchmark: symbol.benchmark,
@@ -4822,6 +4938,15 @@ fn inspect_config_inner(path: &Path) -> Result<Value, ConfigInspectionFailure> {
         inspect_price_alert_config(path, &body)
     } else if has("scanner") {
         inspect_scanner_config(path, &body)
+    } else if is_account_risk_config(path, mapping) {
+        load_account_risk_config_from_str(&body)
+            .map_err(|error| invalid_config_error("account-risk", &error))?;
+        Ok(config_summary(
+            path,
+            "account-risk",
+            ConfigSupport::PaperCompanion,
+            Some("shared limits consumed by replay-backed paper owners"),
+        ))
     } else if is_arbitrage(mapping) {
         inspect_arbitrage_config(path, &body, &document)
     } else if has("exchanges") && has("symbols") {
@@ -5117,6 +5242,27 @@ fn auxiliary_config_filename_kind(path: &Path) -> Option<&'static str> {
         return Some("market-metadata");
     }
     None
+}
+
+fn is_account_risk_config(path: &Path, mapping: &serde_yaml::Mapping) -> bool {
+    let named_for_account_risk =
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                name.contains("account-risk") || name.contains("account_risk")
+            });
+    named_for_account_risk
+        || [
+            "max_symbol_exposure",
+            "max_total_exposure",
+            "min_balance_warning",
+            "min_balance_close_position",
+            "max_position_duration_seconds",
+            "max_daily_trades",
+        ]
+        .iter()
+        .any(|key| mapping.contains_key(serde_yaml::Value::from(*key)))
 }
 
 fn auxiliary_config_kind(path: &Path, document: &serde_yaml::Value) -> Option<&'static str> {

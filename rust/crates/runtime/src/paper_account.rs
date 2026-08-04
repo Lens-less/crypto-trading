@@ -22,7 +22,7 @@ use crypto_trading_exchange::TradingReceipt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::authority_state::{AuthorityStateCache, AuthorityStateError};
@@ -44,6 +44,7 @@ const MAX_RECONCILIATION_MISMATCHES: usize = 16;
 const MAX_RECONCILIATION_EVIDENCE_BYTES: usize = 32 * 1_024;
 const MAX_COST_BPS: u32 = 10_000;
 const PAPER_ACCOUNT_STRATEGY: &str = "paper_account";
+const PAPER_ACCOUNT_INITIALIZED: &str = "paper_account_initialized";
 pub(crate) const PAPER_ACCOUNT_RESERVED: &str = "paper_account_reserved";
 const PAPER_ACCOUNT_UNCERTAIN: &str = "paper_account_uncertain";
 const PAPER_ACCOUNT_COMMITTED: &str = "paper_account_committed";
@@ -53,6 +54,46 @@ const PAPER_ACCOUNT_EXECUTION_SETTLED: &str = "paper_account_execution_settled";
 
 pub(crate) type AuthorityLock = AsyncMutex<()>;
 static AUTHORITY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<AuthorityLock>>>> = OnceLock::new();
+pub(crate) type OperationLock = AsyncMutex<()>;
+static OPERATION_LOCKS: OnceLock<StdMutex<HashMap<OperationLockKey, Weak<OperationLock>>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct OperationLockKey {
+    path: PathBuf,
+    account_id: String,
+}
+
+/// Process-local exclusive lease for one journal-backed paper operation lane.
+///
+/// Hold this guard from the first decision snapshot through reserve,
+/// execution, and settlement when one owner must ensure no sibling authority
+/// instance can interleave another account operation on the same normalized
+/// journal path.
+#[must_use = "dropping the lease releases exclusive paper-account operation access"]
+pub struct PaperAccountOperationLease {
+    inner: Arc<PaperAccountOperationLeaseInner>,
+}
+
+struct PaperAccountOperationLeaseInner {
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl Clone for PaperAccountOperationLease {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl std::fmt::Debug for PaperAccountOperationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PaperAccountOperationLease")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaperAccountConfig {
@@ -1096,6 +1137,7 @@ pub struct PaperAccountAuthority {
     history: JsonlHistory,
     config: PaperAccountConfig,
     authority_lock: Arc<AuthorityLock>,
+    operation_lock: Arc<OperationLock>,
     state_cache: AuthorityStateCache,
 }
 
@@ -1146,12 +1188,17 @@ impl PaperAccountAuthority {
         // would interleave and could commit the same capacity twice.
         let authority_lock =
             shared_authority_lock(&crate::history::normalized_lock_key(history.path()));
+        let operation_lock = shared_operation_lock(
+            &crate::history::normalized_lock_key(history.path()),
+            config.account_id(),
+        );
         let state_cache = AuthorityStateCache::new(journal_id, &history);
         Ok(Self {
             journal_id,
             history,
             config,
             authority_lock,
+            operation_lock,
             state_cache,
         })
     }
@@ -1164,6 +1211,22 @@ impl PaperAccountAuthority {
     #[must_use]
     pub fn history_path(&self) -> &Path {
         self.history.path()
+    }
+
+    /// Acquires the process-local paper operation lane for this journal.
+    ///
+    /// Owners can hold the returned lease across decision snapshots, reserve,
+    /// execute, and settle so no sibling in-process authority instance can
+    /// interleave another account operation on the same normalized journal
+    /// path. This lease is intentionally independent from the internal
+    /// authority lock, so callers can acquire it before invoking authority
+    /// methods without self-deadlocking.
+    pub async fn acquire_operation_lease(&self) -> PaperAccountOperationLease {
+        PaperAccountOperationLease {
+            inner: Arc::new(PaperAccountOperationLeaseInner {
+                _guard: Arc::clone(&self.operation_lock).lock_owned().await,
+            }),
+        }
     }
 
     /// Cold-replays the current frozen journal head and verifies that it is
@@ -1189,6 +1252,58 @@ impl PaperAccountAuthority {
     #[must_use]
     pub const fn config(&self) -> &PaperAccountConfig {
         &self.config
+    }
+
+    /// Durably materializes this account's configured starting capacity.
+    ///
+    /// Paper-account projections historically appeared only after the first
+    /// reservation. Account-wide risk must evaluate balance thresholds before
+    /// that reservation, so risk-enabled owners call this idempotent method at
+    /// startup to make the configured balance part of the shared journal
+    /// truth first.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the journal is degraded, the configured balance
+    /// conflicts with an existing account, the account limit is exhausted, or
+    /// the initialization fact cannot be written and replayed.
+    pub async fn ensure_initialized(&self) -> Result<PaperAccountSnapshot, PaperAccountError> {
+        let _guard = self.authority_lock.lock().await;
+        let projection = self
+            .state_cache
+            .refresh(&self.history)
+            .await
+            .map_err(map_authority_state_error_to_paper)?;
+        let snapshot = projection
+            .paper_snapshot(self.config.account_id(), self.config.initial_available)
+            .map_err(map_authority_state_error_to_paper)?;
+        require_writable(&snapshot)?;
+        if projection
+            .paper_live
+            .accounts
+            .iter()
+            .any(|account| account.account_id == self.config.account_id)
+        {
+            return Ok(snapshot);
+        }
+        if projection.paper_live.accounts.len() >= MAX_PAPER_ACCOUNTS {
+            return Err(PaperAccountError::InvalidConfig(
+                "paper account limit was reached",
+            ));
+        }
+        self.append_fact(
+            PAPER_ACCOUNT_INITIALIZED,
+            &InitializedFact {
+                schema_version: PAPER_ACCOUNT_SCHEMA_VERSION,
+                journal_id: self.journal_id,
+                account_id: self.config.account_id.clone(),
+                initial_available: self.config.initial_available,
+            },
+        )
+        .await?;
+        let initialized = self.load_account_snapshot().await?;
+        require_writable(&initialized)?;
+        Ok(initialized)
     }
 
     /// Returns one frozen durable account projection.
@@ -1751,6 +1866,15 @@ struct ReservedFact {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct InitializedFact {
+    schema_version: u16,
+    journal_id: Uuid,
+    account_id: String,
+    initial_available: Money,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransitionFact {
     schema_version: u16,
     journal_id: Uuid,
@@ -1880,7 +2004,8 @@ impl ProjectionBuilder {
         };
         if !matches!(
             decision,
-            PAPER_ACCOUNT_RESERVED
+            PAPER_ACCOUNT_INITIALIZED
+                | PAPER_ACCOUNT_RESERVED
                 | PAPER_ACCOUNT_UNCERTAIN
                 | PAPER_ACCOUNT_COMMITTED
                 | PAPER_ACCOUNT_RELEASED
@@ -1913,6 +2038,24 @@ impl ProjectionBuilder {
         let symbol = text(payload.get("symbol"))?;
         let details = payload.get("details").ok_or(())?.clone();
         match decision {
+            PAPER_ACCOUNT_INITIALIZED => {
+                require_money_strings_for_initialized(&details)?;
+                let fact: InitializedFact = serde_json::from_value(details).map_err(|_| ())?;
+                validate_initialized_fact(&fact, symbol, self.journal_id)?;
+                if self.accounts.len() >= MAX_PAPER_ACCOUNTS
+                    || self
+                        .accounts
+                        .iter()
+                        .any(|account| account.account_id == fact.account_id)
+                {
+                    return Err(());
+                }
+                self.accounts.push(AccountAccumulator::new(
+                    fact.account_id,
+                    fact.initial_available,
+                ));
+                Ok(Vec::new())
+            }
             PAPER_ACCOUNT_RESERVED => {
                 require_money_strings_for_reserved(&details)?;
                 let fact: ReservedFact = serde_json::from_value(details).map_err(|_| ())?;
@@ -2628,6 +2771,22 @@ fn validate_reserved_fact(fact: &ReservedFact, symbol: &str, journal_id: Uuid) -
     Ok(())
 }
 
+fn validate_initialized_fact(
+    fact: &InitializedFact,
+    symbol: &str,
+    journal_id: Uuid,
+) -> Result<(), ()> {
+    if fact.schema_version != PAPER_ACCOUNT_SCHEMA_VERSION
+        || fact.journal_id != journal_id
+        || fact.account_id != symbol
+        || bounded_identity(&fact.account_id, "account id").is_err()
+        || fact.initial_available <= Money::default()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn validate_transition_fact(
     fact: &TransitionFact,
     symbol: &str,
@@ -3106,6 +3265,24 @@ pub(crate) fn shared_authority_lock(path: &Path) -> Arc<AuthorityLock> {
     lock
 }
 
+pub(crate) fn shared_operation_lock(path: &Path, account_id: &str) -> Arc<OperationLock> {
+    let registry = OPERATION_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    let key = OperationLockKey {
+        path: path.to_path_buf(),
+        account_id: account_id.to_owned(),
+    };
+    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(AsyncMutex::new(()));
+    registry.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
 pub(crate) fn bounded_identity(value: &str, field: &'static str) -> Result<String, &'static str> {
     let normalized = value.trim();
     if normalized.is_empty()
@@ -3289,6 +3466,11 @@ fn require_money_strings_for_reserved(details: &Value) -> Result<(), ()> {
         require_money_string(leg.as_object().and_then(|leg| leg.get("reserved_notional")))?;
     }
     Ok(())
+}
+
+fn require_money_strings_for_initialized(details: &Value) -> Result<(), ()> {
+    let details = details.as_object().ok_or(())?;
+    require_money_string(details.get("initial_available"))
 }
 
 fn require_money_strings_for_transition(details: &Value) -> Result<(), ()> {
