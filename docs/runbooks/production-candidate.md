@@ -272,13 +272,26 @@ Never edit the journal to force a match, and never archive credentials.
 
 ## Binance Testnet 24-hour soak gate
 
-This gate runs the CLI host directly on the Linux candidate host. It is
-read-only: the three rotating samples are the Spot Testnet `bookTicker`
-WebSocket, the signed Spot Testnet user-data WebSocket API, and authenticated
-REST reconciliation. The public stream uses
+This gate runs the CLI host directly on the Linux candidate host. The default
+mode is owner-backed but read-only: the three rotating samples are the Spot
+Testnet `bookTicker` WebSocket, the signed Spot Testnet user-data WebSocket API,
+and two matching authenticated REST reconciliations performed by that same
+`ContinuousTestnetOwner`. Read-only mode does not claim lifecycle-recovery
+evidence. The public stream uses
 `wss://stream.testnet.binance.vision`; the private stream uses
-`wss://ws-api.testnet.binance.vision`. The host never submits or cancels an
-order. Mainnet remains disabled.
+`wss://ws-api.testnet.binance.vision`. Mainnet remains disabled.
+
+An AC-R3 campaign uses the optional exact lifecycle group. On a fresh journal,
+all fields and the existing acknowledgement are mandatory; the owner waits for
+a fresh private-stream subscription ACK before its only submit. On restart,
+the same exact fields reconstruct the durable intent, but no acknowledgement is
+required: only a pending plan is accepted and the first venue operation is an
+exact-client-ID query. Completed, failed, partial, or conflicting configurations
+fail closed. Omitting the whole group keeps the host read-only.
+
+Use a new evidence journal for this owner-backed v2 run. Legacy v1
+`binance_testnet_read_only_soak` records are intentionally not admitted to the
+AC-R3 verifier because they cannot prove owner-driven lifecycle recovery.
 
 Build the exact candidate binary, create a private evidence directory, and
 provide Binance Testnet credentials only through the process environment:
@@ -301,9 +314,23 @@ export SOAK_TASK_ID='binance-testnet-24h'
 export SOAK_HISTORY='/srv/crypto-trading/soak/binance-testnet-24h.jsonl'
 export SOAK_CONTROL_PORT='55124'
 export SOAK_PID_FILE='/srv/crypto-trading/soak/binance-testnet-24h.pid'
+export SOAK_CAMPAIGN_ID='binance-testnet-24h-lifecycle-001'
+export SOAK_CLIENT_ORDER_ID='replace-with-a-new-uuid-v4'
+# Derive these immediately before the run from Testnet bookTicker and current
+# exchangeInfo filters. Price must be post-only, deliberately away from the
+# opposite best quote, tick-aligned, and satisfy minNotional with quantity.
+export SOAK_PRICE='replace-with-current-safe-testnet-price'
+export SOAK_QUANTITY='replace-with-filter-valid-testnet-quantity'
+: "${SOAK_PRICE:?set a current filter-valid Testnet post-only price}"
+: "${SOAK_QUANTITY:?set a current filter-valid Testnet quantity}"
 
 start_soak() {
   suffix="$1"
+  acknowledgement="${2-}"
+  ack_args=()
+  if [ -n "$acknowledgement" ]; then
+    ack_args=(--acknowledge-testnet-lifecycle "$acknowledgement")
+  fi
   nohup "$SOAK_BIN" testnet-soak \
     --mode serve \
     --task-id "$SOAK_TASK_ID" \
@@ -313,6 +340,18 @@ start_soak() {
     --failure-threshold 3 \
     --control-port "$SOAK_CONTROL_PORT" \
     --timeout-ms 10000 \
+    "${ack_args[@]}" \
+    --recovery-campaign-id "$SOAK_CAMPAIGN_ID" \
+    --recovery-client-order-id "$SOAK_CLIENT_ORDER_ID" \
+    --recovery-market spot \
+    --recovery-side buy \
+    --recovery-quantity "$SOAK_QUANTITY" \
+    --recovery-price "$SOAK_PRICE" \
+    --recovery-time-in-force post-only \
+    --recovery-expected-observation open \
+    --recovery-reduce-only false \
+    --recovery-poll-interval-ms 2000 \
+    --recovery-maximum-queries 30 \
     >"/srv/crypto-trading/soak/${suffix}.stdout.log" \
     2>"/srv/crypto-trading/soak/${suffix}.stderr.log" &
   SOAK_PID=$!
@@ -339,13 +378,20 @@ capture_status() {
   cat "$destination"
 }
 
-start_soak initial
+start_soak initial 'I AUTHORIZE BINANCE TESTNET ORDER LIFECYCLE'
 capture_status /srv/crypto-trading/soak/status-before-kill.txt
 ```
 
-Wait until status reports at least three successful probes. Perform exactly one
-forced-termination recovery drill, validate the numeric PID before signalling
-it, and restart with the same task ID, journal, and port:
+Use a dedicated isolated Testnet account. Before starting, prove it has no
+unrelated open orders or positions; otherwise the owner's stable reconciliation
+fails closed. Do not reuse a price from this document or from an earlier run.
+
+The kill drill must interrupt the exact lifecycle after
+`testnet_lifecycle_planned` is durable and before it becomes terminal. Use a
+supervised Testnet fault/latency window and capture the journal observation; do
+not edit the journal or invent a pending state. If `testnet_lifecycle_completed`
+or `testnet_lifecycle_failed` wins the race, stop and begin a new campaign with
+a new campaign ID and UUID. Validate the numeric PID before signalling it:
 
 ```sh
 SOAK_PID="$(cat "$SOAK_PID_FILE")"
@@ -353,6 +399,11 @@ case "$SOAK_PID" in
   ''|*[!0-9]*) echo "invalid soak PID" >&2; exit 1 ;;
 esac
 kill -0 "$SOAK_PID"
+grep -q '"decision":"testnet_lifecycle_planned"' "$SOAK_HISTORY"
+if grep -qE '"decision":"testnet_lifecycle_(completed|failed)"' "$SOAK_HISTORY"; then
+  echo "lifecycle became terminal before the kill drill" >&2
+  exit 1
+fi
 kill -9 "$SOAK_PID"
 wait "$SOAK_PID" 2>/dev/null || true
 if kill -0 "$SOAK_PID" 2>/dev/null; then
@@ -360,8 +411,13 @@ if kill -0 "$SOAK_PID" 2>/dev/null; then
   exit 1
 fi
 
+# Same exact lifecycle fields, deliberately without submit acknowledgement.
 start_soak restarted
 capture_status /srv/crypto-trading/soak/status-after-restart.txt
+grep -q '"decision":"continuous_testnet_campaign_recovery_verified"' "$SOAK_HISTORY"
+grep -q '"query_first":true' "$SOAK_HISTORY"
+grep -Eq '"query_delta":[1-9][0-9]*' "$SOAK_HISTORY"
+grep -q '"decision":"continuous_testnet_user_stream_subscribed"' "$SOAK_HISTORY"
 ```
 
 The verifier counts only active segments that contain probe facts, so downtime
@@ -398,7 +454,11 @@ cat /srv/crypto-trading/soak/evidence.json
 The JSON must report `requirements_met: true`, at least 86,400 observed active
 seconds, a clean stop, one or more unclean restarts, the configured minimum
 success count, and nonzero `market_stream`, `user_data_stream`, and
-`authenticated_reconcile` counts. Archive the
+`authenticated_reconcile` counts. It must also report
+`owner_campaign_recovery_verified: true`; this is accepted only when a
+same-task, UUID-valid, positive exact-query delta is immediately paired with
+the unclean restart. Fixed-timestamp offline tests prove this verifier contract,
+not a credentialed 24-hour run. Archive the
 journal, both process logs, the three status captures, `evidence.json`, and the
 candidate binary checksum. Do not archive credentials or process-environment
 dumps.

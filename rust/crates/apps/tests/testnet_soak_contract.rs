@@ -19,6 +19,10 @@ pub mod task_host {
     }
 }
 
+pub mod continuous_testnet {
+    pub const CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION: u16 = 1;
+}
+
 #[path = "../src/testnet_soak.rs"]
 pub mod testnet_soak;
 
@@ -26,7 +30,10 @@ use std::{
     collections::VecDeque,
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -74,6 +81,24 @@ struct PendingProbe;
 impl TestnetSoakProbe for PendingProbe {
     fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
         Box::pin(std::future::pending())
+    }
+}
+
+struct ShutdownAwareProbe {
+    called: Arc<AtomicBool>,
+}
+
+impl TestnetSoakProbe for ShutdownAwareProbe {
+    fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
+        Box::pin(std::future::pending())
+    }
+
+    fn shutdown(&mut self) -> testnet_soak::TestnetSoakShutdownFuture<'_> {
+        let called = Arc::clone(&self.called);
+        Box::pin(async move {
+            called.store(true, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 
@@ -139,7 +164,37 @@ async fn successful_probe_and_stop_produce_verifiable_evidence() {
     assert!(summary.requirements_met);
     assert_eq!(summary.successful_probe_count, 1);
     assert!(summary.clean_stop_observed);
-    assert_eq!(summary.as_json()["schema_version"], json!(1));
+    assert_eq!(summary.as_json()["schema_version"], json!(2));
+}
+
+#[tokio::test]
+async fn stop_invokes_probe_shutdown_before_recording_a_clean_exit() {
+    let path = history_path("soak-shutdown-hook");
+    let called = Arc::new(AtomicBool::new(false));
+    let config = TestnetSoakTaskConfig::new(
+        "binance-testnet-shutdown-hook",
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        3,
+    )
+    .unwrap();
+    let mut task = TestnetSoakTask::start(
+        config,
+        ShutdownAwareProbe {
+            called: Arc::clone(&called),
+        },
+        JsonlHistory::new(&path),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        task.stop().await.unwrap(),
+        TestnetSoakTaskExit::StopRequested
+    );
+    assert!(called.load(Ordering::SeqCst));
+    let journal = fs::read_to_string(path).unwrap();
+    assert!(journal.contains("testnet_soak_stopped"));
 }
 
 #[tokio::test]
@@ -465,6 +520,7 @@ async fn legacy_rest_samples_do_not_satisfy_the_streaming_policy() {
     assert_eq!(
         summary.violations,
         vec![
+            TestnetSoakEvidenceViolation::OwnerCampaignRecoveryMissing,
             TestnetSoakEvidenceViolation::MarketStreamMissing,
             TestnetSoakEvidenceViolation::UserDataStreamMissing,
         ]
@@ -652,9 +708,9 @@ fn fact(
         symbol: "control-plane".to_owned(),
         decision: decision.to_owned(),
         details: json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": task_id,
-            "task_kind": "binance_testnet_read_only_soak",
+            "task_kind": "binance_testnet_owner_soak",
             "phase": "fixture",
             "observation": observation,
         }),

@@ -136,6 +136,29 @@ pnpm audit --prod --audit-level=high
 pnpm licenses list --json | node scripts/check-licenses.mjs
 ```
 
+## AC-R3 implementation clarification (post-review)
+
+The production `testnet-soak serve` path now constructs and drives
+`ContinuousTestnetOwner`; user-data items are projected by that owner and an
+`authenticated_reconcile` sample is emitted only after the same owner proves
+two stable authoritative REST snapshots.
+
+The lifecycle group is all-or-none. A fresh exact campaign requires the
+existing Testnet acknowledgement and cannot submit until a fresh private-stream
+subscription ACK. A restart supplies the same exact intent without new submit
+authority: only a pending durable campaign is accepted and its UUID client ID
+is queried first. Fresh recovery, completed/failed campaigns, and conflicting
+intent fail closed before remote I/O.
+
+The offline verifier requires a same-task
+`continuous_testnet_campaign_recovery_verified` fact with `query_first=true`, a
+valid UUID, and a positive, arithmetically consistent query delta immediately
+paired with the unclean restart. Read-only owner operation does not satisfy this
+gate. No credentialed external 24-hour run was performed; fixed-clock tests
+prove only the verifier contract, so the real run remains an external gate.
+The owner-backed evidence schema is v2; legacy read-only-soak v1 journals are
+rejected instead of being silently promoted into AC-R3 evidence.
+
 附加卫生结果：workflow YAML 解析通过，`git diff --check` 通过，未发现 merge
 markers，工作树（排除冻结 Python archive、build 与 dependency 目录）的高置信
 secret pattern 命中文件数为 0。`cargo deny` 报告的 duplicate crate 与未遇到的

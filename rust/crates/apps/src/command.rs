@@ -38,18 +38,18 @@ use crypto_trading_exchange::{
 };
 use crypto_trading_runtime::{
     BinanceBookTickerStreamSource, BinancePollingRoute, BinancePublicPollingSource,
-    BinanceUserDataApply, BinanceUserDataState, BinanceUserDataStreamItem,
-    BinanceUserDataStreamSource, DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter,
-    ExecutionBatch, ExecutionMode, ExecutionPolicy, HistoryError, HyperliquidPollingRoute,
-    HyperliquidPublicPollingSource, IntentExecutor, JournalReadError, JsonlHistory,
-    MAX_HISTORY_RECORD_BYTES, MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS, MarketDataBook,
-    MarketDataError, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
-    MarketDataSourceFailure, MarketFreshnessPolicy, MarketInstrument, MarketPollingPolicy,
-    MarketStreamReconnectPolicy, MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority,
-    PaperAccountConfig, ProductionMarketStreamJitter, ReadOnlyTaskExit, ReadOnlyTaskFailure,
-    ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError,
-    SpreadHistoryWriter, SystemMarketDataClock, TokioMarketStreamSleeper,
-    TokioTextWebSocketConnector, current_capability_manifest, read_journal_chain,
+    BinanceUserDataStreamItem, BinanceUserDataStreamSource, DecisionRecord,
+    DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode, ExecutionPolicy,
+    HistoryError, HyperliquidPollingRoute, HyperliquidPublicPollingSource, IntentExecutor,
+    JournalReadError, JsonlHistory, MAX_HISTORY_RECORD_BYTES,
+    MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS, MarketDataBook, MarketDataError, MarketDataEvent,
+    MarketDataEventFuture, MarketDataEventSource, MarketDataSourceFailure, MarketFreshnessPolicy,
+    MarketInstrument, MarketPollingPolicy, MarketStreamReconnectPolicy, MarketSupervisorConfig,
+    MarketUniverse, PaperAccountAuthority, PaperAccountConfig, ProductionMarketStreamJitter,
+    ReadOnlyTaskExit, ReadOnlyTaskFailure, ReadOnlyTaskKind, ReadOnlyTaskPhase,
+    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError, SpreadHistoryWriter,
+    SystemMarketDataClock, TokioMarketStreamSleeper, TokioTextWebSocketConnector,
+    current_capability_manifest, read_journal_chain,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, AprEstimateAssumptions, ArbitrageDecision, ArbitrageState,
@@ -88,6 +88,10 @@ use crate::continuous_scanner::{
     ContinuousScannerTask, ContinuousScannerTaskConfig, ContinuousScannerTaskExit,
     ContinuousScannerTaskStatus, ScannerCandidateSpec, ScannerReplayRuntime,
 };
+use crate::continuous_testnet::{
+    ContinuousTestnetOwner, ContinuousTestnetOwnerError, ContinuousTestnetOwnerPhase,
+    ContinuousTestnetUserDataOutcome,
+};
 use crate::monitor::{
     ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor, ReplayMarketDataClock,
     freshness_policy_from_monitor_config, load_market_snapshot_replay,
@@ -99,7 +103,8 @@ use crate::task_host::{
 };
 use crate::testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TestnetLifecycleConfig, TestnetLifecycleObservation,
-    TestnetLifecycleReport, run_testnet_lifecycle, testnet_lifecycle_requires_submission,
+    TestnetLifecycleRecoveryState, TestnetLifecycleReport, run_testnet_lifecycle,
+    testnet_lifecycle_recovery_state, testnet_lifecycle_requires_submission,
     testnet_lifecycle_wire_symbol,
 };
 use crate::testnet_reconciliation::{
@@ -107,7 +112,7 @@ use crate::testnet_reconciliation::{
     TestnetReconciliationPlan, TestnetReconciliationReport, product_label,
 };
 use crate::testnet_soak::{
-    MAX_TESTNET_SOAK_EVIDENCE_RECORDS, TESTNET_SOAK_SCHEMA_VERSION,
+    MAX_TESTNET_SOAK_EVIDENCE_RECORDS, TESTNET_SOAK_SCHEMA_VERSION, TESTNET_SOAK_TASK_KIND,
     TestnetSoakEvidenceRequirements, TestnetSoakProbe, TestnetSoakProbeFailure,
     TestnetSoakProbeFuture, TestnetSoakSample, TestnetSoakTask, TestnetSoakTaskConfig,
     TestnetSoakTaskExit, TestnetSoakTaskFailure, TestnetSoakTaskStatus,
@@ -1309,6 +1314,33 @@ where
     .context("failed to build Binance testnet mutation protocol")
 }
 
+async fn build_binance_soak_lifecycle_protocol<S>(
+    transport: &(dyn RemoteHttpTransport + Send + Sync),
+    signer: Arc<S>,
+    symbols: &BinanceSmokeSymbols,
+    config: &TestnetLifecycleConfig,
+) -> Result<BinanceTestnetProtocol>
+where
+    S: BinanceRequestSigner + 'static,
+{
+    let endpoints = binance_testnet_endpoints()?;
+    let BinanceExchangeInfoSymbol { rules, .. } = fetch_binance_authoritative_symbol(
+        transport,
+        &endpoints,
+        config.intent().symbol.clone(),
+        config.intent().market_type,
+        config.wire_symbol(),
+    )
+    .await?;
+    BinanceTestnetProtocol::authenticated(
+        endpoints,
+        build_binance_symbol_catalog(symbols)?,
+        InstrumentRuleCatalog::new(vec![rules])?,
+        signer,
+    )
+    .context("failed to build owner-backed Binance testnet lifecycle protocol")
+}
+
 async fn fetch_binance_authoritative_symbol(
     transport: &(dyn RemoteHttpTransport + Send + Sync),
     endpoints: &BinanceTestnetEndpoints,
@@ -1390,27 +1422,52 @@ fn summarize_reconcile_receipt(receipt: &crypto_trading_exchange::ReconcileRecei
 struct ProductionBinanceTestnetSoakProbe {
     market_stream: BinanceBookTickerStreamSource,
     user_stream: BinanceUserDataStreamSource,
-    user_data: BinanceUserDataState,
-    user_stream_subscribed: bool,
-    user_data_reconcile_required: bool,
-    exchange: BinanceTestnetExchange,
+    owner: ContinuousTestnetOwner<BinanceTestnetExchange>,
+    lifecycle_run_pending: bool,
     next_step: usize,
 }
 
+#[derive(Clone, Debug)]
+enum TestnetSoakLifecycleOwnerMode {
+    ReadOnly,
+    Fresh(TestnetLifecycleConfig),
+    Recovery(TestnetLifecycleConfig),
+}
+
 impl ProductionBinanceTestnetSoakProbe {
-    fn new(
+    async fn new(
         transport: &Arc<dyn RemoteHttpTransport>,
         symbols: &BinanceSmokeSymbols,
         api_key: String,
         api_secret: String,
+        owner_id: &str,
+        history: JsonlHistory,
+        lifecycle: TestnetSoakLifecycleOwnerMode,
     ) -> Result<Self> {
         let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
         let user_protocol = Arc::new(build_binance_read_only_protocol(
             Arc::clone(&signer),
             symbols,
         )?);
-        let exchange_protocol = build_binance_read_only_protocol(signer, symbols)?;
-        let exchange = BinanceTestnetExchange::new(exchange_protocol, Arc::clone(transport));
+        let exchange_protocol = match &lifecycle {
+            TestnetSoakLifecycleOwnerMode::Fresh(config) => {
+                build_binance_soak_lifecycle_protocol(
+                    &**transport,
+                    Arc::clone(&signer),
+                    symbols,
+                    config,
+                )
+                .await?
+            }
+            TestnetSoakLifecycleOwnerMode::ReadOnly
+            | TestnetSoakLifecycleOwnerMode::Recovery(_) => {
+                build_binance_read_only_protocol(Arc::clone(&signer), symbols)?
+            }
+        };
+        let exchange = Arc::new(BinanceTestnetExchange::new(
+            exchange_protocol,
+            Arc::clone(transport),
+        ));
 
         let market_route = BinancePollingRoute::new(
             MarketInstrument::new("binance", symbols.spot.clone(), MarketType::Spot)?,
@@ -1452,32 +1509,56 @@ impl ProductionBinanceTestnetSoakProbe {
             Arc::new(TokioMarketStreamSleeper),
             Arc::new(ProductionMarketStreamJitter::new(7_500, 12_500)?),
         );
+        Self::from_parts(
+            market_stream,
+            user_stream,
+            exchange,
+            owner_id,
+            history,
+            lifecycle,
+        )
+        .await
+    }
+
+    async fn from_parts(
+        market_stream: BinanceBookTickerStreamSource,
+        user_stream: BinanceUserDataStreamSource,
+        exchange: Arc<BinanceTestnetExchange>,
+        owner_id: &str,
+        history: JsonlHistory,
+        lifecycle: TestnetSoakLifecycleOwnerMode,
+    ) -> Result<Self> {
+        let lifecycle_run_pending = matches!(lifecycle, TestnetSoakLifecycleOwnerMode::Fresh(_));
+        let owner = match lifecycle {
+            TestnetSoakLifecycleOwnerMode::Fresh(config) => {
+                ContinuousTestnetOwner::start(owner_id, config, Arc::clone(&exchange), history)
+                    .await
+            }
+            TestnetSoakLifecycleOwnerMode::Recovery(config) => {
+                ContinuousTestnetOwner::start_recovery_only(
+                    owner_id,
+                    config,
+                    Arc::clone(&exchange),
+                    history,
+                )
+                .await
+            }
+            TestnetSoakLifecycleOwnerMode::ReadOnly => {
+                ContinuousTestnetOwner::start_read_only(owner_id, Arc::clone(&exchange), history)
+                    .await
+            }
+        }
+        .context("failed to start owner-backed Binance Testnet soak")?;
+        if owner.status().phase != ContinuousTestnetOwnerPhase::AwaitingUserStream {
+            bail!("owner-backed Binance Testnet soak requires recovery before serving");
+        }
         Ok(Self {
             market_stream,
             user_stream,
-            user_data: BinanceUserDataState::default(),
-            user_stream_subscribed: false,
-            user_data_reconcile_required: false,
-            exchange,
+            owner,
+            lifecycle_run_pending,
             next_step: 0,
         })
-    }
-
-    #[cfg(test)]
-    fn from_parts(
-        market_stream: BinanceBookTickerStreamSource,
-        user_stream: BinanceUserDataStreamSource,
-        exchange: BinanceTestnetExchange,
-    ) -> Self {
-        Self {
-            market_stream,
-            user_stream,
-            user_data: BinanceUserDataState::default(),
-            user_stream_subscribed: false,
-            user_data_reconcile_required: false,
-            exchange,
-            next_step: 0,
-        }
     }
 
     async fn next_probe(&mut self) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
@@ -1487,16 +1568,11 @@ impl ProductionBinanceTestnetSoakProbe {
             0 => self.next_market_stream_sample().await,
             1 => self.next_user_stream_sample().await,
             _ => {
-                let result = self
-                    .exchange
-                    .reconcile(ReconcileScope::All)
+                self.owner
+                    .verify_stable_reconcile()
                     .await
-                    .map_err(|error| classify_testnet_soak_probe_failure(&error));
-                if result.is_ok() && self.user_data_reconcile_required {
-                    self.user_data = BinanceUserDataState::default();
-                    self.user_data_reconcile_required = false;
-                }
-                result.map(|_| TestnetSoakSample::AuthenticatedReconcile)
+                    .map_err(classify_continuous_testnet_owner_failure)?;
+                Ok(TestnetSoakSample::AuthenticatedReconcile)
             }
         }
     }
@@ -1528,37 +1604,58 @@ impl ProductionBinanceTestnetSoakProbe {
             .await
             .map_err(|_| TestnetSoakProbeFailure::Protocol)?
             .ok_or(TestnetSoakProbeFailure::Unavailable)?;
-        match item {
-            BinanceUserDataStreamItem::Subscribed { .. } => {
-                if self.user_stream_subscribed {
-                    self.user_data_reconcile_required = true;
+        let recovery_failure = match &item {
+            BinanceUserDataStreamItem::TransportGap { .. } => TestnetSoakProbeFailure::Transport,
+            BinanceUserDataStreamItem::StreamExpired { .. } => TestnetSoakProbeFailure::Unavailable,
+            BinanceUserDataStreamItem::SourceUnavailable { failure, .. } => {
+                classify_market_stream_failure(*failure)
+            }
+            _ => TestnetSoakProbeFailure::Protocol,
+        };
+        let outcome = self
+            .owner
+            .ingest_user_data_item(item)
+            .await
+            .map_err(classify_continuous_testnet_owner_failure)?;
+        match outcome {
+            ContinuousTestnetUserDataOutcome::Subscribed
+            | ContinuousTestnetUserDataOutcome::Heartbeat
+            | ContinuousTestnetUserDataOutcome::Applied(_) => {
+                if self.lifecycle_run_pending {
+                    self.owner
+                        .run_lifecycle()
+                        .await
+                        .map_err(classify_continuous_testnet_owner_failure)?;
+                    self.lifecycle_run_pending = false;
                 }
-                self.user_stream_subscribed = true;
                 Ok(TestnetSoakSample::UserDataStream)
             }
-            BinanceUserDataStreamItem::Heartbeat { .. } => Ok(TestnetSoakSample::UserDataStream),
-            BinanceUserDataStreamItem::Event(envelope) => match self.user_data.apply(envelope) {
-                BinanceUserDataApply::ReconcileRequired(_) => {
-                    self.user_data_reconcile_required = true;
-                    Err(TestnetSoakProbeFailure::Protocol)
-                }
-                BinanceUserDataApply::AppliedExecution
-                | BinanceUserDataApply::AppliedAccountUpdate
-                | BinanceUserDataApply::Duplicate
-                | BinanceUserDataApply::IgnoredUnsupported => Ok(TestnetSoakSample::UserDataStream),
-            },
-            BinanceUserDataStreamItem::TransportGap { .. } => {
-                self.user_data_reconcile_required = true;
-                Err(TestnetSoakProbeFailure::Transport)
+            ContinuousTestnetUserDataOutcome::ReconciledAwaitingSubscription(_) => {
+                Err(recovery_failure)
             }
-            BinanceUserDataStreamItem::StreamExpired { .. } => {
-                self.user_data_reconcile_required = true;
-                Err(TestnetSoakProbeFailure::Unavailable)
-            }
-            BinanceUserDataStreamItem::SourceUnavailable { failure, .. } => {
-                self.user_data_reconcile_required = true;
-                Err(classify_market_stream_failure(failure))
-            }
+        }
+    }
+}
+
+fn classify_continuous_testnet_owner_failure(
+    error: ContinuousTestnetOwnerError,
+) -> TestnetSoakProbeFailure {
+    match error {
+        ContinuousTestnetOwnerError::Exchange(error) => classify_testnet_soak_probe_failure(&error),
+        ContinuousTestnetOwnerError::ForeignActivity
+        | ContinuousTestnetOwnerError::UnstableReconciliation
+        | ContinuousTestnetOwnerError::InvalidJournal
+        | ContinuousTestnetOwnerError::RecoveryPlanMissing
+        | ContinuousTestnetOwnerError::RecoveryQueryMissing => TestnetSoakProbeFailure::Protocol,
+        ContinuousTestnetOwnerError::Lifecycle(_) => TestnetSoakProbeFailure::RemoteRejected,
+        ContinuousTestnetOwnerError::History(_)
+        | ContinuousTestnetOwnerError::JournalRead(_)
+        | ContinuousTestnetOwnerError::InvalidConfig
+        | ContinuousTestnetOwnerError::OwnerBusy
+        | ContinuousTestnetOwnerError::NotReady
+        | ContinuousTestnetOwnerError::KillSwitchLatched
+        | ContinuousTestnetOwnerError::LifecycleAuthorityUnavailable => {
+            TestnetSoakProbeFailure::Unavailable
         }
     }
 }
@@ -1579,6 +1676,16 @@ const fn classify_market_stream_failure(
 impl TestnetSoakProbe for ProductionBinanceTestnetSoakProbe {
     fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
         Box::pin(async move { self.next_probe().await })
+    }
+
+    fn shutdown(&mut self) -> crate::testnet_soak::TestnetSoakShutdownFuture<'_> {
+        Box::pin(async move {
+            // A pending lifecycle must be recovered and cancelled before the
+            // soak can claim a clean stop. Read-only, unsubmitted, and already
+            // completed sessions retain restartability through a final stable
+            // owner-backed reconciliation without latching the kill switch.
+            self.owner.shutdown_cleanly().await.map_err(|_| ())
+        })
     }
 }
 
@@ -1665,9 +1772,26 @@ async fn run_testnet_soak_serve(args: &TestnetSoakArgs) -> Result<()> {
         failure_threshold,
     )?;
 
+    // Validate the all-or-none recovery group and durable campaign state
+    // before credentials, sockets, or any other remote-capable dependency is
+    // constructed.
+    let recovery = testnet_soak_recovery_config(args)?;
+    ensure_control_token_configured()
+        .map_err(anyhow::Error::new)
+        .context("testnet-soak serve requires a valid loopback control token")?;
+    let task_id = args.task_id.as_str();
+    let address = control_addr(task_id, &args.history_path, Some(control_port));
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind testnet soak control socket on {address}"))?;
+    let shutdown = register_task_host_shutdown()?;
+
     if let Some(script) = &args.fixture_probe_script {
+        if !matches!(recovery, TestnetSoakLifecycleOwnerMode::ReadOnly) {
+            bail!("fixture testnet-soak probes cannot claim lifecycle recovery evidence");
+        }
         let probe = ScriptedTestnetSoakProbe::parse(script)?;
-        return serve_testnet_soak_task(args, control_port, config, probe).await;
+        return serve_testnet_soak_task(args, address, listener, shutdown, config, probe).await;
     }
 
     let symbols = testnet_soak_symbols(args)?;
@@ -1675,8 +1799,141 @@ async fn run_testnet_soak_serve(args: &TestnetSoakArgs) -> Result<()> {
     let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
         StdDuration::from_millis(args.timeout_ms),
     )?);
-    let probe = ProductionBinanceTestnetSoakProbe::new(&transport, &symbols, api_key, api_secret)?;
-    serve_testnet_soak_task(args, control_port, config, probe).await
+    let probe = ProductionBinanceTestnetSoakProbe::new(
+        &transport,
+        &symbols,
+        api_key,
+        api_secret,
+        &args.task_id,
+        JsonlHistory::new(&args.history_path),
+        recovery,
+    )
+    .await?;
+    serve_testnet_soak_task(args, address, listener, shutdown, config, probe).await
+}
+
+#[allow(clippy::too_many_lines)]
+fn testnet_soak_recovery_config(args: &TestnetSoakArgs) -> Result<TestnetSoakLifecycleOwnerMode> {
+    let recovery = &args.lifecycle_recovery;
+    let supplied = [
+        recovery.recovery_campaign_id.is_some(),
+        recovery.recovery_client_order_id.is_some(),
+        recovery.recovery_market.is_some(),
+        recovery.recovery_side.is_some(),
+        recovery.recovery_quantity.is_some(),
+        recovery.recovery_price.is_some(),
+        recovery.recovery_time_in_force.is_some(),
+        recovery.recovery_expected_observation.is_some(),
+        recovery.recovery_reduce_only.is_some(),
+        recovery.recovery_poll_interval_ms.is_some(),
+        recovery.recovery_maximum_queries.is_some(),
+    ];
+    if supplied.iter().all(|supplied| !supplied) {
+        if recovery.acknowledge_testnet_lifecycle.is_some() {
+            bail!("testnet-soak lifecycle acknowledgement requires the full exact configuration");
+        }
+        return Ok(TestnetSoakLifecycleOwnerMode::ReadOnly);
+    }
+    if !supplied.iter().all(|supplied| *supplied) {
+        bail!("testnet-soak lifecycle recovery options must be supplied all-or-none");
+    }
+
+    let market = recovery
+        .recovery_market
+        .context("missing recovery market")?;
+    let reduce_only = recovery
+        .recovery_reduce_only
+        .context("missing recovery reduce-only bit")?;
+    if reduce_only && market == TestnetLifecycleMarket::Spot {
+        bail!("testnet-soak recovery --recovery-reduce-only is invalid for spot");
+    }
+    let (symbol, market_type) = match market {
+        TestnetLifecycleMarket::Spot => (
+            Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?,
+            MarketType::Spot,
+        ),
+        TestnetLifecycleMarket::Usdm => (
+            Symbol::new(args.perpetual_symbol.clone()).context("invalid --perpetual-symbol")?,
+            MarketType::Perpetual,
+        ),
+    };
+    let side = match recovery.recovery_side.context("missing recovery side")? {
+        TestnetLifecycleSide::Buy => Side::Buy,
+        TestnetLifecycleSide::Sell => Side::Sell,
+    };
+    let time_in_force = match recovery
+        .recovery_time_in_force
+        .context("missing recovery time-in-force")?
+    {
+        TestnetLifecycleTimeInForce::Gtc => TimeInForce::Gtc,
+        TestnetLifecycleTimeInForce::PostOnly => TimeInForce::PostOnly,
+    };
+    let expected = match recovery
+        .recovery_expected_observation
+        .context("missing recovery expected observation")?
+    {
+        TestnetLifecycleExpected::Open => TestnetLifecycleObservation::Open,
+        TestnetLifecycleExpected::PartiallyFilled => TestnetLifecycleObservation::PartiallyFilled,
+    };
+    let quantity = Quantity::new(
+        recovery
+            .recovery_quantity
+            .context("missing recovery quantity")?,
+    )
+    .context("invalid recovery quantity")?;
+    let price = Price::new(recovery.recovery_price.context("missing recovery price")?)
+        .context("invalid recovery price")?;
+    let mut intent = OrderIntent::limit("binance", symbol, market_type, side, quantity, price);
+    intent.client_order_id = recovery
+        .recovery_client_order_id
+        .context("missing recovery client order ID")?;
+    intent.time_in_force = time_in_force;
+    intent.reduce_only = reduce_only;
+    let config = TestnetLifecycleConfig::new(
+        recovery
+            .recovery_campaign_id
+            .clone()
+            .context("missing recovery campaign ID")?,
+        intent,
+        args.wire_symbol.clone(),
+        expected,
+        StdDuration::from_millis(
+            recovery
+                .recovery_poll_interval_ms
+                .context("missing recovery poll interval")?,
+        ),
+        recovery
+            .recovery_maximum_queries
+            .context("missing recovery query budget")?,
+    )?;
+    let history = JsonlHistory::new(&args.history_path);
+    match testnet_lifecycle_recovery_state(&config, &history)
+        .context("failed to inspect exact durable lifecycle recovery state")?
+    {
+        TestnetLifecycleRecoveryState::Pending { .. } => {
+            if recovery
+                .acknowledge_testnet_lifecycle
+                .as_deref()
+                .is_some_and(|ack| ack != TESTNET_LIFECYCLE_ACKNOWLEDGEMENT)
+            {
+                bail!("invalid Testnet lifecycle acknowledgement");
+            }
+            Ok(TestnetSoakLifecycleOwnerMode::Recovery(config))
+        }
+        TestnetLifecycleRecoveryState::Fresh => {
+            if recovery.acknowledge_testnet_lifecycle.as_deref()
+                != Some(TESTNET_LIFECYCLE_ACKNOWLEDGEMENT)
+            {
+                bail!(
+                    "first-submit eligible testnet-soak lifecycle requires --acknowledge-testnet-lifecycle \"{TESTNET_LIFECYCLE_ACKNOWLEDGEMENT}\""
+                );
+            }
+            Ok(TestnetSoakLifecycleOwnerMode::Fresh(config))
+        }
+        TestnetLifecycleRecoveryState::Completed | TestnetLifecycleRecoveryState::Failed => {
+            bail!("testnet-soak recovery requires a pending non-terminal lifecycle")
+        }
+    }
 }
 
 fn register_task_host_shutdown() -> Result<ShutdownSignalFuture> {
@@ -1701,28 +1958,19 @@ where
 
 async fn serve_testnet_soak_task<P>(
     args: &TestnetSoakArgs,
-    control_port: u16,
+    address: std::net::SocketAddr,
+    listener: tokio::net::TcpListener,
+    shutdown: ShutdownSignalFuture,
     config: TestnetSoakTaskConfig,
     probe: P,
 ) -> Result<()>
 where
     P: TestnetSoakProbe,
 {
-    ensure_control_token_configured()
-        .map_err(anyhow::Error::new)
-        .context("testnet-soak serve requires a valid loopback control token")?;
     let task_id = args.task_id.as_str();
-    let address = control_addr(task_id, &args.history_path, Some(control_port));
-    let listener = tokio::net::TcpListener::bind(address)
+    let mut task = TestnetSoakTask::start(config, probe, JsonlHistory::new(&args.history_path))
         .await
-        .with_context(|| format!("failed to bind testnet soak control socket on {address}"))?;
-    let (shutdown, mut task) =
-        start_after_shutdown_registration(register_task_host_shutdown, || async move {
-            TestnetSoakTask::start(config, probe, JsonlHistory::new(&args.history_path))
-                .await
-                .context("failed to start testnet soak task")
-        })
-        .await?;
+        .context("failed to start testnet soak task")?;
 
     println!(
         "testnet soak task started: task_id={} control={} history={}",
@@ -1921,7 +2169,7 @@ fn project_testnet_soak_status(
         if record.strategy != "testnet_soak" {
             continue;
         }
-        if record.details["task_kind"].as_str() != Some("binance_testnet_read_only_soak") {
+        if record.details["task_kind"].as_str() != Some(TESTNET_SOAK_TASK_KIND) {
             continue;
         }
         if record.details["task_id"].as_str() != Some(task_id) {
@@ -2212,6 +2460,7 @@ fn testnet_soak_task_failure_name(failure: TestnetSoakTaskFailure) -> String {
         TestnetSoakTaskFailure::JournalUnavailable => "journal_unavailable",
         TestnetSoakTaskFailure::TaskPanicked => "task_panicked",
         TestnetSoakTaskFailure::TaskCancelled => "task_cancelled",
+        TestnetSoakTaskFailure::ProbeShutdown => "probe_shutdown",
     }
     .to_owned()
 }
@@ -6185,8 +6434,10 @@ mod tests {
         PositionSide, Price, Quantity, Side, Symbol, TimeInForce,
     };
     use crypto_trading_exchange::{
-        BinanceHmacSha256Signer, BinancePublicExchange, BinanceTestnetExchange, ExchangeError,
-        ForeignOrder, ReconcileReceipt, ReconcileScope, RemoteHttpRequest, RemoteHttpResponse,
+        BinanceHmacSha256Signer, BinancePublicExchange, BinanceTestnetEndpoints,
+        BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError, ExchangeSymbol,
+        ExchangeSymbolCatalog, ForeignOrder, InstrumentRuleCatalog, InstrumentRules,
+        ReconcileReceipt, ReconcileScope, RemoteHttpMethod, RemoteHttpRequest, RemoteHttpResponse,
         RemoteHttpTransport, SubmissionDisposition, TradingReceipt,
     };
     use crypto_trading_runtime::{
@@ -6204,12 +6455,14 @@ mod tests {
         MAX_CONFIG_CHECK_SUMMARIES, MAX_CONFIG_DETAIL_BYTES, MAX_CONFIG_SCHEMA_ISSUE_BYTES,
         MAX_CONFIG_SCHEMA_ISSUES, MAX_RECEIPT_SUMMARY_RECEIPTS, MAX_RECONCILIATION_SUMMARY_ORDERS,
         MAX_RECONCILIATION_SUMMARY_POSITIONS, PaperRuntimeSchema, PreservedExecutionOutcome,
-        ProductionBinanceTestnetSoakProbe, append_execution_planned, auxiliary_config_kind,
-        bounded_issue_detail, build_binance_read_only_protocol, collect_config_report,
-        config_summary, execution_batch, execution_error_summary, finish_arbitrage_execution,
-        finish_execution, inspect_config, paper_runtime_schema_issues, plan_grid_intents,
-        receipt_summary, render_config_summary, start_after_shutdown_registration,
+        ProductionBinanceTestnetSoakProbe, TestnetSoakLifecycleOwnerMode, append_execution_planned,
+        auxiliary_config_kind, bounded_issue_detail, build_binance_read_only_protocol,
+        collect_config_report, config_summary, execution_batch, execution_error_summary,
+        finish_arbitrage_execution, finish_execution, inspect_config, paper_runtime_schema_issues,
+        plan_grid_intents, receipt_summary, render_config_summary,
+        start_after_shutdown_registration,
     };
+    use crate::testnet_lifecycle::{TestnetLifecycleConfig, TestnetLifecycleObservation};
     use crate::testnet_soak::TestnetSoakSample;
     use crypto_trading_config::reject_yaml_anchors_and_aliases;
 
@@ -6321,6 +6574,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn production_testnet_soak_probe_emits_all_three_streaming_samples() {
         let symbols = BinanceSmokeSymbols {
@@ -6372,7 +6626,7 @@ mod tests {
         let http = Arc::new(ScriptedHttpTransport {
             requests: Mutex::new(Vec::new()),
             responses: Mutex::new(
-                (0..3)
+                (0..12)
                     .map(|_| Ok(RemoteHttpResponse::new(200, br"[]").unwrap()))
                     .collect(),
             ),
@@ -6381,12 +6635,21 @@ mod tests {
         let signer = Arc::new(
             BinanceHmacSha256Signer::new("offline-api-key", "offline-api-secret").unwrap(),
         );
-        let exchange = BinanceTestnetExchange::new(
+        let exchange = Arc::new(BinanceTestnetExchange::new(
             build_binance_read_only_protocol(signer, &symbols).unwrap(),
             transport,
-        );
-        let mut probe =
-            ProductionBinanceTestnetSoakProbe::from_parts(market_stream, user_stream, exchange);
+        ));
+        let history = JsonlHistory::new(temp_path("production-soak-owner"));
+        let mut probe = ProductionBinanceTestnetSoakProbe::from_parts(
+            market_stream,
+            user_stream,
+            exchange,
+            "production-soak-owner",
+            history.clone(),
+            TestnetSoakLifecycleOwnerMode::ReadOnly,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             probe.next_probe().await.unwrap(),
@@ -6413,8 +6676,261 @@ mod tests {
                 "/api/v3/openOrders",
                 "/fapi/v1/openOrders",
                 "/fapi/v2/positionRisk",
+                "/api/v3/openOrders",
+                "/fapi/v1/openOrders",
+                "/fapi/v2/positionRisk",
+                "/api/v3/openOrders",
+                "/fapi/v1/openOrders",
+                "/fapi/v2/positionRisk",
+                "/api/v3/openOrders",
+                "/fapi/v1/openOrders",
+                "/fapi/v2/positionRisk",
             ]
         );
+        let journal = std::fs::read_to_string(history.path()).unwrap();
+        assert!(journal.contains("continuous_testnet_user_stream_subscribed"));
+        assert!(journal.contains("continuous_testnet_reconcile_verified"));
+        assert!(!journal.contains("continuous_testnet_campaign_recovery_verified"));
+        let path = history.path().to_owned();
+        drop(probe);
+        drop(history);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn production_soak_waits_for_subscription_then_recovers_pending_campaign_query_first() {
+        let symbols = BinanceSmokeSymbols {
+            spot: Symbol::new("BTC-USDT-SPOT").unwrap(),
+            perpetual: Symbol::new("BTC-USDT-PERP").unwrap(),
+            wire_symbol: "BTCUSDT".to_owned(),
+        };
+        let config = soak_lifecycle_config(&symbols);
+        let history = JsonlHistory::new(temp_path("production-soak-restart"));
+        let first_http = Arc::new(ScriptedHttpTransport {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(
+                (0..6)
+                    .map(|_| Ok(RemoteHttpResponse::new(200, br"[]").unwrap()))
+                    .chain([
+                        Err(ExchangeError::unavailable("fixture submit disconnect")),
+                        Err(ExchangeError::unavailable("fixture query disconnect")),
+                    ])
+                    .collect(),
+            ),
+        });
+        let first_transport: Arc<dyn RemoteHttpTransport> = first_http.clone();
+        let (market, user) = scripted_soak_streams(&symbols, 81);
+        let mut first = ProductionBinanceTestnetSoakProbe::from_parts(
+            market,
+            user,
+            mutation_exchange(&symbols, first_transport),
+            "production-soak-restart",
+            history.clone(),
+            TestnetSoakLifecycleOwnerMode::Fresh(config.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            first_http
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| { request.method() != RemoteHttpMethod::Post })
+        );
+        assert!(first.next_user_stream_sample().await.is_err());
+        assert!(
+            first_http
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| { request.method() == RemoteHttpMethod::Post })
+        );
+        let first_journal = std::fs::read_to_string(history.path()).unwrap();
+        assert!(first_journal.contains("testnet_lifecycle_planned"));
+        assert!(!first_journal.contains("continuous_testnet_campaign_recovery_verified"));
+        drop(first); // deterministic process-kill boundary: no graceful shutdown.
+
+        let open = binance_order_response("NEW");
+        let cancelled = binance_order_response("CANCELED");
+        let recovery_http = Arc::new(ScriptedHttpTransport {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(
+                [
+                    Ok(RemoteHttpResponse::new(200, open.as_bytes()).unwrap()),
+                    Ok(RemoteHttpResponse::new(200, cancelled.as_bytes()).unwrap()),
+                    Ok(RemoteHttpResponse::new(200, cancelled.as_bytes()).unwrap()),
+                ]
+                .into_iter()
+                .chain((0..6).map(|_| Ok(RemoteHttpResponse::new(200, br"[]").unwrap())))
+                .collect(),
+            ),
+        });
+        let recovery_transport: Arc<dyn RemoteHttpTransport> = recovery_http.clone();
+        let (market, user) = scripted_soak_streams(&symbols, 82);
+        let mut recovered = ProductionBinanceTestnetSoakProbe::from_parts(
+            market,
+            user,
+            read_only_exchange(&symbols, recovery_transport),
+            "production-soak-restart",
+            history.clone(),
+            TestnetSoakLifecycleOwnerMode::Recovery(config),
+        )
+        .await
+        .unwrap();
+        {
+            let requests = recovery_http.requests.lock().unwrap();
+            assert_eq!(requests[0].method(), RemoteHttpMethod::Get);
+            assert_eq!(requests[0].url().path(), "/api/v3/order");
+            assert!(
+                requests[0]
+                    .url()
+                    .query()
+                    .unwrap()
+                    .contains("origClientOrderId=0f3c807d-776f-4de4-85d0-93760a82dfcf")
+            );
+            assert_eq!(requests[1].method(), RemoteHttpMethod::Delete);
+            assert_eq!(requests[2].method(), RemoteHttpMethod::Get);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method() != RemoteHttpMethod::Post)
+            );
+        }
+        assert_eq!(
+            recovered.next_user_stream_sample().await.unwrap(),
+            TestnetSoakSample::UserDataStream
+        );
+        let journal = std::fs::read_to_string(history.path()).unwrap();
+        assert!(journal.contains("continuous_testnet_campaign_recovery_verified"));
+        assert!(journal.contains("\"query_delta\":2"));
+        assert!(journal.contains("continuous_testnet_user_stream_subscribed"));
+
+        let path = history.path().to_owned();
+        drop(recovered);
+        drop(history);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn scripted_soak_streams(
+        symbols: &BinanceSmokeSymbols,
+        subscription_id: u64,
+    ) -> (BinanceBookTickerStreamSource, BinanceUserDataStreamSource) {
+        let clock = Arc::new(FixedStreamClock {
+            now: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
+        });
+        let sleeper: Arc<dyn MarketStreamSleeper> = Arc::new(NoopStreamSleeper);
+        let jitter = Arc::new(FixedMarketStreamJitter::new(10_000));
+        let reconnect = MarketStreamReconnectPolicy::new(
+            StdDuration::from_millis(1),
+            StdDuration::from_secs(1),
+        )
+        .unwrap();
+        let route = BinancePollingRoute::new(
+            MarketInstrument::new("binance", symbols.spot.clone(), MarketType::Spot).unwrap(),
+            Symbol::new("BTCUSDT").unwrap(),
+        )
+        .unwrap();
+        let market = BinanceBookTickerStreamSource::new(
+            BinancePublicExchange::new().unwrap(),
+            vec![route],
+            Arc::new(ScriptedWebSocketConnector::one(Vec::new())),
+            reconnect,
+            Arc::clone(&clock),
+            Arc::clone(&sleeper),
+            jitter.clone(),
+        )
+        .unwrap();
+        let user = BinanceUserDataStreamSource::new(
+            Arc::new(ScriptedWebSocketConnector::one(vec![
+                TextWebSocketEvent::Text(format!(
+                    r#"{{"id":"user-data-subscribe","status":200,"result":{{"subscriptionId":{subscription_id}}}}}"#
+                )),
+            ])),
+            reconnect,
+            clock,
+            sleeper,
+            jitter,
+        );
+        (market, user)
+    }
+
+    fn soak_lifecycle_config(symbols: &BinanceSmokeSymbols) -> TestnetLifecycleConfig {
+        let mut intent = OrderIntent::limit(
+            "binance",
+            symbols.spot.clone(),
+            MarketType::Spot,
+            Side::Buy,
+            Quantity::new(Decimal::new(1, 3)).unwrap(),
+            Price::new(Decimal::new(490_001, 1)).unwrap(),
+        );
+        intent.client_order_id =
+            uuid::Uuid::parse_str("0f3c807d-776f-4de4-85d0-93760a82dfcf").unwrap();
+        intent.time_in_force = TimeInForce::PostOnly;
+        TestnetLifecycleConfig::new(
+            "production-soak-campaign",
+            intent,
+            "BTCUSDT",
+            TestnetLifecycleObservation::Open,
+            StdDuration::from_millis(1),
+            4,
+        )
+        .unwrap()
+    }
+
+    fn read_only_exchange(
+        symbols: &BinanceSmokeSymbols,
+        transport: Arc<dyn RemoteHttpTransport>,
+    ) -> Arc<BinanceTestnetExchange> {
+        let signer = Arc::new(
+            BinanceHmacSha256Signer::new("offline-api-key", "offline-api-secret").unwrap(),
+        );
+        Arc::new(BinanceTestnetExchange::new(
+            build_binance_read_only_protocol(signer, symbols).unwrap(),
+            transport,
+        ))
+    }
+
+    fn mutation_exchange(
+        symbols: &BinanceSmokeSymbols,
+        transport: Arc<dyn RemoteHttpTransport>,
+    ) -> Arc<BinanceTestnetExchange> {
+        let signer = Arc::new(
+            BinanceHmacSha256Signer::new("offline-api-key", "offline-api-secret").unwrap(),
+        );
+        let protocol = BinanceTestnetProtocol::authenticated(
+            BinanceTestnetEndpoints::official(),
+            ExchangeSymbolCatalog::new(vec![
+                ExchangeSymbol::new("binance", symbols.spot.clone(), MarketType::Spot, "BTCUSDT")
+                    .unwrap(),
+            ])
+            .unwrap(),
+            InstrumentRuleCatalog::new(vec![
+                InstrumentRules::new(
+                    "binance",
+                    symbols.spot.clone(),
+                    MarketType::Spot,
+                    Price::new(Decimal::new(1, 1)).unwrap(),
+                    Quantity::new(Decimal::new(1, 4)).unwrap(),
+                    Quantity::new(Decimal::new(1, 4)).unwrap(),
+                    Money::new(Decimal::from(5)),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+            signer,
+        )
+        .unwrap();
+        Arc::new(BinanceTestnetExchange::new(protocol, transport))
+    }
+
+    fn binance_order_response(status: &str) -> String {
+        format!(
+            r#"{{"symbol":"BTCUSDT","orderId":28,"clientOrderId":"0f3c807d-776f-4de4-85d0-93760a82dfcf","price":"49000.1","origQty":"0.001","executedQty":"0","status":"{status}","timeInForce":"GTC","type":"LIMIT_MAKER","side":"BUY"}}"#
+        )
     }
 
     #[tokio::test]

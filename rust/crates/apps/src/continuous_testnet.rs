@@ -25,8 +25,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::testnet_lifecycle::{
-    TestnetLifecycleConfig, TestnetLifecycleError, TestnetLifecycleReport, TestnetLifecycleVenue,
-    run_testnet_lifecycle, testnet_lifecycle_requires_submission,
+    TestnetLifecycleConfig, TestnetLifecycleError, TestnetLifecycleRecoveryState,
+    TestnetLifecycleReport, TestnetLifecycleVenue, run_testnet_lifecycle,
+    testnet_lifecycle_recovery_state,
 };
 
 pub const CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION: u16 = 1;
@@ -39,8 +40,9 @@ const USER_STREAM_SUBSCRIBED: &str = "continuous_testnet_user_stream_subscribed"
 const USER_STREAM_HEARTBEAT: &str = "continuous_testnet_user_stream_heartbeat";
 const USER_DATA_APPLIED: &str = "continuous_testnet_user_data_applied";
 const USER_STREAM_RECOVERED: &str = "continuous_testnet_user_stream_recovered";
+const RECONCILE_VERIFIED: &str = "continuous_testnet_reconcile_verified";
 const CAMPAIGN_PLANNED: &str = "continuous_testnet_campaign_planned";
-const CAMPAIGN_RECOVERY_PLANNED: &str = "continuous_testnet_campaign_recovery_planned";
+const CAMPAIGN_RECOVERY_VERIFIED: &str = "continuous_testnet_campaign_recovery_verified";
 const CAMPAIGN_COMPLETED: &str = "continuous_testnet_campaign_completed";
 const RECOVERY_REQUIRED: &str = "continuous_testnet_recovery_required";
 const KILL_SWITCH_ENGAGED: &str = "continuous_testnet_kill_switch_engaged";
@@ -63,7 +65,9 @@ pub enum ContinuousTestnetOwnerPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContinuousTestnetOwnerStatus {
     pub owner_id: String,
-    pub campaign_id: String,
+    /// Present only when this owner was given the exact durable lifecycle
+    /// identity. Read-only stream owners never manufacture a campaign ID.
+    pub campaign_id: Option<String>,
     pub phase: ContinuousTestnetOwnerPhase,
     pub kill_switch_latched: bool,
     /// True only after a subscription acknowledgement on the current stream.
@@ -98,7 +102,7 @@ pub enum ContinuousTestnetUserDataOutcome {
 /// this process; [`JsonlHistory`] provides the matching cross-process lease.
 pub struct ContinuousTestnetOwner<V> {
     owner_id: String,
-    config: TestnetLifecycleConfig,
+    config: Option<TestnetLifecycleConfig>,
     venue: Arc<V>,
     history: JsonlHistory,
     status: ContinuousTestnetOwnerStatus,
@@ -125,26 +129,75 @@ where
     ///
     /// # Errors
     ///
-    /// Fails closed for invalid identity or journal state, a busy writer lane,
-    /// lifecycle recovery failure, or an unstable/foreign REST reconciliation.
+    /// Invalid identity/journal state and a busy writer lane return an error.
+    /// Remote lifecycle or reconciliation failures remain inspectable: they
+    /// are journaled and returned as an owner in [`ContinuousTestnetOwnerPhase::RecoveryRequired`].
     pub async fn start(
         owner_id: impl Into<String>,
         config: TestnetLifecycleConfig,
         venue: Arc<V>,
         history: JsonlHistory,
     ) -> Result<Self, ContinuousTestnetOwnerError> {
-        let owner_id = owner_id.into();
+        Self::start_inner(owner_id.into(), Some(config), venue, history).await
+    }
+
+    /// Starts an owner for authenticated stream projection and stable account
+    /// reconciliation only. This mode has no lifecycle submit/query/cancel
+    /// authority and therefore cannot claim campaign-recovery evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded owner error for invalid identity/journal state, a
+    /// busy writer lane, or failed bootstrap reconciliation.
+    pub async fn start_read_only(
+        owner_id: impl Into<String>,
+        venue: Arc<V>,
+        history: JsonlHistory,
+    ) -> Result<Self, ContinuousTestnetOwnerError> {
+        Self::start_inner(owner_id.into(), None, venue, history).await
+    }
+
+    /// Starts an owner with recovery-only authority for an exact lifecycle
+    /// that is already durably planned. Fresh/first-submit eligible campaigns
+    /// are rejected before any remote I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded owner error unless the lifecycle is pending and its
+    /// exact durable identity can be recovered safely.
+    pub async fn start_recovery_only(
+        owner_id: impl Into<String>,
+        config: TestnetLifecycleConfig,
+        venue: Arc<V>,
+        history: JsonlHistory,
+    ) -> Result<Self, ContinuousTestnetOwnerError> {
+        if !matches!(
+            testnet_lifecycle_recovery_state(&config, &history)?,
+            TestnetLifecycleRecoveryState::Pending { .. }
+        ) {
+            return Err(ContinuousTestnetOwnerError::RecoveryPlanMissing);
+        }
+        Self::start_inner(owner_id.into(), Some(config), venue, history).await
+    }
+
+    async fn start_inner(
+        owner_id: String,
+        config: Option<TestnetLifecycleConfig>,
+        venue: Arc<V>,
+        history: JsonlHistory,
+    ) -> Result<Self, ContinuousTestnetOwnerError> {
         let owner_id = validate_owner_id(&owner_id)?;
         let owner_lock = shared_owner_lock(history.path());
         let owner_lease = owner_lock
             .try_lock_owned()
             .map_err(|_| ContinuousTestnetOwnerError::OwnerBusy)?;
-        let projected = project_owner(history.path(), &owner_id, config.campaign_id())?;
+        let campaign_id = config.as_ref().map(TestnetLifecycleConfig::campaign_id);
+        let projected = project_owner(history.path(), &owner_id, campaign_id)?;
         let now = Utc::now();
         let mut owner = Self {
             status: ContinuousTestnetOwnerStatus {
                 owner_id: owner_id.clone(),
-                campaign_id: config.campaign_id().to_owned(),
+                campaign_id: campaign_id.map(str::to_owned),
                 phase: if projected.kill_switch_latched {
                     ContinuousTestnetOwnerPhase::KilledClean
                 } else {
@@ -173,8 +226,10 @@ where
         // exact client order ID must therefore happen before a broad account
         // snapshot, so restart can never hide an ambiguous submit behind a
         // later aggregate reconcile.
-        if !testnet_lifecycle_requires_submission(&owner.config, &owner.history)?
-            && owner.run_lifecycle_inner().await.is_err()
+        if matches!(
+            owner.lifecycle_recovery_state()?,
+            Some(TestnetLifecycleRecoveryState::Pending { .. })
+        ) && owner.run_lifecycle_inner().await.is_err()
         {
             return Ok(owner);
         }
@@ -338,7 +393,10 @@ where
         )
         .await?;
 
-        if !testnet_lifecycle_requires_submission(&self.config, &self.history)? {
+        if matches!(
+            self.lifecycle_recovery_state()?,
+            Some(TestnetLifecycleRecoveryState::Pending { .. })
+        ) {
             self.run_lifecycle_inner().await?;
         }
         self.status.phase = ContinuousTestnetOwnerPhase::Reconciling;
@@ -377,26 +435,57 @@ where
         if self.status.phase != ContinuousTestnetOwnerPhase::ReadyUnarmed {
             return Err(ContinuousTestnetOwnerError::NotReady);
         }
+        if self.config.is_none() {
+            return Err(ContinuousTestnetOwnerError::LifecycleAuthorityUnavailable);
+        }
         self.run_lifecycle_inner().await
     }
 
     async fn run_lifecycle_inner(
         &mut self,
     ) -> Result<TestnetLifecycleReport, ContinuousTestnetOwnerError> {
-        let recovering = !testnet_lifecycle_requires_submission(&self.config, &self.history)?;
+        let config = self
+            .config
+            .clone()
+            .ok_or(ContinuousTestnetOwnerError::LifecycleAuthorityUnavailable)?;
+        let recovery_state = testnet_lifecycle_recovery_state(&config, &self.history)?;
+        let query_count_before = match recovery_state {
+            TestnetLifecycleRecoveryState::Pending { query_count } => Some(query_count),
+            _ => None,
+        };
         self.status.phase = ContinuousTestnetOwnerPhase::CampaignRunning;
-        self.append(
-            if recovering {
-                CAMPAIGN_RECOVERY_PLANNED
-            } else {
-                CAMPAIGN_PLANNED
-            },
-            "campaign_running",
-            json!({"query_first": recovering}),
-        )
-        .await?;
-        match run_testnet_lifecycle(&self.config, &*self.venue, &self.history).await {
+        if matches!(recovery_state, TestnetLifecycleRecoveryState::Fresh) {
+            self.append(
+                CAMPAIGN_PLANNED,
+                "campaign_running",
+                json!({"query_first": false}),
+            )
+            .await?;
+        }
+        match run_testnet_lifecycle(&config, &*self.venue, &self.history).await {
             Ok(report) => {
+                if let Some(query_count_before) = query_count_before {
+                    let query_delta = report
+                        .query_count
+                        .checked_sub(query_count_before)
+                        .ok_or(ContinuousTestnetOwnerError::RecoveryQueryMissing)?;
+                    if query_delta == 0 {
+                        self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+                        return Err(ContinuousTestnetOwnerError::RecoveryQueryMissing);
+                    }
+                    self.append(
+                        CAMPAIGN_RECOVERY_VERIFIED,
+                        "campaign_recovered",
+                        json!({
+                            "query_first": true,
+                            "query_count_before": query_count_before,
+                            "query_count_after": report.query_count,
+                            "query_delta": query_delta,
+                            "client_order_id": config.intent().client_order_id,
+                        }),
+                    )
+                    .await?;
+                }
                 self.status.phase = ContinuousTestnetOwnerPhase::ReadyUnarmed;
                 self.append(
                     CAMPAIGN_COMPLETED,
@@ -440,7 +529,10 @@ where
         self.append(KILL_SWITCH_ENGAGED, "kill_switch_engaged", json!({}))
             .await?;
 
-        if !testnet_lifecycle_requires_submission(&self.config, &self.history)? {
+        if matches!(
+            self.lifecycle_recovery_state()?,
+            Some(TestnetLifecycleRecoveryState::Pending { .. })
+        ) {
             self.run_lifecycle_inner().await?;
             self.status.kill_switch_latched = true;
         }
@@ -459,6 +551,59 @@ where
         self.append(KILLED_CLEAN, "killed_clean", json!({})).await
     }
 
+    /// Proves two identical authoritative REST snapshots through the same
+    /// owner that projects the authenticated stream. This is the reconcile
+    /// sample used by the production soak path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded owner error for a latched/not-ready owner or an
+    /// unstable, foreign, or unavailable authoritative snapshot.
+    pub async fn verify_stable_reconcile(&mut self) -> Result<(), ContinuousTestnetOwnerError> {
+        if self.status.kill_switch_latched {
+            return Err(ContinuousTestnetOwnerError::KillSwitchLatched);
+        }
+        if self.status.phase == ContinuousTestnetOwnerPhase::RecoveryRequired {
+            return Err(ContinuousTestnetOwnerError::NotReady);
+        }
+        if let Err(error) = self.stable_reconcile().await {
+            self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+            self.append(
+                RECOVERY_REQUIRED,
+                "recovery_required",
+                json!({"reason": error.reason_label()}),
+            )
+            .await?;
+            return Err(error);
+        }
+        self.append(
+            RECONCILE_VERIFIED,
+            "stable_reconcile_verified",
+            reconciliation_scope_observation(),
+        )
+        .await
+    }
+
+    /// Ends an owner-hosted session without abandoning an in-flight durable
+    /// lifecycle. A pending plan is resolved through the latching kill switch
+    /// and exact-ID recovery; read-only, fresh-unsubmitted, and completed
+    /// sessions require only a final stable authoritative reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded owner error when pending lifecycle cleanup or the
+    /// final stable reconciliation cannot be proven durably.
+    pub async fn shutdown_cleanly(&mut self) -> Result<(), ContinuousTestnetOwnerError> {
+        if matches!(
+            self.lifecycle_recovery_state()?,
+            Some(TestnetLifecycleRecoveryState::Pending { .. })
+        ) {
+            self.engage_kill_switch().await
+        } else {
+            self.verify_stable_reconcile().await
+        }
+    }
+
     async fn stable_reconcile(&self) -> Result<(), ContinuousTestnetOwnerError> {
         let first = self.venue.reconcile(ReconcileScope::All).await?;
         let second = self.venue.reconcile(ReconcileScope::All).await?;
@@ -469,6 +614,16 @@ where
             return Err(ContinuousTestnetOwnerError::UnstableReconciliation);
         }
         Ok(())
+    }
+
+    fn lifecycle_recovery_state(
+        &self,
+    ) -> Result<Option<TestnetLifecycleRecoveryState>, ContinuousTestnetOwnerError> {
+        self.config
+            .as_ref()
+            .map(|config| testnet_lifecycle_recovery_state(config, &self.history))
+            .transpose()
+            .map_err(Into::into)
     }
 
     async fn append(
@@ -487,7 +642,7 @@ where
                 details: json!({
                     "schema_version": CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION,
                     "owner_id": self.owner_id,
-                    "campaign_id": self.config.campaign_id(),
+                    "campaign_id": self.config.as_ref().map(TestnetLifecycleConfig::campaign_id),
                     "phase": phase,
                     "kill_switch_latched": self.status.kill_switch_latched,
                     "observation": observation,
@@ -588,7 +743,7 @@ struct ProjectedOwner {
 fn project_owner(
     path: &Path,
     owner_id: &str,
-    campaign_id: &str,
+    campaign_id: Option<&str>,
 ) -> Result<ProjectedOwner, ContinuousTestnetOwnerError> {
     if !path.exists() {
         return Ok(ProjectedOwner::default());
@@ -610,9 +765,15 @@ fn project_owner(
         if record.details.get("owner_id").and_then(Value::as_str) != Some(owner_id) {
             continue;
         }
-        if record.details.get("campaign_id").and_then(Value::as_str) != Some(campaign_id)
-            || record.details.get("schema_version").and_then(Value::as_u64)
-                != Some(u64::from(CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION))
+        let record_campaign_id = record.details.get("campaign_id").and_then(Value::as_str);
+        if record_campaign_id != campaign_id {
+            // One durable journal may contain a read-only soak owner followed
+            // by an explicitly configured recovery campaign. Kill-switch and
+            // phase facts are scoped to the exact (owner, campaign) pair.
+            continue;
+        }
+        if record.details.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION))
             || projected
                 .last_recorded_at
                 .is_some_and(|last| record.timestamp < last)
@@ -669,6 +830,9 @@ pub enum ContinuousTestnetOwnerError {
     OwnerBusy,
     NotReady,
     KillSwitchLatched,
+    LifecycleAuthorityUnavailable,
+    RecoveryPlanMissing,
+    RecoveryQueryMissing,
     ForeignActivity,
     UnstableReconciliation,
     InvalidJournal,
@@ -696,6 +860,15 @@ impl fmt::Display for ContinuousTestnetOwnerError {
             Self::OwnerBusy => "continuous Testnet owner lane is already held",
             Self::NotReady => "continuous Testnet owner is not ready and unarmed",
             Self::KillSwitchLatched => "continuous Testnet owner kill switch is latched",
+            Self::LifecycleAuthorityUnavailable => {
+                "continuous Testnet owner has no lifecycle authority"
+            }
+            Self::RecoveryPlanMissing => {
+                "continuous Testnet recovery requires an exact pending durable lifecycle plan"
+            }
+            Self::RecoveryQueryMissing => {
+                "continuous Testnet recovery did not perform a fresh exact-ID query"
+            }
             Self::ForeignActivity => "foreign Testnet account activity requires recovery",
             Self::UnstableReconciliation => "Testnet account reconciliation was not stable",
             Self::InvalidJournal => "continuous Testnet owner journal is invalid",

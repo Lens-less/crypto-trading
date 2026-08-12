@@ -261,6 +261,55 @@ pub struct TestnetSoakArgs {
     /// Comma-separated fixture probe script for bounded local tests.
     #[arg(long, hide = true)]
     pub fixture_probe_script: Option<String>,
+    /// Optional exact lifecycle configuration. A fresh campaign additionally
+    /// requires the Testnet acknowledgement; a pending campaign is recovered
+    /// query-first without new submit authority.
+    #[command(flatten)]
+    pub lifecycle_recovery: TestnetSoakLifecycleRecoveryArgs,
+}
+
+/// All-or-none identity and intent for one continuous Testnet lifecycle.
+/// Fresh submit authority is acknowledgement-gated, while a durable pending
+/// plan can only enter the exact-ID recovery branch.
+#[derive(Debug, Args, Default)]
+pub struct TestnetSoakLifecycleRecoveryArgs {
+    /// Exact acknowledgement required only when this exact configuration is
+    /// still eligible for its first Testnet submit.
+    #[arg(long, value_name = "PHRASE")]
+    pub acknowledge_testnet_lifecycle: Option<String>,
+    /// Campaign identity already present in the lifecycle journal.
+    #[arg(long)]
+    pub recovery_campaign_id: Option<String>,
+    /// Exact UUID-backed client order ID from the durable plan.
+    #[arg(long)]
+    pub recovery_client_order_id: Option<Uuid>,
+    /// Product from the durable plan.
+    #[arg(long, value_enum)]
+    pub recovery_market: Option<TestnetLifecycleMarket>,
+    /// Side from the durable plan.
+    #[arg(long, value_enum)]
+    pub recovery_side: Option<TestnetLifecycleSide>,
+    /// Exact quantity from the durable plan.
+    #[arg(long)]
+    pub recovery_quantity: Option<Decimal>,
+    /// Exact price from the durable plan.
+    #[arg(long)]
+    pub recovery_price: Option<Decimal>,
+    /// Exact time-in-force from the durable plan.
+    #[arg(long, value_enum)]
+    pub recovery_time_in_force: Option<TestnetLifecycleTimeInForce>,
+    /// Exact expected observation from the durable plan.
+    #[arg(long, value_enum)]
+    pub recovery_expected_observation: Option<TestnetLifecycleExpected>,
+    /// Exact reduce-only bit from the durable plan (`true` or `false`).
+    #[arg(long, value_name = "BOOL")]
+    pub recovery_reduce_only: Option<bool>,
+    /// Exact query cadence from the durable plan.
+    #[arg(long)]
+    pub recovery_poll_interval_ms: Option<u64>,
+    /// Exact query budget from the durable plan.
+    #[arg(long)]
+    pub recovery_maximum_queries: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]

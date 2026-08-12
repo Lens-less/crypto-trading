@@ -187,7 +187,7 @@ fn continuous_capabilities_separate_monitor_market_reads_from_paper_owner_author
         continuous
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("External continuous trading sources"))
+            .any(|blocker| blocker.contains("external continuous trading sources"))
     );
     assert!(
         continuous
@@ -252,7 +252,7 @@ fn market_data_reflects_one_streaming_and_one_polling_venue() {
 }
 
 #[test]
-fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
+fn testnet_soak_is_acknowledgement_gated_and_keeps_external_evidence_explicit() {
     let manifest = current_capability_manifest();
     let lifecycle = manifest.capability("runtime.testnet-lifecycle").unwrap();
     let reconciliation = manifest
@@ -324,17 +324,16 @@ fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
             .any(|blocker| blocker.contains("credentialed apply"))
     );
 
-    assert_eq!(soak.level, CapabilityLevel::ReadOnly);
+    assert_eq!(soak.level, CapabilityLevel::Available);
     assert_eq!(
         soak.scope.environments,
         vec![CapabilityEnvironment::Testnet]
     );
-    assert_eq!(soak.scope.access, CapabilityAccess::TestnetReadOnly);
+    assert_eq!(soak.scope.access, CapabilityAccess::TestnetTrading);
     assert!(
         soak.summary.contains("signed user-data WebSocket API")
-            && soak
-                .summary
-                .contains("without submitting or cancelling orders")
+            && soak.summary.contains("existing acknowledgement")
+            && soak.summary.contains("query-first")
     );
     assert!(
         soak.blockers

@@ -372,7 +372,7 @@ fn binance_adapter() -> AdapterSupport {
         "rust/crates/apps/tests/testnet_soak_cli_contract.rs",
     ];
     let credentialed_evidence_blocker = [
-        "The executable adapter, durable order-lifecycle owner, signed account reconciliation gate, and read-only soak harness have deterministic coverage, but credentialed Binance Testnet lifecycle/reconciliation evidence and a completed 24-hour soak are not checked in.",
+        "The executable adapter, durable lifecycle/stream owner, signed account reconciliation gate, and acknowledgement-gated Testnet soak lifecycle have deterministic coverage, but credentialed Binance Testnet lifecycle/reconciliation evidence and a completed 24-hour soak are not checked in.",
     ];
     AdapterSupport {
         id: "binance".to_owned(),
@@ -804,7 +804,7 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
             ),
             "Supervised replay-backed Grid and exact-pair Arbitrage paper owners with durable start/status/stop/cancel facts and bounded graceful shutdown.",
             &[
-                "External continuous trading sources and automatic nonterminal restart are not enabled; the Testnet soak path is read-only, and all mainnet authority remains unavailable.",
+                "Paper owners still lack external continuous trading sources and automatic nonterminal restart; the separate Testnet soak host has an explicitly acknowledged UUID-bound lifecycle with query-first pending recovery, while all mainnet authority remains unavailable.",
             ],
             &[
                 "rust/crates/runtime/src/market_supervisor.rs",
@@ -1112,14 +1112,17 @@ fn testnet_soak_capability() -> Capability {
     capability(
         "runtime.testnet-soak",
         CapabilityArea::Runtime,
-        CapabilityLevel::ReadOnly,
+        CapabilityLevel::Available,
         scope(
             &[CapabilityEnvironment::Testnet],
-            CapabilityAccess::TestnetReadOnly,
+            CapabilityAccess::TestnetTrading,
         ),
-        "Durable Binance Spot Testnet soak owner that cycles the public bookTicker WebSocket, signed user-data WebSocket API, and authenticated REST reconciliation without submitting or cancelling orders.",
+        "Durable Binance Spot Testnet owner behind the existing soak host. Its default mode is read-only and cycles bookTicker WebSocket, signed user-data WebSocket API, and owner-backed stable REST reconciliation. Supplying the complete exact lifecycle configuration plus the existing acknowledgement permits one UUID-bound Testnet lifecycle only after a fresh private-stream subscription ACK; restart accepts only a pending durable campaign and recovers it query-first without new submit authority.",
         &[
-            "A passing 24-hour credentialed run with an observed kill-and-restart drill remains external release evidence and has not been produced in this workspace.",
+            "Read-only soak evidence does not count as campaign recovery. The production verifier additionally requires a same-task continuous_testnet_campaign_recovery_verified fact with a fresh exact-ID query delta immediately bound to the observed unclean restart.",
+            "Fresh lifecycle mode is opt-in, Testnet-only, and acknowledgement-gated; incomplete configuration and fresh, completed, or failed recovery attempts fail before remote I/O.",
+            "A passing 24-hour credentialed run with an observed lifecycle kill-and-query-first-restart drill remains external release evidence and has not been produced in this workspace.",
+            "No mainnet endpoint or mainnet submit authority is available.",
         ],
         &[
             "rust/crates/apps/src/command.rs",

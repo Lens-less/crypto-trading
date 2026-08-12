@@ -53,7 +53,7 @@ async fn restarted_continuous_owner_reconciles_then_recovers_query_first() {
         ],
         vec![Ok(order(&config, OrderStatus::Cancelled))],
     ));
-    let mut owner = ContinuousTestnetOwner::start(
+    let mut owner = ContinuousTestnetOwner::start_recovery_only(
         "testnet-owner-recovery",
         config,
         Arc::clone(&venue),
@@ -102,7 +102,171 @@ async fn restarted_continuous_owner_reconciles_then_recovers_query_first() {
 
     let body = std::fs::read_to_string(history.path()).unwrap();
     assert!(body.contains("continuous_testnet_bootstrap_planned"));
-    assert!(body.contains("continuous_testnet_campaign_recovery_planned"));
+    assert!(body.contains("continuous_testnet_campaign_recovery_verified"));
+    assert!(body.contains("continuous_testnet_kill_switch_engaged"));
+    assert!(body.contains("continuous_testnet_killed_clean"));
+    cleanup(history);
+}
+
+#[tokio::test]
+async fn read_only_owner_projects_streams_without_claiming_campaign_recovery() {
+    let history = history();
+    let venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    let mut owner = ContinuousTestnetOwner::start_read_only(
+        "testnet-owner-read-only",
+        Arc::clone(&venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(owner.status().campaign_id, None);
+    assert_eq!(
+        owner.status().phase,
+        ContinuousTestnetOwnerPhase::AwaitingUserStream
+    );
+    subscribe(&mut owner, 71, 1).await;
+    assert!(owner.run_lifecycle().await.is_err());
+    owner.verify_stable_reconcile().await.unwrap();
+
+    let body = std::fs::read_to_string(history.path()).unwrap();
+    assert!(body.contains("continuous_testnet_user_stream_subscribed"));
+    assert!(body.contains("continuous_testnet_reconcile_verified"));
+    assert!(!body.contains("continuous_testnet_campaign_recovery_verified"));
+    assert!(!venue.calls().contains(&"submit"));
+    cleanup(history);
+}
+
+#[tokio::test]
+async fn recovery_only_owner_rejects_first_submit_eligible_campaign_before_io() {
+    let config = lifecycle_config();
+    let history = history();
+    let venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+
+    let error = ContinuousTestnetOwner::start_recovery_only(
+        "testnet-owner-unplanned",
+        config,
+        Arc::clone(&venue),
+        history.clone(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("durable lifecycle plan"));
+    assert!(venue.calls().is_empty());
+    assert!(!history.path().exists());
+    cleanup(history);
+}
+
+#[tokio::test]
+async fn recovery_only_owner_rejects_completed_and_failed_campaigns_before_io() {
+    let completed_config = lifecycle_config();
+    let completed_history = history();
+    let completed_venue = FixtureVenue::new(
+        vec![Ok(order(&completed_config, OrderStatus::Open))],
+        vec![
+            Ok(order(&completed_config, OrderStatus::Open)),
+            Ok(order(&completed_config, OrderStatus::Cancelled)),
+        ],
+        vec![Ok(order(&completed_config, OrderStatus::Cancelled))],
+    );
+    run_testnet_lifecycle(&completed_config, &completed_venue, &completed_history)
+        .await
+        .unwrap();
+    let unused = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    assert!(
+        ContinuousTestnetOwner::start_recovery_only(
+            "completed-owner",
+            completed_config,
+            Arc::clone(&unused),
+            completed_history.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(unused.calls().is_empty());
+
+    let failed_config = lifecycle_config();
+    let failed_history = history();
+    let failed_venue = FixtureVenue::new(
+        vec![Err(ExchangeError::unavailable("fixture reject"))],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(
+        run_testnet_lifecycle(&failed_config, &failed_venue, &failed_history)
+            .await
+            .is_err()
+    );
+    let unused = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    assert!(
+        ContinuousTestnetOwner::start_recovery_only(
+            "failed-owner",
+            failed_config,
+            Arc::clone(&unused),
+            failed_history.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(unused.calls().is_empty());
+
+    cleanup(completed_history);
+    cleanup(failed_history);
+}
+
+#[tokio::test]
+async fn clean_shutdown_recovers_and_cancels_an_interrupted_fresh_lifecycle() {
+    let config = lifecycle_config();
+    let history = history();
+    let venue = Arc::new(FixtureVenue::new(
+        vec![Err(ambiguous_submit(&config))],
+        vec![
+            Err(ExchangeError::unavailable("fixture query interrupted")),
+            Ok(order(&config, OrderStatus::Open)),
+            Ok(order(&config, OrderStatus::Cancelled)),
+        ],
+        vec![Ok(order(&config, OrderStatus::Cancelled))],
+    ));
+    let mut owner = ContinuousTestnetOwner::start(
+        "testnet-owner-clean-shutdown",
+        config,
+        Arc::clone(&venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
+    subscribe(&mut owner, 91, 1).await;
+
+    assert!(owner.run_lifecycle().await.is_err());
+    assert_eq!(
+        owner.status().phase,
+        ContinuousTestnetOwnerPhase::RecoveryRequired
+    );
+
+    owner.shutdown_cleanly().await.unwrap();
+    assert_eq!(
+        owner.status().phase,
+        ContinuousTestnetOwnerPhase::KilledClean
+    );
+    assert!(owner.status().kill_switch_latched);
+    assert_eq!(
+        venue.calls(),
+        vec![
+            "reconcile",
+            "reconcile",
+            "submit",
+            "query",
+            "query",
+            "cancel",
+            "query",
+            "reconcile",
+            "reconcile",
+        ]
+    );
+
+    let body = std::fs::read_to_string(history.path()).unwrap();
+    assert!(body.contains("continuous_testnet_campaign_recovery_verified"));
     assert!(body.contains("continuous_testnet_kill_switch_engaged"));
     assert!(body.contains("continuous_testnet_killed_clean"));
     cleanup(history);

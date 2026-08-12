@@ -258,6 +258,41 @@ pub fn testnet_lifecycle_requires_submission(
     Ok(!project_campaign(history.path(), config)?.planned)
 }
 
+/// Durable lifecycle state used by recovery-only continuous owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestnetLifecycleRecoveryState {
+    Fresh,
+    Pending { query_count: u32 },
+    Completed,
+    Failed,
+}
+
+/// Projects whether an exact campaign has pending query-first recovery work.
+/// Recovery-only hosts must accept only [`TestnetLifecycleRecoveryState::Pending`];
+/// a completed campaign cannot be recycled into new recovery evidence.
+///
+/// # Errors
+///
+/// Returns a bounded lifecycle error when the journal cannot be projected or
+/// conflicts with the supplied exact configuration.
+pub fn testnet_lifecycle_recovery_state(
+    config: &TestnetLifecycleConfig,
+    history: &JsonlHistory,
+) -> Result<TestnetLifecycleRecoveryState, TestnetLifecycleError> {
+    let projected = project_campaign(history.path(), config)?;
+    Ok(if projected.completed.is_some() {
+        TestnetLifecycleRecoveryState::Completed
+    } else if projected.failed {
+        TestnetLifecycleRecoveryState::Failed
+    } else if projected.planned {
+        TestnetLifecycleRecoveryState::Pending {
+            query_count: projected.query_count,
+        }
+    } else {
+        TestnetLifecycleRecoveryState::Fresh
+    })
+}
+
 /// Returns the exact wire symbol from the durable submit plan, or the
 /// validated caller mapping for a fresh campaign.
 ///

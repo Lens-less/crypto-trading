@@ -123,9 +123,9 @@ fn fact(
         symbol: "control-plane".to_owned(),
         decision: decision.to_owned(),
         details: json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": task_id,
-            "task_kind": "binance_testnet_read_only_soak",
+            "task_kind": "binance_testnet_owner_soak",
             "phase": phase,
             "observation": observation,
         }),
@@ -166,6 +166,117 @@ fn serve_without_credentials_fails_before_writing_a_started_fact() {
         "history unexpectedly exists at {}",
         history.display()
     );
+}
+
+fn owner_recovery_fact(timestamp: chrono::DateTime<Utc>, task_id: &str) -> DecisionRecord {
+    DecisionRecord {
+        timestamp,
+        strategy: "binance_testnet_continuous_owner".to_owned(),
+        symbol: "control-plane".to_owned(),
+        decision: "continuous_testnet_campaign_recovery_verified".to_owned(),
+        details: json!({
+            "schema_version": 1,
+            "owner_id": task_id,
+            "campaign_id": "pending-campaign",
+            "phase": "campaign_recovered",
+            "kill_switch_latched": false,
+            "observation": {
+                "query_first": true,
+                "query_count_before": 0,
+                "query_count_after": 2,
+                "query_delta": 2,
+                "client_order_id": "0f3c807d-776f-4de4-85d0-93760a82dfcf",
+            },
+        }),
+    }
+}
+
+#[test]
+fn partial_or_unacknowledged_fresh_config_fails_before_credentials_or_network() {
+    let partial_history = temp_path("testnet-soak-partial-recovery", "jsonl");
+    let partial = Command::new(binary())
+        .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
+        .args([
+            "testnet-soak",
+            "--mode",
+            "serve",
+            "--task-id",
+            "binance-testnet-soak-partial-recovery",
+            "--history-path",
+            partial_history.to_str().unwrap(),
+            "--interval-ms",
+            "5",
+            "--probe-timeout-ms",
+            "50",
+            "--failure-threshold",
+            "3",
+            "--control-port",
+            &free_port().to_string(),
+            "--recovery-campaign-id",
+            "pending-campaign",
+        ])
+        .output()
+        .unwrap();
+    assert!(!partial.status.success(), "{partial:?}");
+    let stderr = String::from_utf8(partial.stderr).unwrap();
+    assert!(stderr.contains("all-or-none"), "{stderr}");
+    assert!(!stderr.contains("BINANCE_API_KEY"), "{stderr}");
+    assert!(!partial_history.exists());
+
+    let fresh_history = temp_path("testnet-soak-fresh-recovery", "jsonl");
+    let fresh = Command::new(binary())
+        .current_dir(repo_root())
+        .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
+        .args([
+            "testnet-soak",
+            "--mode",
+            "serve",
+            "--task-id",
+            "binance-testnet-soak-fresh-recovery",
+            "--history-path",
+            fresh_history.to_str().unwrap(),
+            "--interval-ms",
+            "5",
+            "--probe-timeout-ms",
+            "50",
+            "--failure-threshold",
+            "3",
+            "--control-port",
+            &free_port().to_string(),
+            "--recovery-campaign-id",
+            "pending-campaign",
+            "--recovery-client-order-id",
+            "0f3c807d-776f-4de4-85d0-93760a82dfcf",
+            "--recovery-market",
+            "spot",
+            "--recovery-side",
+            "buy",
+            "--recovery-quantity",
+            "0.001",
+            "--recovery-price",
+            "49000.1",
+            "--recovery-time-in-force",
+            "post-only",
+            "--recovery-expected-observation",
+            "open",
+            "--recovery-reduce-only",
+            "false",
+            "--recovery-poll-interval-ms",
+            "2000",
+            "--recovery-maximum-queries",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(!fresh.status.success(), "{fresh:?}");
+    let stderr = String::from_utf8(fresh.stderr).unwrap();
+    assert!(
+        stderr.contains("requires --acknowledge-testnet-lifecycle"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("BINANCE_API_KEY"), "{stderr}");
+    assert!(!fresh_history.exists());
 }
 
 #[test]
@@ -405,6 +516,7 @@ fn verify_accepts_full_production_sample_coverage() {
                 "running",
                 &json!({"sample": "user_data_stream", "successful_probe_count": 2, "failed_probe_count": 0, "consecutive_failure_count": 0}),
             ),
+            owner_recovery_fact(started_at + ChronoDuration::hours(12), task_id),
             fact(
                 started_at + ChronoDuration::hours(12),
                 task_id,

@@ -1,6 +1,8 @@
-//! Durable, read-only Binance testnet soak owner and offline evidence verifier.
+//! Durable Binance Testnet soak owner and offline evidence verifier.
 //!
-//! The task records only bounded result categories and counters. Transport
+//! The default production mode is read-only. An optional exact lifecycle is
+//! Testnet-only and acknowledgement-gated; its mutation/recovery facts remain
+//! separate from the bounded observation samples used by this task. Transport
 //! errors, response bodies, credentials, and other free-form text never enter
 //! the decision journal.
 
@@ -16,11 +18,15 @@ use tokio::{
     sync::watch,
     task::{JoinError, JoinHandle},
 };
+use uuid::Uuid;
 
+use crate::continuous_testnet::CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION;
 use crate::task_host::{TaskHost, TaskHostStatus, TaskHostStopFuture};
 
 /// Current process-local and durable fact schema.
-pub const TESTNET_SOAK_SCHEMA_VERSION: u16 = 1;
+pub const TESTNET_SOAK_SCHEMA_VERSION: u16 = 2;
+/// Durable task kind for the owner-backed Testnet soak host.
+pub const TESTNET_SOAK_TASK_KIND: &str = "binance_testnet_owner_soak";
 /// Maximum number of physical JSONL records accepted by one evidence read.
 pub const MAX_TESTNET_SOAK_EVIDENCE_RECORDS: usize = 131_072;
 
@@ -38,14 +44,21 @@ const PROBE_SUCCEEDED: &str = "testnet_soak_probe_succeeded";
 const PROBE_FAILED: &str = "testnet_soak_probe_failed";
 const STOPPED: &str = "testnet_soak_stopped";
 const FAILED: &str = "testnet_soak_failed";
+const CONTINUOUS_OWNER_STRATEGY: &str = "binance_testnet_continuous_owner";
+const CAMPAIGN_RECOVERY_VERIFIED: &str = "continuous_testnet_campaign_recovery_verified";
 
-/// Borrowing future returned by an injected read-only testnet probe.
+/// Borrowing future returned by an injected Testnet owner probe.
 pub type TestnetSoakProbeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TestnetSoakSample, TestnetSoakProbeFailure>> + Send + 'a>>;
+pub type TestnetSoakShutdownFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
 
-/// Async injection seam for one bounded, read-only testnet observation.
+/// Async injection seam for one bounded Testnet owner step.
 pub trait TestnetSoakProbe: Send + 'static {
     fn probe(&mut self) -> TestnetSoakProbeFuture<'_>;
+
+    fn shutdown(&mut self) -> TestnetSoakShutdownFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Closed set of successful read-only observations that may be journaled.
@@ -82,7 +95,7 @@ pub struct TestnetSoakTaskConfig {
 }
 
 impl TestnetSoakTaskConfig {
-    /// Creates a bounded read-only soak configuration.
+    /// Creates a bounded soak-host configuration.
     ///
     /// # Errors
     ///
@@ -148,6 +161,7 @@ pub enum TestnetSoakTaskFailure {
     JournalUnavailable,
     TaskPanicked,
     TaskCancelled,
+    ProbeShutdown,
 }
 
 /// Latest status, advanced only after the matching durable append succeeds.
@@ -182,7 +196,7 @@ impl TaskHostStatus for TestnetSoakTaskStatus {
     }
 }
 
-/// Opaque owner of one read-only probe loop.
+/// Opaque owner of one bounded Testnet probe loop.
 #[derive(Debug)]
 pub struct TestnetSoakTask {
     stop: watch::Sender<bool>,
@@ -451,7 +465,7 @@ where
         let probe_result = tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow_and_update() {
-                    return stop_owner(&history, &status_sender, last_recorded_at).await;
+                    return stop_owner(&mut probe, &history, &status_sender, last_recorded_at).await;
                 }
                 continue;
             }
@@ -524,7 +538,7 @@ where
         tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow_and_update() {
-                    return stop_owner(&history, &status_sender, last_recorded_at).await;
+                    return stop_owner(&mut probe, &history, &status_sender, last_recorded_at).await;
                 }
             }
             () = tokio::time::sleep(config.interval) => {}
@@ -532,11 +546,19 @@ where
     }
 }
 
-async fn stop_owner(
+async fn stop_owner<P>(
+    probe: &mut P,
     history: &JsonlHistory,
     status_sender: &watch::Sender<TestnetSoakTaskStatus>,
     last_recorded_at: DateTime<Utc>,
-) -> TaskResult {
+) -> TaskResult
+where
+    P: TestnetSoakProbe,
+{
+    probe
+        .shutdown()
+        .await
+        .map_err(|()| TestnetSoakTaskError::ProbeShutdown)?;
     let mut stopped = status_sender.borrow().clone();
     stopped.phase = TestnetSoakTaskPhase::Stopped;
     stopped.last_recorded_at = Utc::now().max(last_recorded_at);
@@ -642,6 +664,7 @@ pub enum TestnetSoakEvidenceViolation {
     MarketStreamMissing,
     UserDataStreamMissing,
     AuthenticatedReconcileMissing,
+    OwnerCampaignRecoveryMissing,
 }
 
 /// Per-kind successful probe counts.
@@ -676,6 +699,7 @@ pub struct TestnetSoakEvidenceSummary {
     pub failed_probe_count: u64,
     pub clean_stop_observed: bool,
     pub unclean_restart_count: u32,
+    pub owner_campaign_recovery_verified: bool,
     pub requirements_met: bool,
     pub violations: Vec<TestnetSoakEvidenceViolation>,
 }
@@ -706,6 +730,7 @@ impl TestnetSoakEvidenceSummary {
             "failed_probe_count": self.failed_probe_count,
             "clean_stop_observed": self.clean_stop_observed,
             "unclean_restart_count": self.unclean_restart_count,
+            "owner_campaign_recovery_verified": self.owner_campaign_recovery_verified,
             "requirements_met": self.requirements_met,
             "violations": self
                 .violations
@@ -744,6 +769,14 @@ pub fn verify_testnet_soak_evidence(
     }
     if requirements.require_unclean_restart && projection.unclean_restart_count == 0 {
         violations.push(TestnetSoakEvidenceViolation::UncleanRestartMissing);
+    }
+    if matches!(
+        requirements.sample_coverage,
+        TestnetSoakSampleCoverageRequirement::StreamingPath
+    ) && requirements.require_unclean_restart
+        && !projection.owner_campaign_recovery_verified
+    {
+        violations.push(TestnetSoakEvidenceViolation::OwnerCampaignRecoveryMissing);
     }
     if matches!(
         requirements.sample_coverage,
@@ -789,11 +822,13 @@ pub fn verify_testnet_soak_evidence(
         failed_probe_count: projection.failed_probe_count,
         clean_stop_observed,
         unclean_restart_count: projection.unclean_restart_count,
+        owner_campaign_recovery_verified: projection.owner_campaign_recovery_verified,
         requirements_met: violations.is_empty(),
         violations,
     })
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default)]
 struct EvidenceProjection {
     first_started_at: Option<DateTime<Utc>>,
@@ -811,6 +846,8 @@ struct EvidenceProjection {
     running: bool,
     awaiting_restart_start: bool,
     clean_stop: bool,
+    owner_campaign_recovery_verified: bool,
+    owner_campaign_recovery_candidate: bool,
 }
 
 impl EvidenceProjection {
@@ -829,6 +866,8 @@ impl EvidenceProjection {
         self.running = false;
         self.awaiting_restart_start = false;
         self.clean_stop = false;
+        self.owner_campaign_recovery_verified = false;
+        self.owner_campaign_recovery_candidate = false;
     }
 
     fn close_segment(&mut self) -> Result<(), TestnetSoakEvidenceError> {
@@ -867,6 +906,10 @@ fn project_records(
 ) -> Result<EvidenceProjection, TestnetSoakEvidenceError> {
     let mut projection = EvidenceProjection::default();
     for record in records {
+        if record.strategy == CONTINUOUS_OWNER_STRATEGY {
+            project_owner_recovery_fact(&mut projection, record, task_id)?;
+            continue;
+        }
         if record.strategy != TASK_STRATEGY {
             continue;
         }
@@ -881,8 +924,14 @@ fn project_records(
         if record_task_id != task_id {
             continue;
         }
-        if record.details.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(TESTNET_SOAK_SCHEMA_VERSION))
+        if projection.owner_campaign_recovery_candidate
+            && record.decision.as_str() != UNCLEAN_RESTART
+        {
+            projection.owner_campaign_recovery_candidate = false;
+        }
+        if record.details.get("task_kind").and_then(Value::as_str) != Some(TESTNET_SOAK_TASK_KIND)
+            || record.details.get("schema_version").and_then(Value::as_u64)
+                != Some(u64::from(TESTNET_SOAK_SCHEMA_VERSION))
         {
             return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
         }
@@ -896,6 +945,81 @@ fn project_records(
         apply_projected_record(&mut projection, record)?;
     }
     Ok(projection)
+}
+
+fn project_owner_recovery_fact(
+    projection: &mut EvidenceProjection,
+    record: &DecisionRecord,
+    task_id: &str,
+) -> Result<(), TestnetSoakEvidenceError> {
+    if record.decision != CAMPAIGN_RECOVERY_VERIFIED {
+        return Ok(());
+    }
+    let Some(owner_id) = record.details.get("owner_id").and_then(Value::as_str) else {
+        return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
+    };
+    let normalized_owner_id =
+        validate_task_id(owner_id).map_err(|_| TestnetSoakEvidenceError::InvalidSoakRecord)?;
+    if normalized_owner_id != owner_id {
+        return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
+    }
+    if owner_id != task_id {
+        return Ok(());
+    }
+    if projection
+        .last_recorded_at
+        .is_some_and(|last| record.timestamp < last)
+        || record
+            .details
+            .get("campaign_id")
+            .and_then(Value::as_str)
+            .is_none()
+        || record.details.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION))
+        || record.details.get("phase").and_then(Value::as_str) != Some("campaign_recovered")
+        || record
+            .details
+            .get("observation")
+            .and_then(|value| value.get("query_first"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        || record
+            .details
+            .get("observation")
+            .and_then(|value| value.get("query_delta"))
+            .and_then(Value::as_u64)
+            .is_none_or(|delta| delta == 0)
+        || record
+            .details
+            .get("observation")
+            .and_then(|value| value.get("client_order_id"))
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_none()
+    {
+        return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
+    }
+    let observation = record.details.get("observation").expect("validated above");
+    let before = observation
+        .get("query_count_before")
+        .and_then(Value::as_u64)
+        .ok_or(TestnetSoakEvidenceError::InvalidSoakRecord)?;
+    let after = observation
+        .get("query_count_after")
+        .and_then(Value::as_u64)
+        .ok_or(TestnetSoakEvidenceError::InvalidSoakRecord)?;
+    let delta = observation
+        .get("query_delta")
+        .and_then(Value::as_u64)
+        .ok_or(TestnetSoakEvidenceError::InvalidSoakRecord)?;
+    if after.checked_sub(before) != Some(delta) {
+        return Err(TestnetSoakEvidenceError::InvalidSoakRecord);
+    }
+    projection.last_recorded_at = Some(record.timestamp);
+    if projection.running {
+        projection.owner_campaign_recovery_candidate = true;
+    }
+    Ok(())
 }
 
 fn apply_projected_record(
@@ -948,6 +1072,10 @@ fn project_unclean_restart(
     projection: &mut EvidenceProjection,
 ) -> Result<(), TestnetSoakEvidenceError> {
     require_running(projection)?;
+    if projection.owner_campaign_recovery_candidate {
+        projection.owner_campaign_recovery_verified = true;
+        projection.owner_campaign_recovery_candidate = false;
+    }
     projection.unclean_restart_count = projection
         .unclean_restart_count
         .checked_add(1)
@@ -1203,7 +1331,7 @@ fn record(
         details: json!({
             "schema_version": TESTNET_SOAK_SCHEMA_VERSION,
             "task_id": task_id,
-            "task_kind": "binance_testnet_read_only_soak",
+            "task_kind": TESTNET_SOAK_TASK_KIND,
             "phase": phase,
             "observation": observation,
         }),
@@ -1284,6 +1412,7 @@ const fn task_failure_label(failure: TestnetSoakTaskFailure) -> &'static str {
         TestnetSoakTaskFailure::JournalUnavailable => "journal_unavailable",
         TestnetSoakTaskFailure::TaskPanicked => "task_panicked",
         TestnetSoakTaskFailure::TaskCancelled => "task_cancelled",
+        TestnetSoakTaskFailure::ProbeShutdown => "probe_shutdown",
     }
 }
 
@@ -1300,6 +1429,9 @@ const fn evidence_violation_label(violation: TestnetSoakEvidenceViolation) -> &'
         TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing => {
             "authenticated_reconcile_missing"
         }
+        TestnetSoakEvidenceViolation::OwnerCampaignRecoveryMissing => {
+            "owner_campaign_recovery_missing"
+        }
     }
 }
 
@@ -1312,6 +1444,7 @@ pub enum TestnetSoakTaskError {
     CounterOverflow,
     TaskPanicked,
     TaskCancelled,
+    ProbeShutdown,
     PreviouslyFailed(TestnetSoakTaskFailure),
 }
 
@@ -1331,6 +1464,7 @@ impl TestnetSoakTaskError {
             Self::ProbeFailureThreshold(_) => TestnetSoakTaskFailure::ProbeFailureThreshold,
             Self::TaskPanicked => TestnetSoakTaskFailure::TaskPanicked,
             Self::TaskCancelled => TestnetSoakTaskFailure::TaskCancelled,
+            Self::ProbeShutdown => TestnetSoakTaskFailure::ProbeShutdown,
             Self::PreviouslyFailed(failure) => *failure,
         }
     }
@@ -1352,6 +1486,7 @@ impl fmt::Display for TestnetSoakTaskError {
             Self::CounterOverflow => "testnet soak counter overflow",
             Self::TaskPanicked => "testnet soak task panicked",
             Self::TaskCancelled => "testnet soak task was cancelled",
+            Self::ProbeShutdown => "testnet soak probe shutdown failed",
             Self::PreviouslyFailed(_) => "testnet soak task previously failed",
         })
     }
