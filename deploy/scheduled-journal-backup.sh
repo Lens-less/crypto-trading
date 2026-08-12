@@ -7,7 +7,7 @@ set -eu
 : "${CRYPTO_TRADING_JOURNAL_ID:?set CRYPTO_TRADING_JOURNAL_ID}"
 : "${CRYPTO_TRADING_WEB_BINARY:?set CRYPTO_TRADING_WEB_BINARY}"
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
 exec "$script_dir/journal-backup-restore-drill.sh" \
     "$CRYPTO_TRADING_BACKUP_JOURNAL" \

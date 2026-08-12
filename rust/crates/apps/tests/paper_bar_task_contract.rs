@@ -59,7 +59,7 @@ impl BarStrategy for FixedTargetStrategy {
 
 #[test]
 fn paper_bar_task_matches_shared_strategy_targets_and_rebalance_directions() {
-    let bars = vec![bar(0, "100"), bar(1, "90"), bar(2, "110"), bar(3, "80")];
+    let bars = [bar(0, "100"), bar(1, "90"), bar(2, "110"), bar(3, "80")];
     let mut paper = PaperBarTask::new(SlowTimeSeriesMomentum::new(2, 1).unwrap());
     let mut strategy = SlowTimeSeriesMomentum::new(2, 1).unwrap();
     let mut previous_target = Decimal::ZERO;

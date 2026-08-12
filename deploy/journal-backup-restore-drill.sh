@@ -100,6 +100,7 @@ log="$restore_dir/verifier.log"
     --allow-open-loopback-read-api >"$log" 2>&1 &
 verifier_pid=$!
 
+# shellcheck disable=SC2329  # invoked indirectly via the trap below
 cleanup() {
     # shellcheck disable=SC2317  # invoked indirectly via the trap below
     kill "$verifier_pid" >/dev/null 2>&1 || true

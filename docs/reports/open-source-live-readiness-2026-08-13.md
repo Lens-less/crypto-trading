@@ -46,8 +46,8 @@ and operator gates, not omissions to bypass in order to make CI green.
 - The legacy volume-maker command remains parse-compatible but is described
   only as offline Paper simulation; the immutable Python snapshot is clearly
   historical and non-operational.
-- Gitleaks scanned every locally available Git ref and reported 107 commits.
-  Ten generic-key matches were inspected: two
+- Gitleaks scanned every locally available Git ref. Ten generic-key matches
+  were inspected: two
   were non-authentication work-claim identifiers and eight were deterministic
   loopback test tokens. Suppressions are exact fingerprints containing the
   introducing commit, path, rule, and line; there is no broad path or regex
@@ -55,7 +55,8 @@ and operator gates, not omissions to bypass in order to make CI green.
 - Dependabot payloads were integrated into the current workflows and lockfile:
   `actions/checkout` 7.0.1, `actions/setup-node` 7.0.0,
   `actions/upload-artifact` 7.0.1, the reviewed `dtolnay/rust-toolchain`
-  revision, and seven Cargo minor/patch updates. No new direct dependency was
+  revision, and the reviewed Cargo minor/patch updates through `async-trait`
+  0.1.92, `clap` 4.6.6, and `thiserror` 2.0.20. No new direct dependency was
   added.
 
 ## Repository-local verification
@@ -69,7 +70,7 @@ and operator gates, not omissions to bypass in order to make CI green.
 | Browser contract against the embedded Rust binary | PASS — 6 Playwright tests |
 | RustSec and Cargo license/ban/source policy | PASS — 243 locked dependencies scanned; deny policies OK |
 | Frontend production advisory, registry, and license policy | PASS — no known high-severity vulnerability; 269 packages allowed |
-| Full-history Gitleaks | PASS — all locally available refs / 107 reported commits; no unreviewed finding |
+| Full-history Gitleaks | PASS — all locally available refs; no unreviewed finding |
 | GitHub Actions static validation | PASS — all workflow files accepted by Actionlint 1.7.12 |
 | Public repository hygiene and diff whitespace | PASS |
 

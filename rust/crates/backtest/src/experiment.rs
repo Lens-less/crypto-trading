@@ -1177,7 +1177,7 @@ pub(crate) fn bootstrap_seed(identifier: &str, metric: &str, base_seed: u64) -> 
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     hash ^= base_seed;
     hash = hash.wrapping_mul(0x0100_0000_01b3);
-    for byte in identifier.bytes().chain([b':']).chain(metric.bytes()) {
+    for byte in identifier.bytes().chain(*b":").chain(metric.bytes()) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }

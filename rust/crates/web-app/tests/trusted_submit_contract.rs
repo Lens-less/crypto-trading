@@ -61,13 +61,15 @@ impl SubmitDispatcher for ReconciliationDispatcher {
                 SubmitCommand::ReconcileRelease { proof } => authority
                     .reconcile_release(proof.clone())
                     .await
-                    .map(|_| SubmitDispatchOutcome::Applied)
-                    .unwrap_or(SubmitDispatchOutcome::Rejected),
+                    .map_or(SubmitDispatchOutcome::Rejected, |_| {
+                        SubmitDispatchOutcome::Applied
+                    }),
                 SubmitCommand::RecordReconcileFailure { proof } => authority
                     .record_reconciliation_failure(proof.clone())
                     .await
-                    .map(|_| SubmitDispatchOutcome::Applied)
-                    .unwrap_or(SubmitDispatchOutcome::Rejected),
+                    .map_or(SubmitDispatchOutcome::Rejected, |_| {
+                        SubmitDispatchOutcome::Applied
+                    }),
                 _ => SubmitDispatchOutcome::Rejected,
             }
         })
