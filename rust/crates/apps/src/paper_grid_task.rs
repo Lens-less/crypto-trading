@@ -2293,6 +2293,12 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
+                // A terminal saga owns the decision when its lock release also
+                // wakes a pending risk read. The outer owner will immediately
+                // observe any directive and close the now-settled position.
+                result = &mut run => {
+                    break OperationOutcome::Terminal(result, stop_requested);
+                }
                 // Poll the risk read as part of this select branch. The saga
                 // can hold the shared authority lock across journal I/O; if a
                 // completed tick won first and awaited directives outside the
@@ -2319,9 +2325,6 @@ async fn run_operation(
                 }
                 () = &mut deadline => {
                     break OperationOutcome::TimedOut(cancel_request);
-                }
-                result = &mut run => {
-                    break OperationOutcome::Terminal(result, stop_requested);
                 }
             }
         }

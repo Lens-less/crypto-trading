@@ -1283,6 +1283,12 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
+                // If settlement releases the authority lock while the risk
+                // read is waiting, finish the terminal saga first. The owner
+                // then observes the directive and closes settled inventory.
+                result = &mut run => {
+                    break OperationOutcome::Terminal(result, stop_requested);
+                }
                 // Keep the authority read inside the selected future so the
                 // saga remains polled while it holds the shared lock across
                 // journal I/O. Awaiting directives after the tick wins would
@@ -1315,9 +1321,6 @@ async fn run_operation(
                 }
                 () = &mut forced_close_deadline, if !interrupt_on_account_risk => {
                     break OperationOutcome::Cancelled(cancel_request);
-                }
-                result = &mut run => {
-                    break OperationOutcome::Terminal(result, stop_requested);
                 }
             }
         }
