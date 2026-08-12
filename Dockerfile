@@ -5,7 +5,7 @@ WORKDIR /workspace/frontend
 
 # The lockfile-pinned pnpm from the packageManager field is activated through
 # corepack, so the image build uses exactly the toolchain the repo declares.
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml frontend/.npmrc ./
 RUN corepack enable \
     && pnpm install --frozen-lockfile
 
