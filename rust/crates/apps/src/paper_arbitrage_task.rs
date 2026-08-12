@@ -80,7 +80,6 @@ const TASK_SYMBOL: &str = "control-plane";
 const MAX_TASK_ID_BYTES: usize = 96;
 const OPERATION_SUFFIX_BYTES: usize = "/op/00000000000000000000".len();
 const ACCOUNT_RISK_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const ACCOUNT_RISK_INFLIGHT_GRACE: Duration = Duration::from_millis(500);
 
 /// Boxed execution future behind the trusted paper adapter seam.
 pub type ArbitragePaperExecutionFuture =
@@ -814,6 +813,7 @@ async fn run_owner(
                     config.account_risk.as_ref(),
                     &config.task_id,
                     config.cost_model,
+                    config.supervisor.shutdown_grace(),
                     &saga,
                     Arc::clone(&executor),
                     None,
@@ -890,6 +890,7 @@ async fn run_owner(
                     config.account_risk.as_ref(),
                     &config.task_id,
                     config.cost_model,
+                    config.supervisor.shutdown_grace(),
                     &saga,
                     Arc::clone(&executor),
                     directive_close_pair,
@@ -1345,6 +1346,7 @@ async fn run_owner(
                             config.account_risk.as_ref(),
                             &config.task_id,
                             config.cost_model,
+                            config.supervisor.shutdown_grace(),
                             &saga,
                             Arc::clone(&executor),
                             directive_close_pair,
@@ -1446,6 +1448,7 @@ async fn run_owner(
                     config.account_risk.as_ref(),
                     &config.task_id,
                     config.cost_model,
+                    config.supervisor.shutdown_grace(),
                     &saga,
                     Arc::clone(&executor),
                     None,
@@ -2306,6 +2309,7 @@ async fn stop_owner(
     risk: Option<&AccountRiskAuthority>,
     owner_task_id: &str,
     cost_model: PaperCostModel,
+    operation_grace: Duration,
     saga: &DurablePaperArbitrageSaga,
     executor: Arc<dyn ArbitragePaperExecutor>,
     directive_close_pair: Option<ObservedMarketPair>,
@@ -2516,8 +2520,7 @@ async fn stop_owner(
             let result = if directive_shutdown
                 || matches!(requested_exit, ArbitragePaperTaskExit::SourceEnded)
             {
-                let Ok(result) =
-                    tokio::time::timeout(ACCOUNT_RISK_INFLIGHT_GRACE, operation.join_mut()).await
+                let Ok(result) = tokio::time::timeout(operation_grace, operation.join_mut()).await
                 else {
                     operation.abort().await;
                     let _retention = retain_cancelled_operation(
@@ -2710,8 +2713,7 @@ async fn stop_owner(
         *operation_sequence = next_sequence;
         publish_operation_count(status_sender, *operation_sequence);
         let mut close_operation = start_operation(saga, executor, planned);
-        let Ok(result) =
-            tokio::time::timeout(ACCOUNT_RISK_INFLIGHT_GRACE, close_operation.join_mut()).await
+        let Ok(result) = tokio::time::timeout(operation_grace, close_operation.join_mut()).await
         else {
             close_operation.abort().await;
             let _retention = retain_cancelled_operation(

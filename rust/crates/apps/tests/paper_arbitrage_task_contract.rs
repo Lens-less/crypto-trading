@@ -992,7 +992,7 @@ async fn kill_switch_during_a_blocked_open_reprojects_and_closes_the_raced_posit
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:risk-raced-open", StdDuration::from_secs(30))
+        task_config("arbitrage:risk-raced-open", StdDuration::from_secs(2))
             .with_account_risk(risk.clone()),
         monitor(),
         left_source,
@@ -1035,6 +1035,10 @@ async fn kill_switch_during_a_blocked_open_reprojects_and_closes_the_raced_posit
     })
     .await;
 
+    // The configured owner grace, rather than a hidden fixed deadline, must
+    // bound both the raced opening saga and its forced close. Windows journal
+    // I/O can legitimately cross 500 ms while remaining inside this policy.
+    tokio::time::sleep(StdDuration::from_millis(750)).await;
     executor.release_one();
     wait_until(|| executor.calls.load(Ordering::SeqCst) == 2).await;
     executor.release_one();
@@ -1647,7 +1651,7 @@ async fn kill_switch_bounds_a_permanently_pending_execution_and_requires_recover
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:pending-kill", StdDuration::from_secs(30))
+        task_config("arbitrage:pending-kill", StdDuration::from_millis(500))
             .with_account_risk(risk.clone()),
         monitor(),
         left_source,
@@ -1712,8 +1716,11 @@ async fn kill_switch_bounds_a_permanently_pending_forced_close_and_requires_reco
     let (left_source, left_sender) = ChannelSource::new("left");
     let (right_source, right_sender) = ChannelSource::new("right");
     let mut task = ArbitragePaperTask::start(
-        task_config("arbitrage:pending-forced-close", StdDuration::from_secs(30))
-            .with_account_risk(risk.clone()),
+        task_config(
+            "arbitrage:pending-forced-close",
+            StdDuration::from_millis(500),
+        )
+        .with_account_risk(risk.clone()),
         monitor(),
         left_source,
         right_source,
