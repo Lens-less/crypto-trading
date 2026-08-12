@@ -9,7 +9,7 @@
 - Last heartbeat: 2026-08-12T01:51:46+08:00
 - Completed at: 2026-08-12T01:51:46+08:00
 - Attempt: 1
-- Repository: `C:\Users\28340\Desktop\crypto-trading`
+- Repository: `<repo-root>`
 - Worktree: intentionally dirty with integrated, locally verified safety
   changes. Do not reset, discard, overwrite, or recreate the work from the
   baseline.

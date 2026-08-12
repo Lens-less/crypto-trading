@@ -76,7 +76,7 @@ One-shot Goal prompt:
 ```text
 Goal: Complete Issue 1 — G-001 interrupted trade-safety recovery
 This is a one-shot worker launch prompt, not a recurring automation prompt.
-Objective: complete issue G-001 in C:\Users\28340\Desktop\crypto-trading by recovering the interrupted authoritative Binance-rule and buying-power implementations already present in the dirty worktree. Do not revert or overwrite other audit fixes.
+Objective: complete issue G-001 in <repo-root> by recovering the interrupted authoritative Binance-rule and buying-power implementations already present in the dirty worktree. Do not revert or overwrite other audit fixes.
 Read first: docs/automation/goal-board.md, docs/automation/handoffs/issue-g-001-handoff.md, docs/automation/goal-automation-runbook.md, README.md, docs/runbooks/production-candidate.md, and any applicable AGENTS.md.
 Issue boundary: only finish/integrate the two interrupted safety slices and the tests/docs directly required for them. Out of scope: new strategy research, mainnet enablement, external order/cancel calls, new dependencies, broad refactors, and commits/pushes.
 Use $ultracode for this issue if the work is non-trivial, multi-file, multi-phase, risky, or benefits from subagents. For tiny single-file or documentation-only changes, execute directly and verify narrowly.
@@ -273,7 +273,7 @@ The user explicitly requested one Goal prompt that can run unattended. Paste the
 following into Goal mode:
 
 ```text
-在 C:\Users\28340\Desktop\crypto-trading 持续完成“交易安全收口 + 最新策略离线评估”目标，直到 docs/automation/goal-board.md 中 G-001 到 G-006 均满足验收标准，或只剩无法伪造的外部人工门禁。
+在 <repo-root> 持续完成“交易安全收口 + 最新策略离线评估”目标，直到 docs/automation/goal-board.md 中 G-001 到 G-006 均满足验收标准，或只剩无法伪造的外部人工门禁。
 
 先完整读取 docs/automation/goal-automation-runbook.md、docs/automation/goal-board.md、docs/automation/handoffs/issue-g-001-handoff.md、README.md、docs/runbooks/production-candidate.md、当前 git diff，以及遇到的所有 AGENTS.md。当前工作树包含大量已经验证的安全修复和两条被中断的半成品；不得 reset、checkout 丢弃、覆盖他人改动或从头重做。先认领 G-001，依据当前编译/测试输出接管并完成 Binance 权威 exchangeInfo 规则和保守资金购买力控制；随后严格按依赖顺序推进 G-002 至 G-006。每完成一项就更新 board、claim、heartbeat 和对应 handoff，记录文件、决策、命令、结果、风险与下一步。
 
@@ -296,7 +296,7 @@ Use this only if a recurring controller is configured. It coordinates and does
 not implement code:
 
 ```text
-Every 10 minutes, read C:\Users\28340\Desktop\crypto-trading\docs\automation\goal-board.md and the active issue handoff. Coordinate only; do not implement code in this recurring controller thread.
+Every 10 minutes, read <repo-root>/docs/automation/goal-board.md and the active issue handoff. Coordinate only; do not implement code in this recurring controller thread.
 
 Reread the board immediately before claiming. If a fresh claim exists, do not launch a duplicate; inspect the worker if thread tools exist and update last_heartbeat from real progress. Treat a claim as stale only after two missed checks, an uninspectable thread, or explicit context-loss evidence. If duplicate workers exist, keep the worker matching claim_token canonical and require evidence merge from superseded workers.
 

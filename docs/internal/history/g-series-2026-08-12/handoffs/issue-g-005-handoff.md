@@ -73,7 +73,7 @@
   strategy metric was inspected before this freeze.
 - 2026-08-12T02:53:26+08:00 - The public read-only preparation script fetched
   and verified all 103 official monthly ZIPs and sibling checksums into
-  `C:\Users\28340\AppData\Local\Temp\crypto-trading-g005-btcusdt-v1`.
+  `<temporary-cache-dir>/crypto-trading-g005-btcusdt-v1`.
   The small repository lock records 103 unique ZIP/content digests, 3134 total
   bars, the exact millisecond-to-microsecond transition, and SHA-256
   `5eb95ab4efeddc2656c6cd2863a48a50c685758ef458a5102bcc64c5047c2d3f`.

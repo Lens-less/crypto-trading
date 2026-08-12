@@ -30,6 +30,10 @@
 - [`reports/project-refocus-acceptance-2026-08-12.md`](reports/project-refocus-acceptance-2026-08-12.md)
   — the W0–W3 acceptance record, including the failed hourly data-admission
   result and the external gates that were deliberately not fabricated.
+- [`reports/open-source-live-readiness-2026-08-13.md`](reports/open-source-live-readiness-2026-08-13.md)
+  — the current public-repository acceptance and live-readiness disposition,
+  including reviewed false positives, branch-integration scope, and the
+  credentialed gates that remain closed.
 - [`releasing.md`](releasing.md) — how a version is cut.
 
 ## Contributing
@@ -48,7 +52,9 @@
 specifications, execution plans, and upstream research. These are kept as
 evidence for how the current boundaries were arrived at. They are **snapshots,
 not living documents** — where they disagree with the code, the code and the
-capability manifest win.
+capability manifest win. Paths, commands, prompts, and credentials-shaped
+placeholders inside these snapshots are historical text only and must not be
+executed or treated as current operator instructions.
 
 - [`internal/audits/`](internal/audits/) — dated project audits and their
   remediation records. `RUST_PROJECT_AUDIT_REMEDIATION_2026-07-17.md` is the

@@ -87,7 +87,7 @@ the required conjunctive result is `no candidate passed`.
 From `rust/`, the exact locked offline command was:
 
 ```powershell
-cargo +1.89.0 run --locked -p crypto-trading-backtest --example g005_evaluation -- --cache C:\Users\28340\AppData\Local\Temp\crypto-trading-g005-btcusdt-v1 --provenance-lock ..\artifacts\strategy-evaluation\g005-btcusdt-provenance.tsv --output-dir ..\artifacts\strategy-evaluation
+cargo +1.89.0 run --locked -p crypto-trading-backtest --example g005_evaluation -- --cache <temporary-cache-dir>/crypto-trading-g005-btcusdt-v1 --provenance-lock ../artifacts/strategy-evaluation/g005-btcusdt-provenance.tsv --output-dir ../artifacts/strategy-evaluation
 ```
 
 Repeated executions produced byte-identical selection JSON, final JSON, and

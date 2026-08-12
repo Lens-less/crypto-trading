@@ -1,0 +1,17 @@
+# Historical false positives reviewed on 2026-08-12.
+#
+# The first two values are non-authentication work-claim identifiers in dated
+# handoff records. The remaining values are deterministic loopback-only bearer
+# strings in trusted-submit contract tests. Keep suppressions fingerprinted to
+# the exact introducing commit, path, rule, and line: broader regex/path
+# allowlists would hide future credentials-shaped changes.
+6453a028ce5f61e80f706d1579589a7e07f130c4:docs/internal/history/g-series-2026-08-12/handoffs/issue-g-003-handoff.md:generic-api-key:6
+574a4aee8d299bdc5d2ba998471383d21829760e:docs/automation/handoffs/issue-g-003-handoff.md:generic-api-key:6
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:90
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:137
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:160
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:236
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:317
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:358
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:397
+a9dbd00db76e2b7d80966a08f3814932226bc289:rust/crates/apps/tests/trusted_submit_cli_contract.rs:generic-api-key:429

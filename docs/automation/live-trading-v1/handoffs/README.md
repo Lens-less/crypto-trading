@@ -27,7 +27,7 @@ Use this template:
 - Claim token:
 - Canonical worker thread:
 - Last heartbeat:
-- Repository: C:\Users\28340\Desktop\crypto-trading
+- Repository: `<repo-root>`
 
 ## Source Documents
 

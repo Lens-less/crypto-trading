@@ -1,9 +1,9 @@
 # ==============================================================================
-# Lighter市价刷量配置文件（支持Backpack/Hyperliquid信号源）
+# 冻结的 Lighter Paper 市价成交量仿真配置（支持 Backpack/Hyperliquid 信号源）
 # LEGACY-PARSEABLE：Rust volume-maker 支持 validate/serve/status/stop（serve 为 replay-backed Paper owner）；以下实时/adapter 说明仍未接入，本文件 emergency_stop: false，validate 可通过。
 # ==============================================================================
 # 
-# 🎯 功能说明：在Lighter上执行市价刷量（基于Backpack或Hyperliquid价格信号）
+# 🎯 功能说明：在离线 Paper 模式仿真市价成交量（基于 Backpack 或 Hyperliquid 回放信号）
 # 
 # 📋 架构说明：
 #    【双交易所架构】
@@ -25,7 +25,7 @@
 #    7. 重复下一轮
 # 
 # 🔥 核心特性：
-#    - 完全独立运行，不影响原Backpack刷量脚本
+#    - 完全独立运行，不影响原 Backpack 仿真配置
 #    - 复用原脚本的所有判断逻辑
 #    - 简单高效的市价交易
 #    - WebSocket + client_id 追踪订单成交
@@ -112,7 +112,7 @@ volume_maker:
                                    # 监控中：Backpack买1数量(40) < 卖1数量(80) → 反转了！触发Lighter平仓
   
   market_wait_timeout: 60.0        # 市价模式：等待价格变化的最大超时时间（秒，默认30秒）
-                                   # - 10   : 快速超时（适合高频刷量）
+                                   # - 10   : 快速超时（适合高频仿真）
                                    # - 30   : 默认超时（推荐）
                                    # - 60   : 较长超时（允许更多时间等待价格变化）
                                    # 

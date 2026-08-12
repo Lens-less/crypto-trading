@@ -303,10 +303,13 @@ async fn restarted_owner_finishes_pending_kill_switch_cleanup() {
     drop(first);
 
     let venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
-    let restarted =
-        ContinuousTestnetOwner::start_read_only(owner_id, Arc::clone(&venue), history.clone())
-            .await
-            .unwrap();
+    let restarted = ContinuousTestnetOwner::start_read_only(
+        "testnet-owner-kill-restart-successor",
+        Arc::clone(&venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         restarted.status().phase,
         ContinuousTestnetOwnerPhase::KilledClean
@@ -317,6 +320,44 @@ async fn restarted_owner_finishes_pending_kill_switch_cleanup() {
     assert!(body.contains("continuous_testnet_killed_clean"));
     assert!(body.contains("\"recovered_from_kill_switch_engaged\":true"));
     assert!(body.contains("\"spot_balance_authority\":\"unavailable_in_reconcile_receipt\""));
+    cleanup(history);
+}
+
+#[tokio::test]
+async fn account_kill_switch_latch_cannot_be_bypassed_by_a_new_owner_or_campaign() {
+    let history = history();
+    let first_venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    let mut first = ContinuousTestnetOwner::start_read_only(
+        "testnet-owner-account-kill-a",
+        Arc::clone(&first_venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
+    subscribe(&mut first, 18, 1).await;
+    first.engage_kill_switch().await.unwrap();
+    drop(first);
+
+    let second_venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    let mut second = ContinuousTestnetOwner::start(
+        "testnet-owner-account-kill-b",
+        lifecycle_config(),
+        Arc::clone(&second_venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        second.status().phase,
+        ContinuousTestnetOwnerPhase::KilledClean
+    );
+    assert!(second.status().kill_switch_latched);
+    assert!(second.run_lifecycle().await.is_err());
+    assert!(
+        second_venue.calls().is_empty(),
+        "an account-level latch must block before remote I/O"
+    );
     cleanup(history);
 }
 

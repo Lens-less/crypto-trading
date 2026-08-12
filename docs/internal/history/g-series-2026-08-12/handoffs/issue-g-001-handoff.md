@@ -6,7 +6,7 @@
 - Claim token: cleared after acceptance (`54374ae9-d39e-4c96-b10f-9ae76d11ce6b` was the completed claim)
 - Claimed by thread: `019ff1a7-229a-71d1-94c6-548f93748f08`
 - Last heartbeat: 2026-08-12T01:07:37+08:00
-- Repository: `C:\Users\28340\Desktop\crypto-trading`
+- Repository: `<repo-root>`
 - Worktree: intentionally dirty with uncommitted audit fixes; do not reset,
   discard, or overwrite existing edits.
 - Previous workers `authoritative_binance_rules` and

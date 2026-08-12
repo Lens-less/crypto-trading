@@ -7,7 +7,7 @@
 | Status | Implementation-ready baseline; mainnet promotion remains gated |
 | Version | 1.0 |
 | Date | 2026-08-12 |
-| Repository | `C:\Users\28340\Desktop\crypto-trading` |
+| Repository | `<repo-root>` |
 | Product baseline | Binance Spot, one dedicated account, one symbol |
 | Default symbol | `BTCUSDT` |
 | Settlement asset | `USDT` |

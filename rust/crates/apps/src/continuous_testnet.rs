@@ -202,7 +202,7 @@ where
         {
             return Err(ContinuousTestnetOwnerError::RecoveryPlanMissing);
         }
-        let projected = project_owner(history.path(), &owner_id, campaign_id)?;
+        let projected = project_account_owner(history.path())?;
         let now = Utc::now();
         let mut owner = Self {
             status: ContinuousTestnetOwnerStatus {
@@ -613,8 +613,12 @@ where
         }
         self.status.kill_switch_latched = true;
         self.status.user_stream_active = false;
-        self.append(KILL_SWITCH_ENGAGED, "kill_switch_engaged", json!({}))
-            .await?;
+        self.append(
+            KILL_SWITCH_ENGAGED,
+            "kill_switch_engaged",
+            json!({"scope": "account_journal"}),
+        )
+        .await?;
 
         if matches!(
             self.lifecycle_recovery_state()?,
@@ -894,11 +898,7 @@ struct ProjectedOwner {
     last_recorded_at: Option<DateTime<Utc>>,
 }
 
-fn project_owner(
-    path: &Path,
-    owner_id: &str,
-    campaign_id: Option<&str>,
-) -> Result<ProjectedOwner, ContinuousTestnetOwnerError> {
+fn project_account_owner(path: &Path) -> Result<ProjectedOwner, ContinuousTestnetOwnerError> {
     if !path.exists() {
         return Ok(ProjectedOwner::default());
     }
@@ -916,16 +916,10 @@ fn project_owner(
         if record.strategy != OWNER_STRATEGY {
             continue;
         }
-        if record.details.get("owner_id").and_then(Value::as_str) != Some(owner_id) {
-            continue;
-        }
-        let record_campaign_id = record.details.get("campaign_id").and_then(Value::as_str);
-        if record_campaign_id != campaign_id {
-            // One durable journal may contain a read-only soak owner followed
-            // by an explicitly configured recovery campaign. Kill-switch and
-            // phase facts are scoped to the exact (owner, campaign) pair.
-            continue;
-        }
+        // The journal is the single-writer account boundary. A kill fact must
+        // therefore survive changes to task/owner and campaign identity;
+        // filtering it to an exact pair would let a restart regain submit
+        // authority simply by choosing new identifiers.
         if record.details.get("schema_version").and_then(Value::as_u64)
             != Some(u64::from(CONTINUOUS_TESTNET_OWNER_SCHEMA_VERSION))
             || projected

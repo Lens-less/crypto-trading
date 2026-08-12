@@ -92,26 +92,26 @@ Legend:
 
 ## 3) Current Rust refactor sample
 
-**Workspace path:** `C:\Users\28340\Desktop\crypto-trading\rust`
+**Workspace path:** `<repo-root>/rust`
 
 ### Observed surface
 
 | Conclusion | Status | Evidence |
 |---|---|---|
-| The Rust refactor is a workspace with `apps`, `config`, `domain`, `exchange`, `runtime`, and `strategy` crates. | definite | [`rust/Cargo.toml`](C:/Users/28340/Desktop/crypto-trading/rust/Cargo.toml) |
-| The public command surface is CLI-first: `grid`, `arbitrage`, `monitor`, `volume-maker`, `price-alert`, `scanner`, `config-check`. | definite | [`rust/crates/apps/src/cli.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/apps/src/cli.rs) |
-| The command runner deliberately fail-closes live and continuous paths; only paper one-shot execution is allowed today. | definite | [`rust/crates/apps/src/command.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/apps/src/command.rs) |
-| The runtime layer provides execution batching and append-only JSONL history, with explicit live-mode acknowledgement checks. | definite | [`rust/crates/runtime/src/execution.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/runtime/src/execution.rs), [`rust/crates/runtime/tests/runtime_contract.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/runtime/tests/runtime_contract.rs) |
-| The exchange layer is typed and bounded, with paper execution, remote transport abstractions, testnet protocols, and an `UnsupportedLiveExchange` seam. | definite | [`rust/crates/exchange/src/lib.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/exchange/src/lib.rs), [`rust/crates/exchange/src/paper.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/exchange/src/paper.rs), [`rust/crates/exchange/src/remote.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/exchange/src/remote.rs) |
-| The strategy layer already contains core machines for arbitrage, grid, alerts, risk, virtual grid, and volume maker. | definite | [`rust/crates/strategy/src/lib.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/src/lib.rs) |
+| The Rust refactor is a workspace with `apps`, `config`, `domain`, `exchange`, `runtime`, and `strategy` crates. | definite | [`rust/Cargo.toml`](../../../rust/Cargo.toml) |
+| The public command surface is CLI-first: `grid`, `arbitrage`, `monitor`, `volume-maker`, `price-alert`, `scanner`, `config-check`. | definite | [`rust/crates/apps/src/cli.rs`](../../../rust/crates/apps/src/cli.rs) |
+| The command runner deliberately fail-closes live and continuous paths; only paper one-shot execution is allowed today. | definite | [`rust/crates/apps/src/command.rs`](../../../rust/crates/apps/src/command.rs) |
+| The runtime layer provides execution batching and append-only JSONL history, with explicit live-mode acknowledgement checks. | definite | [`rust/crates/runtime/src/execution.rs`](../../../rust/crates/runtime/src/execution.rs), [`rust/crates/runtime/tests/runtime_contract.rs`](../../../rust/crates/runtime/tests/runtime_contract.rs) |
+| The exchange layer is typed and bounded, with paper execution, remote transport abstractions, testnet protocols, and an `UnsupportedLiveExchange` seam. | definite | [`rust/crates/exchange/src/lib.rs`](../../../rust/crates/exchange/src/lib.rs), [`rust/crates/exchange/src/paper.rs`](../../../rust/crates/exchange/src/paper.rs), [`rust/crates/exchange/src/remote.rs`](../../../rust/crates/exchange/src/remote.rs) |
+| The strategy layer already contains core machines for arbitrage, grid, alerts, risk, virtual grid, and volume maker. | definite | [`rust/crates/strategy/src/lib.rs`](../../../rust/crates/strategy/src/lib.rs) |
 
 ### What the tests prove
 
 | Conclusion | Status | Evidence |
 |---|---|---|
-| CLI contract tests lock the supported subcommands and their strict argument combinations. | definite | [`rust/crates/apps/tests/cli_contract.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/apps/tests/cli_contract.rs) |
-| Integration tests enforce fail-closed behavior for missing live runtimes, unavailable monitor/volume-maker/price-alert/scanner modes, and history-file failures. | definite | [`rust/crates/apps/tests/command_smoke.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/apps/tests/command_smoke.rs) |
-| Strategy tests already cover segmented arbitrage, alerts, risk, and volume-maker logic as pure deterministic engines. | definite | [`rust/crates/strategy/tests/segmented_arbitrage.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/tests/segmented_arbitrage.rs), [`rust/crates/strategy/tests/price_alert.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/tests/price_alert.rs), [`rust/crates/strategy/tests/risk_engine.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/tests/risk_engine.rs), [`rust/crates/strategy/tests/volume_maker.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/tests/volume_maker.rs) |
+| CLI contract tests lock the supported subcommands and their strict argument combinations. | definite | [`rust/crates/apps/tests/cli_contract.rs`](../../../rust/crates/apps/tests/cli_contract.rs) |
+| Integration tests enforce fail-closed behavior for missing live runtimes, unavailable monitor/volume-maker/price-alert/scanner modes, and history-file failures. | definite | [`rust/crates/apps/tests/command_smoke.rs`](../../../rust/crates/apps/tests/command_smoke.rs) |
+| Strategy tests already cover segmented arbitrage, alerts, risk, and volume-maker logic as pure deterministic engines. | definite | [`rust/crates/strategy/tests/segmented_arbitrage.rs`](../../../rust/crates/strategy/tests/segmented_arbitrage.rs), [`rust/crates/strategy/tests/price_alert.rs`](../../../rust/crates/strategy/tests/price_alert.rs), [`rust/crates/strategy/tests/risk_engine.rs`](../../../rust/crates/strategy/tests/risk_engine.rs), [`rust/crates/strategy/tests/volume_maker.rs`](../../../rust/crates/strategy/tests/volume_maker.rs) |
 
 ## 4) Gap matrix
 
@@ -119,22 +119,22 @@ Legend:
 
 | Gap | Why it is P0 | Evidence |
 |---|---|---|
-| Live / continuous execution is still missing. `grid`, `arbitrage`, `monitor`, `volume-maker`, `price-alert`, and `scanner` all fail closed except for paper one-shot and config validation. | This blocks parity with the crypto trading upstream if the goal is operational execution rather than just strategy math. | [`rust/crates/apps/src/command.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/apps/src/command.rs), [`rust/README.md`](C:/Users/28340/Desktop/crypto-trading/rust/README.md) |
-| There is no web/API panel equivalent to `tickflow-stock-panel`'s dashboard, watchlist, screener, backtest, analysis, monitor, review, and settings flow. | This is a hard gap only if the target product includes an operator-facing UI. | [`rust/Cargo.toml`](C:/Users/28340/Desktop/crypto-trading/rust/Cargo.toml), [`rust/crates/apps/src/cli.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/apps/src/cli.rs), [`tickflow-stock-panel/frontend/src/pages`](https://github.com/shy3130/tickflow-stock-panel/tree/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/frontend/src/pages) |
+| Live / continuous execution is still missing. `grid`, `arbitrage`, `monitor`, `volume-maker`, `price-alert`, and `scanner` all fail closed except for paper one-shot and config validation. | This blocks parity with the crypto trading upstream if the goal is operational execution rather than just strategy math. | [`rust/crates/apps/src/command.rs`](../../../rust/crates/apps/src/command.rs), [`rust/README.md`](../../../rust/README.md) |
+| There is no web/API panel equivalent to `tickflow-stock-panel`'s dashboard, watchlist, screener, backtest, analysis, monitor, review, and settings flow. | This is a hard gap only if the target product includes an operator-facing UI. | [`rust/Cargo.toml`](../../../rust/Cargo.toml), [`rust/crates/apps/src/cli.rs`](../../../rust/crates/apps/src/cli.rs), [`tickflow-stock-panel/frontend/src/pages`](https://github.com/shy3130/tickflow-stock-panel/tree/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/frontend/src/pages) |
 
 ### P1
 
 | Gap | Why it is P1 | Evidence |
 |---|---|---|
-| Exchange support is still narrow relative to `crypto-trading-open`; the Rust sample has a typed exchange boundary plus paper/testnet/unsupported-live seams, but not the broad live venue matrix. | Execution coverage and venue parity are the core product delta versus the Python upstream. | [`rust/crates/exchange/src/lib.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/exchange/src/lib.rs), [`crypto-trading-open/README.md`](https://github.com/cryptocj520/crypto-trading-open/blob/620737399bfe3c331f9989fc77d631536f2e89df/README.md) |
-| The Rust tree has history persistence, but not a scheduled data pipeline, enriched store, or backtest/reporting stack like TickFlow. | This matters if the project must support analytics, monitoring, or operator review, not just order logic. | [`rust/crates/runtime/src/history.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/runtime/src/history.rs), [`tickflow-stock-panel/docs/features.md`](https://raw.githubusercontent.com/shy3130/tickflow-stock-panel/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/docs/features.md) |
-| Notifications are not yet a product surface in the Rust tree. | `tickflow-stock-panel` demonstrates alerting and review UX; the Rust tree currently only has alert math, not delivery or presentation. | [`rust/crates/strategy/src/alert.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/src/alert.rs), [`tickflow-stock-panel/docs/features.md`](https://raw.githubusercontent.com/shy3130/tickflow-stock-panel/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/docs/features.md) |
+| Exchange support is still narrow relative to `crypto-trading-open`; the Rust sample has a typed exchange boundary plus paper/testnet/unsupported-live seams, but not the broad live venue matrix. | Execution coverage and venue parity are the core product delta versus the Python upstream. | [`rust/crates/exchange/src/lib.rs`](../../../rust/crates/exchange/src/lib.rs), [`crypto-trading-open/README.md`](https://github.com/cryptocj520/crypto-trading-open/blob/620737399bfe3c331f9989fc77d631536f2e89df/README.md) |
+| The Rust tree has history persistence, but not a scheduled data pipeline, enriched store, or backtest/reporting stack like TickFlow. | This matters if the project must support analytics, monitoring, or operator review, not just order logic. | [`rust/crates/runtime/src/history.rs`](../../../rust/crates/runtime/src/history.rs), [`tickflow-stock-panel/docs/features.md`](https://raw.githubusercontent.com/shy3130/tickflow-stock-panel/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/docs/features.md) |
+| Notifications are not yet a product surface in the Rust tree. | `tickflow-stock-panel` demonstrates alerting and review UX; the Rust tree currently only has alert math, not delivery or presentation. | [`rust/crates/strategy/src/alert.rs`](../../../rust/crates/strategy/src/alert.rs), [`tickflow-stock-panel/docs/features.md`](https://raw.githubusercontent.com/shy3130/tickflow-stock-panel/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/docs/features.md) |
 
 ### P2
 
 | Gap | Why it is P2 | Evidence |
 |---|---|---|
-| The Rust code already has strong core boundaries, so the best next step is to preserve those seams and add only the thinnest possible operator surface around them. | The existing crate split is a good foundation; overbuilding UI or plugin layers too early would add churn. | [`rust/Cargo.toml`](C:/Users/28340/Desktop/crypto-trading/rust/Cargo.toml), [`rust/crates/strategy/src/lib.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/strategy/src/lib.rs), [`rust/crates/exchange/src/lib.rs`](C:/Users/28340/Desktop/crypto-trading/rust/crates/exchange/src/lib.rs) |
+| The Rust code already has strong core boundaries, so the best next step is to preserve those seams and add only the thinnest possible operator surface around them. | The existing crate split is a good foundation; overbuilding UI or plugin layers too early would add churn. | [`rust/Cargo.toml`](../../../rust/Cargo.toml), [`rust/crates/strategy/src/lib.rs`](../../../rust/crates/strategy/src/lib.rs), [`rust/crates/exchange/src/lib.rs`](../../../rust/crates/exchange/src/lib.rs) |
 | Tickflow-style data-source extensibility is attractive, but only after the Rust project has a stable ingestion contract. | Otherwise the extension surface will just mirror changing internals. | [`tickflow-stock-panel/docs/custom-data-source.md`](https://github.com/shy3130/tickflow-stock-panel/blob/60fe9e6fa61dd774968d483cb8466b4b485e7ad0/docs/custom-data-source.md) |
 
 ## 5) Recommendations

@@ -101,6 +101,7 @@ fn user_data_parser_supports_wrapped_execution_reports_and_account_updates() {
                 "z":"0.10000000",
                 "L":"0.10264410",
                 "T":1723422221999,
+                "t":731942,
                 "I":8641984
             }
         }"#,
@@ -116,7 +117,7 @@ fn user_data_parser_supports_wrapped_execution_reports_and_account_updates() {
     );
     assert_eq!(execution.symbol.as_str(), "ETHBTC");
     assert_eq!(execution.order_id, 4_293_153);
-    assert_eq!(execution.execution_id, Some(8_641_984));
+    assert_eq!(execution.execution_id, Some(731_942));
     assert_eq!(
         execution.cumulative_filled_quantity.as_decimal(),
         decimal("0.10000000")
@@ -193,4 +194,38 @@ fn user_data_parser_accepts_market_execution_reports_with_zero_order_price() {
         execution.last_executed_price.unwrap().as_decimal(),
         decimal("0.10264410")
     );
+}
+
+#[test]
+fn user_data_parser_treats_binance_non_trade_sentinel_as_no_trade_identity() {
+    let execution = BinanceTestnetProtocol::parse_user_data_event(
+        br#"{
+            "subscriptionId":0,
+            "event":{
+                "e":"executionReport",
+                "E":1723422222000,
+                "s":"ETHBTC",
+                "c":"order-9",
+                "S":"BUY",
+                "o":"LIMIT",
+                "f":"GTC",
+                "q":"1.00000000",
+                "p":"0.10264410",
+                "x":"NEW",
+                "X":"NEW",
+                "i":4293155,
+                "l":"0.00000000",
+                "z":"0.00000000",
+                "L":"0.00000000",
+                "T":1723422221999,
+                "t":-1,
+                "I":8641986
+            }
+        }"#,
+    )
+    .unwrap();
+    let BinanceUserDataEvent::ExecutionReport(execution) = execution else {
+        panic!("expected execution report");
+    };
+    assert_eq!(execution.execution_id, None);
 }

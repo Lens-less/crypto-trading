@@ -102,7 +102,7 @@ One-shot Goal prompt:
 ```text
 Goal: Complete L-001 — lock the Live Trading V1 scope and establish a safe baseline.
 This is a one-shot worker launch prompt, not a recurring automation prompt.
-Objective: in C:\Users\28340\Desktop\crypto-trading, turn docs/internal/specs/LIVE_TRADING_V1_SPEC.md into an evidence-backed implementation baseline without widening trading authority.
+Objective: in <repo-root>, turn docs/internal/specs/LIVE_TRADING_V1_SPEC.md into an evidence-backed implementation baseline without widening trading authority.
 Read first: docs/internal/specs/LIVE_TRADING_V1_SPEC.md, docs/automation/live-trading-v1/goal-board.md, this runbook, docs/reports/release-readiness-2026-08-12.md, docs/adapter-support.md, current git diff/status, Cargo manifests, and applicable AGENTS.md.
 Issue boundary: scope lock, dirty-worktree inventory, binary/dependency/module map, configuration decision record, and baseline tests only. Out of scope: adapters, WebSockets, external authenticated calls, order mutation, dependency additions, deletion, commits, and pushes.
 Use $ultracode for this issue if the work is non-trivial, multi-file, multi-phase, risky, or benefits from subagents. For tiny single-file or documentation-only changes, execute directly and verify narrowly.
@@ -591,7 +591,7 @@ Paste this into a recurring controller only. It coordinates and does not
 implement code or perform external trading operations.
 
 ```text
-Every 10 minutes, coordinate the Live Trading V1 program in C:\Users\28340\Desktop\crypto-trading. Read docs/automation/live-trading-v1/goal-board.md, docs/automation/live-trading-v1/goal-automation-runbook.md, the active handoff, and docs/internal/specs/LIVE_TRADING_V1_SPEC.md. Do not implement code in this recurring controller thread.
+Every 10 minutes, coordinate the Live Trading V1 program in <repo-root>. Read docs/automation/live-trading-v1/goal-board.md, docs/automation/live-trading-v1/goal-automation-runbook.md, the active handoff, and docs/internal/specs/LIVE_TRADING_V1_SPEC.md. Do not implement code in this recurring controller thread.
 
 Reread the board immediately before claiming. Use compare-before-write: if another fresh claim exists, do not launch a duplicate. A claim is stale only after two missed controller checks, an uninspectable worker, or explicit context-loss evidence. Heartbeat only from observed worker progress. If duplicate workers exist, keep the one matching claim_token canonical, mark others superseded, and require evidence merge.
 

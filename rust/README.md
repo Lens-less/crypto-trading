@@ -4,6 +4,7 @@
 
 > [!WARNING]
 > **不得用于真实资金。** Live 适配器、真实交易所账户真值（equity、margin、持仓）和多腿故障补偿尚未达到开放门槛；`--live` 即使带确认短语也会失败关闭。唯一具备下单权限的路径是 Binance **Testnet**，需要精确确认短语。Paper 只计完全成交同步 taker 回执采用的配置手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。本项目按原样提供，不含任何担保，也不构成投资建议。
+> `volume-maker` 仅为冻结的兼容命令名，不得用于自成交、制造虚假成交量、市场操纵或违反交易所服务条款的活动。
 > 项目定位、安装与部署见[仓库根 README](../README.md)。
 
 ## 能力矩阵
@@ -21,7 +22,7 @@
 | `paper grid/arbitrage` | 活跃 | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`）；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
 | `paper risk` | 活跃 | `--enable-paper-writes` 时必须提供 `--paper-account-risk-config` 共享限额 | 不适用 | 是（Paper） | 否 | `pause`/`resume`/`kill-switch` 经同一 loopback trusted-submit 服务写入持久事实；kill switch 需要专属 `account_kill_switch_armed` 风险确认与 CLI 精确确认短语，且闩锁不可解除 |
 | `monitor` | 活跃 | 是 | 否 | 是（只读 replay / `--live`） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 相同地失败关闭）；`--live` 默认使用 Binance Spot Testnet `bookTicker` WebSocket + Hyperliquid 永续轮询，只有显式 `--live-transport polling` 才把 Binance 降级为 REST 轮询；两条路径都不授予交易权限 |
-| `volume-maker` | 维护冻结 | 是 | 否 | 是（Paper replay） | 否 | 默认 `--mode validate` 校验（含 emergency stop 闸）后成功返回；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、被后续盘口穿越后才执行单腿开仓，市价模式按盘口薄侧吃单，平仓一律 reduce-only 市价；每笔操作独立 reservation 并先过账户级风控准入，小时统计与生命周期事实写入 journal（`task_kind volume_maker`），`max_cycles`/`target_volume` 达界以 `completed` 干净收束，状态可降级到 journal 投影 |
+| `volume-maker` | 维护冻结 | 是 | 否 | 是（Paper replay） | 否 | 兼容命令名，仅表示离线 Paper 成交量仿真。默认 `--mode validate` 校验（含 emergency stop 闸）后成功返回；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay Paper owner：限价模式持有虚拟报价、被后续盘口穿越后才执行单腿开仓，市价模式消费仿真盘口薄侧，平仓一律 reduce-only 市价；每笔操作独立 reservation 并先过账户级风控准入，小时统计与生命周期事实写入 journal（`task_kind volume_maker`），`max_cycles`/`target_volume` 达界以 `completed` 干净收束，状态可降级到 journal 投影 |
 | `price-alert` | 维护冻结 | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert owner，状态可降级到 journal 投影 |
 | `scanner` | 维护冻结 | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验 fail-closed scanner schema 后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 owner，评级排名与生命周期事实写入 journal，状态可降级到 journal 投影 |
 

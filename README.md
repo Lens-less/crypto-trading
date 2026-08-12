@@ -12,18 +12,23 @@
 > **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、真实交易所账户风控真相（equity/margin/持仓）和多腿故障补偿尚未达到开放门槛；账户级风控权威目前仅覆盖 Paper 模拟账本。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 只计配置的同步 taker 手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。
 > 唯一具备下单权限的路径是 Binance **Testnet**（模拟资金的真实外部环境），且需要精确确认短语。
 > 本项目按原样提供，不含任何担保，也不构成投资建议；使用后果由使用者自行承担。
+> 不得将本项目用于自成交、制造虚假成交量、市场操纵或任何违反交易所服务条款的活动。
 >
 > **This is not a production trading bot and must not be used with real funds.**
 > Live adapters, real exchange account truth (equity/margin/positions), and
 > multi-leg failure compensation all fail closed; the account-level risk
 > authority governs the paper ledger only. The only path with order
 > authority is Binance Testnet, behind an exact acknowledgement phrase.
-> Provided as is, without warranty; not investment advice.
+> Provided as is, without warranty; not investment advice. Do not use this
+> project for wash trading, artificial volume, market manipulation, or any
+> activity that violates an exchange's terms of service.
 
 W3 maintenance-freeze note:
 - `scanner`, `price-alert`, and `volume-maker` remain replay-backed legacy
   surfaces. They stay parseable and testable at their existing config paths,
-  but no new runtime investment is planned there.
+  but no new runtime investment is planned there. `volume-maker` is retained
+  only as a compatibility command name for offline Paper volume simulation; it
+  must never be connected to a real venue.
 - Config-only exchange-auth samples for Backpack, EdgeX, GRVT, Lighter, and
   Paradex now live under [`rust/config/legacy/`](rust/config/legacy/README.md),
   so the active `rust/config/exchanges/` surface only lists operator-supported
@@ -43,7 +48,7 @@ W3 maintenance-freeze note:
 它暂时不适合：
 
 - 连接私有交易 API 或管理真实资产。
-- 启动 7×24 小时网格、套利监控、做量或价格提醒服务。
+- 启动 7×24 小时网格、套利监控、成交量仿真或价格提醒服务。
 - 用 paper 成交结果推断真实交易收益或生产就绪程度。
 
 ## 当前能力
@@ -57,7 +62,7 @@ W3 maintenance-freeze note:
 | `paper grid`／`paper arbitrage` | 活跃 | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；完全成交的同步 taker 回执会写入精确 FIFO lot、手续费、已实现 PnL 与 settled equity，reduce-only 平仓额度在 reserve 与 settle 两处校验；Grid owner 会把配置启用的纯策略网格保护指令写成 `grid_protection` journal 事实并映射为受限 paper 动作；Arbitrage owner 可选 spread-history 自然价差门控，资金费率缺失时标注 `funding_degraded`；两个 owner 的开仓在 reservation 前都要通过 journal-backed 账户风控，拒绝会写成 `account_risk_rejected` 事实 |
 | `paper risk` | 活跃 | `--enable-paper-writes` 时必须提供 `--paper-account-risk-config` 共享限额 | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝，owner 会在有可信缓存盘口时以 reduce-only 平仓后停止；缺少盘口或平仓不完整时进入 `RecoveryRequired`，不得伪装为正常停止 |
 | `monitor` | 活跃 | 可解析并校验 | 不可用 | 可用（只读 replay / `--live`） | 不可用 | `serve/status/stop` 运行精确双源 monitor owner；`--live` 默认使用 Binance Spot Testnet `bookTicker` WebSocket + Hyperliquid 永续轮询，并将价差事实写入独立 spread-history journal；WebSocket 有有界队列、ping/pong、退避重连和 update-ID 回退门禁，只有显式 `--live-transport polling` 才将 Binance 降级为 REST；所有路径都拒绝超出配置 skew 的配对且不授予交易权限 |
-| `volume-maker` | 维护冻结 | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式吃盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源仍未开放 |
+| `volume-maker` | 维护冻结 | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 兼容命令名，仅表示离线 Paper 成交量仿真。默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式消费仿真盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源始终未开放 |
 | `price-alert` | 维护冻结 | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
 | `scanner` | 维护冻结 | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
 
@@ -83,7 +88,7 @@ Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Va
 ## 核心特性
 
 - **精确领域类型**：价格、数量和金额使用 `rust_decimal`，关键算术使用受检操作，不以二进制浮点承担交易计算。
-- **纯策略内核**：固定/马丁网格、网格保护子系统（剥头皮、本金保护、止盈、价格锁定、止损，按固定优先级仲裁）、分段套利、价格提醒、做量和虚拟网格逻辑与 I/O 分离，便于确定性测试。
+- **纯策略内核**：固定/马丁网格、网格保护子系统（剥头皮、本金保护、止盈、价格锁定、止损，按固定优先级仲裁）、分段套利、价格提醒、Paper 成交量仿真和虚拟网格逻辑与 I/O 分离，便于确定性测试。
 - **可验证的 Paper 执行与账本**：`PaperExchange` 覆盖订单状态、顶层深度消耗、GTC/IOC/FOK、部分成交与撤单语义；journal-backed Paper account 对完全成交的同步 taker 回执记录 FIFO lot、即时手续费、已实现 PnL、settled equity 和 reduce-only 容量。尚不包含周期性 mark-to-market、资金费率、保证金/强平、真实排队延迟、多档冲击或 resting-maker 的持久成交回调。
 - **失败关闭的执行边界**：未授权模式、过期行情、产品身份不匹配、深度不足、风险超限和未实现适配器都在提交前拒绝。
 - **可审计执行历史**：先写入 `execution_planned`，再写入 `execution_completed`、`execution_partial` 或 `execution_incomplete`。
@@ -403,7 +408,7 @@ rust/config/
 ├── grid/            # 网格策略配置
 ├── price_alert/     # 价格提醒配置
 ├── scanner/         # 虚拟网格扫描器配置
-├── volume_maker/    # 做量策略配置
+├── volume_maker/    # 冻结的 Paper 成交量仿真兼容配置
 ├── logging.yaml     # 迁移期辅助配置；Rust runtime 不读取
 └── symbol_conversion.yaml
 ```
@@ -468,7 +473,7 @@ Rust workspace 包含十一个 crate。依赖方向是单向的：`domain` 不�
 | --- | --- |
 | `domain` | Symbol、MarketSnapshot、Order、Position、Price、Quantity、Money 等领域类型 |
 | `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
-| `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、风险、价格提醒、做量和虚拟网格算法 |
+| `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、风险、价格提醒、Paper 成交量仿真和虚拟网格算法 |
 | `indicators` | workspace 内部的 Decimal 指标研究库；未链接到已出货 CLI/HTTP/二进制，manifest 中为 `Unavailable` |
 | `backtest` | workspace 内部的确定性事件带研究库；未链接到已出货 CLI/HTTP/二进制，manifest 中为 `Unavailable` |
 | `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |

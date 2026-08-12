@@ -286,12 +286,6 @@ impl BinanceUserDataStreamSource {
             .local_sequence
             .checked_add(1)
             .ok_or(MarketDataError::RevisionExhausted)?;
-        let Ok(payload) = normalize_execution_trade_id(text, payload) else {
-            return Ok(Some(self.schedule_local_reconnect(
-                MarketDataSourceFailure::InvalidPayload,
-                true,
-            )));
-        };
         if matches!(payload, BinanceUserDataEvent::StreamTerminated(_)) {
             self.session = None;
             return Ok(Some(self.schedule_stream_expired(observed_at)));
@@ -600,21 +594,6 @@ impl BinanceUserDataState {
         self.reconcile_required = Some(reason.clone());
         BinanceUserDataApply::ReconcileRequired(reason)
     }
-}
-
-fn normalize_execution_trade_id(
-    text: &str,
-    payload: BinanceUserDataEvent,
-) -> Result<BinanceUserDataEvent, serde_json::Error> {
-    let BinanceUserDataEvent::ExecutionReport(mut event) = payload else {
-        return Ok(payload);
-    };
-    let value: serde_json::Value = serde_json::from_str(text)?;
-    event.execution_id = value
-        .get("event")
-        .and_then(|event| event.get("t"))
-        .and_then(serde_json::Value::as_u64);
-    Ok(BinanceUserDataEvent::ExecutionReport(event))
 }
 
 fn unix_seconds(observed_at: DateTime<Utc>) -> u64 {

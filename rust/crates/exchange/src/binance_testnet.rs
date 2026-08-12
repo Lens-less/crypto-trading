@@ -166,6 +166,10 @@ pub struct BinanceExecutionReportEvent {
     pub order_type: String,
     pub time_in_force: String,
     pub order_id: u64,
+    /// Stable venue trade identity from Binance execution-report field `t`.
+    ///
+    /// Binance field `I` is explicitly an ignore field and must never drive
+    /// execution deduplication.
     pub execution_id: Option<u64>,
     pub quantity: Quantity,
     pub price: Option<Price>,
@@ -2369,7 +2373,7 @@ fn parse_execution_report_event(
             order_type: required_str(event, "o")?.to_owned(),
             time_in_force: required_str(event, "f")?.to_owned(),
             order_id: required_u64(event, "i")?,
-            execution_id: optional_u64(event, "I")?,
+            execution_id: optional_trade_id(event)?,
             quantity,
             price,
             last_executed_quantity,
@@ -2448,12 +2452,14 @@ fn required_u64(event: &serde_json::Value, field: &str) -> Result<u64, ExchangeE
         })
 }
 
-fn optional_u64(event: &serde_json::Value, field: &str) -> Result<Option<u64>, ExchangeError> {
-    match event.get(field) {
+fn optional_trade_id(event: &serde_json::Value) -> Result<Option<u64>, ExchangeError> {
+    match event.get("t") {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-            ExchangeError::invalid_response(EXCHANGE, format!("Binance field {field} is invalid"))
-        }),
+        Some(value) if value.as_i64() == Some(-1) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| ExchangeError::invalid_response(EXCHANGE, "Binance field t is invalid")),
     }
 }
 
