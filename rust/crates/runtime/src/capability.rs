@@ -347,28 +347,10 @@ pub fn current_capability_manifest() -> CapabilityManifest {
 
 fn adapter_support_matrix() -> Vec<AdapterSupport> {
     vec![
-        config_only_adapter(
-            "backpack",
-            "Backpack",
-            "rust/config/exchanges/backpack_config.yaml",
-        ),
         binance_adapter(),
-        config_only_adapter("edgex", "EdgeX", "rust/config/exchanges/edgex_config.yaml"),
-        config_only_adapter("grvt", "GRVT", "rust/config/exchanges/grvt_config.yaml"),
         hyperliquid_adapter(),
-        config_only_adapter(
-            "lighter",
-            "Lighter",
-            "rust/config/exchanges/lighter_config.yaml",
-        ),
-        legacy_only_adapter("okx", "OKX"),
         paper_adapter(),
-        config_only_adapter(
-            "paradex",
-            "Paradex",
-            "rust/config/exchanges/paradex_config.yaml",
-        ),
-        legacy_only_adapter("variational", "Variational"),
+        unsupported_venues_adapter(),
     ]
 }
 
@@ -504,64 +486,34 @@ fn paper_adapter() -> AdapterSupport {
     }
 }
 
-fn config_only_adapter(id: &str, name: &str, config_path: &str) -> AdapterSupport {
-    let config_evidence = [
-        "rust/crates/config/src/auth.rs",
-        config_path,
-        "rust/crates/config/tests/config_compatibility.rs",
-    ];
-    let unavailable_evidence = [
-        config_path,
-        "docs/internal/research/upstream-repository-alignment.md",
-    ];
-    AdapterSupport {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        public_data: adapter_facet(
-            AdapterSupportLevel::ConfigOnly,
-            &["Rust can parse venue configuration, but no market-data adapter is implemented."],
-            &config_evidence,
-        ),
-        testnet_protocol: adapter_facet(
-            AdapterSupportLevel::Unavailable,
-            &["No Rust testnet request/response protocol is implemented."],
-            &unavailable_evidence,
-        ),
-        authenticated: adapter_facet(
-            AdapterSupportLevel::ConfigOnly,
-            &["Credential fields can be loaded and redacted, but no private API consumes them."],
-            &config_evidence,
-        ),
-        reconcile: adapter_facet(
-            AdapterSupportLevel::Unavailable,
-            &["No Rust open-order, position, or balance reconciliation is implemented."],
-            &unavailable_evidence,
-        ),
-        live: external_live_unavailable(),
-    }
-}
-
-fn legacy_only_adapter(id: &str, name: &str) -> AdapterSupport {
+fn unsupported_venues_adapter() -> AdapterSupport {
     let evidence = [
+        "rust/crates/config/src/auth.rs",
+        "rust/crates/config/tests/config_compatibility.rs",
+        "rust/config/legacy/exchanges/backpack_config.yaml",
+        "rust/config/legacy/exchanges/edgex_config.yaml",
+        "rust/config/legacy/exchanges/grvt_config.yaml",
+        "rust/config/legacy/exchanges/lighter_config.yaml",
+        "rust/config/legacy/exchanges/paradex_config.yaml",
         "docs/internal/research/upstream-repository-alignment.md",
         "docs/internal/plans/2026-07-24-project-alignment-web-goal-plan.md",
     ];
-    let unavailable = || {
+    let unsupported = || {
         adapter_facet(
             AdapterSupportLevel::Unavailable,
             &[
-                "Only the frozen Python adapter exists; no current Rust adapter or configuration contract is implemented.",
+                "Backpack, EdgeX, GRVT, Lighter, and Paradex still appear as compatibility-only venue configs, while OKX and Variational remain frozen legacy references; none of these venues has an operator-supported Rust market-data adapter, testnet protocol, authenticated private API, or reconciliation path.",
             ],
             &evidence,
         )
     };
     AdapterSupport {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        public_data: unavailable(),
-        testnet_protocol: unavailable(),
-        authenticated: unavailable(),
-        reconcile: unavailable(),
+        id: "unsupported-venues".to_owned(),
+        name: "Unsupported venues".to_owned(),
+        public_data: unsupported(),
+        testnet_protocol: unsupported(),
+        authenticated: unsupported(),
+        reconcile: unsupported(),
         live: external_live_unavailable(),
     }
 }
@@ -765,19 +717,28 @@ fn research_capabilities() -> Vec<Capability> {
         capability(
             "research.backtest",
             CapabilityArea::Research,
-            CapabilityLevel::Unavailable,
+            CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Internal library-only deterministic single-instrument SimClock/EventTape kernel with explicit fee/slippage assumptions, ledger outputs, equity curves, performance-metric primitives, and out-of-sample window primitives.",
+            "Formal frozen-protocol research CLI plus a deterministic single-instrument SimClock/EventTape kernel; bar-driven candidate implementations are shared with the paper owner, and datasets, costs, selection, and holdout boundaries remain provenance-locked.",
             &[
-                "Unavailable as a product capability: no shipped binary links this crate, and no supported CLI or HTTP entry point, bounded tape input contract, or production strategy adapter exists.",
+                "The first hourly protocol is terminally data-admission-aborted because the official monthly history is not a contiguous UTC-hour series; no selection or holdout evaluation was run.",
+                "The earlier daily frozen experiment produced no passing holdout configuration, so this capability provides reproducible research mechanics rather than a validated edge.",
                 "identified perpetual production-snapshot seams fail closed until a real margin/liquidation/funding model exists; the current ledger must not be read as realistic derivatives PnL.",
                 "This kernel is not a profitability claim: multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
             ],
             &[
+                "rust/crates/backtest/src/bin/crypto-trading-research.rs",
+                "rust/crates/backtest/src/research_runner_shared.rs",
                 "rust/crates/backtest/src/engine.rs",
                 "rust/crates/backtest/src/ledger.rs",
                 "rust/crates/backtest/src/walk_forward.rs",
+                "rust/crates/strategy/src/bar.rs",
+                "rust/crates/strategy/src/bar_research.rs",
+                "rust/crates/apps/src/paper_bar_task.rs",
                 "rust/crates/backtest/tests/backtest_contract.rs",
+                "rust/crates/backtest/tests/bar_strategy_shared_contract.rs",
+                "rust/crates/apps/tests/paper_bar_task_contract.rs",
+                "docs/research/strategy-evaluation-1h-2026-08-12.md",
             ],
         ),
         capability(
@@ -910,23 +871,29 @@ fn market_data_capability() -> Capability {
             &[
                 CapabilityEnvironment::Offline,
                 CapabilityEnvironment::Paper,
+                CapabilityEnvironment::Testnet,
                 CapabilityEnvironment::Mainnet,
             ],
             CapabilityAccess::MarketData,
         ),
-        "Bounded exact-universe market book with explicit timestamp provenance, venue sequence metadata, cross-venue skew rejection, deterministic replay, subscription gaps, credential-free Binance Spot polling, and credential-free Hyperliquid perpetual polling with an hourly funding-rate side feed.",
+        "Bounded exact-universe market book with explicit timestamp provenance, venue sequence metadata, cross-venue skew rejection, deterministic replay, subscription gaps, a Binance Spot Testnet bookTicker WebSocket source, and Hyperliquid perpetual polling with an hourly funding-rate side feed.",
         &[
-            "Both real venues are credential-free HTTP polling rather than realtime streams. Their documented REST payloads do not expose venue event time, so observations are explicitly marked local-receipt-time; the executable live bootstrap remains limited to the opt-in binance+hyperliquid monitor pair, and the funding side feed drives no decision yet.",
+            "The Binance leg is a realtime Testnet WebSocket with bounded queues, ping/pong liveness, reconnect backoff, and sequence regression fail-closed; Hyperliquid remains credential-free HTTP polling, so cross-venue freshness is still bounded by its poll cadence.",
+            "The explicit --live-transport polling path remains a degraded fallback, and the Hyperliquid funding side feed drives no decision yet.",
         ],
         &[
             "rust/crates/runtime/src/market_data.rs",
+            "rust/crates/runtime/src/market_stream.rs",
             "rust/crates/runtime/src/market_polling.rs",
             "rust/crates/runtime/src/market_supervisor.rs",
             "rust/crates/runtime/tests/market_data_contract.rs",
+            "rust/crates/runtime/tests/market_stream_contract.rs",
             "rust/crates/runtime/tests/market_supervisor_contract.rs",
             "rust/crates/runtime/tests/hyperliquid_polling_contract.rs",
+            "rust/crates/exchange/tests/binance_stream_contract.rs",
             "rust/crates/apps/src/continuous_monitor.rs",
             "rust/crates/apps/tests/continuous_monitor_task_contract.rs",
+            "rust/crates/apps/tests/monitor_live_transport_contract.rs",
             "rust/crates/runtime/src/task_read_model.rs",
             "rust/crates/runtime/tests/task_read_model_contract.rs",
         ],
@@ -940,10 +907,18 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             "runtime.monitor",
             CapabilityArea::Runtime,
             CapabilityLevel::ReadOnly,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, spread observations mirrored into the dedicated spread-history journal, bounded stop, and a Web-visible task projection.",
+            scope(
+                &[
+                    CapabilityEnvironment::Offline,
+                    CapabilityEnvironment::Testnet,
+                    CapabilityEnvironment::Mainnet,
+                ],
+                CapabilityAccess::MarketData,
+            ),
+            "Exact-pair continuous read-only arbitrage composition with journal-first monitor facts, durable source-status checkpoints, a dedicated spread-history journal, a default Binance Spot Testnet WebSocket leg, a Hyperliquid polling leg, bounded stop, and a Web-visible task projection.",
             &[
-                "The CLI service bootstrap defaults to replay; the explicit --live opt-in polls only the credential-free binance+hyperliquid pair, and restart recovery projects prior facts without automatically resuming external sources.",
+                "The CLI service bootstrap defaults to replay; explicit --live starts only the credential-free binance+hyperliquid pair, and --live-transport polling must be selected deliberately to use the degraded REST fallback.",
+                "This monitor is observational only and grants no Testnet or mainnet order authority.",
             ],
             &[
                 "rust/crates/apps/src/command.rs",
@@ -969,6 +944,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Bounded multi-symbol price-alert evaluation with durable samples, cooldowns, acknowledgements, a stable read model, isolated local delivery adapters, and a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts.",
             &[
+                "This surface is maintenance-frozen: keep the existing replay-backed evidence path available, but do not widen it with new venue, notification, or automation scope until the shared bar-driven strategy and realtime data seams land.",
                 "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the price-alert task host, and restart recovery projects prior facts without automatically resuming external sources.",
                 "The JSONL alert journal rotates through bounded sealed segments with no compaction by design; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
             ],
@@ -1003,6 +979,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
             ),
             "Validated volume-maker configuration plus a recoverable replay-backed paper owner: serve requires an explicit account-risk configuration; virtual maker quotes and imbalance market cycles become independent single-leg reservations with reduce-only closes, account-risk admission, durable hourly statistics facts, and a CLI validate/serve/status/stop task host.",
             &[
+                "This surface is maintenance-frozen: keep the current replay-backed paper evidence intact, but do not widen venue coverage, automation, or execution scope until the shared strategy/runtime seam is refocused.",
                 "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the volume-maker task host, and no testnet/mainnet order authority is implied.",
                 "The owner keeps no resting orders: limit-mode quotes are virtual and execute only when a later observation crosses them, so legacy post-only resting semantics are simulated, not reproduced; each serve run plans a fresh paper account generation and restart on a foreign generation fails closed.",
             ],
@@ -1028,6 +1005,7 @@ fn scanner_capability() -> Capability {
         scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
         "Bounded deterministic virtual-grid replay with explicit benchmark/APR ranking, a validated scanner configuration schema, a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts, durable projection, and a read-only Web view.",
         &[
+            "This surface is maintenance-frozen: preserve the deterministic replay/read-model contract, but do not widen it with new market discovery, scheduling, or venue scope until the shared research/runtime seam is rebuilt.",
             "The CLI service bootstrap is replay-backed only: no real-time market discovery or external continuous market source is wired into the scanner task host, and no continuous supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
             "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
             "A sparse price jump credits every crossed virtual level as a deterministic fill; no order-book depth, queue priority, latency, partial-fill, or gap-liquidity model exists, so rankings are not execution-quality or profitability evidence.",
@@ -1139,15 +1117,21 @@ fn testnet_soak_capability() -> Capability {
             &[CapabilityEnvironment::Testnet],
             CapabilityAccess::TestnetReadOnly,
         ),
-        "Durable Binance Testnet soak owner that cycles Spot and USD-M book tickers plus authenticated reconciliation without submitting or cancelling orders.",
+        "Durable Binance Spot Testnet soak owner that cycles the public bookTicker WebSocket, signed user-data WebSocket API, and authenticated REST reconciliation without submitting or cancelling orders.",
         &[
             "A passing 24-hour credentialed run with an observed kill-and-restart drill remains external release evidence and has not been produced in this workspace.",
         ],
         &[
             "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/src/continuous_testnet.rs",
             "rust/crates/apps/src/testnet_soak.rs",
+            "rust/crates/runtime/src/binance_user_data.rs",
+            "rust/crates/runtime/src/market_stream.rs",
             "rust/crates/apps/tests/testnet_soak_contract.rs",
             "rust/crates/apps/tests/testnet_soak_cli_contract.rs",
+            "rust/crates/apps/tests/testnet_stream_soak_contract.rs",
+            "rust/crates/apps/tests/continuous_testnet_owner_contract.rs",
+            "rust/crates/runtime/tests/binance_user_data_contract.rs",
         ],
     )
 }
@@ -1252,7 +1236,7 @@ fn adapter_cell<'a>(
     id: &str,
     facet: AdapterFacet,
 ) -> &'a AdapterFacetSupport {
-    // A linear scan over the ten-row static matrix costs nothing and, unlike a
+    // A linear scan over the tiny static matrix costs nothing and, unlike a
     // binary search, does not turn a mis-ordered literal into a startup panic
     // for every consumer of the infallible manifest constructor.
     adapters

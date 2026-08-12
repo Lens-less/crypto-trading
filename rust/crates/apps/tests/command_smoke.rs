@@ -58,13 +58,29 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
     assert_eq!(payload["release_stage"], "paper-only");
     assert_eq!(payload["live_trading_enabled"], false);
     let adapters = payload["adapters"].as_array().unwrap();
-    assert_eq!(adapters.len(), 10);
+    assert_eq!(adapters.len(), 4);
     assert!(adapters.iter().any(|entry| {
         entry["id"] == "binance"
             && entry["public_data"]["level"] == "implemented"
             && entry["testnet_protocol"]["level"] == "implemented"
             && entry["reconcile"]["level"] == "implemented"
             && entry["live"]["level"] == "unavailable"
+    }));
+    assert!(adapters.iter().any(|entry| {
+        entry["id"] == "unsupported-venues"
+            && entry["public_data"]["level"] == "unavailable"
+            && entry["authenticated"]["level"] == "unavailable"
+            && entry["public_data"]["blockers"]
+                .as_array()
+                .is_some_and(|blockers| {
+                    blockers.iter().any(|blocker| {
+                        blocker.as_str().is_some_and(|text| {
+                            text.contains("Backpack")
+                                && text.contains("Lighter")
+                                && text.contains("Variational")
+                        })
+                    })
+                })
     }));
     let capabilities = payload["capabilities"].as_array().unwrap();
     assert!(capabilities.iter().any(|entry| {
@@ -75,19 +91,33 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
                 .as_array()
                 .is_some_and(|environments| environments.iter().any(|mode| mode == "mainnet"))
     }));
-    for capability_id in ["research.backtest", "research.indicators"] {
-        let capability = capabilities
-            .iter()
-            .find(|entry| entry["id"] == capability_id)
-            .unwrap_or_else(|| panic!("missing capability {capability_id}"));
-        assert_eq!(capability["level"], "unavailable", "{capability_id}");
-        assert!(
-            capability["blockers"]
-                .as_array()
-                .is_some_and(|blockers| !blockers.is_empty()),
-            "{capability_id} must explain its library-only boundary"
-        );
-    }
+    let research_backtest = capabilities
+        .iter()
+        .find(|entry| entry["id"] == "research.backtest")
+        .expect("missing research.backtest capability");
+    assert_eq!(research_backtest["level"], "available");
+    assert_eq!(research_backtest["scope"]["access"], "local");
+    assert!(
+        research_backtest["blockers"]
+            .as_array()
+            .is_some_and(|blockers| blockers.iter().any(|blocker| {
+                blocker
+                    .as_str()
+                    .is_some_and(|text| text.contains("data-admission"))
+            })),
+        "the formal research entry must not imply a validated edge"
+    );
+    let research_indicators = capabilities
+        .iter()
+        .find(|entry| entry["id"] == "research.indicators")
+        .expect("missing research.indicators capability");
+    assert_eq!(research_indicators["level"], "unavailable");
+    assert!(
+        research_indicators["blockers"]
+            .as_array()
+            .is_some_and(|blockers| !blockers.is_empty()),
+        "research.indicators must explain its library-only boundary"
+    );
 }
 
 #[test]
@@ -111,6 +141,12 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
     );
     assert!(
         stdout.contains("binance\timplemented\timplemented\timplemented\timplemented\tunavailable"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "unsupported-venues\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable"
+        ),
         "{stdout}"
     );
     assert!(
@@ -1501,7 +1537,7 @@ fn config_check_recognizes_every_supported_schema() {
             "config/scanner/binance_scanner.yaml",
             "config/paper/account-risk.example.yaml",
             "config/symbol_conversion.yaml",
-            "config/exchanges/paradex_config.example.yaml",
+            "config/legacy/exchanges/paradex_config.example.yaml",
             "--json",
         ])
         .output()
@@ -1565,7 +1601,7 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
     assert!(output.status.success(), "{output:?}");
     let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let summaries = summaries.as_array().unwrap();
-    assert_eq!(summaries.len(), 62, "{summaries:#?}");
+    assert_eq!(summaries.len(), 63, "{summaries:#?}");
     for summary in summaries {
         assert!(summary["parseable"].is_boolean(), "{summary}");
         assert!(summary["executable"].is_boolean(), "{summary}");
@@ -1608,6 +1644,13 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
         "paper-companion",
     );
     assert_status(
+        entry("config/arbitrage/monitor-live-testnet.yaml"),
+        true,
+        false,
+        "partial",
+        "unavailable",
+    );
+    assert_status(
         entry("config/grid/lighter-long-perp-btc.yaml"),
         true,
         false,
@@ -1629,7 +1672,7 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
         "paper-companion",
     );
     assert_status(
-        entry("config/exchanges/paradex_config.example.yaml"),
+        entry("config/legacy/exchanges/paradex_config.example.yaml"),
         true,
         false,
         "parse-only",
@@ -1736,6 +1779,35 @@ grid_system:
 #[test]
 fn config_check_accepts_every_checked_in_exchange_yaml() {
     let exchange_dir = repo_root().join("config/exchanges");
+    let mut paths = std::fs::read_dir(&exchange_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "yaml")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert!(!paths.is_empty());
+
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("config-check")
+        .args(&paths)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout.matches("legacy-parseable: exchange-auth").count(),
+        paths.len()
+    );
+}
+
+#[test]
+fn config_check_accepts_legacy_exchange_auth_profiles_explicitly() {
+    let exchange_dir = repo_root().join("config/legacy/exchanges");
     let mut paths = std::fs::read_dir(&exchange_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

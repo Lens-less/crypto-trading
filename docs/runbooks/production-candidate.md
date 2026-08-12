@@ -273,9 +273,12 @@ Never edit the journal to force a match, and never archive credentials.
 ## Binance Testnet 24-hour soak gate
 
 This gate runs the CLI host directly on the Linux candidate host. It is
-read-only: the three rotating samples are Spot `bookTicker`, USD-M
-`bookTicker`, and authenticated reconciliation. The host never submits or
-cancels an order. Mainnet remains disabled.
+read-only: the three rotating samples are the Spot Testnet `bookTicker`
+WebSocket, the signed Spot Testnet user-data WebSocket API, and authenticated
+REST reconciliation. The public stream uses
+`wss://stream.testnet.binance.vision`; the private stream uses
+`wss://ws-api.testnet.binance.vision`. The host never submits or cancels an
+order. Mainnet remains disabled.
 
 Build the exact candidate binary, create a private evidence directory, and
 provide Binance Testnet credentials only through the process environment:
@@ -394,7 +397,8 @@ cat /srv/crypto-trading/soak/evidence.json
 
 The JSON must report `requirements_met: true`, at least 86,400 observed active
 seconds, a clean stop, one or more unclean restarts, the configured minimum
-success count, and nonzero counts for all three sample kinds. Archive the
+success count, and nonzero `market_stream`, `user_data_stream`, and
+`authenticated_reconcile` counts. Archive the
 journal, both process logs, the three status captures, `evidence.json`, and the
 candidate binary checksum. Do not archive credentials or process-environment
 dumps.

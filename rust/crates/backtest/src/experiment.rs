@@ -41,10 +41,10 @@ pub enum ExperimentError {
     NonSpotDataset,
     #[error("frozen registry must contain exactly {expected} configurations, found {actual}")]
     InvalidRegistryBudget { expected: usize, actual: usize },
-    #[error("frozen registry family counts do not match the pre-registered G-005 budget")]
+    #[error("frozen registry family counts do not match the pre-registered protocol budget")]
     InvalidFamilyBudget,
     #[error(
-        "frozen registry does not exactly match the pre-registered G-005 identifiers, parameters, and order"
+        "frozen registry does not exactly match the pre-registered protocol identifiers, parameters, and order"
     )]
     RegistryDoesNotMatchPreregistration,
     #[error("frozen registry identifiers must be unique")]
@@ -721,6 +721,21 @@ fn validate_registry(
 }
 
 fn registry_matches_preregistration(registered_configurations: &[RegisteredConfiguration]) -> bool {
+    registered_configurations
+        .iter()
+        .zip(expected_daily_preregistration())
+        .all(|(actual, (identifier, strategy))| {
+            actual.identifier() == identifier && actual.strategy() == strategy
+        })
+        || registered_configurations
+            .iter()
+            .zip(expected_hourly_preregistration())
+            .all(|(actual, (identifier, strategy))| {
+                actual.identifier() == identifier && actual.strategy() == strategy
+            })
+}
+
+fn expected_daily_preregistration() -> Vec<(String, SpotStrategyConfig)> {
     let mut expected = vec![
         ("cash".to_owned(), SpotStrategyConfig::Cash),
         ("buy-and-hold".to_owned(), SpotStrategyConfig::BuyAndHold),
@@ -756,13 +771,47 @@ fn registry_matches_preregistration(registered_configurations: &[RegisteredConfi
             }
         }
     }
+    expected
+}
 
-    registered_configurations
-        .iter()
-        .zip(expected)
-        .all(|(actual, (identifier, strategy))| {
-            actual.identifier() == identifier && actual.strategy() == strategy
-        })
+fn expected_hourly_preregistration() -> Vec<(String, SpotStrategyConfig)> {
+    let mut expected = vec![
+        ("cash".to_owned(), SpotStrategyConfig::Cash),
+        ("buy-and-hold".to_owned(), SpotStrategyConfig::BuyAndHold),
+    ];
+    for lookback_bars in [672, 1_344, 2_016, 2_688, 4_032] {
+        expected.push((
+            format!("tsm-lb{lookback_bars:03}-rb168"),
+            SpotStrategyConfig::SlowTimeSeriesMomentum {
+                lookback_bars,
+                rebalance_every_bars: 168,
+            },
+        ));
+    }
+    for lookback_bars in [480, 1_440, 2_880] {
+        expected.push((
+            format!("donchian-lb{lookback_bars:03}"),
+            SpotStrategyConfig::LongOnlyDonchian { lookback_bars },
+        ));
+    }
+    for lookback_returns in [480, 1_440] {
+        for (target_code, annual_target) in [("10", 10), ("15", 15), ("20", 20)] {
+            for (band_code, rebalance_band) in [("00", Decimal::ZERO), ("20", Decimal::new(20, 2))]
+            {
+                expected.push((
+                    format!("vol-lb{lookback_returns:03}-t{target_code}-b{band_code}-rb168"),
+                    SpotStrategyConfig::CappedVolatilityTargetExplicitAnnualization {
+                        lookback_returns,
+                        annual_target: Decimal::new(annual_target, 2),
+                        rebalance_band,
+                        rebalance_every_bars: 168,
+                        periods_per_year: Decimal::from(8_760_u32),
+                    },
+                ));
+            }
+        }
+    }
+    expected
 }
 
 fn summarize_configuration(
@@ -1258,6 +1307,20 @@ fn canonical_strategy_spec(strategy: SpotStrategyConfig) -> String {
             decimal_string(annual_target),
             decimal_string(rebalance_band),
             rebalance_every_bars,
+        ),
+        SpotStrategyConfig::CappedVolatilityTargetExplicitAnnualization {
+            lookback_returns,
+            annual_target,
+            rebalance_band,
+            rebalance_every_bars,
+            periods_per_year,
+        } => format!(
+            "capped_volatility_target:{}:{}:{}:{}:{}",
+            lookback_returns,
+            decimal_string(annual_target),
+            decimal_string(rebalance_band),
+            rebalance_every_bars,
+            decimal_string(periods_per_year),
         ),
     }
 }

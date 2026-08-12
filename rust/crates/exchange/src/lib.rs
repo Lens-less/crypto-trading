@@ -18,13 +18,17 @@ mod unsupported;
 
 pub use binance::{BinancePublicExchange, BinancePublicObservation};
 pub use binance_testnet::{
-    BinanceExchangeInfoSymbol, BinanceHmacSha256Signer, BinanceRequestSigner,
-    BinanceServerOrderRef, BinanceTestnetBalance, BinanceTestnetProtocol,
+    BinanceAccountUpdateEvent, BinanceExchangeInfoSymbol, BinanceExecutionReportEvent,
+    BinanceHmacSha256Signer, BinanceRequestSigner, BinanceServerOrderRef,
+    BinanceStreamTerminatedEvent, BinanceTestnetBalance, BinanceTestnetProtocol,
+    BinanceUnsupportedUserDataEvent, BinanceUserDataBalance, BinanceUserDataEvent,
+    BinanceWsApiUserDataStreamSubscription,
 };
 pub use binance_testnet_exchange::{BinanceTestnetAccountSnapshot, BinanceTestnetExchange};
 pub use bounded::BoundedExchangeHandle;
 pub use endpoint::{
-    BinanceProduct, BinanceTestnetEndpoints, HyperliquidPublicEndpoint, HyperliquidTestnetEndpoint,
+    BinanceProduct, BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint,
+    BinanceTestnetEndpoints, HyperliquidPublicEndpoint, HyperliquidTestnetEndpoint,
 };
 pub use error::{ExchangeError, ExchangeOperation, RemoteFailureMetadata, RemoteRetryAfter};
 pub use hyperliquid_public::{

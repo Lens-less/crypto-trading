@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     future::pending,
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    process::Command,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -2201,7 +2201,7 @@ fn volume_maker_serve_runs_a_finite_replay_and_status_degrades_to_projection() {
     let task_id = format!("volume-maker-serve-smoke-{}", std::process::id());
     let control_port = free_port();
 
-    let child = Command::new(binary())
+    let output = Command::new(binary())
         .current_dir(repo_root())
         .env("CRYPTO_TRADING_TASK_CONTROL_TOKEN", control_token())
         .arg("volume-maker")
@@ -2224,13 +2224,10 @@ fn volume_maker_serve_runs_a_finite_replay_and_status_degrades_to_projection() {
             "--shutdown-grace-ms",
             "30000",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
     // The finite replay drains on its own; the serve loop then observes the
     // terminal owner and exits without any control interaction.
-    let output = wait_with_output(child, StdDuration::from_secs(120));
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -2298,20 +2295,6 @@ async fn wait_until(predicate: impl Fn() -> bool) {
         tokio::time::sleep(StdDuration::from_millis(10)).await;
     }
     panic!("condition was not observed within the test deadline");
-}
-
-fn wait_with_output(mut child: Child, timeout: StdDuration) -> Output {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "child did not exit in time"
-        );
-        std::thread::sleep(StdDuration::from_millis(50));
-    }
 }
 
 fn free_port() -> u16 {

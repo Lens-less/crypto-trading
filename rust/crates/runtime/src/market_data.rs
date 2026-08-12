@@ -12,7 +12,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 /// Version of the stable read-only market-data view.
-pub const MARKET_DATA_VIEW_SCHEMA_VERSION: u16 = 1;
+pub const MARKET_DATA_VIEW_SCHEMA_VERSION: u16 = 2;
 /// Maximum number of exact instruments in one market-data universe.
 pub const MAX_MARKET_DATA_TARGETS: usize = 4_096;
 /// Maximum number of deterministic source events retained in memory.
@@ -336,6 +336,9 @@ pub struct MarketDataObservation {
     pub received_at: DateTime<Utc>,
     pub timestamp_provenance: MarketTimestampProvenance,
     pub source_sequence: Option<u64>,
+    /// Transport connection generation for connection-oriented sources.
+    /// Polling and deterministic replay sources leave this absent.
+    pub source_generation: Option<u64>,
 }
 
 impl MarketDataObservation {
@@ -413,14 +416,44 @@ impl MarketDataObservation {
     /// [`MarketDataError::InvalidTimestampProvenance`] when callers omit the
     /// accepted timestamp provenance.
     pub fn with_source_metadata(
-        mut snapshot: MarketSnapshot,
+        snapshot: MarketSnapshot,
         revision: u64,
         received_at: DateTime<Utc>,
         timestamp_provenance: MarketTimestampProvenance,
         source_sequence: Option<u64>,
     ) -> Result<Self, MarketDataError> {
+        Self::with_source_metadata_and_generation(
+            snapshot,
+            revision,
+            received_at,
+            timestamp_provenance,
+            source_sequence,
+            None,
+        )
+    }
+
+    /// Creates one ordered source observation with explicit timestamp,
+    /// sequence, and connection-generation metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::InvalidRevision`] for revision zero,
+    /// [`MarketDataError::InvalidSourceGeneration`] for generation zero, and
+    /// [`MarketDataError::InvalidTimestampProvenance`] when callers omit the
+    /// accepted timestamp provenance.
+    pub fn with_source_metadata_and_generation(
+        mut snapshot: MarketSnapshot,
+        revision: u64,
+        received_at: DateTime<Utc>,
+        timestamp_provenance: MarketTimestampProvenance,
+        source_sequence: Option<u64>,
+        source_generation: Option<u64>,
+    ) -> Result<Self, MarketDataError> {
         if revision == 0 {
             return Err(MarketDataError::InvalidRevision);
+        }
+        if source_generation == Some(0) {
+            return Err(MarketDataError::InvalidSourceGeneration);
         }
         if timestamp_provenance == MarketTimestampProvenance::Missing {
             return Err(MarketDataError::InvalidTimestampProvenance);
@@ -434,6 +467,7 @@ impl MarketDataObservation {
             received_at,
             timestamp_provenance,
             source_sequence,
+            source_generation,
         })
     }
 }
@@ -629,6 +663,8 @@ impl MarketDataBook {
                     instrument: entry.instrument.clone(),
                     snapshot: entry.last.as_ref().map(|last| last.snapshot.clone()),
                     revision: entry.last.as_ref().map(|last| last.revision),
+                    source_sequence: entry.last.as_ref().and_then(|last| last.source_sequence),
+                    source_generation: entry.last.as_ref().and_then(|last| last.source_generation),
                     received_at: entry.last.as_ref().map(|last| last.received_at),
                     timestamp_provenance: entry
                         .last
@@ -896,6 +932,8 @@ pub struct MarketInstrumentView {
     pub instrument: MarketInstrument,
     pub snapshot: Option<MarketSnapshot>,
     pub revision: Option<u64>,
+    pub source_sequence: Option<u64>,
+    pub source_generation: Option<u64>,
     pub received_at: Option<DateTime<Utc>>,
     pub timestamp_provenance: MarketTimestampProvenance,
     pub source_latency_millis: Option<i64>,
@@ -1142,6 +1180,8 @@ pub enum MarketDataError {
     InvalidFreshnessPolicy(&'static str),
     #[error("market-data revision must be greater than zero")]
     InvalidRevision,
+    #[error("market-data source generation must be greater than zero when present")]
+    InvalidSourceGeneration,
     #[error("market-data source gap must skip at least one observation")]
     InvalidGapCount,
     #[error("market-data timestamp provenance must be explicit for accepted observations")]

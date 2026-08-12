@@ -8,26 +8,26 @@
 
 ## 能力矩阵
 
-| 命令 | 配置检查 | Paper 单次执行 | 连续运行 | Live 执行 | 当前行为 |
-| --- | --- | --- | --- | --- | --- |
-| `capabilities [--json]` | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
-| `config-check` | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；public path loaders、public `from_str` loaders 和 shared raw reader 共享 1 MiB / YAML 读入护栏；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
-| `testnet-smoke` | 不适用 | 否 | 否 | 否 | 显式选择后执行 Binance Testnet Spot/USD-M 只读行情和鉴权对账探针；不会提交或撤销订单 |
-| `testnet-lifecycle` | 不适用 | 否 | 否 | 否 | 精确确认短语授权的 Binance Testnet submit-query-cancel owner；UUID 与 intent 先写 journal，恢复时 query-first，mainnet 始终关闭 |
-| `testnet-reconcile` | 不适用 | 否 | 否 | 否 | 默认只报告的 clean-account gate；将签名 Testnet 余额/挂单/持仓与 exact committed Paper reservation 比对，精确确认后才写 release/failure transition |
-| `testnet-soak` | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
-| `grid` | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
-| `arbitrage` | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
-| `paper grid/arbitrage` | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`）；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
-| `paper risk` | `--enable-paper-writes` 时必须提供 `--paper-account-risk-config` 共享限额 | 不适用 | 是（Paper） | 否 | `pause`/`resume`/`kill-switch` 经同一 loopback trusted-submit 服务写入持久事实；kill switch 需要专属 `account_kill_switch_armed` 风险确认与 CLI 精确确认短语，且闩锁不可解除 |
-| `monitor` | 是 | 否 | 是（只读 replay / `--live` 轮询） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 相同地失败关闭）；`--live` 可显式选用真实免凭证公开轮询双源（仅限 binance+hyperliquid 精确对：Binance 现货 bookTicker + Hyperliquid 永续 asset contexts，后者附每小时资金费率只读侧通道，轮询非实时）；自动恢复仍未开放 |
-| `volume-maker` | 是 | 否 | 是（Paper replay） | 否 | 默认 `--mode validate` 校验（含 emergency stop 闸）后成功返回；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、被后续盘口穿越后才执行单腿开仓，市价模式按盘口薄侧吃单，平仓一律 reduce-only 市价；每笔操作独立 reservation 并先过账户级风控准入，小时统计与生命周期事实写入 journal（`task_kind volume_maker`），`max_cycles`/`target_volume` 达界以 `completed` 干净收束，状态可降级到 journal 投影 |
-| `price-alert` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert owner，状态可降级到 journal 投影 |
-| `scanner` | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验 fail-closed scanner schema 后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 owner，评级排名与生命周期事实写入 journal，状态可降级到 journal 投影 |
+| 命令 | 演进状态 | 配置检查 | Paper 单次执行 | 连续运行 | Live 执行 | 当前行为 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `capabilities [--json]` | 活跃 | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
+| `config-check` | 活跃 | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；public path loaders、public `from_str` loaders 和 shared raw reader 共享 1 MiB / YAML 读入护栏；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
+| `testnet-smoke` | 活跃 | 不适用 | 否 | 否 | 否 | 显式选择后执行 Binance Testnet Spot/USD-M 只读行情和鉴权对账探针；不会提交或撤销订单 |
+| `testnet-lifecycle` | 活跃 | 不适用 | 否 | 否 | 否 | 精确确认短语授权的 Binance Testnet submit-query-cancel owner；UUID 与 intent 先写 journal，恢复时 query-first，mainnet 始终关闭 |
+| `testnet-reconcile` | 活跃 | 不适用 | 否 | 否 | 否 | 默认只报告的 clean-account gate；将签名 Testnet 余额/挂单/持仓与 exact committed Paper reservation 比对，精确确认后才写 release/failure transition |
+| `testnet-soak` | 活跃 | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
+| `grid` | 活跃 | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
+| `arbitrage` | 活跃 | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
+| `paper grid/arbitrage` | 活跃 | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`）；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
+| `paper risk` | 活跃 | `--enable-paper-writes` 时必须提供 `--paper-account-risk-config` 共享限额 | 不适用 | 是（Paper） | 否 | `pause`/`resume`/`kill-switch` 经同一 loopback trusted-submit 服务写入持久事实；kill switch 需要专属 `account_kill_switch_armed` 风险确认与 CLI 精确确认短语，且闩锁不可解除 |
+| `monitor` | 活跃 | 是 | 否 | 是（只读 replay / `--live`） | 否 | `serve/status/stop` 运行精确双源 replay monitor owner；serve 同时把每次价差观测追加到独立 spread-history journal（默认 `var/history/spread-history.jsonl`，复用密封段轮转，写失败与主 journal 相同地失败关闭）；`--live` 默认使用 Binance Spot Testnet `bookTicker` WebSocket + Hyperliquid 永续轮询，只有显式 `--live-transport polling` 才把 Binance 降级为 REST 轮询；两条路径都不授予交易权限 |
+| `volume-maker` | 维护冻结 | 是 | 否 | 是（Paper replay） | 否 | 默认 `--mode validate` 校验（含 emergency stop 闸）后成功返回；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay 刷量 Paper owner：限价模式持有虚拟报价、被后续盘口穿越后才执行单腿开仓，市价模式按盘口薄侧吃单，平仓一律 reduce-only 市价；每笔操作独立 reservation 并先过账户级风控准入，小时统计与生命周期事实写入 journal（`task_kind volume_maker`），`max_cycles`/`target_volume` 达界以 `completed` 干净收束，状态可降级到 journal 投影 |
+| `price-alert` | 维护冻结 | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert owner，状态可降级到 journal 投影 |
+| `scanner` | 维护冻结 | 是 | 否 | 是（只读 replay） | 否 | 默认 `--mode validate` 校验 fail-closed scanner schema 后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 owner，评级排名与生命周期事实写入 journal，状态可降级到 journal 投影 |
 
 `grid` 和 `arbitrage` 的 one-shot 以及连续 Paper owner 都会先持久化计划/预留事实，再跨订单提交边界。套利批次只有全部腿均成交才写入 `execution_completed`；提交报错后的部分执行写入带自动对账摘要的 `execution_partial`，确定但未全部成交则写入 receipt 摘要明确的 `execution_incomplete`。不确定结果不得直接重试，必须先按 journal 投影和权威对账处理。
 
-`research.indicators` 与 `research.backtest` 只标识 workspace 中存在的内部研究库；两者在 capability manifest 中均为 `Unavailable`。当前没有已出货二进制链接这些 crate，也没有受支持的 CLI 或 HTTP 入口。它们的单元/契约测试只证明库内算法约束，不代表 paper/live 等价、可执行生产策略或盈利能力。
+`research.backtest` 已通过正式 `crypto-trading-research` 二进制成为可用的离线能力，冻结候选注册表与 Paper bar owner 消费同一组纯 bar 策略实现。它仍不代表盈利能力：既有日线实验没有通过项，首个小时线协议又因官方历史并非连续 UTC 小时序列而在数据准入阶段终止，未运行 selection 或 holdout。`research.indicators` 仍是 `Unavailable` 的内部库能力。
 
 ## 快速验证
 
@@ -117,7 +117,7 @@ cargo run -- arbitrage `
 $env:PARADEX_API_KEY = "..."
 $env:PARADEX_L2_ADDRESS = "..."
 $env:PARADEX_WALLET_ADDRESS = "..."
-cargo run -- config-check config/exchanges/paradex_config.yaml
+cargo run -- config-check config/legacy/exchanges/paradex_config.yaml
 ```
 
 不要把密钥写入仓库。各 exchange YAML 仅用于字段映射；私有 live 适配器仍未开放。
@@ -156,7 +156,7 @@ cargo run --locked -- testnet-reconcile --help
 
 ## Binance Testnet 24 小时演练
 
-`testnet-soak` 只执行 Spot `bookTicker`、USD-M `bookTicker` 和鉴权对账，不具有下单或撤单权限。凭证必须仅通过 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 进程环境变量提供。生产候选要求使用同一 `task_id`、history 和 control port 完成一次真实强制终止后重启，并在累计有探针活动时长达到 24 小时后干净停止：
+`testnet-soak` 只执行 Spot Testnet `bookTicker` WebSocket、签名 User Data WebSocket API 和 REST 鉴权对账，不具有下单或撤单权限。凭证必须仅通过 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 进程环境变量提供。生产候选要求使用同一 `task_id`、history 和 control port 完成一次真实强制终止后重启，并在累计有探针活动时长达到 24 小时后干净停止：
 
 ```powershell
 cargo run --locked -- testnet-soak --mode serve --help

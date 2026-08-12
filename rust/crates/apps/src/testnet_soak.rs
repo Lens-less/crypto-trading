@@ -53,6 +53,10 @@ pub trait TestnetSoakProbe: Send + 'static {
 pub enum TestnetSoakSample {
     SpotBookTicker,
     UsdMBookTicker,
+    /// Fresh observation received through the reconnecting public stream.
+    MarketStream,
+    /// Fresh account/order observation received through the private stream.
+    UserDataStream,
     AuthenticatedReconcile,
 }
 
@@ -560,7 +564,11 @@ fn publish_runtime_failure(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestnetSoakSampleCoverageRequirement {
     NotRequired,
+    /// Legacy REST probe coverage retained for historical evidence readers.
     AllKinds,
+    /// The realtime release gate: public stream, private stream, and an
+    /// authoritative REST reconciliation must all be observed.
+    StreamingPath,
 }
 
 /// Bounded evidence policy used by the offline verifier.
@@ -590,7 +598,7 @@ impl TestnetSoakEvidenceRequirements {
             minimum_successful_probes,
             true,
             true,
-            TestnetSoakSampleCoverageRequirement::AllKinds,
+            TestnetSoakSampleCoverageRequirement::StreamingPath,
         )
     }
 
@@ -631,6 +639,8 @@ pub enum TestnetSoakEvidenceViolation {
     UncleanRestartMissing,
     SpotBookTickerMissing,
     UsdMBookTickerMissing,
+    MarketStreamMissing,
+    UserDataStreamMissing,
     AuthenticatedReconcileMissing,
 }
 
@@ -639,6 +649,8 @@ pub enum TestnetSoakEvidenceViolation {
 pub struct TestnetSoakSampleCounts {
     pub spot_book_ticker: u64,
     pub usd_m_book_ticker: u64,
+    pub market_stream: u64,
+    pub user_data_stream: u64,
     pub authenticated_reconcile: u64,
 }
 
@@ -687,6 +699,8 @@ impl TestnetSoakEvidenceSummary {
             "sample_counts": {
                 "spot_book_ticker": self.sample_counts.spot_book_ticker,
                 "usd_m_book_ticker": self.sample_counts.usd_m_book_ticker,
+                "market_stream": self.sample_counts.market_stream,
+                "user_data_stream": self.sample_counts.user_data_stream,
                 "authenticated_reconcile": self.sample_counts.authenticated_reconcile,
             },
             "failed_probe_count": self.failed_probe_count,
@@ -740,6 +754,20 @@ pub fn verify_testnet_soak_evidence(
         }
         if projection.sample_counts.usd_m_book_ticker == 0 {
             violations.push(TestnetSoakEvidenceViolation::UsdMBookTickerMissing);
+        }
+        if projection.sample_counts.authenticated_reconcile == 0 {
+            violations.push(TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing);
+        }
+    }
+    if matches!(
+        requirements.sample_coverage,
+        TestnetSoakSampleCoverageRequirement::StreamingPath
+    ) {
+        if projection.sample_counts.market_stream == 0 {
+            violations.push(TestnetSoakEvidenceViolation::MarketStreamMissing);
+        }
+        if projection.sample_counts.user_data_stream == 0 {
+            violations.push(TestnetSoakEvidenceViolation::UserDataStreamMissing);
         }
         if projection.sample_counts.authenticated_reconcile == 0 {
             violations.push(TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing);
@@ -948,6 +976,8 @@ fn project_probe_success(
     let sample_count = match sample {
         TestnetSoakSample::SpotBookTicker => &mut projection.sample_counts.spot_book_ticker,
         TestnetSoakSample::UsdMBookTicker => &mut projection.sample_counts.usd_m_book_ticker,
+        TestnetSoakSample::MarketStream => &mut projection.sample_counts.market_stream,
+        TestnetSoakSample::UserDataStream => &mut projection.sample_counts.user_data_stream,
         TestnetSoakSample::AuthenticatedReconcile => {
             &mut projection.sample_counts.authenticated_reconcile
         }
@@ -1197,6 +1227,8 @@ const fn sample_label(sample: TestnetSoakSample) -> &'static str {
     match sample {
         TestnetSoakSample::SpotBookTicker => "spot_book_ticker",
         TestnetSoakSample::UsdMBookTicker => "usd_m_book_ticker",
+        TestnetSoakSample::MarketStream => "market_stream",
+        TestnetSoakSample::UserDataStream => "user_data_stream",
         TestnetSoakSample::AuthenticatedReconcile => "authenticated_reconcile",
     }
 }
@@ -1205,6 +1237,8 @@ fn parse_sample(value: &str) -> Option<TestnetSoakSample> {
     match value {
         "spot_book_ticker" => Some(TestnetSoakSample::SpotBookTicker),
         "usd_m_book_ticker" => Some(TestnetSoakSample::UsdMBookTicker),
+        "market_stream" => Some(TestnetSoakSample::MarketStream),
+        "user_data_stream" => Some(TestnetSoakSample::UserDataStream),
         "authenticated_reconcile" => Some(TestnetSoakSample::AuthenticatedReconcile),
         _ => None,
     }
@@ -1214,6 +1248,7 @@ const fn sample_coverage_label(requirement: TestnetSoakSampleCoverageRequirement
     match requirement {
         TestnetSoakSampleCoverageRequirement::NotRequired => "not_required",
         TestnetSoakSampleCoverageRequirement::AllKinds => "all_kinds",
+        TestnetSoakSampleCoverageRequirement::StreamingPath => "streaming_path",
     }
 }
 
@@ -1260,6 +1295,8 @@ const fn evidence_violation_label(violation: TestnetSoakEvidenceViolation) -> &'
         TestnetSoakEvidenceViolation::UncleanRestartMissing => "unclean_restart_missing",
         TestnetSoakEvidenceViolation::SpotBookTickerMissing => "spot_book_ticker_missing",
         TestnetSoakEvidenceViolation::UsdMBookTickerMissing => "usd_m_book_ticker_missing",
+        TestnetSoakEvidenceViolation::MarketStreamMissing => "market_stream_missing",
+        TestnetSoakEvidenceViolation::UserDataStreamMissing => "user_data_stream_missing",
         TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing => {
             "authenticated_reconcile_missing"
         }

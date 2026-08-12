@@ -8,6 +8,8 @@ mod account_risk;
 mod alert;
 mod arbitrage;
 mod arbitrage_history;
+mod bar;
+mod bar_research;
 mod grid;
 mod grid_protection;
 mod risk;
@@ -36,6 +38,11 @@ pub use arbitrage_history::{
     FUNDING_INTERVALS_PER_YEAR, HistoryArbitrageConfig, HistoryDecision, HistoryDecisionKind,
     HistoryDecisionMachine, MAX_HISTORY_WINDOW_SECONDS, MAX_SPREAD_SAMPLES,
     NaturalSpreadCalculator, SpreadSample,
+};
+pub use bar::{Bar, BarStrategy, BarStrategyContext, TargetExposure};
+pub use bar_research::{
+    BuyAndHoldStrategy, CappedVolatilityTarget, CashStrategy, LongOnlyDonchian,
+    SlowTimeSeriesMomentum,
 };
 pub use grid::{
     GridDirection, GridLevel, GridPlanConfig, GridPlanner, GridRange, GridState, GridStrategy,

@@ -642,7 +642,7 @@ async fn run_owner(
                 }
             }
             _ = risk_poll.tick(), if config.account_risk.is_some() => Selected::RiskPoll(Utc::now()),
-            result = source.next_event() => Selected::Source(result),
+            result = source.next_event() => Selected::Source(result.map(|event| event.map(Box::new))),
         };
         match selected {
             Selected::Cancel | Selected::Stop => {
@@ -656,6 +656,7 @@ async fn run_owner(
                 .await;
             }
             Selected::Source(Ok(Some(event))) => {
+                let event = *event;
                 if *cancel.borrow() || *stop.borrow() {
                     return stop_owner(
                         &mut source,
@@ -2201,7 +2202,7 @@ enum Selected {
     Stop,
     Cancel,
     RiskPoll(DateTime<Utc>),
-    Source(Result<Option<MarketDataEvent>, MarketSupervisorError>),
+    Source(Result<Option<Box<MarketDataEvent>>, MarketSupervisorError>),
 }
 
 enum OperationOutcome {

@@ -1,5 +1,8 @@
 # Live Trading V1 Handoff Contract
 
+This directory is dormant while D2=`no`. Do not create an issue handoff or
+claim work until the board is explicitly reopened by an operator decision.
+
 Each one-shot Goal worker creates or updates exactly one file:
 
 ```text
@@ -10,10 +13,13 @@ The handoff is a compact recovery record, not a transcript or duplicate of the
 Spec/runbook. A continuation worker starts from the board, this handoff, source
 documents, and current repository evidence.
 
+No issue-specific handoff file exists until the corresponding issue is actively
+claimed.
+
 Use this template:
 
 ```md
-# L-XXX — <Title> Handoff
+# L-XXX - <Title> Handoff
 
 ## Status
 
@@ -32,7 +38,7 @@ Use this template:
 
 ## Files Inspected or Changed
 
-- <path — inspected/changed and why>
+- <path - inspected/changed and why>
 
 ## Decisions
 

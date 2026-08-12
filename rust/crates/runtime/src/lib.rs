@@ -3,6 +3,7 @@
 mod account_risk;
 mod alert_read_model;
 mod authority_state;
+mod binance_user_data;
 mod capability;
 mod control_plane_projection;
 mod execution;
@@ -11,6 +12,7 @@ mod journal;
 mod journal_reader;
 mod market_data;
 mod market_polling;
+mod market_stream;
 mod market_supervisor;
 mod mode;
 mod monitor_read_model;
@@ -31,6 +33,11 @@ pub use alert_read_model::{
     AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
     AlertOccurrenceView, MAX_ALERT_READ_MODEL_OCCURRENCES, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
     PriceAlertReadModel,
+};
+pub use binance_user_data::{
+    BinanceUserDataApply, BinanceUserDataBalanceState, BinanceUserDataOrderState,
+    BinanceUserDataReconcileReason, BinanceUserDataState, BinanceUserDataStreamItem,
+    BinanceUserDataStreamSource, StreamEnvelope,
 };
 pub use capability::{
     AdapterFacet, AdapterFacetSupport, AdapterSupport, AdapterSupportLevel,
@@ -73,6 +80,12 @@ pub use market_data::{
 pub use market_polling::{
     BinancePollingRoute, BinancePublicPollingSource, FundingRateFeed, FundingRateObservation,
     HyperliquidPollingRoute, HyperliquidPublicPollingSource, MarketPollingPolicy,
+};
+pub use market_stream::{
+    BinanceBookTickerStreamSource, FixedMarketStreamJitter, MarketStreamJitter,
+    MarketStreamReconnectPolicy, MarketStreamSleeper, ProductionMarketStreamJitter,
+    TextWebSocketConnector, TextWebSocketEvent, TextWebSocketSession, TokioMarketStreamSleeper,
+    TokioTextWebSocketConnector, WebSocketCloseKind,
 };
 pub use market_supervisor::{
     MARKET_SUPERVISOR_STATUS_SCHEMA_VERSION, MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS,

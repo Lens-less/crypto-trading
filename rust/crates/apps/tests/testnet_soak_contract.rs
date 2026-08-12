@@ -403,7 +403,7 @@ async fn twenty_four_hour_evidence_passes_and_stricter_policy_reports_violations
 }
 
 #[tokio::test]
-async fn public_only_samples_do_not_satisfy_the_production_policy() {
+async fn legacy_rest_samples_do_not_satisfy_the_streaming_policy() {
     let path = history_path("soak-public-only");
     let history = JsonlHistory::new(&path);
     let task_id = "binance-testnet-public-only";
@@ -415,7 +415,7 @@ async fn public_only_samples_do_not_satisfy_the_production_policy() {
                 started_at + ChronoDuration::hours(6),
                 task_id,
                 "testnet_soak_probe_succeeded",
-                json!({"sample": "spot_book_ticker"}),
+                json!({"sample": "authenticated_reconcile"}),
             ),
             fact(
                 started_at + ChronoDuration::hours(12),
@@ -459,12 +459,15 @@ async fn public_only_samples_do_not_satisfy_the_production_policy() {
     .unwrap();
     assert!(!summary.requirements_met);
     assert_eq!(summary.observed_duration_seconds, 25 * 60 * 60);
-    assert_eq!(summary.sample_counts.spot_book_ticker, 2);
+    assert_eq!(summary.sample_counts.spot_book_ticker, 1);
     assert_eq!(summary.sample_counts.usd_m_book_ticker, 1);
-    assert_eq!(summary.sample_counts.authenticated_reconcile, 0);
+    assert_eq!(summary.sample_counts.authenticated_reconcile, 1);
     assert_eq!(
         summary.violations,
-        vec![TestnetSoakEvidenceViolation::AuthenticatedReconcileMissing]
+        vec![
+            TestnetSoakEvidenceViolation::MarketStreamMissing,
+            TestnetSoakEvidenceViolation::UserDataStreamMissing,
+        ]
     );
 }
 

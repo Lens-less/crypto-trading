@@ -1,5 +1,6 @@
 use crypto_trading_exchange::{
-    BinanceProduct, BinanceTestnetEndpoints, ExchangeError, HyperliquidTestnetEndpoint,
+    BinanceProduct, BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint,
+    BinanceTestnetEndpoints, ExchangeError, HyperliquidTestnetEndpoint,
 };
 
 #[test]
@@ -123,4 +124,35 @@ fn endpoint_joining_cannot_escape_the_selected_origin() {
             "{invalid_path} must not escape or weaken the endpoint profile"
         );
     }
+}
+
+#[test]
+fn websocket_testnet_profiles_use_exact_official_hosts_and_paths() {
+    let market = BinanceSpotMarketStreamEndpoint::official();
+    assert_eq!(
+        market.stream_url("btcusdt@bookTicker").unwrap().as_str(),
+        "wss://stream.testnet.binance.vision/ws/btcusdt@bookTicker"
+    );
+
+    let user_data = BinanceSpotUserDataStreamEndpoint::official();
+    assert_eq!(
+        user_data.websocket_url().unwrap().as_str(),
+        "wss://ws-api.testnet.binance.vision/ws-api/v3"
+    );
+}
+
+#[test]
+fn websocket_testnet_profiles_reject_non_whitelisted_hosts_and_unsafe_paths() {
+    assert!(matches!(
+        BinanceSpotMarketStreamEndpoint::try_official("wss://stream.binance.com"),
+        Err(ExchangeError::InvalidRequest { .. })
+    ));
+    assert!(matches!(
+        BinanceSpotUserDataStreamEndpoint::try_official("wss://stream.testnet.binance.vision"),
+        Err(ExchangeError::InvalidRequest { .. })
+    ));
+
+    let market = BinanceSpotMarketStreamEndpoint::official();
+    assert!(market.stream_url("../btcusdt@bookTicker").is_err());
+    assert!(market.stream_url("btcusdt@bookTicker?foo=bar").is_err());
 }

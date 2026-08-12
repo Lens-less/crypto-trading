@@ -120,20 +120,25 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
 }
 
 #[test]
-fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
+fn continuous_capabilities_separate_monitor_market_reads_from_paper_owner_authority() {
     let manifest = current_capability_manifest();
 
     let monitor_runtime = manifest.capability("runtime.monitor").unwrap();
     assert_eq!(monitor_runtime.level, CapabilityLevel::ReadOnly);
     assert_eq!(
         monitor_runtime.scope.environments,
-        vec![CapabilityEnvironment::Offline]
+        vec![
+            CapabilityEnvironment::Offline,
+            CapabilityEnvironment::Testnet,
+            CapabilityEnvironment::Mainnet
+        ]
     );
+    assert_eq!(monitor_runtime.scope.access, CapabilityAccess::MarketData);
     assert!(
         monitor_runtime
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("without automatically resuming external sources"))
+            .any(|blocker| blocker.contains("--live-transport polling"))
     );
     assert!(
         monitor_runtime
@@ -192,7 +197,7 @@ fn continuous_capabilities_separate_monitor_reads_from_paper_owner_authority() {
 }
 
 #[test]
-fn market_data_reflects_two_polling_venues_without_realtime_claims() {
+fn market_data_reflects_one_streaming_and_one_polling_venue() {
     let manifest = current_capability_manifest();
 
     let market_data = manifest.capability("runtime.market-data").unwrap();
@@ -203,6 +208,7 @@ fn market_data_reflects_two_polling_venues_without_realtime_claims() {
         vec![
             CapabilityEnvironment::Offline,
             CapabilityEnvironment::Paper,
+            CapabilityEnvironment::Testnet,
             CapabilityEnvironment::Mainnet
         ]
     );
@@ -223,11 +229,15 @@ fn market_data_reflects_two_polling_venues_without_realtime_claims() {
         "time provenance and pair-skew safety must stay visible in the capability contract"
     );
     assert!(
+        market_data.summary.contains("Testnet bookTicker WebSocket"),
+        "the Binance realtime transport must be visible in the capability contract"
+    );
+    assert!(
         market_data
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("credential-free HTTP polling rather than realtime")),
-        "the polling (non-realtime) limitation must stay an explicit blocker"
+            .any(|blocker| blocker.contains("Hyperliquid remains credential-free HTTP polling")),
+        "the remaining polling limitation must stay an explicit blocker"
     );
     assert!(
         market_data
@@ -321,8 +331,10 @@ fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
     );
     assert_eq!(soak.scope.access, CapabilityAccess::TestnetReadOnly);
     assert!(
-        soak.summary
-            .contains("without submitting or cancelling orders")
+        soak.summary.contains("signed user-data WebSocket API")
+            && soak
+                .summary
+                .contains("without submitting or cancelling orders")
     );
     assert!(
         soak.blockers
@@ -420,23 +432,27 @@ fn paper_owner_evidence_does_not_overstate_full_account_or_external_authority() 
 }
 
 #[test]
-fn research_kernels_are_visible_but_fail_closed_as_library_only() {
+fn research_backtest_is_a_formal_but_non_profitable_offline_capability() {
     let manifest = current_capability_manifest();
     let backtest = manifest.capability("research.backtest").unwrap();
     assert_eq!(backtest.area, CapabilityArea::Research);
-    assert_eq!(backtest.level, CapabilityLevel::Unavailable);
+    assert_eq!(backtest.level, CapabilityLevel::Available);
     assert_eq!(
         backtest.scope.environments,
         vec![CapabilityEnvironment::Offline]
     );
     assert_eq!(backtest.scope.access, CapabilityAccess::Local);
-    assert!(backtest.summary.contains("library-only"));
+    assert!(
+        backtest
+            .summary
+            .contains("Formal frozen-protocol research CLI")
+    );
     assert!(
         backtest
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("no shipped binary")
-                && blocker.contains("no supported CLI or HTTP entry point"))
+            .any(|blocker| blocker.contains("data-admission-aborted")
+                && blocker.contains("no selection or holdout evaluation"))
     );
     assert!(
         backtest
@@ -557,6 +573,13 @@ fn journal_rotation_is_reflected_without_advertising_compaction() {
                 .iter()
                 .any(|blocker| blocker.contains("no compaction by design")),
             "{id} must keep the no-compaction design decision explicit"
+        );
+        assert!(
+            capability
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("maintenance-frozen")),
+            "{id} must remain explicitly maintenance-frozen"
         );
         assert!(capability.evidence.contains(&rotation_evidence));
     }
@@ -685,6 +708,13 @@ fn volume_maker_paper_owner_is_available_without_external_or_resting_authority()
         "the virtual-quote simulation boundary must stay explicit"
     );
     assert!(
+        runtime
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("maintenance-frozen")),
+        "the maintenance-frozen status must stay explicit"
+    );
+    assert!(
         !runtime
             .blockers
             .iter()
@@ -726,18 +756,7 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         .collect::<Vec<_>>();
     assert_eq!(
         ids,
-        [
-            "backpack",
-            "binance",
-            "edgex",
-            "grvt",
-            "hyperliquid",
-            "lighter",
-            "okx",
-            "paper",
-            "paradex",
-            "variational",
-        ]
+        ["binance", "hyperliquid", "paper", "unsupported-venues"]
     );
 
     let binance = manifest.adapter("binance").unwrap();
@@ -767,13 +786,34 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         CapabilityLevel::Available
     );
 
-    let backpack = manifest.adapter("backpack").unwrap();
-    assert_eq!(backpack.public_data.level, AdapterSupportLevel::ConfigOnly);
+    let unsupported = manifest.adapter("unsupported-venues").unwrap();
     assert_eq!(
-        backpack.authenticated.level,
-        AdapterSupportLevel::ConfigOnly
+        unsupported.public_data.level,
+        AdapterSupportLevel::Unavailable
     );
-    assert_eq!(backpack.reconcile.level, AdapterSupportLevel::Unavailable);
+    assert_eq!(
+        unsupported.testnet_protocol.level,
+        AdapterSupportLevel::Unavailable
+    );
+    assert_eq!(
+        unsupported.authenticated.level,
+        AdapterSupportLevel::Unavailable
+    );
+    assert_eq!(
+        unsupported.reconcile.level,
+        AdapterSupportLevel::Unavailable
+    );
+    assert_eq!(unsupported.live.level, AdapterSupportLevel::Unavailable);
+    assert!(
+        unsupported
+            .public_data
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Backpack")
+                && blocker.contains("EdgeX")
+                && blocker.contains("OKX")),
+        "the aggregated unsupported venues row must enumerate the folded venues"
+    );
 
     let paper = manifest.adapter("paper").unwrap();
     assert_eq!(paper.public_data.level, AdapterSupportLevel::NotApplicable);

@@ -459,8 +459,8 @@ async fn run_owner(
                     continue;
                 }
             }
-            result = left.next_event() => Selected::Source(result),
-            result = right.next_event() => Selected::Source(result),
+            result = left.next_event() => Selected::Source(result.map(|event| event.map(Box::new))),
+            result = right.next_event() => Selected::Source(result.map(|event| event.map(Box::new))),
         };
         match selected {
             Selected::Stop => {
@@ -475,6 +475,7 @@ async fn run_owner(
                 .await;
             }
             Selected::Source(Ok(Some(event))) => {
+                let event = *event;
                 let Ok(monitor_event) = monitor.process(event) else {
                     return fail_owner(
                         &mut left,
@@ -573,7 +574,7 @@ async fn run_owner(
 
 enum Selected {
     Stop,
-    Source(Result<Option<MarketDataEvent>, MarketSupervisorError>),
+    Source(Result<Option<Box<MarketDataEvent>>, MarketSupervisorError>),
 }
 
 async fn stop_owner(

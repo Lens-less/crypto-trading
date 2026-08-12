@@ -1,8 +1,10 @@
-//! Serve-mode contract for the explicit `--live` binance+hyperliquid pair.
+//! Serve-mode contract for the explicit polling fallback of the `--live`
+//! binance+hyperliquid pair.
 //!
 //! Both venues are stubbed on loopback with fixed fixture responses, so the
-//! test proves the real polling-source wiring (base-URL overrides included)
-//! without any external network dependency.
+//! test proves the deliberately selected polling-source wiring (base-URL
+//! overrides included) without any external network dependency. The separate
+//! transport contract locks WebSocket as the product default.
 
 use std::{
     io::{Read, Write},
@@ -216,6 +218,8 @@ fn spawn_live_serve(spec: &LiveServeSpec<'_>) -> ChildGuard {
                 "--config",
                 spec.config.to_str().unwrap(),
                 "--live",
+                "--live-transport",
+                "polling",
                 "--binance-base-url",
                 spec.binance_url,
                 "--hyperliquid-base-url",

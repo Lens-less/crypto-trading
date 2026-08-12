@@ -63,9 +63,9 @@ volume_maker:
   execution_symbol: "BTC"          # Lighter执行端符号（用于订单簿订阅，自动解析成正确格式）
   
   # ⚠️ 注意：配置文件中同时需要配置：
-  #    - config/exchanges/backpack_config.yaml （信号源）
+  #    - config/legacy/exchanges/backpack_config.yaml （仅作兼容信号源样例）
   #    - config/exchanges/hyperliquid_config.yaml （信号源）
-  #    - config/exchanges/lighter_config.yaml  （执行端）
+  #    - config/legacy/exchanges/lighter_config.yaml  （仅作兼容执行端样例）
   
   # ============================================================================
   # 订单参数

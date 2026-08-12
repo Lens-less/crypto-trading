@@ -18,30 +18,28 @@ Status meanings:
 - `unavailable`: the current Rust system has no supported path for that facet.
 - `not-applicable`: the facet does not apply to the process-local paper model.
 
+W3 note: the operator-facing matrix now folds config-only and legacy-only venue
+rows into one `Unsupported venues` record to keep the supported surface small.
+
 <!-- adapter-matrix:start -->
 | Adapter | Public data | Testnet protocol | Authenticated | Reconcile | Live |
 | --- | --- | --- | --- | --- | --- |
-| Backpack | config-only | unavailable | config-only | unavailable | unavailable |
 | Binance | implemented | implemented | implemented | implemented | unavailable |
-| EdgeX | config-only | unavailable | config-only | unavailable | unavailable |
-| GRVT | config-only | unavailable | config-only | unavailable | unavailable |
 | Hyperliquid | implemented | protocol-only | protocol-only | request-only | unavailable |
-| Lighter | config-only | unavailable | config-only | unavailable | unavailable |
-| OKX | unavailable | unavailable | unavailable | unavailable | unavailable |
 | PaperExchange | not-applicable | not-applicable | not-applicable | implemented | not-applicable |
-| Paradex | config-only | unavailable | config-only | unavailable | unavailable |
-| Variational | unavailable | unavailable | unavailable | unavailable | unavailable |
+| Unsupported venues | unavailable | unavailable | unavailable | unavailable | unavailable |
 <!-- adapter-matrix:end -->
 
-`implemented` is not synonymous with production-ready. Binance public data is
-read-only credential-free REST polling; optional update IDs are retained as
-source sequences, while the documented response has no venue event timestamp
-and is therefore marked with explicit local-receipt-time provenance.
-Hyperliquid public data is read-only credential-free polling of the perpetual
-asset contexts (impact prices plus an hourly funding-rate side channel), also
-without a venue event timestamp. The runtime rejects cross-venue pairs beyond
-an explicit skew bound, but neither adapter is a realtime stream or grants
-order/account authority. Binance's Testnet lifecycle owner has deterministic
+`implemented` is not synonymous with production-ready. Binance public data has
+a read-only Spot Testnet `bookTicker` WebSocket source with bounded buffering,
+ping/pong liveness, reconnect backoff, and update-ID regression checks. The
+explicit polling fallback retains optional update IDs as source sequences and
+marks REST snapshots with local-receipt-time provenance. Hyperliquid public
+data remains credential-free polling of perpetual asset contexts (impact
+prices plus an hourly funding-rate side channel), without a venue event
+timestamp. The runtime rejects cross-venue pairs beyond an explicit skew bound;
+none of these read paths grants order/account authority. Binance's Testnet
+lifecycle owner has deterministic
 submit-query-cancel/query-first recovery coverage, and its report-first account
 gate compares signed balances, open orders, and positions to one exact
 committed Paper reservation. Real credentialed Spot/USD-M reconciliation,
@@ -50,16 +48,23 @@ release gates. PaperExchange is process-local. Every external venue still
 reports `live: unavailable`, and the manifest validation rejects any live claim
 while `live_trading_enabled` is false.
 
+The aggregated `Unsupported venues` row currently covers Backpack, EdgeX, GRVT,
+Lighter, Paradex, OKX, and Variational. The remaining checked-in venue samples
+for Backpack, EdgeX, GRVT, Lighter, and Paradex now live under
+`rust/config/legacy/exchanges/`; none has an operator-supported Rust adapter
+path, so the manifest fails closed with one summary row instead of advertising
+a wider venue matrix than the runtime can actually honor.
+
 The journal-backed Paper account above the adapter now settles fully filled
 synchronous taker receipts into exact FIFO lots, immediate fees, realized PnL,
 settled equity, and reduce-only capacity. This does not widen adapter authority:
 resting-maker callbacks, funding, mark-to-market, margin/liquidation rules,
 queue/depth impact, and external account truth remain unavailable.
 
-The internal research kernels remain visible as `research.indicators` and
-`research.backtest` in the capability manifest, but both are explicitly
-`unavailable` product capabilities. They are workspace-only libraries: no
-shipped binary links them and no supported CLI or HTTP entry point exists. The
-current backtest is a deterministic single-instrument kernel; it does not yet
-share the production market-event/strategy adapter seam and is not evidence of
-paper/live parity or profitability.
+`research.backtest` is now an available offline capability through the formal
+`crypto-trading-research` binary. Its frozen candidate registry consumes the
+same pure bar-strategy implementations as the paper bar owner. Availability is
+not an edge claim: the earlier daily experiment had no passing configuration,
+and the first hourly protocol stopped at data admission before selection or
+holdout because the official history is not a contiguous UTC-hour series.
+`research.indicators` remains an unavailable library-only product capability.

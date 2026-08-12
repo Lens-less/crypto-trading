@@ -106,9 +106,11 @@ the software may do exactly what it could do before.
   single-instrument tape identity and spot buying power, prices takers at the
   opposing touch, and runs independent strategy selection for each
   walk-forward training window while returning only out-of-sample results.
-- `research.indicators` and `research.backtest` remain stable manifest IDs but
-  are now truthfully `Unavailable`: no shipped CLI, HTTP route, or binary links
-  either workspace-only library.
+- `research.backtest` is now an available offline capability through the
+  frozen-protocol `crypto-trading-research` binary; `research.indicators`
+  remains an unavailable library-only capability. Availability is explicitly
+  not an edge claim: the daily experiment had no passing configuration and the
+  first hourly protocol stopped at data admission before selection or holdout.
 - Martingale sizing treats the deepest adverse grid level as the largest order
   for both long and short grids. This intentionally follows the documented
   strategy meaning instead of the legacy Python short-grid index formula.
@@ -123,6 +125,13 @@ the software may do exactly what it could do before.
   policy, and fails on `rustdoc` warnings.
 - Journal fixtures are pinned to LF so the Windows CI leg reads the same bytes
   the checksums were computed over.
+- CI builds the frontend bundle once and passes it to Rust and browser jobs;
+  the Rust matrix keeps Ubuntu MSRV/stable plus Windows MSRV, while docs-only
+  and frozen-archive changes no longer trigger the full matrix.
+- Config-only and legacy-only venue rows are collapsed into one fail-closed
+  `unsupported-venues` capability, with compatibility samples moved under
+  `rust/config/legacy/exchanges/`. Volume maker, price alert, and scanner
+  remain available but are maintenance-frozen against scope expansion.
 
 ### Added
 
@@ -149,10 +158,24 @@ the software may do exactly what it could do before.
   deterministic single-instrument event-tape backtester with fee/slippage
   assumptions, raw trades/equity curves, and out-of-sample walk-forward
   windows.
+- A pure bar-strategy contract and shared momentum, Donchian, volatility,
+  buy-and-hold, and cash implementations consumed directly by both the
+  backtest evaluator and a paper bar owner.
+- Reconnecting Binance Spot Testnet `bookTicker` and signed user-data
+  WebSocket sources with bounded buffering, ping/pong, jittered backoff,
+  connection generations, gap/regression detection, and query-first account
+  recovery. The read-only Testnet soak gate now requires market stream, user
+  stream, and authenticated REST reconciliation evidence.
 - `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue and pull
   request templates, `CODEOWNERS`, and `dependabot.yml`.
 - `rust/deny.toml` supply-chain policy covering licenses, duplicate versions,
   and crate provenance.
+
+### Removed
+
+- The unreferenced frontend placeholder component, unused design previews,
+  duplicate backtest SHA-256 implementation, per-venue config-only capability
+  rows, and duplicate active G-series automation tree.
 
 ### Authority
 
@@ -161,6 +184,11 @@ the software may do exactly what it could do before.
   exposure ceiling. External authority did not widen: mainnet remains disabled
   in the capability manifest, and Binance Testnet behind an exact
   acknowledgement phrase remains the only path that can place external orders.
+- Testnet read authority widened to public and signed WebSocket observations;
+  no new mainnet or autonomous order authority was granted. The continuous
+  Testnet owner remains explicit, journaled, kill-switchable, and query-first,
+  and mainnet stays unavailable while the Edge and external 24-hour gates are
+  open.
 
 ## [0.1.0] — unreleased
 

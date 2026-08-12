@@ -79,7 +79,14 @@ const ROUND_CONSTANTS: [u32; 64] = [
     0xc671_78f2,
 ];
 
-pub(crate) fn sha256(message: &[u8]) -> [u8; DIGEST_BYTES] {
+/// Computes a SHA-256 digest over exact bytes without external I/O.
+///
+/// # Panics
+///
+/// Panics only if the supplied slice length cannot fit into the in-memory
+/// SHA-256 padding arithmetic on the current target.
+#[must_use]
+pub fn sha256_digest(message: &[u8]) -> [u8; DIGEST_BYTES] {
     let bit_length = u64::try_from(message.len())
         .expect("an addressable message length must fit in u64")
         .checked_mul(8)

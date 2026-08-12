@@ -47,6 +47,27 @@ struct BookTickerWire {
 }
 
 #[derive(Debug, Deserialize)]
+struct BookTickerStreamWire {
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "b")]
+    bid_price: String,
+    #[serde(rename = "B")]
+    bid_qty: String,
+    #[serde(rename = "a")]
+    ask_price: String,
+    #[serde(rename = "A")]
+    ask_qty: String,
+    #[serde(rename = "u", default)]
+    source_sequence: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CombinedBookTickerStreamWire {
+    data: BookTickerStreamWire,
+}
+
+#[derive(Debug, Deserialize)]
 struct BinanceErrorWire {
     code: i64,
     msg: String,
@@ -306,28 +327,88 @@ impl BinancePublicExchange {
     ) -> Result<BinancePublicObservation, ExchangeError> {
         let wire: BookTickerWire = serde_json::from_slice(payload)
             .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
-        let symbol = Symbol::new(wire.symbol)
+        Self::observation_from_wire(
+            &wire.symbol,
+            &wire.bid_price,
+            &wire.bid_qty,
+            &wire.ask_price,
+            &wire.ask_qty,
+            wire.source_sequence,
+            received_at,
+        )
+    }
+
+    /// Parses a websocket `bookTicker` message, including combined-stream
+    /// wrappers, into one observation with local-receipt time.
+    ///
+    /// Binance spot book-ticker streams expose `u` for monotonic duplicate/
+    /// regression checks, but this top-of-book feed does not provide a depth
+    /// sequence contract that would justify inferring transport gaps from
+    /// skipped source ids alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed JSON or invalid
+    /// financial values.
+    pub fn parse_book_ticker_stream_observation(
+        payload: &[u8],
+        received_at: DateTime<Utc>,
+    ) -> Result<BinancePublicObservation, ExchangeError> {
+        if let Ok(wire) = serde_json::from_slice::<BookTickerStreamWire>(payload) {
+            return Self::observation_from_wire(
+                &wire.symbol,
+                &wire.bid_price,
+                &wire.bid_qty,
+                &wire.ask_price,
+                &wire.ask_qty,
+                wire.source_sequence,
+                received_at,
+            );
+        }
+        let wrapped: CombinedBookTickerStreamWire = serde_json::from_slice(payload)
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        Self::observation_from_wire(
+            &wrapped.data.symbol,
+            &wrapped.data.bid_price,
+            &wrapped.data.bid_qty,
+            &wrapped.data.ask_price,
+            &wrapped.data.ask_qty,
+            wrapped.data.source_sequence,
+            received_at,
+        )
+    }
+
+    fn observation_from_wire(
+        symbol: &str,
+        bid_price: &str,
+        bid_qty: &str,
+        ask_price: &str,
+        ask_qty: &str,
+        source_sequence: Option<u64>,
+        received_at: DateTime<Utc>,
+    ) -> Result<BinancePublicObservation, ExchangeError> {
+        let symbol = Symbol::new(symbol.to_owned())
             .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
         let bid: Price =
-            wire.bid_price
+            bid_price
                 .parse()
                 .map_err(|error: crypto_trading_domain::DomainError| {
                     ExchangeError::invalid_response(EXCHANGE, error.to_string())
                 })?;
         let ask: Price =
-            wire.ask_price
+            ask_price
                 .parse()
                 .map_err(|error: crypto_trading_domain::DomainError| {
                     ExchangeError::invalid_response(EXCHANGE, error.to_string())
                 })?;
         let bid_quantity: Quantity =
-            wire.bid_qty
+            bid_qty
                 .parse()
                 .map_err(|error: crypto_trading_domain::DomainError| {
                     ExchangeError::invalid_response(EXCHANGE, error.to_string())
                 })?;
         let ask_quantity: Quantity =
-            wire.ask_qty
+            ask_qty
                 .parse()
                 .map_err(|error: crypto_trading_domain::DomainError| {
                     ExchangeError::invalid_response(EXCHANGE, error.to_string())
@@ -340,7 +421,7 @@ impl BinancePublicExchange {
         Ok(BinancePublicObservation {
             snapshot,
             event_time: None,
-            source_sequence: wire.source_sequence,
+            source_sequence,
         })
     }
 }

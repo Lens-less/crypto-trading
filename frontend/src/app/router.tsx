@@ -2,8 +2,8 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 import { AppShell } from "./AppShell";
 
 /**
- * 9 条路由,除总览外均为懒加载占位骨架。
- * 页面模块导出 `Component`,由 React Router 的 route.lazy 消费。
+ * The shell redirects `/` to `/overview` and lazy-loads each page module.
+ * Every route module exports `Component` for React Router's `route.lazy`.
  */
 export const router = createBrowserRouter([
   {

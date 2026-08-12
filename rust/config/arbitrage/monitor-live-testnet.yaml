@@ -1,0 +1,27 @@
+# Read-only realtime monitor profile. Binance uses the public Spot Testnet
+# bookTicker stream; Hyperliquid remains a credential-free public comparison
+# leg. This profile has no order or account authority.
+exchanges:
+  - binance
+  - hyperliquid
+
+symbols:
+  - BTCUSDT
+
+thresholds:
+  min_spread_pct: 0.1
+  min_funding_rate_diff: 0.01
+
+websocket:
+  ping_interval: 20
+  reconnect_delay: 1
+  max_reconnect_attempts: 10
+
+performance:
+  analysis_interval_ms: 100
+  ui_refresh_interval_ms: 1000
+
+health_check:
+  interval: 10
+  data_timeout: 30
+  max_pair_skew_ms: 1000

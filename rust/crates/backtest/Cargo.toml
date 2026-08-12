@@ -12,6 +12,7 @@ publish = false
 chrono.workspace = true
 crypto-trading-domain = { path = "../domain" }
 crypto-trading-indicators = { path = "../indicators" }
+crypto-trading-strategy = { path = "../strategy" }
 rust_decimal.workspace = true
 thiserror.workspace = true
 

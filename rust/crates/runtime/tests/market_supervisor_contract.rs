@@ -310,6 +310,7 @@ async fn binance_polling_keeps_wire_sequence_separate_from_poll_continuity() {
             received_at,
             timestamp_provenance,
             source_sequence,
+            ..
         }) if snapshot.symbol.as_str() == "LTC-BTC-SPOT"
             && *received_at == now
             && *timestamp_provenance == crypto_trading_runtime::MarketTimestampProvenance::LocalReceipt

@@ -150,20 +150,8 @@ fn volatility_target_skips_rebalancing_when_bar_index_is_off_cadence() {
 
 #[test]
 fn candidate_parameters_fail_closed_before_any_evaluation() {
-    assert_eq!(
-        SlowTimeSeriesMomentum::new(0, 1),
-        Err(BacktestError::InvalidStrategyConfiguration)
-    );
-    assert_eq!(
-        LongOnlyDonchian::new(0),
-        Err(BacktestError::InvalidStrategyConfiguration)
-    );
-    assert_eq!(
-        CappedVolatilityTarget::new(1, decimal("1.01"), Decimal::ZERO, 1),
-        Err(BacktestError::InvalidStrategyConfiguration)
-    );
-    assert_eq!(
-        CappedVolatilityTarget::new(2, decimal("0.15"), Decimal::ZERO, 0),
-        Err(BacktestError::InvalidStrategyConfiguration)
-    );
+    assert!(SlowTimeSeriesMomentum::new(0, 1).is_err());
+    assert!(LongOnlyDonchian::new(0).is_err());
+    assert!(CappedVolatilityTarget::new(1, decimal("1.01"), Decimal::ZERO, 1).is_err());
+    assert!(CappedVolatilityTarget::new(2, decimal("0.15"), Decimal::ZERO, 0).is_err());
 }

@@ -333,7 +333,7 @@ fn verify_exits_nonzero_before_the_twenty_four_hour_policy_is_met() {
                 task_id,
                 "testnet_soak_probe_succeeded",
                 "running",
-                &json!({"sample": "spot_book_ticker", "successful_probe_count": 1, "failed_probe_count": 0, "consecutive_failure_count": 0}),
+                &json!({"sample": "market_stream", "successful_probe_count": 1, "failed_probe_count": 0, "consecutive_failure_count": 0}),
             ),
             fact(
                 started_at + ChronoDuration::minutes(5),
@@ -396,14 +396,14 @@ fn verify_accepts_full_production_sample_coverage() {
                 task_id,
                 "testnet_soak_probe_succeeded",
                 "running",
-                &json!({"sample": "spot_book_ticker", "successful_probe_count": 1, "failed_probe_count": 0, "consecutive_failure_count": 0}),
+                &json!({"sample": "market_stream", "successful_probe_count": 1, "failed_probe_count": 0, "consecutive_failure_count": 0}),
             ),
             fact(
                 started_at + ChronoDuration::hours(12),
                 task_id,
                 "testnet_soak_probe_succeeded",
                 "running",
-                &json!({"sample": "usd_m_book_ticker", "successful_probe_count": 2, "failed_probe_count": 0, "consecutive_failure_count": 0}),
+                &json!({"sample": "user_data_stream", "successful_probe_count": 2, "failed_probe_count": 0, "consecutive_failure_count": 0}),
             ),
             fact(
                 started_at + ChronoDuration::hours(12),
@@ -456,8 +456,8 @@ fn verify_accepts_full_production_sample_coverage() {
     assert!(output.status.success(), "{output:?}");
     let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["requirements_met"], true);
-    assert_eq!(stdout["sample_counts"]["spot_book_ticker"], 1);
-    assert_eq!(stdout["sample_counts"]["usd_m_book_ticker"], 1);
+    assert_eq!(stdout["sample_counts"]["market_stream"], 1);
+    assert_eq!(stdout["sample_counts"]["user_data_stream"], 1);
     assert_eq!(stdout["sample_counts"]["authenticated_reconcile"], 1);
     assert_eq!(stdout["unclean_restart_count"], 1);
 

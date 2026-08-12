@@ -52,7 +52,10 @@ impl BinanceRequestSigner for CapturingSigner {
     }
 }
 
-fn protocol(signer: Arc<CapturingSigner>) -> BinanceTestnetProtocol {
+fn protocol_with_signer<S>(signer: Arc<S>) -> BinanceTestnetProtocol
+where
+    S: BinanceRequestSigner + 'static,
+{
     let spot = Symbol::new("BTC-USDC-SPOT").unwrap();
     let perpetual = Symbol::new("BTC-USDC-PERP").unwrap();
     let symbols = ExchangeSymbolCatalog::new(vec![
@@ -97,6 +100,10 @@ fn protocol(signer: Arc<CapturingSigner>) -> BinanceTestnetProtocol {
         signer,
     )
     .unwrap()
+}
+
+fn protocol(signer: Arc<CapturingSigner>) -> BinanceTestnetProtocol {
+    protocol_with_signer(signer)
 }
 
 #[test]
@@ -205,6 +212,48 @@ fn request_debug_output_redacts_credentials_signatures_and_parameter_values() {
             "{secret:?} leaked through request Debug"
         );
     }
+}
+
+#[test]
+fn websocket_user_data_subscription_signature_uses_plain_alphabetical_params() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(Arc::clone(&signer));
+
+    let subscription = protocol
+        .build_user_data_stream_subscribe_signature(1_723_422_222_000, Some(5_000))
+        .unwrap();
+
+    assert_eq!(subscription.api_key, "offline-api-key");
+    assert_eq!(subscription.timestamp_ms, 1_723_422_222_000);
+    assert_eq!(subscription.recv_window_ms, Some(5_000));
+    assert_eq!(
+        subscription.signed_payload(),
+        "apiKey=offline-api-key&recvWindow=5000&timestamp=1723422222000"
+    );
+    assert_eq!(subscription.signature, "offline-signature/+");
+    assert_eq!(
+        signer.payloads.lock().unwrap().as_slice(),
+        &["apiKey=offline-api-key&recvWindow=5000&timestamp=1723422222000"]
+    );
+}
+
+#[test]
+fn websocket_user_data_subscription_signature_matches_hmac_sha256_vector() {
+    let signer = Arc::new(BinanceHmacSha256Signer::new("test-key", "test-secret").unwrap());
+    let protocol = protocol_with_signer(signer);
+
+    let subscription = protocol
+        .build_user_data_stream_subscribe_signature(1_723_422_222_000, Some(5_000))
+        .unwrap();
+
+    assert_eq!(
+        subscription.signed_payload(),
+        "apiKey=test-key&recvWindow=5000&timestamp=1723422222000"
+    );
+    assert_eq!(
+        subscription.signature,
+        "367a8cdda33212532850d80c9aa734aa8ca2a10698baf569412ba9a0390121dd"
+    );
 }
 
 #[test]

@@ -37,6 +37,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 clap.workspace = true
 
 [lints]

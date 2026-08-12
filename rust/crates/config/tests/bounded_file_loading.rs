@@ -125,13 +125,13 @@ fn every_public_from_str_loader_matches_path_loader_size_boundaries() {
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "auth-from-str-boundary",
-        "config/exchanges/lighter_config.yaml",
+        "config/legacy/exchanges/lighter_config.yaml",
         |path| load_exchange_auth(path, "lighter").map(|_| ()),
         |yaml| load_exchange_auth_from_str("lighter", yaml).map(|_| ()),
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "auth-from-str-with-env-boundary",
-        "config/exchanges/lighter_config.yaml",
+        "config/legacy/exchanges/lighter_config.yaml",
         |path| load_exchange_auth_with_env(path, "lighter", &EmptyEnvironment).map(|_| ()),
         |yaml| load_exchange_auth_from_str_with_env("lighter", yaml, &EmptyEnvironment).map(|_| ()),
     );
@@ -232,7 +232,7 @@ fn every_public_path_loader_allows_literal_tokens_inside_block_scalars() {
     );
     assert_path_loader_allows_block_scalar(
         "auth-block",
-        "config/exchanges/lighter_config.yaml",
+        "config/legacy/exchanges/lighter_config.yaml",
         |path| load_exchange_auth_with_env(path, "lighter", &EmptyEnvironment),
     );
     assert_path_loader_allows_block_scalar(

@@ -1,10 +1,12 @@
 use std::{collections::HashSet, path::Path, str::FromStr};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use crypto_trading_domain::{MarketType, Price, Symbol};
+use crypto_trading_domain::{MarketType, Price, Symbol, sha256_digest};
+pub use crypto_trading_strategy::Bar as SpotBar;
+use crypto_trading_strategy::StrategyError;
 use rust_decimal::Decimal;
 
-use crate::{BacktestError, sha256::sha256};
+use crate::BacktestError;
 
 const OFFICIAL_SPOT_PREFIX: &str = "https://data.binance.vision/data/spot/";
 const PARSER_VERSION: &str = "binance-spot-kline-v1";
@@ -30,7 +32,7 @@ impl Sha256Digest {
     #[must_use]
     pub fn from_bytes(value: &[u8]) -> Self {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let bytes = sha256(value);
+        let bytes = sha256_digest(value);
         let mut output = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
             output.push(char::from(DIGITS[usize::from(byte >> 4)]));
@@ -92,64 +94,6 @@ pub struct DatasetManifest {
     pub expected_first_open: DateTime<Utc>,
     pub expected_last_close: DateTime<Utc>,
     pub expected_bar_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpotBar {
-    pub open_time: DateTime<Utc>,
-    pub close_time: DateTime<Utc>,
-    pub open: Price,
-    pub high: Price,
-    pub low: Price,
-    pub close: Price,
-    pub volume: Decimal,
-    pub quote_volume: Decimal,
-    pub trade_count: u64,
-}
-
-impl SpotBar {
-    /// Builds one closed Spot bar after validating its price and volume shape.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BacktestError::InvalidBarSequence`] for an inverted timestamp,
-    /// inconsistent OHLC values, or negative volume.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        open_time: DateTime<Utc>,
-        close_time: DateTime<Utc>,
-        open: Price,
-        high: Price,
-        low: Price,
-        close: Price,
-        volume: Decimal,
-        quote_volume: Decimal,
-        trade_count: u64,
-    ) -> Result<Self, BacktestError> {
-        if close_time < open_time
-            || high < low
-            || high < open
-            || high < close
-            || low > open
-            || low > close
-            || volume.is_sign_negative()
-            || quote_volume.is_sign_negative()
-        {
-            return Err(BacktestError::InvalidBarSequence);
-        }
-
-        Ok(Self {
-            open_time,
-            close_time,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            quote_volume,
-            trade_count,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,17 +171,20 @@ impl SpotKlineDataset {
                 }
             }
 
-            bars.push(SpotBar::new(
-                open_time,
-                close_time,
-                open,
-                high,
-                low,
-                close,
-                volume,
-                quote_volume,
-                trade_count,
-            )?);
+            bars.push(
+                SpotBar::new(
+                    open_time,
+                    close_time,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    quote_volume,
+                    trade_count,
+                )
+                .map_err(|error| map_strategy_bar_error(&error))?,
+            );
             previous_open = Some(open_time);
         }
 
@@ -452,4 +399,14 @@ fn parse_u64(value: &str) -> Result<u64, BacktestError> {
     value
         .parse::<u64>()
         .map_err(|_| BacktestError::InvalidBarSequence)
+}
+
+fn map_strategy_bar_error(error: &StrategyError) -> BacktestError {
+    match error {
+        StrategyError::InvalidFinancialValue("bar")
+        | StrategyError::InvalidConfig(_)
+        | StrategyError::SnapshotMismatch(_)
+        | StrategyError::MissingMarketData(_) => BacktestError::InvalidBarSequence,
+        StrategyError::InvalidFinancialValue(_) => BacktestError::ArithmeticOverflow,
+    }
 }

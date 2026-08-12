@@ -1,8 +1,12 @@
+use crypto_trading_strategy::{
+    BarStrategy, BarStrategyContext, BuyAndHoldStrategy, CappedVolatilityTarget, CashStrategy,
+    LongOnlyDonchian, SlowTimeSeriesMomentum, StrategyError,
+};
 use rust_decimal::Decimal;
 
 use crate::{BacktestError, SpotDecisionContext, TargetExposureStrategy};
 
-/// Concrete, pre-registered Spot-only research configurations.
+/// Concrete, pre-registered spot-only research configurations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpotStrategyConfig {
     Cash,
@@ -20,6 +24,13 @@ pub enum SpotStrategyConfig {
         rebalance_band: Decimal,
         rebalance_every_bars: usize,
     },
+    CappedVolatilityTargetExplicitAnnualization {
+        lookback_returns: usize,
+        annual_target: Decimal,
+        rebalance_band: Decimal,
+        rebalance_every_bars: usize,
+        periods_per_year: Decimal,
+    },
 }
 
 impl SpotStrategyConfig {
@@ -31,11 +42,14 @@ impl SpotStrategyConfig {
             Self::BuyAndHold => "buy_and_hold",
             Self::SlowTimeSeriesMomentum { .. } => "slow_time_series_momentum",
             Self::LongOnlyDonchian { .. } => "long_only_donchian",
-            Self::CappedVolatilityTarget { .. } => "capped_volatility_target",
+            Self::CappedVolatilityTarget { .. }
+            | Self::CappedVolatilityTargetExplicitAnnualization { .. } => {
+                "capped_volatility_target"
+            }
         }
     }
 
-    /// Builds the corresponding bounded Spot strategy.
+    /// Builds the corresponding bounded spot strategy.
     ///
     /// # Errors
     ///
@@ -51,10 +65,11 @@ impl SpotStrategyConfig {
                 lookback_bars,
                 rebalance_every_bars,
             } => Ok(BoundedSpotStrategy::SlowTimeSeriesMomentum(
-                SlowTimeSeriesMomentum::new(lookback_bars, rebalance_every_bars)?,
+                SlowTimeSeriesMomentum::new(lookback_bars, rebalance_every_bars)
+                    .map_err(map_strategy_error)?,
             )),
             Self::LongOnlyDonchian { lookback_bars } => Ok(BoundedSpotStrategy::LongOnlyDonchian(
-                LongOnlyDonchian::new(lookback_bars)?,
+                LongOnlyDonchian::new(lookback_bars).map_err(map_strategy_error)?,
             )),
             Self::CappedVolatilityTarget {
                 lookback_returns,
@@ -67,13 +82,30 @@ impl SpotStrategyConfig {
                     annual_target,
                     rebalance_band,
                     rebalance_every_bars,
-                )?,
+                )
+                .map_err(map_strategy_error)?,
+            )),
+            Self::CappedVolatilityTargetExplicitAnnualization {
+                lookback_returns,
+                annual_target,
+                rebalance_band,
+                rebalance_every_bars,
+                periods_per_year,
+            } => Ok(BoundedSpotStrategy::CappedVolatilityTarget(
+                CappedVolatilityTarget::new_with_periods_per_year(
+                    lookback_returns,
+                    annual_target,
+                    rebalance_band,
+                    rebalance_every_bars,
+                    periods_per_year,
+                )
+                .map_err(map_strategy_error)?,
             )),
         }
     }
 }
 
-/// Dispatch wrapper for every bounded Spot research family.
+/// Dispatch wrapper for every bounded spot research family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundedSpotStrategy {
     Cash(CashStrategy),
@@ -89,32 +121,30 @@ impl TargetExposureStrategy for BoundedSpotStrategy {
         context: &SpotDecisionContext<'_>,
     ) -> Result<Decimal, BacktestError> {
         match self {
-            Self::Cash(strategy) => strategy.target_exposure(context),
-            Self::BuyAndHold(strategy) => strategy.target_exposure(context),
-            Self::SlowTimeSeriesMomentum(strategy) => strategy.target_exposure(context),
-            Self::LongOnlyDonchian(strategy) => strategy.target_exposure(context),
-            Self::CappedVolatilityTarget(strategy) => strategy.target_exposure(context),
+            Self::Cash(strategy) => TargetExposureStrategy::target_exposure(strategy, context),
+            Self::BuyAndHold(strategy) => {
+                TargetExposureStrategy::target_exposure(strategy, context)
+            }
+            Self::SlowTimeSeriesMomentum(strategy) => {
+                TargetExposureStrategy::target_exposure(strategy, context)
+            }
+            Self::LongOnlyDonchian(strategy) => {
+                TargetExposureStrategy::target_exposure(strategy, context)
+            }
+            Self::CappedVolatilityTarget(strategy) => {
+                TargetExposureStrategy::target_exposure(strategy, context)
+            }
         }
     }
 }
 
-/// Mandatory abstention baseline.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CashStrategy;
-
 impl TargetExposureStrategy for CashStrategy {
     fn target_exposure(
         &mut self,
-        _context: &SpotDecisionContext<'_>,
+        context: &SpotDecisionContext<'_>,
     ) -> Result<Decimal, BacktestError> {
-        Ok(Decimal::ZERO)
+        decide_shared(self, context)
     }
-}
-
-/// Mandatory cost-matched passive Spot baseline.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BuyAndHoldStrategy {
-    entered: bool,
 }
 
 impl TargetExposureStrategy for BuyAndHoldStrategy {
@@ -122,37 +152,7 @@ impl TargetExposureStrategy for BuyAndHoldStrategy {
         &mut self,
         context: &SpotDecisionContext<'_>,
     ) -> Result<Decimal, BacktestError> {
-        if self.entered {
-            Ok(context.current_target)
-        } else {
-            self.entered = true;
-            Ok(Decimal::ONE)
-        }
-    }
-}
-
-/// Long-or-cash sign of a completed trailing return.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlowTimeSeriesMomentum {
-    lookback_bars: usize,
-    rebalance_every_bars: usize,
-}
-
-impl SlowTimeSeriesMomentum {
-    /// Creates a bounded trailing-return strategy.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BacktestError::InvalidStrategyConfiguration`] when either
-    /// count is zero.
-    pub fn new(lookback_bars: usize, rebalance_every_bars: usize) -> Result<Self, BacktestError> {
-        if lookback_bars == 0 || rebalance_every_bars == 0 {
-            return Err(BacktestError::InvalidStrategyConfiguration);
-        }
-        Ok(Self {
-            lookback_bars,
-            rebalance_every_bars,
-        })
+        decide_shared(self, context)
     }
 }
 
@@ -161,52 +161,7 @@ impl TargetExposureStrategy for SlowTimeSeriesMomentum {
         &mut self,
         context: &SpotDecisionContext<'_>,
     ) -> Result<Decimal, BacktestError> {
-        if context.history.len() <= self.lookback_bars {
-            return Ok(Decimal::ZERO);
-        }
-        if !context.bar_index.is_multiple_of(self.rebalance_every_bars) {
-            return Ok(context.current_target);
-        }
-
-        let current = context
-            .history
-            .last()
-            .ok_or(BacktestError::InvalidEvaluationRange)?
-            .close
-            .as_decimal();
-        let trailing = context.history[context.history.len() - self.lookback_bars - 1]
-            .close
-            .as_decimal();
-        Ok(if current > trailing {
-            Decimal::ONE
-        } else {
-            Decimal::ZERO
-        })
-    }
-}
-
-/// Long-only close-channel breakout with a non-decreasing midpoint exit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LongOnlyDonchian {
-    lookback_bars: usize,
-    trailing_exit: Option<Decimal>,
-}
-
-impl LongOnlyDonchian {
-    /// Creates a fixed-window channel adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BacktestError::InvalidStrategyConfiguration`] for a zero
-    /// lookback.
-    pub const fn new(lookback_bars: usize) -> Result<Self, BacktestError> {
-        if lookback_bars == 0 {
-            return Err(BacktestError::InvalidStrategyConfiguration);
-        }
-        Ok(Self {
-            lookback_bars,
-            trailing_exit: None,
-        })
+        decide_shared(self, context)
     }
 }
 
@@ -215,99 +170,7 @@ impl TargetExposureStrategy for LongOnlyDonchian {
         &mut self,
         context: &SpotDecisionContext<'_>,
     ) -> Result<Decimal, BacktestError> {
-        if context.history.len() <= self.lookback_bars {
-            self.trailing_exit = None;
-            return Ok(Decimal::ZERO);
-        }
-
-        let current = context
-            .history
-            .last()
-            .ok_or(BacktestError::InvalidEvaluationRange)?
-            .close
-            .as_decimal();
-        if context.current_target.is_zero() {
-            self.trailing_exit = None;
-            let prior = &context.history
-                [context.history.len() - self.lookback_bars - 1..context.history.len() - 1];
-            let prior_high = prior
-                .iter()
-                .map(|bar| bar.close.as_decimal())
-                .max()
-                .ok_or(BacktestError::InvalidEvaluationRange)?;
-            return Ok(if current > prior_high {
-                Decimal::ONE
-            } else {
-                Decimal::ZERO
-            });
-        }
-
-        let channel = &context.history[context.history.len() - self.lookback_bars..];
-        let high = channel
-            .iter()
-            .map(|bar| bar.close.as_decimal())
-            .max()
-            .ok_or(BacktestError::InvalidEvaluationRange)?;
-        let low = channel
-            .iter()
-            .map(|bar| bar.close.as_decimal())
-            .min()
-            .ok_or(BacktestError::InvalidEvaluationRange)?;
-        let midpoint = high
-            .checked_add(low)
-            .and_then(|sum| sum.checked_div(Decimal::from(2_u32)))
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        let trailing_exit = self
-            .trailing_exit
-            .map_or(midpoint, |previous| previous.max(midpoint));
-        self.trailing_exit = Some(trailing_exit);
-        if current < trailing_exit {
-            self.trailing_exit = None;
-            Ok(Decimal::ZERO)
-        } else {
-            Ok(Decimal::ONE)
-        }
-    }
-}
-
-/// Long-only exposure capped by completed-close realized volatility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CappedVolatilityTarget {
-    lookback_returns: usize,
-    annual_target: Decimal,
-    rebalance_band: Decimal,
-    rebalance_every_bars: usize,
-}
-
-impl CappedVolatilityTarget {
-    /// Creates a rolling volatility target.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BacktestError::InvalidStrategyConfiguration`] unless the
-    /// lookback has at least two returns, the target is in `(0, 1]`, and the
-    /// rebalance band is in `[0, 1]`.
-    pub fn new(
-        lookback_returns: usize,
-        annual_target: Decimal,
-        rebalance_band: Decimal,
-        rebalance_every_bars: usize,
-    ) -> Result<Self, BacktestError> {
-        if lookback_returns < 2
-            || annual_target <= Decimal::ZERO
-            || annual_target > Decimal::ONE
-            || rebalance_band < Decimal::ZERO
-            || rebalance_band > Decimal::ONE
-            || rebalance_every_bars == 0
-        {
-            return Err(BacktestError::InvalidStrategyConfiguration);
-        }
-        Ok(Self {
-            lookback_returns,
-            annual_target,
-            rebalance_band,
-            rebalance_every_bars,
-        })
+        decide_shared(self, context)
     }
 }
 
@@ -316,124 +179,48 @@ impl TargetExposureStrategy for CappedVolatilityTarget {
         &mut self,
         context: &SpotDecisionContext<'_>,
     ) -> Result<Decimal, BacktestError> {
-        if context.history.len() <= self.lookback_returns {
-            return Ok(Decimal::ZERO);
-        }
-        if !context.bar_index.is_multiple_of(self.rebalance_every_bars) {
-            return Ok(context.current_target);
-        }
-        let start = context.history.len() - self.lookback_returns - 1;
-        let closes = &context.history[start..];
-        let returns = closes
-            .windows(2)
-            .map(|pair| {
-                pair[1]
-                    .close
-                    .as_decimal()
-                    .checked_sub(pair[0].close.as_decimal())
-                    .and_then(|change| change.checked_div(pair[0].close.as_decimal()))
-                    .ok_or(BacktestError::ArithmeticOverflow)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let count = Decimal::from(
-            u64::try_from(returns.len()).map_err(|_| BacktestError::ArithmeticOverflow)?,
-        );
-        let mean = returns
-            .iter()
-            .try_fold(Decimal::ZERO, |sum, value| {
-                sum.checked_add(*value)
-                    .ok_or(BacktestError::ArithmeticOverflow)
-            })?
-            .checked_div(count)
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        let squared_deviations = returns.iter().try_fold(Decimal::ZERO, |sum, value| {
-            let deviation = value
-                .checked_sub(mean)
-                .ok_or(BacktestError::ArithmeticOverflow)?;
-            sum.checked_add(
-                deviation
-                    .checked_mul(deviation)
-                    .ok_or(BacktestError::ArithmeticOverflow)?,
-            )
-            .ok_or(BacktestError::ArithmeticOverflow)
-        })?;
-        let denominator = count
-            .checked_sub(Decimal::ONE)
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        let annual_variance = squared_deviations
-            .checked_div(denominator)
-            .and_then(|variance| variance.checked_mul(Decimal::from(365_u32)))
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        if annual_variance.is_zero() {
-            return Ok(Decimal::ZERO);
-        }
-        let annual_volatility = checked_sqrt(annual_variance)?;
-        let desired = self
-            .annual_target
-            .checked_div(annual_volatility)
-            .ok_or(BacktestError::ArithmeticOverflow)?
-            .min(Decimal::ONE);
-        let band = context
-            .current_target
-            .checked_mul(self.rebalance_band)
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        let difference = desired
-            .checked_sub(context.current_target)
-            .ok_or(BacktestError::ArithmeticOverflow)?
-            .abs();
-        Ok(if difference <= band {
-            context.current_target
-        } else {
-            desired
-        })
+        decide_shared(self, context)
     }
 }
 
-fn checked_sqrt(value: Decimal) -> Result<Decimal, BacktestError> {
-    if value < Decimal::ZERO {
-        return Err(BacktestError::ArithmeticOverflow);
-    }
-    if value.is_zero() {
-        return Ok(Decimal::ZERO);
-    }
-    let two = Decimal::from(2_u32);
-    let mut guess = if value > Decimal::ONE {
-        value
-            .checked_div(two)
-            .ok_or(BacktestError::ArithmeticOverflow)?
-    } else {
-        Decimal::ONE
+fn decide_shared<S: BarStrategy>(
+    strategy: &mut S,
+    context: &SpotDecisionContext<'_>,
+) -> Result<Decimal, BacktestError> {
+    let context = BarStrategyContext {
+        history: context.history,
+        decided_at: context.decided_at,
+        bar_index: context.bar_index,
+        current_target: context.current_target,
     };
-    let tolerance = Decimal::from_parts(1, 0, 0, false, 18);
-    for _ in 0..64 {
-        let next = guess
-            .checked_add(
-                value
-                    .checked_div(guess)
-                    .ok_or(BacktestError::ArithmeticOverflow)?,
-            )
-            .and_then(|sum| sum.checked_div(two))
-            .ok_or(BacktestError::ArithmeticOverflow)?;
-        if next
-            .checked_sub(guess)
-            .ok_or(BacktestError::ArithmeticOverflow)?
-            .abs()
-            <= tolerance
-        {
-            return Ok(next.round_dp(18));
+    strategy
+        .target_exposure(&context)
+        .map(crypto_trading_strategy::TargetExposure::as_decimal)
+        .map_err(map_strategy_error)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn map_strategy_error(error: StrategyError) -> BacktestError {
+    match error {
+        StrategyError::InvalidConfig(_) => BacktestError::InvalidStrategyConfiguration,
+        StrategyError::InvalidFinancialValue("target exposure") => {
+            BacktestError::InvalidTargetExposure
         }
-        guess = next;
+        StrategyError::InvalidFinancialValue("bar") => BacktestError::InvalidBarSequence,
+        StrategyError::InvalidFinancialValue(_) => BacktestError::ArithmeticOverflow,
+        StrategyError::SnapshotMismatch(_) | StrategyError::MissingMarketData(_) => {
+            BacktestError::InvalidEvaluationRange
+        }
     }
-    Ok(guess.round_dp(18))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BoundedSpotStrategy, BuyAndHoldStrategy, CashStrategy, LongOnlyDonchian,
-        SlowTimeSeriesMomentum, SpotStrategyConfig,
+    use super::{BoundedSpotStrategy, SpotStrategyConfig};
+    use crate::{
+        BacktestError, BuyAndHoldStrategy, CappedVolatilityTarget, CashStrategy, LongOnlyDonchian,
+        SlowTimeSeriesMomentum,
     };
-    use crate::{BacktestError, CappedVolatilityTarget};
     use rust_decimal::Decimal;
 
     fn decimal(value: &str) -> Decimal {
@@ -544,5 +331,15 @@ mod tests {
             .build(),
             Err(BacktestError::InvalidStrategyConfiguration)
         );
+    }
+
+    #[test]
+    fn spot_bar_history_is_shared_bar_history_without_rebuilding() {
+        fn shared_history_len(history: &[crypto_trading_strategy::Bar]) -> usize {
+            history.len()
+        }
+
+        let history: &[crate::SpotBar] = &[];
+        assert_eq!(shared_history_len(history), 0);
     }
 }

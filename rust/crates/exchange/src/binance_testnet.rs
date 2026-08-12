@@ -109,6 +109,84 @@ pub struct BinanceTestnetBalance {
     pub locked_balance: Option<Decimal>,
 }
 
+/// Signed parameters for `userDataStream.subscribe.signature` on the Binance
+/// Spot websocket API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceWsApiUserDataStreamSubscription {
+    pub api_key: String,
+    pub timestamp_ms: u64,
+    pub recv_window_ms: Option<u64>,
+    pub signature: String,
+}
+
+impl BinanceWsApiUserDataStreamSubscription {
+    #[must_use]
+    pub fn signed_payload(&self) -> String {
+        match self.recv_window_ms {
+            Some(recv_window_ms) => format!(
+                "apiKey={}&recvWindow={recv_window_ms}&timestamp={}",
+                self.api_key, self.timestamp_ms
+            ),
+            None => format!("apiKey={}&timestamp={}", self.api_key, self.timestamp_ms),
+        }
+    }
+}
+
+/// One parsed Binance Spot user-data event.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinanceUserDataEvent {
+    ExecutionReport(BinanceExecutionReportEvent),
+    AccountUpdate(BinanceAccountUpdateEvent),
+    StreamTerminated(BinanceStreamTerminatedEvent),
+    Unsupported(BinanceUnsupportedUserDataEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceExecutionReportEvent {
+    pub event_time: DateTime<Utc>,
+    pub transaction_time: DateTime<Utc>,
+    pub symbol: Symbol,
+    pub client_order_id: String,
+    pub execution_type: String,
+    pub order_status: String,
+    pub side: String,
+    pub order_type: String,
+    pub time_in_force: String,
+    pub order_id: u64,
+    pub execution_id: Option<u64>,
+    pub quantity: Quantity,
+    pub price: Option<Price>,
+    pub last_executed_quantity: Option<Quantity>,
+    pub cumulative_filled_quantity: Quantity,
+    pub last_executed_price: Option<Price>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceAccountUpdateEvent {
+    pub event_time: DateTime<Utc>,
+    pub account_update_time: DateTime<Utc>,
+    pub balances: Vec<BinanceUserDataBalance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceUserDataBalance {
+    pub asset: String,
+    pub free: Decimal,
+    pub locked: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceStreamTerminatedEvent {
+    pub event_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceUnsupportedUserDataEvent {
+    pub event_type: String,
+    pub event_time: Option<DateTime<Utc>>,
+}
+
 /// One exact Binance exchangeInfo selection resolved into shared symbol/rule types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinanceExchangeInfoSymbol {
@@ -330,6 +408,85 @@ impl BinanceTestnetProtocol {
         }
         self.recv_window_ms = recv_window_ms;
         Ok(())
+    }
+
+    /// Builds the signed websocket-API parameters for
+    /// `userDataStream.subscribe.signature`.
+    ///
+    /// The websocket API signs a plain `apiKey[..]&timestamp[..]` parameter
+    /// string sorted lexicographically by parameter name. This differs from
+    /// the REST URL builder and intentionally does not percent-encode the
+    /// payload before signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] when `recvWindow` is outside
+    /// Binance's accepted range, or a signing/credential error from the
+    /// configured signer.
+    pub fn build_user_data_stream_subscribe_signature(
+        &self,
+        timestamp_ms: u64,
+        recv_window_ms: Option<u64>,
+    ) -> Result<BinanceWsApiUserDataStreamSubscription, ExchangeError> {
+        if let Some(recv_window_ms) = recv_window_ms
+            && !(1..=MAX_RECV_WINDOW_MS).contains(&recv_window_ms)
+        {
+            return Err(ExchangeError::invalid(format!(
+                "Binance recvWindow must be in 1..={MAX_RECV_WINDOW_MS} milliseconds"
+            )));
+        }
+        let subscription = BinanceWsApiUserDataStreamSubscription {
+            api_key: self.signer.api_key().to_owned(),
+            timestamp_ms,
+            recv_window_ms,
+            signature: String::new(),
+        };
+        let payload = subscription.signed_payload();
+        let signature = self.signer.sign(&payload)?;
+        validate_secret_text("Binance signature", &signature, MAX_SIGNATURE_BYTES)?;
+        Ok(BinanceWsApiUserDataStreamSubscription {
+            signature,
+            ..subscription
+        })
+    }
+
+    /// Parses one Binance Spot websocket user-data event. Current production
+    /// payloads are wrapped as `{subscriptionId,event:{...}}`; flat top-level
+    /// payloads remain accepted only for backward-compatible fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] when the payload is not
+    /// valid JSON, is missing the event discriminator, or carries invalid
+    /// timestamps/financial values.
+    pub fn parse_user_data_event(payload: &[u8]) -> Result<BinanceUserDataEvent, ExchangeError> {
+        let value: serde_json::Value = serde_json::from_slice(payload)
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        let event = value.get("event").unwrap_or(&value);
+        let event_type = event
+            .get("e")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ExchangeError::invalid_response(
+                    EXCHANGE,
+                    "Binance user-data payload is missing event type",
+                )
+            })?;
+        match event_type {
+            "executionReport" => parse_execution_report_event(event),
+            "outboundAccountPosition" => parse_account_update_event(event),
+            "eventStreamTerminated" => Ok(BinanceUserDataEvent::StreamTerminated(
+                BinanceStreamTerminatedEvent {
+                    event_time: optional_event_time(event)?,
+                },
+            )),
+            other => Ok(BinanceUserDataEvent::Unsupported(
+                BinanceUnsupportedUserDataEvent {
+                    event_type: other.to_owned(),
+                    event_time: optional_event_time(event)?,
+                },
+            )),
+        }
     }
 
     /// Builds one fully signed Spot or USDⓈ-M testnet order request.
@@ -2159,6 +2316,149 @@ fn parse_required_millis(value: i64) -> Result<DateTime<Utc>, ExchangeError> {
     DateTime::from_timestamp_millis(value).ok_or_else(|| {
         ExchangeError::invalid_response(EXCHANGE, "Binance timestamp is outside UTC range")
     })
+}
+
+fn parse_execution_report_event(
+    event: &serde_json::Value,
+) -> Result<BinanceUserDataEvent, ExchangeError> {
+    let event_time = required_event_time(event)?;
+    let transaction_time = parse_required_millis(required_i64(event, "T")?)?;
+    let symbol = Symbol::new(required_str(event, "s")?.to_owned())
+        .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+    let client_order_id = required_str(event, "c")?.to_owned();
+    let quantity = parse_quantity(required_str(event, "q")?)?;
+    let price = parse_optional_decimal_price(required_str(event, "p")?)?;
+    let cumulative_filled_quantity = parse_quantity(required_str(event, "z")?)?;
+    let last_executed_quantity = optional_quantity(event, "l")?;
+    let last_executed_price = optional_price(event, "L")?;
+    Ok(BinanceUserDataEvent::ExecutionReport(
+        BinanceExecutionReportEvent {
+            event_time,
+            transaction_time,
+            symbol,
+            client_order_id,
+            execution_type: required_str(event, "x")?.to_owned(),
+            order_status: required_str(event, "X")?.to_owned(),
+            side: required_str(event, "S")?.to_owned(),
+            order_type: required_str(event, "o")?.to_owned(),
+            time_in_force: required_str(event, "f")?.to_owned(),
+            order_id: required_u64(event, "i")?,
+            execution_id: optional_u64(event, "I")?,
+            quantity,
+            price,
+            last_executed_quantity,
+            cumulative_filled_quantity,
+            last_executed_price,
+        },
+    ))
+}
+
+fn parse_account_update_event(
+    event: &serde_json::Value,
+) -> Result<BinanceUserDataEvent, ExchangeError> {
+    let event_time = required_event_time(event)?;
+    let account_update_time = parse_required_millis(required_i64(event, "u")?)?;
+    let balances = event
+        .get("B")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            ExchangeError::invalid_response(
+                EXCHANGE,
+                "Binance account update payload is missing balances",
+            )
+        })?
+        .iter()
+        .map(|balance| {
+            Ok(BinanceUserDataBalance {
+                asset: required_str(balance, "a")?.to_owned(),
+                free: parse_balance_decimal(
+                    "Binance free balance",
+                    required_str(balance, "f")?,
+                    false,
+                )?,
+                locked: parse_balance_decimal(
+                    "Binance locked balance",
+                    required_str(balance, "l")?,
+                    false,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, ExchangeError>>()?;
+    let mut balances = balances;
+    balances.sort_by(|left, right| left.asset.cmp(&right.asset));
+    Ok(BinanceUserDataEvent::AccountUpdate(
+        BinanceAccountUpdateEvent {
+            event_time,
+            account_update_time,
+            balances,
+        },
+    ))
+}
+
+fn required_str<'a>(event: &'a serde_json::Value, field: &str) -> Result<&'a str, ExchangeError> {
+    event
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ExchangeError::invalid_response(EXCHANGE, format!("Binance payload is missing {field}"))
+        })
+}
+
+fn required_i64(event: &serde_json::Value, field: &str) -> Result<i64, ExchangeError> {
+    event
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            ExchangeError::invalid_response(EXCHANGE, format!("Binance payload is missing {field}"))
+        })
+}
+
+fn required_u64(event: &serde_json::Value, field: &str) -> Result<u64, ExchangeError> {
+    event
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ExchangeError::invalid_response(EXCHANGE, format!("Binance payload is missing {field}"))
+        })
+}
+
+fn optional_u64(event: &serde_json::Value, field: &str) -> Result<Option<u64>, ExchangeError> {
+    match event.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            ExchangeError::invalid_response(EXCHANGE, format!("Binance field {field} is invalid"))
+        }),
+    }
+}
+
+fn required_event_time(event: &serde_json::Value) -> Result<DateTime<Utc>, ExchangeError> {
+    parse_required_millis(required_i64(event, "E")?)
+}
+
+fn optional_event_time(event: &serde_json::Value) -> Result<Option<DateTime<Utc>>, ExchangeError> {
+    let parsed = match event.get("E") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_i64().map(parse_required_millis).transpose(),
+    };
+    parsed.map_err(|_| ExchangeError::invalid_response(EXCHANGE, "Binance field E is invalid"))
+}
+
+fn optional_quantity(
+    event: &serde_json::Value,
+    field: &str,
+) -> Result<Option<Quantity>, ExchangeError> {
+    match event.get(field).and_then(serde_json::Value::as_str) {
+        None | Some("") => Ok(None),
+        Some(value) => parse_quantity(value).map(Some),
+    }
+}
+
+fn optional_price(event: &serde_json::Value, field: &str) -> Result<Option<Price>, ExchangeError> {
+    match event.get(field).and_then(serde_json::Value::as_str) {
+        None => Ok(None),
+        Some(value) if value.is_empty() || decimal_is_zero(value) => Ok(None),
+        Some(value) => parse_price(value).map(Some),
+    }
 }
 
 fn parse_optional_decimal_price(value: &str) -> Result<Option<Price>, ExchangeError> {

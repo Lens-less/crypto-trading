@@ -1,28 +1,37 @@
 name: Frontend quality gates
 
-# Same denylist stance as the Rust workflow: only frozen evidence trees are
-# exempt, so a change to the frontend, its lockfile, or this workflow always
-# runs the gates.
 on:
-  push:
-    paths-ignore:
-      - "archive/**"
-      - "design-previews/**"
-  pull_request:
-    paths-ignore:
-      - "archive/**"
-      - "design-previews/**"
-
-concurrency:
-  group: frontend-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
+  bundle:
+    name: Build frontend bundle once
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      # corepack activates the pnpm version pinned by the packageManager
+      # field, so CI and local builds share one toolchain definition.
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+
   frontend:
-    name: ${{ matrix.os }} / typecheck, lint, test, build
+    name: ${{ matrix.os }} / typecheck, lint, test
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -44,20 +53,15 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test -- --run
-      - run: pnpm build
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: frontend-dist-${{ matrix.os }}
-          path: frontend/dist
-          if-no-files-found: error
 
-  # Real-browser contract: Playwright drives the shipped artifact — the
-  # crypto-trading-web binary with frontend/dist embedded — not a dev server.
+  # Real-browser contract: Playwright drives the shipped artifact - the
+  # crypto-trading-web binary with frontend/dist embedded - not a dev server.
   # Runs on ubuntu only; the same suite runs locally on Windows via `pnpm e2e`.
   e2e:
     name: Browser contract against the embedded binary
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    needs: bundle
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -67,9 +71,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
-      - name: Build the frontend bundle for embedding
-        working-directory: frontend
-        run: pnpm build
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: frontend-dist
+          path: frontend/dist
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: "1.89.0"

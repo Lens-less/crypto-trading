@@ -21,3 +21,10 @@
 4. `../rust/config/` 是当前配置的独立副本；对它的修改不会回写本归档。
 
 旧项目的原始 README、依赖清单、源码、脚本和配置均保留在 [`python-legacy/`](python-legacy/) 中。
+
+## W3 split gate
+
+没有为本次重构配置外部归档仓库或目标 URL，因此 R6 不能诚实地标记为已拆库。
+[`python-legacy/packaging/manifest-2026-08-12.tsv`](python-legacy/packaging/manifest-2026-08-12.tsv)
+冻结了 366 个源文件的路径、大小与 SHA-256，供未来导出后逐项验收；完整门禁见
+[`python-legacy/packaging/MIGRATION-GATE-2026-08-12.md`](python-legacy/packaging/MIGRATION-GATE-2026-08-12.md)。

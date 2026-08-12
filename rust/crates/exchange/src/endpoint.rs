@@ -6,6 +6,8 @@ use crate::ExchangeError;
 
 const BINANCE_SPOT_TESTNET_HOST: &str = "testnet.binance.vision";
 const BINANCE_USDM_TESTNET_HOST: &str = "demo-fapi.binance.com";
+const BINANCE_SPOT_TESTNET_STREAM_HOST: &str = "stream.testnet.binance.vision";
+const BINANCE_SPOT_TESTNET_WS_API_HOST: &str = "ws-api.testnet.binance.vision";
 const HYPERLIQUID_TESTNET_HOST: &str = "api.hyperliquid-testnet.xyz";
 const HYPERLIQUID_MAINNET_HOST: &str = "api.hyperliquid.xyz";
 
@@ -77,6 +79,115 @@ impl BinanceTestnetEndpoints {
             BinanceProduct::UsdM => &self.usdm,
         };
         fixed_api_url(base, path)
+    }
+}
+
+/// Testnet-only Binance Spot public websocket stream endpoint selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceSpotMarketStreamEndpoint {
+    base: Url,
+}
+
+impl BinanceSpotMarketStreamEndpoint {
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("wss://stream.testnet.binance.vision") {
+            Ok(endpoint) => endpoint,
+            Err(_) => unreachable!("hard-coded Binance Spot stream endpoint must be valid"),
+        }
+    }
+
+    /// Validates a caller-supplied Binance Spot public-stream websocket origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is the exact
+    /// official testnet `wss` origin.
+    pub fn try_official(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: official_websocket_root(
+                base,
+                BINANCE_SPOT_TESTNET_STREAM_HOST,
+                "Binance Spot stream testnet",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline public-stream websocket origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is a root
+    /// `ws`/`wss` URL on a literal loopback IP address.
+    pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: loopback_websocket_root(base, "Binance Spot stream offline endpoint")?,
+        })
+    }
+
+    /// Resolves one fixed raw-stream path on the selected websocket origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] when `stream_name` would
+    /// escape the selected origin or introduce query/fragment components.
+    pub fn stream_url(&self, stream_name: &str) -> Result<Url, ExchangeError> {
+        fixed_websocket_path(&self.base, &format!("/ws/{stream_name}"))
+    }
+}
+
+/// Testnet-only Binance Spot websocket API endpoint selection for authenticated
+/// user-data subscriptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceSpotUserDataStreamEndpoint {
+    base: Url,
+}
+
+impl BinanceSpotUserDataStreamEndpoint {
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("wss://ws-api.testnet.binance.vision") {
+            Ok(endpoint) => endpoint,
+            Err(_) => unreachable!("hard-coded Binance Spot WS API endpoint must be valid"),
+        }
+    }
+
+    /// Validates a caller-supplied Binance Spot websocket-API origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is the exact
+    /// official testnet `wss` origin.
+    pub fn try_official(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: official_websocket_root(
+                base,
+                BINANCE_SPOT_TESTNET_WS_API_HOST,
+                "Binance Spot WS API testnet",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline websocket-API origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is a root
+    /// `ws`/`wss` URL on a literal loopback IP address.
+    pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: loopback_websocket_root(base, "Binance Spot WS API offline endpoint")?,
+        })
+    }
+
+    /// Resolves the fixed Spot websocket-API route on the selected origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] if the selected origin is not
+    /// structurally safe for the fixed `/ws-api/v3` path.
+    pub fn websocket_url(&self) -> Result<Url, ExchangeError> {
+        fixed_websocket_path(&self.base, "/ws-api/v3")
     }
 }
 
@@ -202,11 +313,56 @@ fn official_root(value: &str, expected_host: &str, label: &str) -> Result<Url, E
     Ok(url)
 }
 
+fn official_websocket_root(
+    value: &str,
+    expected_host: &str,
+    label: &str,
+) -> Result<Url, ExchangeError> {
+    let url = parse_root(value, label)?;
+    if url.scheme() != "wss"
+        || url.port().is_some()
+        || !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(expected_host))
+    {
+        return Err(ExchangeError::invalid(format!(
+            "{label} must use wss://{expected_host}"
+        )));
+    }
+    Ok(url)
+}
+
 fn loopback_root(value: &str, label: &str) -> Result<Url, ExchangeError> {
     let url = parse_root(value, label)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ExchangeError::invalid(format!(
             "{label} must use http or https"
+        )));
+    }
+    let address = url
+        .host_str()
+        .and_then(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .ok()
+        })
+        .ok_or_else(|| {
+            ExchangeError::invalid(format!("{label} must use a literal loopback IP address"))
+        })?;
+    if !address.is_loopback() {
+        return Err(ExchangeError::invalid(format!(
+            "{label} must use a loopback IP address"
+        )));
+    }
+    Ok(url)
+}
+
+fn loopback_websocket_root(value: &str, label: &str) -> Result<Url, ExchangeError> {
+    let url = parse_root(value, label)?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return Err(ExchangeError::invalid(format!(
+            "{label} must use ws or wss"
         )));
     }
     let address = url
@@ -256,6 +412,24 @@ fn fixed_api_url(base: &Url, path: &str) -> Result<Url, ExchangeError> {
     {
         return Err(ExchangeError::invalid(
             "exchange API path must be a fixed absolute path on the selected origin",
+        ));
+    }
+    let mut url = base.clone();
+    url.set_path(path);
+    Ok(url)
+}
+
+fn fixed_websocket_path(base: &Url, path: &str) -> Result<Url, ExchangeError> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(['?', '#', '\\'])
+        || path.split('/').any(|segment| matches!(segment, "." | ".."))
+        || !path.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '@' | '.')
+        })
+    {
+        return Err(ExchangeError::invalid(
+            "exchange websocket path must stay on the selected origin",
         ));
     }
     let mut url = base.clone();

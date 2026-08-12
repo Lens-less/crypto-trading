@@ -15,15 +15,15 @@ mod engine;
 mod evaluation;
 mod experiment;
 mod ledger;
-mod sha256;
 mod spot_data;
 mod walk_forward;
 
-pub use candidates::{
-    BoundedSpotStrategy, BuyAndHoldStrategy, CappedVolatilityTarget, CashStrategy,
-    LongOnlyDonchian, SlowTimeSeriesMomentum, SpotStrategyConfig,
-};
+pub use candidates::{BoundedSpotStrategy, SpotStrategyConfig};
 pub use crypto_trading_domain::Side;
+pub use crypto_trading_strategy::{
+    BuyAndHoldStrategy, CappedVolatilityTarget, CashStrategy, LongOnlyDonchian,
+    SlowTimeSeriesMomentum,
+};
 pub use engine::{
     BacktestEngine, BacktestMetrics, BacktestResult, EquityPoint, EventTape, FillModel, Liquidity,
     MarketEvent, MarketEventPrice, OrderRequest, SimClock, Strategy, StrategyContext,

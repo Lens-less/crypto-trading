@@ -1,22 +1,10 @@
-# Goal Worker Handoffs
+# Redirected G-Series Handoffs
 
-Each worker owns one issue and updates `issue-<id>-handoff.md` before yielding.
-A continuation worker must read the board, this README, the issue handoff, and
-the referenced source files. It must not depend on an old conversation.
+The completed G-series handoff set moved to
+[../../internal/history/g-series-2026-08-12/handoffs/](../../internal/history/g-series-2026-08-12/handoffs/)
+on 2026-08-12.
 
-Every handoff must contain:
-
-- issue id and title
-- current status
-- source documents by path
-- repository path
-- files changed or inspected
-- decisions made
-- commands run and exact results
-- acceptance-criteria status
-- blockers and remaining risks
-- the exact next prompt for a continuation session
-
-If a handoff is missing, empty, contradictory, or stale relative to the
-worktree, stop that continuation, mark the issue blocked, and rebuild the
-handoff from read-only repository evidence before editing code.
+The files in this directory remain only as stable redirects for older links and
+reports. The only unarchived handoff location is
+[../live-trading-v1/handoffs/](../live-trading-v1/handoffs/), but it must remain
+empty while the D2=`no` gate keeps that automation tree dormant.

@@ -130,7 +130,7 @@ paradex:
 
 # 步骤1: 检查当前 Rust 配置分类
 # --------------------------------------------------------
-# cargo run -- config-check config/exchanges/paradex_config.yaml
+# cargo run -- config-check config/legacy/exchanges/paradex_config.yaml
 # 当前没有 Paradex 私有下单 adapter；本文件不能启动 live 或 testnet 交易。
 
 # 步骤2: 为未来私有 adapter 准备进程环境变量（当前不会用于下单）

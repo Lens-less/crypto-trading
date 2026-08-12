@@ -685,7 +685,7 @@ async fn run_owner(
                     continue;
                 }
             }
-            result = source.next_event() => Selected::Source(result),
+            result = source.next_event() => Selected::Source(result.map(|event| event.map(Box::new))),
         };
         match selected {
             Selected::Stop => {
@@ -700,6 +700,7 @@ async fn run_owner(
                 .await;
             }
             Selected::Source(Ok(Some(event))) => {
+                let event = *event;
                 if let Some(terminal) = apply_event(
                     &mut runtime,
                     &mut source,
@@ -740,7 +741,7 @@ async fn run_owner(
 
 enum Selected {
     Stop,
-    Source(Result<Option<MarketDataEvent>, MarketSupervisorError>),
+    Source(Result<Option<Box<MarketDataEvent>>, MarketSupervisorError>),
 }
 
 /// Applies one market event and durably checkpoints the owner status.

@@ -398,24 +398,46 @@ pub struct ArbitrageMarketArgs {
 )]
 #[derive(Debug, Args)]
 pub struct MonitorArgs {
-    #[arg(long, default_value_t = MonitorMode::Replay, value_enum)]
+    #[arg(
+        long,
+        default_value_t = MonitorMode::Replay,
+        default_value_if("live", "true", "serve"),
+        value_enum
+    )]
     pub mode: MonitorMode,
-    #[arg(long, default_value = "config/arbitrage/monitor_v2.yaml")]
+    #[arg(
+        long,
+        default_value = "config/arbitrage/monitor_v2.yaml",
+        default_value_if("live", "true", "config/arbitrage/monitor-live-testnet.yaml")
+    )]
     pub config: PathBuf,
     /// Finite JSONL replay of validated top-of-book snapshots.
     #[arg(long, value_name = "PATH")]
     pub replay: Option<PathBuf>,
-    /// Poll the real credential-free public endpoints (Binance Spot +
-    /// Hyperliquid perpetuals) instead of a --replay fixture. Read-only.
+    /// Consume the real credential-free Binance Spot stream plus the
+    /// Hyperliquid public leg instead of a --replay fixture. Read-only.
     #[arg(long, conflicts_with = "replay")]
     pub live: bool,
+    /// Binance live transport. Streaming is the default; REST polling is an
+    /// explicit degraded fallback for incident handling.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = MonitorLiveTransport::Stream,
+        requires = "live"
+    )]
+    pub live_transport: MonitorLiveTransport,
+    /// Loopback Binance websocket-root override for bounded local tests.
+    #[arg(long, hide = true)]
+    pub binance_ws_base_url: Option<String>,
     /// Loopback Binance base-URL override for bounded local tests.
     #[arg(long, hide = true)]
     pub binance_base_url: Option<String>,
     /// Loopback Hyperliquid base-URL override for bounded local tests.
     #[arg(long, hide = true)]
     pub hyperliquid_base_url: Option<String>,
-    /// Live polling interval in milliseconds.
+    /// Live polling interval in milliseconds, used only by the explicit
+    /// `--live-transport polling` degradation path.
     #[arg(long, hide = true, default_value_t = 1_000)]
     pub poll_interval_ms: u64,
     /// Service task identity for long-running monitor operations.
@@ -444,6 +466,13 @@ pub struct MonitorArgs {
     /// Supervisor shutdown grace override for bounded local tests.
     #[arg(long, hide = true)]
     pub shutdown_grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+pub enum MonitorLiveTransport {
+    #[default]
+    Stream,
+    Polling,
 }
 
 #[derive(Debug, Clone, Default, ValueEnum)]

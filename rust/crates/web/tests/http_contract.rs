@@ -52,21 +52,35 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
             .as_str()
             .is_some_and(|text| text.contains("mainnet authority are not exposed"))
     }));
-    for capability_id in ["research.backtest", "research.indicators"] {
-        let capability = capabilities["capabilities"]
+    let research_backtest = capabilities["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "research.backtest")
+        .expect("missing research.backtest capability");
+    assert_eq!(research_backtest["level"], "available");
+    assert_eq!(research_backtest["scope"]["access"], "local");
+    assert!(
+        research_backtest["blockers"]
             .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["id"] == capability_id)
-            .unwrap_or_else(|| panic!("missing capability {capability_id}"));
-        assert_eq!(capability["level"], "unavailable", "{capability_id}");
-        assert!(
-            capability["blockers"]
-                .as_array()
-                .is_some_and(|blockers| !blockers.is_empty()),
-            "{capability_id} must explain its library-only boundary"
-        );
-    }
+            .is_some_and(|blockers| blockers.iter().any(|blocker| blocker
+                .as_str()
+                .is_some_and(|text| text.contains("no passing holdout"))))
+    );
+
+    let research_indicators = capabilities["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "research.indicators")
+        .expect("missing research.indicators capability");
+    assert_eq!(research_indicators["level"], "unavailable");
+    assert!(
+        research_indicators["blockers"]
+            .as_array()
+            .is_some_and(|blockers| !blockers.is_empty()),
+        "research.indicators must explain its library-only boundary"
+    );
 
     let system = app.oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(system.status(), StatusCode::OK);

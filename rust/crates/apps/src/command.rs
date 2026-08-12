@@ -29,22 +29,27 @@ use crypto_trading_domain::{
 };
 use crypto_trading_exchange::{
     BinanceExchangeInfoSymbol, BinanceHmacSha256Signer, BinanceProduct, BinancePublicExchange,
-    BinanceRequestSigner, BinanceTestnetEndpoints, BinanceTestnetExchange, BinanceTestnetProtocol,
-    ExchangeError, ExchangeHandle, ExchangeSymbol, ExchangeSymbolCatalog,
-    HyperliquidPublicEndpoint, HyperliquidPublicExchange, InstrumentRuleCatalog, PaperExchange,
-    ReconcileScope, RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition,
-    TradingReceipt, hyperliquid_usdt_symbol_catalog,
+    BinanceRequestSigner, BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint,
+    BinanceTestnetEndpoints, BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError,
+    ExchangeHandle, ExchangeSymbol, ExchangeSymbolCatalog, HyperliquidPublicEndpoint,
+    HyperliquidPublicExchange, InstrumentRuleCatalog, PaperExchange, ReconcileScope,
+    RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition, TradingReceipt,
+    hyperliquid_usdt_symbol_catalog,
 };
 use crypto_trading_runtime::{
-    BinancePollingRoute, BinancePublicPollingSource, DecisionRecord,
-    DeterministicMarketDataAdapter, ExchangeRouter, ExecutionBatch, ExecutionMode, ExecutionPolicy,
-    HistoryError, HyperliquidPollingRoute, HyperliquidPublicPollingSource, IntentExecutor,
-    JournalReadError, JsonlHistory, MAX_HISTORY_RECORD_BYTES, MarketDataBook, MarketDataError,
-    MarketDataEvent, MarketDataEventFuture, MarketDataEventSource, MarketFreshnessPolicy,
-    MarketInstrument, MarketPollingPolicy, MarketSupervisorConfig, MarketUniverse,
-    PaperAccountAuthority, PaperAccountConfig, ReadOnlyTaskExit, ReadOnlyTaskFailure,
+    BinanceBookTickerStreamSource, BinancePollingRoute, BinancePublicPollingSource,
+    BinanceUserDataApply, BinanceUserDataState, BinanceUserDataStreamItem,
+    BinanceUserDataStreamSource, DecisionRecord, DeterministicMarketDataAdapter, ExchangeRouter,
+    ExecutionBatch, ExecutionMode, ExecutionPolicy, HistoryError, HyperliquidPollingRoute,
+    HyperliquidPublicPollingSource, IntentExecutor, JournalReadError, JsonlHistory,
+    MAX_HISTORY_RECORD_BYTES, MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS, MarketDataBook,
+    MarketDataError, MarketDataEvent, MarketDataEventFuture, MarketDataEventSource,
+    MarketDataSourceFailure, MarketFreshnessPolicy, MarketInstrument, MarketPollingPolicy,
+    MarketStreamReconnectPolicy, MarketSupervisorConfig, MarketUniverse, PaperAccountAuthority,
+    PaperAccountConfig, ProductionMarketStreamJitter, ReadOnlyTaskExit, ReadOnlyTaskFailure,
     ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, RuntimeError,
-    SpreadHistoryWriter, SystemMarketDataClock, current_capability_manifest, read_journal_chain,
+    SpreadHistoryWriter, SystemMarketDataClock, TokioMarketStreamSleeper,
+    TokioTextWebSocketConnector, current_capability_manifest, read_journal_chain,
 };
 use crypto_trading_strategy::{
     AccountRiskSnapshot, AprEstimateAssumptions, ArbitrageDecision, ArbitrageState,
@@ -65,11 +70,11 @@ use crate::alert::{
 };
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
-    MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs,
-    PaperTaskArgs, PriceAlertArgs, PriceAlertMode, ScannerArgs, ScannerMode, TestnetLifecycleArgs,
-    TestnetLifecycleExpected, TestnetLifecycleMarket, TestnetLifecycleSide,
-    TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs,
-    TestnetSoakMode, VolumeMakerArgs,
+    MonitorLiveTransport, MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation,
+    PaperStartArgs, PaperStatusArgs, PaperTaskArgs, PriceAlertArgs, PriceAlertMode, ScannerArgs,
+    ScannerMode, TestnetLifecycleArgs, TestnetLifecycleExpected, TestnetLifecycleMarket,
+    TestnetLifecycleSide, TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs,
+    TestnetSoakArgs, TestnetSoakMode, VolumeMakerArgs,
 };
 use crate::continuous_alert::{
     ContinuousAlertTask, ContinuousAlertTaskConfig, ContinuousAlertTaskExit,
@@ -1383,62 +1388,191 @@ fn summarize_reconcile_receipt(receipt: &crypto_trading_exchange::ReconcileRecei
 }
 
 struct ProductionBinanceTestnetSoakProbe {
-    protocol: BinanceTestnetProtocol,
+    market_stream: BinanceBookTickerStreamSource,
+    user_stream: BinanceUserDataStreamSource,
+    user_data: BinanceUserDataState,
+    user_stream_subscribed: bool,
+    user_data_reconcile_required: bool,
     exchange: BinanceTestnetExchange,
-    transport: Arc<dyn RemoteHttpTransport>,
-    symbols: BinanceSmokeSymbols,
     next_step: usize,
 }
 
 impl ProductionBinanceTestnetSoakProbe {
     fn new(
-        transport: Arc<dyn RemoteHttpTransport>,
-        symbols: BinanceSmokeSymbols,
+        transport: &Arc<dyn RemoteHttpTransport>,
+        symbols: &BinanceSmokeSymbols,
         api_key: String,
         api_secret: String,
     ) -> Result<Self> {
         let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
-        let protocol = build_binance_read_only_protocol(Arc::clone(&signer), &symbols)?;
-        let exchange_protocol = build_binance_read_only_protocol(signer, &symbols)?;
-        let exchange = BinanceTestnetExchange::new(exchange_protocol, Arc::clone(&transport));
-        Ok(Self {
-            protocol,
-            exchange,
-            transport,
+        let user_protocol = Arc::new(build_binance_read_only_protocol(
+            Arc::clone(&signer),
             symbols,
+        )?);
+        let exchange_protocol = build_binance_read_only_protocol(signer, symbols)?;
+        let exchange = BinanceTestnetExchange::new(exchange_protocol, Arc::clone(transport));
+
+        let market_route = BinancePollingRoute::new(
+            MarketInstrument::new("binance", symbols.spot.clone(), MarketType::Spot)?,
+            Symbol::new(&symbols.wire_symbol)?,
+        )?;
+        let queue_capacity = NonZeroUsize::new(MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS)
+            .context("market supervisor queue capacity must be nonzero")?;
+        let market_connector = Arc::new(TokioTextWebSocketConnector::for_binance_book_ticker(
+            BinanceSpotMarketStreamEndpoint::official(),
+            std::slice::from_ref(&market_route),
+            queue_capacity,
+            StdDuration::from_secs(20),
+        )?);
+        let reconnect_policy = MarketStreamReconnectPolicy::new(
+            StdDuration::from_secs(1),
+            StdDuration::from_secs(60),
+        )?
+        .with_max_reconnect_attempts(10);
+        let market_stream = BinanceBookTickerStreamSource::new(
+            BinancePublicExchange::with_base_url("https://testnet.binance.vision")?,
+            vec![market_route],
+            market_connector,
+            reconnect_policy,
+            Arc::new(SystemMarketDataClock),
+            Arc::new(TokioMarketStreamSleeper),
+            Arc::new(ProductionMarketStreamJitter::new(7_500, 12_500)?),
+        )?;
+        let user_connector = Arc::new(TokioTextWebSocketConnector::for_binance_user_data_stream(
+            BinanceSpotUserDataStreamEndpoint::official(),
+            user_protocol,
+            None,
+            queue_capacity,
+            StdDuration::from_secs(20),
+        )?);
+        let user_stream = BinanceUserDataStreamSource::new(
+            user_connector,
+            reconnect_policy,
+            Arc::new(SystemMarketDataClock),
+            Arc::new(TokioMarketStreamSleeper),
+            Arc::new(ProductionMarketStreamJitter::new(7_500, 12_500)?),
+        );
+        Ok(Self {
+            market_stream,
+            user_stream,
+            user_data: BinanceUserDataState::default(),
+            user_stream_subscribed: false,
+            user_data_reconcile_required: false,
+            exchange,
             next_step: 0,
         })
+    }
+
+    #[cfg(test)]
+    fn from_parts(
+        market_stream: BinanceBookTickerStreamSource,
+        user_stream: BinanceUserDataStreamSource,
+        exchange: BinanceTestnetExchange,
+    ) -> Self {
+        Self {
+            market_stream,
+            user_stream,
+            user_data: BinanceUserDataState::default(),
+            user_stream_subscribed: false,
+            user_data_reconcile_required: false,
+            exchange,
+            next_step: 0,
+        }
     }
 
     async fn next_probe(&mut self) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
         let step = self.next_step;
         self.next_step = (self.next_step + 1) % 3;
         match step {
-            0 => fetch_binance_book_ticker(
-                &self.protocol,
-                &*self.transport,
-                &self.symbols.spot,
-                MarketType::Spot,
-            )
-            .await
-            .map(|_| TestnetSoakSample::SpotBookTicker)
-            .map_err(|error| classify_testnet_soak_probe_failure(&error)),
-            1 => fetch_binance_book_ticker(
-                &self.protocol,
-                &*self.transport,
-                &self.symbols.perpetual,
-                MarketType::Perpetual,
-            )
-            .await
-            .map(|_| TestnetSoakSample::UsdMBookTicker)
-            .map_err(|error| classify_testnet_soak_probe_failure(&error)),
-            _ => self
-                .exchange
-                .reconcile(ReconcileScope::All)
-                .await
-                .map(|_| TestnetSoakSample::AuthenticatedReconcile)
-                .map_err(|error| classify_testnet_soak_probe_failure(&error)),
+            0 => self.next_market_stream_sample().await,
+            1 => self.next_user_stream_sample().await,
+            _ => {
+                let result = self
+                    .exchange
+                    .reconcile(ReconcileScope::All)
+                    .await
+                    .map_err(|error| classify_testnet_soak_probe_failure(&error));
+                if result.is_ok() && self.user_data_reconcile_required {
+                    self.user_data = BinanceUserDataState::default();
+                    self.user_data_reconcile_required = false;
+                }
+                result.map(|_| TestnetSoakSample::AuthenticatedReconcile)
+            }
         }
+    }
+
+    async fn next_market_stream_sample(
+        &mut self,
+    ) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
+        match self
+            .market_stream
+            .next_event()
+            .await
+            .map_err(|_| TestnetSoakProbeFailure::Protocol)?
+        {
+            Some(MarketDataEvent::Observation(_)) => Ok(TestnetSoakSample::MarketStream),
+            Some(MarketDataEvent::SourceGap { .. }) => Err(TestnetSoakProbeFailure::Transport),
+            Some(MarketDataEvent::SourceUnavailable { failure, .. }) => {
+                Err(classify_market_stream_failure(failure))
+            }
+            None => Err(TestnetSoakProbeFailure::Unavailable),
+        }
+    }
+
+    async fn next_user_stream_sample(
+        &mut self,
+    ) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
+        let item = self
+            .user_stream
+            .next_item()
+            .await
+            .map_err(|_| TestnetSoakProbeFailure::Protocol)?
+            .ok_or(TestnetSoakProbeFailure::Unavailable)?;
+        match item {
+            BinanceUserDataStreamItem::Subscribed { .. } => {
+                if self.user_stream_subscribed {
+                    self.user_data_reconcile_required = true;
+                }
+                self.user_stream_subscribed = true;
+                Ok(TestnetSoakSample::UserDataStream)
+            }
+            BinanceUserDataStreamItem::Heartbeat { .. } => Ok(TestnetSoakSample::UserDataStream),
+            BinanceUserDataStreamItem::Event(envelope) => match self.user_data.apply(envelope) {
+                BinanceUserDataApply::ReconcileRequired(_) => {
+                    self.user_data_reconcile_required = true;
+                    Err(TestnetSoakProbeFailure::Protocol)
+                }
+                BinanceUserDataApply::AppliedExecution
+                | BinanceUserDataApply::AppliedAccountUpdate
+                | BinanceUserDataApply::Duplicate
+                | BinanceUserDataApply::IgnoredUnsupported => Ok(TestnetSoakSample::UserDataStream),
+            },
+            BinanceUserDataStreamItem::TransportGap { .. } => {
+                self.user_data_reconcile_required = true;
+                Err(TestnetSoakProbeFailure::Transport)
+            }
+            BinanceUserDataStreamItem::StreamExpired { .. } => {
+                self.user_data_reconcile_required = true;
+                Err(TestnetSoakProbeFailure::Unavailable)
+            }
+            BinanceUserDataStreamItem::SourceUnavailable { failure, .. } => {
+                self.user_data_reconcile_required = true;
+                Err(classify_market_stream_failure(failure))
+            }
+        }
+    }
+}
+
+const fn classify_market_stream_failure(
+    failure: MarketDataSourceFailure,
+) -> TestnetSoakProbeFailure {
+    match failure {
+        MarketDataSourceFailure::Disconnected => TestnetSoakProbeFailure::Transport,
+        MarketDataSourceFailure::TimedOut => TestnetSoakProbeFailure::Timeout,
+        MarketDataSourceFailure::Backpressure => TestnetSoakProbeFailure::RateLimited,
+        MarketDataSourceFailure::InvalidPayload => TestnetSoakProbeFailure::Protocol,
+        MarketDataSourceFailure::Rejected => TestnetSoakProbeFailure::RemoteRejected,
+        MarketDataSourceFailure::Unknown => TestnetSoakProbeFailure::Unavailable,
     }
 }
 
@@ -1541,7 +1675,7 @@ async fn run_testnet_soak_serve(args: &TestnetSoakArgs) -> Result<()> {
     let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
         StdDuration::from_millis(args.timeout_ms),
     )?);
-    let probe = ProductionBinanceTestnetSoakProbe::new(transport, symbols, api_key, api_secret)?;
+    let probe = ProductionBinanceTestnetSoakProbe::new(&transport, &symbols, api_key, api_secret)?;
     serve_testnet_soak_task(args, control_port, config, probe).await
 }
 
@@ -1705,6 +1839,8 @@ fn parse_fixture_probe_step(
     Ok(match token {
         "spot" | "spot_book_ticker" => Ok(TestnetSoakSample::SpotBookTicker),
         "usdm" | "usd_m_book_ticker" => Ok(TestnetSoakSample::UsdMBookTicker),
+        "market_stream" => Ok(TestnetSoakSample::MarketStream),
+        "user_data_stream" => Ok(TestnetSoakSample::UserDataStream),
         "reconcile" | "authenticated_reconcile" => Ok(TestnetSoakSample::AuthenticatedReconcile),
         "transport" => Err(TestnetSoakProbeFailure::Transport),
         "timeout" => Err(TestnetSoakProbeFailure::Timeout),
@@ -2033,6 +2169,8 @@ fn testnet_soak_sample_name(sample: TestnetSoakSample) -> String {
     match sample {
         TestnetSoakSample::SpotBookTicker => "spot_book_ticker",
         TestnetSoakSample::UsdMBookTicker => "usd_m_book_ticker",
+        TestnetSoakSample::MarketStream => "market_stream",
+        TestnetSoakSample::UserDataStream => "user_data_stream",
         TestnetSoakSample::AuthenticatedReconcile => "authenticated_reconcile",
     }
     .to_owned()
@@ -2282,12 +2420,21 @@ async fn run_monitor_serve(args: &MonitorArgs) -> Result<()> {
     validate_monitor_pair(&monitor)?;
     let symbol = selected_monitor_symbol(args, &monitor)?;
     if args.live {
-        let (read_monitor, left_source, right_source) =
-            build_live_monitor_pair(args, &monitor, &symbol)?;
-        return serve_monitor_task(args, task_id, read_monitor, left_source, right_source).await;
+        return match args.live_transport {
+            MonitorLiveTransport::Stream => {
+                let (read_monitor, left_source, right_source) =
+                    build_live_stream_monitor_pair(args, &monitor, &symbol)?;
+                serve_monitor_task(args, task_id, read_monitor, left_source, right_source).await
+            }
+            MonitorLiveTransport::Polling => {
+                let (read_monitor, left_source, right_source) =
+                    build_live_polling_monitor_pair(args, &monitor, &symbol)?;
+                serve_monitor_task(args, task_id, read_monitor, left_source, right_source).await
+            }
+        };
     }
     let replay_path = args.replay.as_ref().context(
-        "monitor serve requires --replay unless --live opts into the credential-free binance+hyperliquid polling pair",
+        "monitor serve requires --replay unless --live opts into the credential-free binance+hyperliquid pair",
     )?;
     let market_type = serve_market_type(&symbol);
     let left = MarketInstrument::new(&monitor.exchanges[0], symbol.clone(), market_type)?;
@@ -2323,13 +2470,61 @@ fn build_exact_pair_monitor(
     )?)
 }
 
-/// Builds the explicit live pair: a Binance Spot polling leg and a Hyperliquid
-/// perpetual polling leg, both credential-free and read-only.
+/// Builds the default live pair: a Binance Spot Testnet websocket leg and a
+/// Hyperliquid perpetual polling leg, both credential-free and read-only.
+fn build_live_stream_monitor_pair(
+    args: &MonitorArgs,
+    monitor: &MonitorConfig,
+    symbol: &Symbol,
+) -> Result<(
+    ReadOnlyArbitrageMonitor,
+    BinanceBookTickerStreamSource,
+    HyperliquidPublicPollingSource,
+)> {
+    let (read_monitor, left, right, wire_coin) = live_monitor_context(monitor, symbol)?;
+    let routes = vec![BinancePollingRoute::new(
+        left,
+        Symbol::new(symbol.as_str())?,
+    )?];
+    let endpoint = match args.binance_ws_base_url.as_deref() {
+        Some(base_url) => BinanceSpotMarketStreamEndpoint::loopback(base_url)?,
+        None => BinanceSpotMarketStreamEndpoint::official(),
+    };
+    let queue_capacity = NonZeroUsize::new(MAX_MARKET_SUPERVISOR_BUFFERED_EVENTS)
+        .context("market supervisor queue capacity must be nonzero")?;
+    let connector = Arc::new(TokioTextWebSocketConnector::for_binance_book_ticker(
+        endpoint,
+        &routes,
+        queue_capacity,
+        StdDuration::from_secs(monitor.ws_ping_interval),
+    )?);
+    let initial_retry_delay = StdDuration::from_secs(monitor.ws_reconnect_delay);
+    let max_retry_delay = initial_retry_delay
+        .checked_mul(32)
+        .unwrap_or(StdDuration::from_secs(300))
+        .min(StdDuration::from_secs(300));
+    let reconnect_policy = MarketStreamReconnectPolicy::new(initial_retry_delay, max_retry_delay)?
+        .with_max_reconnect_attempts(monitor.ws_max_reconnect_attempts);
+    let left_source = BinanceBookTickerStreamSource::new(
+        BinancePublicExchange::with_base_url("https://testnet.binance.vision")?,
+        routes,
+        connector,
+        reconnect_policy,
+        Arc::new(SystemMarketDataClock),
+        Arc::new(TokioMarketStreamSleeper),
+        Arc::new(ProductionMarketStreamJitter::new(7_500, 12_500)?),
+    )?;
+    let right_source = build_hyperliquid_live_source(args, right, wire_coin)?;
+    Ok((read_monitor, left_source, right_source))
+}
+
+/// Builds the explicit degraded live pair: Binance Spot and Hyperliquid both
+/// use REST polling. Operators must select this path deliberately.
 ///
 /// The Hyperliquid leg's funding-rate side feed is not consumed here yet: the
 /// spread-history journal keeps recording funding fields as absent, so
 /// history-mode decisions stay explicitly funding-degraded.
-fn build_live_monitor_pair(
+fn build_live_polling_monitor_pair(
     args: &MonitorArgs,
     monitor: &MonitorConfig,
     symbol: &Symbol,
@@ -2338,28 +2533,7 @@ fn build_live_monitor_pair(
     BinancePublicPollingSource,
     HyperliquidPublicPollingSource,
 )> {
-    if monitor.exchanges.len() != 2
-        || monitor.exchanges[0] != "binance"
-        || monitor.exchanges[1] != "hyperliquid"
-    {
-        bail!(
-            "monitor --live currently supports exactly the configured exchange pair [binance, hyperliquid] in that order"
-        );
-    }
-    let Some(coin) = symbol
-        .as_str()
-        .strip_suffix("USDT")
-        .filter(|coin| !coin.is_empty())
-    else {
-        bail!("monitor --live requires a USDT-quoted symbol such as BTCUSDT; got {symbol}");
-    };
-    let catalog = hyperliquid_usdt_symbol_catalog(&[coin])?;
-    let wire_coin = catalog
-        .to_wire("hyperliquid", symbol, MarketType::Perpetual)?
-        .to_owned();
-    let left = MarketInstrument::new("binance", symbol.clone(), MarketType::Spot)?;
-    let right = MarketInstrument::new("hyperliquid", symbol.clone(), MarketType::Perpetual)?;
-    let read_monitor = build_exact_pair_monitor(monitor, left.clone(), right.clone())?;
+    let (read_monitor, left, right, wire_coin) = live_monitor_context(monitor, symbol)?;
     let poll_interval = StdDuration::from_millis(args.poll_interval_ms.max(1));
     let policy = MarketPollingPolicy::new(
         poll_interval,
@@ -2368,7 +2542,7 @@ fn build_live_monitor_pair(
     )?;
     let binance = match args.binance_base_url.as_deref() {
         Some(base_url) => BinancePublicExchange::with_base_url(base_url)?,
-        None => BinancePublicExchange::new()?,
+        None => BinancePublicExchange::with_base_url("https://testnet.binance.vision")?,
     };
     let hyperliquid_endpoint = match args.hyperliquid_base_url.as_deref() {
         Some(base_url) => HyperliquidPublicEndpoint::loopback(base_url)?,
@@ -2394,6 +2568,67 @@ fn build_live_monitor_pair(
         Arc::new(SystemMarketDataClock),
     )?;
     Ok((read_monitor, left_source, right_source))
+}
+
+fn live_monitor_context(
+    monitor: &MonitorConfig,
+    symbol: &Symbol,
+) -> Result<(
+    ReadOnlyArbitrageMonitor,
+    MarketInstrument,
+    MarketInstrument,
+    String,
+)> {
+    if monitor.exchanges.len() != 2
+        || monitor.exchanges[0] != "binance"
+        || monitor.exchanges[1] != "hyperliquid"
+    {
+        bail!(
+            "monitor --live currently supports exactly the configured exchange pair [binance, hyperliquid] in that order"
+        );
+    }
+    let Some(coin) = symbol
+        .as_str()
+        .strip_suffix("USDT")
+        .filter(|coin| !coin.is_empty())
+    else {
+        bail!("monitor --live requires a USDT-quoted symbol such as BTCUSDT; got {symbol}");
+    };
+    let catalog = hyperliquid_usdt_symbol_catalog(&[coin])?;
+    let wire_coin = catalog
+        .to_wire("hyperliquid", symbol, MarketType::Perpetual)?
+        .to_owned();
+    let left = MarketInstrument::new("binance", symbol.clone(), MarketType::Spot)?;
+    let right = MarketInstrument::new("hyperliquid", symbol.clone(), MarketType::Perpetual)?;
+    let read_monitor = build_exact_pair_monitor(monitor, left.clone(), right.clone())?;
+    Ok((read_monitor, left, right, wire_coin))
+}
+
+fn build_hyperliquid_live_source(
+    args: &MonitorArgs,
+    right: MarketInstrument,
+    wire_coin: String,
+) -> Result<HyperliquidPublicPollingSource> {
+    let poll_interval = StdDuration::from_millis(args.poll_interval_ms.max(1));
+    let policy = MarketPollingPolicy::new(
+        poll_interval,
+        poll_interval,
+        poll_interval.max(StdDuration::from_secs(60)),
+    )?;
+    let endpoint = match args.hyperliquid_base_url.as_deref() {
+        Some(base_url) => HyperliquidPublicEndpoint::loopback(base_url)?,
+        None => HyperliquidPublicEndpoint::official(),
+    };
+    let exchange = HyperliquidPublicExchange::with_endpoint(&endpoint)?;
+    Ok(HyperliquidPublicPollingSource::new(
+        exchange,
+        vec![HyperliquidPollingRoute::new(
+            right,
+            Symbol::new(wire_coin)?,
+        )?],
+        policy,
+        Arc::new(SystemMarketDataClock),
+    )?)
 }
 
 /// Starts one continuous monitor owner over the given exact sources and hosts
@@ -5933,10 +6168,14 @@ fn has_auth_fields(mapping: &serde_yaml::Mapping) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
+        fmt,
         sync::{Arc, Mutex},
+        time::Duration as StdDuration,
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use async_trait::async_trait;
     use chrono::{Duration, TimeZone, Utc};
     use crypto_trading_config::{
         ArbitrageConfig, load_arbitrage_config_from_str, load_grid_config_from_str,
@@ -5946,27 +6185,32 @@ mod tests {
         PositionSide, Price, Quantity, Side, Symbol, TimeInForce,
     };
     use crypto_trading_exchange::{
-        ExchangeError, ForeignOrder, ReconcileReceipt, ReconcileScope, SubmissionDisposition,
-        TradingReceipt,
+        BinanceHmacSha256Signer, BinancePublicExchange, BinanceTestnetExchange, ExchangeError,
+        ForeignOrder, ReconcileReceipt, ReconcileScope, RemoteHttpRequest, RemoteHttpResponse,
+        RemoteHttpTransport, SubmissionDisposition, TradingReceipt,
     };
     use crypto_trading_runtime::{
-        ExecutionBatch, JsonlHistory, ReconciliationObservation, RuntimeError,
+        BinanceBookTickerStreamSource, BinancePollingRoute, BinanceUserDataStreamSource,
+        ExecutionBatch, FixedMarketStreamJitter, JsonlHistory, MarketDataClock, MarketInstrument,
+        MarketStreamReconnectPolicy, MarketStreamSleeper, ReconciliationObservation, RuntimeError,
+        TextWebSocketConnector, TextWebSocketEvent, TextWebSocketSession, WebSocketCloseKind,
     };
     use rust_decimal::Decimal;
     use serde_json::json;
 
     use super::{
-        ConfigCheckReport, ConfigDiscovery, ExecutionOutcomeJournalError, MAX_CONFIG_CHECK_ENTRIES,
-        MAX_CONFIG_CHECK_ERRORS, MAX_CONFIG_CHECK_OUTPUT_BYTES, MAX_CONFIG_CHECK_SUMMARIES,
-        MAX_CONFIG_DETAIL_BYTES, MAX_CONFIG_SCHEMA_ISSUE_BYTES, MAX_CONFIG_SCHEMA_ISSUES,
-        MAX_RECEIPT_SUMMARY_RECEIPTS, MAX_RECONCILIATION_SUMMARY_ORDERS,
+        BinanceSmokeSymbols, ConfigCheckReport, ConfigDiscovery, ExecutionOutcomeJournalError,
+        MAX_CONFIG_CHECK_ENTRIES, MAX_CONFIG_CHECK_ERRORS, MAX_CONFIG_CHECK_OUTPUT_BYTES,
+        MAX_CONFIG_CHECK_SUMMARIES, MAX_CONFIG_DETAIL_BYTES, MAX_CONFIG_SCHEMA_ISSUE_BYTES,
+        MAX_CONFIG_SCHEMA_ISSUES, MAX_RECEIPT_SUMMARY_RECEIPTS, MAX_RECONCILIATION_SUMMARY_ORDERS,
         MAX_RECONCILIATION_SUMMARY_POSITIONS, PaperRuntimeSchema, PreservedExecutionOutcome,
-        append_execution_planned, auxiliary_config_kind, bounded_issue_detail,
-        collect_config_report, config_summary, execution_batch, execution_error_summary,
-        finish_arbitrage_execution, finish_execution, inspect_config, paper_runtime_schema_issues,
-        plan_grid_intents, receipt_summary, render_config_summary,
-        start_after_shutdown_registration,
+        ProductionBinanceTestnetSoakProbe, append_execution_planned, auxiliary_config_kind,
+        bounded_issue_detail, build_binance_read_only_protocol, collect_config_report,
+        config_summary, execution_batch, execution_error_summary, finish_arbitrage_execution,
+        finish_execution, inspect_config, paper_runtime_schema_issues, plan_grid_intents,
+        receipt_summary, render_config_summary, start_after_shutdown_registration,
     };
+    use crate::testnet_soak::TestnetSoakSample;
     use crypto_trading_config::reject_yaml_anchors_and_aliases;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
@@ -5978,6 +6222,199 @@ mod tests {
             "crypto-trading-command-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[derive(Clone)]
+    struct FixedStreamClock {
+        now: chrono::DateTime<Utc>,
+    }
+
+    impl fmt::Debug for FixedStreamClock {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("FixedStreamClock")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl MarketDataClock for FixedStreamClock {
+        fn now(&self) -> chrono::DateTime<Utc> {
+            self.now
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct NoopStreamSleeper;
+
+    #[async_trait]
+    impl MarketStreamSleeper for NoopStreamSleeper {
+        async fn sleep(&self, _duration: StdDuration) {}
+    }
+
+    #[derive(Debug)]
+    struct ScriptedWebSocketSession {
+        events: VecDeque<Result<TextWebSocketEvent, ExchangeError>>,
+    }
+
+    #[async_trait]
+    impl TextWebSocketSession for ScriptedWebSocketSession {
+        async fn next_event(&mut self) -> Result<TextWebSocketEvent, ExchangeError> {
+            self.events.pop_front().unwrap_or_else(|| {
+                Ok(TextWebSocketEvent::Closed {
+                    kind: WebSocketCloseKind::Remote,
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedWebSocketConnector {
+        sessions: Mutex<VecDeque<ScriptedWebSocketSession>>,
+    }
+
+    impl ScriptedWebSocketConnector {
+        fn one(events: Vec<TextWebSocketEvent>) -> Self {
+            Self {
+                sessions: Mutex::new(
+                    vec![ScriptedWebSocketSession {
+                        events: events.into_iter().map(Ok).collect(),
+                    }]
+                    .into(),
+                ),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TextWebSocketConnector for ScriptedWebSocketConnector {
+        async fn connect(&self) -> Result<Box<dyn TextWebSocketSession>, ExchangeError> {
+            self.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .map(|session| Box::new(session) as Box<dyn TextWebSocketSession>)
+                .ok_or_else(|| ExchangeError::unavailable("no scripted websocket session"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedHttpTransport {
+        requests: Mutex<Vec<RemoteHttpRequest>>,
+        responses: Mutex<VecDeque<Result<RemoteHttpResponse, ExchangeError>>>,
+    }
+
+    #[async_trait]
+    impl RemoteHttpTransport for ScriptedHttpTransport {
+        async fn send(
+            &self,
+            request: RemoteHttpRequest,
+        ) -> Result<RemoteHttpResponse, ExchangeError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            self.responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("scripted HTTP transport ran out of responses")
+        }
+    }
+
+    #[tokio::test]
+    async fn production_testnet_soak_probe_emits_all_three_streaming_samples() {
+        let symbols = BinanceSmokeSymbols {
+            spot: Symbol::new("BTC-USDT-SPOT").unwrap(),
+            perpetual: Symbol::new("BTC-USDT-PERP").unwrap(),
+            wire_symbol: "BTCUSDT".to_owned(),
+        };
+        let clock = Arc::new(FixedStreamClock {
+            now: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
+        });
+        let sleeper: Arc<dyn MarketStreamSleeper> = Arc::new(NoopStreamSleeper);
+        let jitter = Arc::new(FixedMarketStreamJitter::new(10_000));
+        let reconnect = MarketStreamReconnectPolicy::new(
+            StdDuration::from_millis(1),
+            StdDuration::from_secs(1),
+        )
+        .unwrap();
+        let route = BinancePollingRoute::new(
+            MarketInstrument::new("binance", symbols.spot.clone(), MarketType::Spot).unwrap(),
+            Symbol::new("BTCUSDT").unwrap(),
+        )
+        .unwrap();
+        let market_connector: Arc<dyn TextWebSocketConnector> =
+            Arc::new(ScriptedWebSocketConnector::one(vec![
+                TextWebSocketEvent::Text(
+                    r#"{"u":7,"s":"BTCUSDT","b":"50000.0","B":"1.0","a":"50000.1","A":"2.0"}"#
+                        .to_owned(),
+                ),
+            ]));
+        let market_stream = BinanceBookTickerStreamSource::new(
+            BinancePublicExchange::new().unwrap(),
+            vec![route],
+            market_connector,
+            reconnect,
+            Arc::clone(&clock),
+            Arc::clone(&sleeper),
+            jitter.clone(),
+        )
+        .unwrap();
+        let user_connector: Arc<dyn TextWebSocketConnector> =
+            Arc::new(ScriptedWebSocketConnector::one(vec![
+                TextWebSocketEvent::Text(
+                    r#"{"id":"user-data-subscribe","status":200,"result":{"subscriptionId":17}}"#
+                        .to_owned(),
+                ),
+            ]));
+        let user_stream =
+            BinanceUserDataStreamSource::new(user_connector, reconnect, clock, sleeper, jitter);
+        let http = Arc::new(ScriptedHttpTransport {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(
+                (0..3)
+                    .map(|_| Ok(RemoteHttpResponse::new(200, br"[]").unwrap()))
+                    .collect(),
+            ),
+        });
+        let transport: Arc<dyn RemoteHttpTransport> = http.clone();
+        let signer = Arc::new(
+            BinanceHmacSha256Signer::new("offline-api-key", "offline-api-secret").unwrap(),
+        );
+        let exchange = BinanceTestnetExchange::new(
+            build_binance_read_only_protocol(signer, &symbols).unwrap(),
+            transport,
+        );
+        let mut probe =
+            ProductionBinanceTestnetSoakProbe::from_parts(market_stream, user_stream, exchange);
+
+        assert_eq!(
+            probe.next_probe().await.unwrap(),
+            TestnetSoakSample::MarketStream
+        );
+        assert_eq!(
+            probe.next_probe().await.unwrap(),
+            TestnetSoakSample::UserDataStream
+        );
+        assert_eq!(
+            probe.next_probe().await.unwrap(),
+            TestnetSoakSample::AuthenticatedReconcile
+        );
+        let request_paths = http
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|request| request.url().path().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_paths,
+            [
+                "/api/v3/openOrders",
+                "/fapi/v1/openOrders",
+                "/fapi/v2/positionRisk",
+            ]
+        );
     }
 
     #[tokio::test]
