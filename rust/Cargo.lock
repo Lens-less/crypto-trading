@@ -388,6 +388,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "crypto-trading-backtest",
  "crypto-trading-config",
  "crypto-trading-control-plane",
  "crypto-trading-domain",
@@ -516,6 +517,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "crypto-trading-control-plane",
+ "crypto-trading-domain",
  "crypto-trading-runtime",
  "futures-util",
  "include_dir",

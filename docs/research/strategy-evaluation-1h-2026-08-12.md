@@ -29,6 +29,16 @@ closed. This is a data-admission result, not evidence for or against any of the
 
 The machine-readable evidence is
 [`w1-btcusdt-spot-1h-20260812-v1-data-admission.json`](../../artifacts/strategy-evaluation/w1-1h/w1-btcusdt-spot-1h-20260812-v1-data-admission.json).
+Recompute it from verified cached ZIPs with the checked-in audit. The default
+mode is offline and fails closed unless every archive has a local checksum
+sidecar or a frozen provenance-lock row; `-FetchMissingChecksums` is an explicit
+one-time network bootstrap, not part of the reproducible offline gate.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\audit-w1-btcusdt-1h.ps1 `
+  -CacheDirectory C:\path\to\crypto-trading-w1-btcusdt-1h-v1 `
+  -ExpectedArtifact artifacts\strategy-evaluation\w1-1h\w1-btcusdt-spot-1h-20260812-v1-data-admission.json
+```
 
 ## Why the protocol is not repaired in place
 

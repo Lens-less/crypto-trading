@@ -17,6 +17,16 @@ Testnet 实时通道、mainnet 持续关闭”为主线，不再把流程或安�
 这两项都不授予 mainnet 权限，也不阻塞本次代码库改造合入；它们继续作为
 生产候选的外部门禁。
 
+## Correction after independent review
+
+This report records repo-local acceptance only. It does not claim the credentialed Binance Testnet 24-hour soak, the backup/restore drill, or any mainnet/edge promotion has been completed. Those remain external gates that still require operator execution.
+
+Evidence boundary:
+
+- CI and offline verifier results prove repo-local contracts only.
+- A 24-hour evidence bundle is incomplete unless it includes the journal, both process logs, the three status captures, `evidence.json`, and the matching candidate checksum.
+- `mainnet` and `edge` remain closed until the external gates pass.
+
 ## Operator 决策
 
 | 决策 | 本次采用值 | 结果 |
@@ -154,10 +164,20 @@ The offline verifier requires a same-task
 `continuous_testnet_campaign_recovery_verified` fact with `query_first=true`, a
 valid UUID, and a positive, arithmetically consistent query delta immediately
 paired with the unclean restart. Read-only owner operation does not satisfy this
-gate. No credentialed external 24-hour run was performed; fixed-clock tests
-prove only the verifier contract, so the real run remains an external gate.
-The owner-backed evidence schema is v2; legacy read-only-soak v1 journals are
+gate. It now also enforces independent per-kind density and maximum-gap limits,
+process-monotonic active elapsed time, and a recomputed SHA-256 record chain.
+The chain is tamper-evident only after its head/source digest is externally
+anchored; it is not an operator identity signature. No credentialed external
+24-hour run was performed, so the real run remains an external gate. The
+owner-backed evidence schema is v2; legacy read-only-soak v1 journals are
 rejected instead of being silently promoted into AC-R3 evidence.
+
+AC-R1 now has a runnable `paper-bar` owner path using the durable Paper account,
+reservation saga, optional account-risk admission, and journal. Its contract
+drives the same warmup, absolute bar indexes, achieved-current-target semantics,
+next-open fills, costs, and terminal liquidation as `CausalSpotEvaluator`, and
+compares the resulting trades end to end. Reusing a non-empty owner journal is
+still fail-closed rather than claiming unsupported recovery.
 
 附加卫生结果：workflow YAML 解析通过，`git diff --check` 通过，未发现 merge
 markers，工作树（排除冻结 Python archive、build 与 dependency 目录）的高置信

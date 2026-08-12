@@ -55,8 +55,9 @@ pub use execution::{
     RuntimeError,
 };
 pub use history::{
-    DecisionRecord, HistoryError, JsonlHistory, MAX_HISTORY_BATCH_BYTES, MAX_HISTORY_CHAIN_BYTES,
-    MAX_HISTORY_FILE_BYTES, MAX_HISTORY_RECORD_BYTES, MAX_HISTORY_SEALED_SEGMENTS,
+    DecisionRecord, HistoryError, HistoryTailRepairOutcome, JsonlHistory, MAX_HISTORY_BATCH_BYTES,
+    MAX_HISTORY_CHAIN_BYTES, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_RECORD_BYTES,
+    MAX_HISTORY_SEALED_SEGMENTS, normalized_lock_key,
 };
 pub use journal::{
     AggregateRef, CursorError, EventContractError, JOURNAL_CURSOR_SCHEMA_VERSION, JournalCursor,

@@ -39,8 +39,8 @@ curl --fail \
   http://127.0.0.1:8787/api/v1/system
 ```
 
-The unauthenticated readiness probe is deliberately data-free and must report
-healthy. The authenticated startup probe must report
+The unauthenticated `/api/v1/health` probe is deliberately data-free and
+reports liveness only. The authenticated startup probe must report
 `live_trading_enabled: false`, the expected `journal_id`, and a non-degraded
 projection before promotion.
 
@@ -66,6 +66,59 @@ do not bypass it with additional clients.
 Treat projection conflicts, `recovery_required`, a journal-integrity error, or a
 capability-manifest validation error as release blockers. Do not work around a
 failed startup by replacing the journal UUID or deleting journal records.
+
+## Observability and alerting
+
+The Web process exposes protected `GET /api/v1/metrics`. Every long-running
+task host, including `testnet-soak serve`, also exposes protected
+`GET /metrics` on its loopback control port. Authenticate the former with
+`CRYPTO_TRADING_WEB_TOKEN` and the latter with
+`CRYPTO_TRADING_TASK_CONTROL_TOKEN`; never put either token in the scrape URL.
+These endpoints report process-local state, so scrape the endpoint belonging to
+the actual owner rather than a separate Web process. Keep `/api/v1/health` as
+liveness only; do not infer trading readiness or degradation from it. The
+checked-in baseline alert rules are
+[`deploy/prometheus-alerts.yml`](../../deploy/prometheus-alerts.yml); that file
+is the authoritative alert-policy source.
+
+For example, scrape the owner process itself (replace the port with the
+configured Testnet soak control port):
+
+```sh
+curl --fail \
+  -H "Authorization: Bearer $CRYPTO_TRADING_TASK_CONTROL_TOKEN" \
+  http://127.0.0.1:49152/metrics
+```
+
+The checked-in minimum alert set is:
+
+1. Fire immediately if `crypto_trading_process_up != 1`, if the metrics scrape
+   fails, or if the process restarts without an operator-recorded clean stop.
+2. Fire on stale streams or transport churn when
+   `crypto_trading_stream_observed` is zero, when
+   `time() - crypto_trading_stream_last_frame_timestamp_seconds{stream="market"}`
+   exceeds 5 seconds, or when the corresponding `user_data` expression exceeds
+   the 60-second transport-watchdog budget. The user-data threshold measures
+   transport liveness (including Pong), not account-state freshness.
+3. Fire immediately when
+   `crypto_trading_owner_phase{phase="recovery_required"} == 1` or when
+   `increase(crypto_trading_journal_append_failure_total[5m]) > 0`.
+4. Fire when `abs(crypto_trading_clock_skew_milliseconds) > 1000` persists for
+   one minute, and warn whenever
+   `increase(crypto_trading_rest_status_total{class="429"}[5m]) > 0`.
+
+Reconnect/gap counters, REST latency/request totals, Binance used-weight and
+order-count headers, and successful journal-append totals are exported for
+dashboards and capacity drill-down; the checked-in rules do not currently
+alert on those series. Add site-specific thresholds in the deployment layer
+and preserve this baseline unchanged so repository contract tests can detect
+policy drift.
+
+The 240-request / 60-second Web threshold protects only the local read API; it
+is not a Binance venue budget. The exchange client must obey its separate
+conservative request-weight/order-count budget and any exported `Retry-After`
+deadline. Retain those response headers in the evidence bundle so recovery
+decisions can be replayed.
 
 ## Binance Testnet order-lifecycle gate
 
@@ -453,29 +506,53 @@ cat /srv/crypto-trading/soak/evidence.json
 
 The JSON must report `requirements_met: true`, at least 86,400 observed active
 seconds, a clean stop, one or more unclean restarts, the configured minimum
-success count, and nonzero `market_stream`, `user_data_stream`, and
-`authenticated_reconcile` counts. It must also report
+success count, the enforced per-kind minimum, and a maximum gap no greater than
+the policy for each of `market_stream`, `user_data_stream`, and
+`authenticated_reconcile`. It must also report
 `owner_campaign_recovery_verified: true`; this is accepted only when a
 same-task, UUID-valid, positive exact-query delta is immediately paired with
-the unclean restart. Fixed-timestamp offline tests prove this verifier contract,
-not a credentialed 24-hour run. Archive the
+the unclean restart. `monotonic_elapsed_verified` and
+`integrity_chain_verified` must both be true; archive the reported integrity
+head and `source_sha256` alongside the verifier output.
+
+The SHA-256 chain detects truncation or modification only after its head and
+source digest have been anchored outside the journal. It is not an identity
+signature: an operator with write access to every file could recompute it.
+Before moving the bundle off the candidate host, create one manifest over the
 journal, both process logs, the three status captures, `evidence.json`, and the
-candidate binary checksum. Do not archive credentials or process-environment
-dumps.
+candidate binary, then protect that manifest with the organisation's signing
+or immutable-storage control. Fixed-clock offline tests prove the verifier
+contract, not a credentialed 24-hour run. The bundle must come from the
+operator-controlled host with real Testnet credentials; this runbook does not
+simulate or replace it. Never archive credentials or process-environment dumps.
+
+`continuous_testnet_killed_clean` proves two identical snapshots with zero
+owned/foreign open orders and zero positions, and records the owner's observed
+balance projection. The generic `ReconcileReceipt` does not carry authoritative
+Spot balances, so this fact explicitly records
+`spot_balance_authority: unavailable_in_reconcile_receipt`; it must not be used
+as a substitute for the separate account-reconciliation gate above.
 
 ## Backup and restore release gate
 
 The journal is append-only, but copying an actively changing tail is not a
-transactional snapshot. Quiesce the writer or take a filesystem snapshot before
-running the drill. The script independently:
+transactional snapshot. The drill takes the same OS-level writer lease used by
+the runtime and fails immediately when an owner is active; quiesce the writer
+or take a filesystem snapshot before running it. The script independently:
 
 1. refuses to overwrite an existing backup;
-2. rejects a source whose size changes during the copy;
+2. refuses a symlinked writer lock, requires the writer lease, and rejects a
+   source whose size or SHA-256 changes during the copy;
 3. records and verifies a SHA-256 byte manifest;
 4. restores into a newly created drill directory;
 5. starts the bounded read model against the restored copy, which replays and
    validates the journal's sequence and FNV boundary anchors;
 6. saves the projected `/api/v1/system` result as evidence.
+
+Run this drill on every release candidate and whenever the journal generation
+changes. Keep the emitted backup path, checksum manifest, restore directory,
+`system.json`, and verifier log with the release evidence until a newer
+successful release package supersedes them.
 
 Build the verifier first, then run it. The drill consumes only the JSON API,
 so building without `frontend/dist/` is acceptable here (the binary then serves
@@ -506,13 +583,44 @@ never moved over the live journal. The drill starts its short-lived verifier
 with the explicit `--allow-open-loopback-read-api` escape hatch; normal operator
 control-plane deployments remain bearer-protected by default.
 
+For a scheduled Linux host, install
+`deploy/systemd/crypto-trading-journal-backup.service` and `.timer`, place these
+non-secret values in `/etc/crypto-trading/journal-backup.env`, then enable the
+timer. The scheduled run fails (and must alert through the service manager)
+while the owner still holds its writer lease; arrange an explicit quiescent
+window or a filesystem-snapshot job rather than weakening that check.
+
+```text
+CRYPTO_TRADING_BACKUP_JOURNAL=/srv/crypto-trading/data/operations.jsonl
+CRYPTO_TRADING_BACKUP_DIR=/srv/crypto-trading/backups
+CRYPTO_TRADING_RESTORE_DRILL_DIR=/srv/crypto-trading/restore-drills
+CRYPTO_TRADING_JOURNAL_ID=replace-with-the-journal-uuid
+CRYPTO_TRADING_WEB_BINARY=/opt/crypto-trading/bin/crypto-trading-web
+```
+
+Store daily backups and manifests on immutable or versioned storage for at
+least 35 days, and retain each release-candidate evidence bundle until a newer
+candidate has passed both backup and restore. Apply retention in the storage
+backend; these scripts intentionally never delete the last known-good backup.
+
+## Host time synchronization gate
+
+The exported `crypto_trading_clock_skew_milliseconds` value measures the
+exchange-observed offset and the checked-in alert fires above one second. Also
+monitor the host time service independently: on systemd hosts,
+`timedatectl show --property=NTPSynchronized --value` must remain `yes`, and the
+chrony/systemd-timesyncd service must be healthy. Disable mutation authority if
+either the host synchronization check or the exchange-skew alert fails; do not
+fix timestamp errors by widening `recvWindow`.
+
 ## Promotion and rollback
 
 Promotion requires all repository quality gates, healthy and non-degraded Web
 projections, the backup/restore drill, both credentialed Testnet reconciliation
 products, the three credentialed Testnet lifecycle cases above, and the 24-hour
 soak evidence. A local deterministic harness is not a substitute for
-credentialed Binance Testnet evidence or the 24-hour soak.
+credentialed Binance Testnet evidence or the 24-hour soak. Edge and mainnet
+remain closed until those external gates pass.
 
 To roll back, keep the data volume and journal UUID unchanged, deploy the prior
 image digest, and repeat the system projection check. Never roll back by

@@ -1,0 +1,65 @@
+groups:
+  - name: crypto-trading-safety
+    rules:
+      - alert: CryptoTradingProcessDown
+        expr: absent(crypto_trading_process_up) == 1 or crypto_trading_process_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Crypto trading owner is not being scraped
+          action: Keep trading authority disabled and inspect the process exit plus the last durable owner fact.
+
+      - alert: CryptoTradingMarketStreamStale
+        expr: crypto_trading_stream_observed{stream="market"} == 0 or (time() - crypto_trading_stream_last_frame_timestamp_seconds{stream="market"}) > 5
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: Market stream is absent or stale
+          action: Block admission, preserve the journal, and investigate reconnect or sequence-gap counters.
+
+      - alert: CryptoTradingUserDataStreamStale
+        expr: crypto_trading_stream_observed{stream="user_data"} == 0 or (time() - crypto_trading_stream_last_frame_timestamp_seconds{stream="user_data"}) > 60
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: User-data stream is absent or has missed its transport watchdog
+          action: Block admission and require authoritative REST reconciliation before re-arming.
+
+      - alert: CryptoTradingRecoveryRequired
+        expr: crypto_trading_owner_phase{phase="recovery_required"} == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: The owner entered recovery_required
+          action: Keep the kill switch latched and resolve the durable ambiguity query-first.
+
+      - alert: CryptoTradingJournalAppendFailure
+        expr: increase(crypto_trading_journal_append_failure_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: A durable journal append failed
+          action: Stop new authority and preserve the journal for bounded recovery.
+
+      - alert: CryptoTradingClockSkew
+        expr: abs(crypto_trading_clock_skew_milliseconds) > 1000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Host or Binance clock skew exceeds the operational guardrail
+          action: Block signed mutations and repair host time synchronization before retrying.
+
+      - alert: CryptoTradingRateLimited
+        expr: increase(crypto_trading_rest_status_total{class="429"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Binance returned HTTP 429
+          action: Honor the exported Retry-After deadline and inspect the retained request-weight budget.

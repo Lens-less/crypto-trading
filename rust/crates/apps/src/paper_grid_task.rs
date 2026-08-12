@@ -3405,6 +3405,7 @@ const fn source_exit_label(exit: MarketSupervisorExit) -> &'static str {
     match exit {
         MarketSupervisorExit::StopRequested => "stop_requested",
         MarketSupervisorExit::SourceEnded => "source_ended",
+        MarketSupervisorExit::ReconnectExhausted => "reconnect_exhausted",
         MarketSupervisorExit::ShutdownTimedOut => "shutdown_timed_out",
     }
 }

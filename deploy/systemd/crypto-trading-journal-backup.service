@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto Trading journal backup and restore verification
+Documentation=file:/opt/crypto-trading/docs/runbooks/production-candidate.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=crypto-trading
+Group=crypto-trading
+EnvironmentFile=/etc/crypto-trading/journal-backup.env
+ExecStart=/opt/crypto-trading/deploy/scheduled-journal-backup.sh
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=full

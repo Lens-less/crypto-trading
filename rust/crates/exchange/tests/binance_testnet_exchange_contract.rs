@@ -9,10 +9,11 @@ use chrono::{TimeZone, Utc};
 use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side, Symbol};
 use crypto_trading_exchange::{
     BinanceHmacSha256Signer, BinanceProduct, BinanceTestnetEndpoints, BinanceTestnetExchange,
-    BinanceTestnetProtocol, CancellationDisposition, ExchangeError, ExchangeHandle, ExchangeMode,
-    ExchangeOperation, ExchangeOperationKey, ExchangeSymbol, ExchangeSymbolCatalog,
-    InstrumentRuleCatalog, InstrumentRules, ReconcileScope, RemoteHttpRequest, RemoteHttpResponse,
-    RemoteHttpTransport, RemoteRetryAfter, TradingCommand, TradingReceipt,
+    BinanceTestnetProtocol, CancellationDisposition, ExchangeAvailability, ExchangeError,
+    ExchangeHandle, ExchangeMode, ExchangeOperation, ExchangeOperationKey, ExchangeSymbol,
+    ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules, ReconcileScope,
+    RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport, RemoteRetryAfter, TradingCommand,
+    TradingReceipt,
 };
 use rust_decimal::Decimal;
 
@@ -790,6 +791,123 @@ async fn reconcile_preserves_retry_after_metadata_on_binance_rate_limits() {
         Some(RemoteRetryAfter::Seconds(120))
     ));
     assert_eq!(transport.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_after_gate_blocks_immediate_testnet_retries_without_more_network() {
+    let transport = Arc::new(ScriptedTransport::from_responses(vec![Ok(
+        RemoteHttpResponse::new_with_headers(
+            429,
+            vec![
+                ("Retry-After".to_owned(), "120".to_owned()),
+                (
+                    "Date".to_owned(),
+                    "Fri, 25 Jul 2026 09:10:11 GMT".to_owned(),
+                ),
+            ],
+            br#"{"code":-1003,"msg":"Too many requests"}"#,
+        )
+        .unwrap(),
+    )]));
+    let exchange = BinanceTestnetExchange::with_clock(protocol(), transport.clone(), || {
+        Utc.with_ymd_and_hms(2026, 7, 25, 9, 10, 11).unwrap()
+    });
+
+    let first = exchange
+        .reconcile(ReconcileScope::Orders {
+            symbol: Some(Symbol::new("BTC-USDC-SPOT").unwrap()),
+        })
+        .await
+        .unwrap_err();
+    let second = exchange
+        .reconcile(ReconcileScope::Orders {
+            symbol: Some(Symbol::new("BTC-USDC-SPOT").unwrap()),
+        })
+        .await
+        .unwrap_err();
+    let status = exchange.status().await.unwrap();
+
+    assert!(matches!(
+        first.remote_failure_metadata().unwrap().retry_after,
+        Some(RemoteRetryAfter::Seconds(120))
+    ));
+    assert!(matches!(
+        second.remote_failure_metadata().unwrap().retry_after,
+        Some(RemoteRetryAfter::Seconds(120))
+    ));
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(status.availability, ExchangeAvailability::Unavailable);
+}
+
+#[tokio::test]
+async fn used_weight_high_water_gate_blocks_until_the_next_minute_boundary() {
+    let clock = Arc::new(Mutex::new(
+        Utc.with_ymd_and_hms(2026, 7, 25, 9, 10, 45).unwrap(),
+    ));
+    let transport = Arc::new(ScriptedTransport::from_responses(vec![
+        Ok(RemoteHttpResponse::new_with_headers(
+            200,
+            vec![
+                (
+                    "Date".to_owned(),
+                    "Fri, 25 Jul 2026 09:10:40 GMT".to_owned(),
+                ),
+                ("X-MBX-USED-WEIGHT-1M".to_owned(), "240".to_owned()),
+            ],
+            br"[]",
+        )
+        .unwrap()),
+        Ok(RemoteHttpResponse::new_with_headers(
+            200,
+            vec![(
+                "Date".to_owned(),
+                "Fri, 25 Jul 2026 09:11:01 GMT".to_owned(),
+            )],
+            br"[]",
+        )
+        .unwrap()),
+    ]));
+    let exchange = BinanceTestnetExchange::with_clock(protocol(), transport.clone(), {
+        let clock = Arc::clone(&clock);
+        move || *clock.lock().unwrap()
+    });
+    let scope = ReconcileScope::Orders {
+        symbol: Some(Symbol::new("BTC-USDC-SPOT").unwrap()),
+    };
+
+    let first = exchange.reconcile(scope.clone()).await.unwrap();
+    let blocked = exchange.reconcile(scope.clone()).await.unwrap_err();
+    let blocked_status = exchange.status().await.unwrap();
+
+    assert!(first.orders.is_empty());
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(
+        blocked_status.availability,
+        ExchangeAvailability::Unavailable
+    );
+    match blocked
+        .remote_failure_metadata()
+        .unwrap()
+        .retry_after
+        .as_ref()
+    {
+        Some(RemoteRetryAfter::At(deadline)) => assert_eq!(
+            *deadline,
+            Utc.with_ymd_and_hms(2026, 7, 25, 9, 11, 0)
+                .unwrap()
+                .checked_add_signed(chrono::TimeDelta::milliseconds(250))
+                .unwrap()
+        ),
+        other => panic!("expected local retry-after boundary, got {other:?}"),
+    }
+
+    *clock.lock().unwrap() = Utc.with_ymd_and_hms(2026, 7, 25, 9, 11, 1).unwrap();
+    let resumed = exchange.reconcile(scope).await.unwrap();
+    let resumed_status = exchange.status().await.unwrap();
+
+    assert!(resumed.orders.is_empty());
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(resumed_status.availability, ExchangeAvailability::Ready);
 }
 
 #[tokio::test]

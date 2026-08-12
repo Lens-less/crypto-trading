@@ -37,7 +37,7 @@ test.beforeAll(async () => {
       TOKEN_ENV,
       "--enable-paper-writes",
       "--paper-account-risk-config",
-      join(REPO_ROOT, "rust", "config", "paper", "account-risk.example.yaml"),
+      join(REPO_ROOT, "rust", "fixtures", "e2e-paper-account-risk.yaml"),
       "--paper-grid-task-id",
       GRID_TASK_ID,
       "--paper-grid-strategy-id",
@@ -98,6 +98,9 @@ test("start_paper_grid → stop_task 全流程通过受信 submit 生效", async
     name: "只读连续任务明细,可横向滚动",
   });
   await expect(taskTable).toContainText(GRID_TASK_ID, { timeout: 30_000 });
+  await expect(
+    taskTable.getByRole("row").filter({ hasText: GRID_TASK_ID }),
+  ).toContainText("运行中", { timeout: 30_000 });
   await expect(
     gridCard.getByText(/生效判定:已生效/),
   ).toBeVisible({ timeout: 30_000 });

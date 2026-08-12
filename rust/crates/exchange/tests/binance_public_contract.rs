@@ -264,6 +264,40 @@ async fn binance_rate_limit_preserves_retry_after_metadata() {
 }
 
 #[tokio::test]
+async fn binance_public_retry_after_gate_blocks_immediate_retries_without_more_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).unwrap();
+        let body = r#"{"code":-1003,"msg":"too many requests"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nDate: Tue, 15 Nov 1994 08:12:31 GMT\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let exchange = BinancePublicExchange::with_base_url(&base_url).unwrap();
+    let symbol = Symbol::new("LTCBTC").unwrap();
+
+    let first = exchange.fetch_snapshot(&symbol).await.unwrap_err();
+    let second = exchange.fetch_snapshot(&symbol).await.unwrap_err();
+    let status = exchange.status().await.unwrap();
+
+    assert!(matches!(
+        first.remote_failure_metadata().unwrap().retry_after,
+        Some(RemoteRetryAfter::Seconds(7))
+    ));
+    assert!(matches!(
+        second.remote_failure_metadata().unwrap().retry_after,
+        Some(RemoteRetryAfter::Seconds(7))
+    ));
+    assert_eq!(status.availability, ExchangeAvailability::Unavailable);
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn non_json_error_bodies_fall_back_to_a_bounded_text_reason() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());

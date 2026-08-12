@@ -74,10 +74,10 @@ impl BinanceHmacSha256Signer {
         let api_secret = api_secret.into();
         validate_secret_text("Binance API key", &api_key, MAX_API_KEY_BYTES)?;
         validate_secret_text("Binance API secret", &api_secret, MAX_SECRET_BYTES)?;
-        Ok(Self {
-            api_key,
-            secret: HmacSha256Key::new(api_secret.as_bytes()),
-        })
+        let mut secret_bytes = api_secret.into_bytes();
+        let secret = HmacSha256Key::new(&secret_bytes);
+        secret_bytes.fill(0);
+        Ok(Self { api_key, secret })
     }
 }
 
@@ -111,12 +111,24 @@ pub struct BinanceTestnetBalance {
 
 /// Signed parameters for `userDataStream.subscribe.signature` on the Binance
 /// Spot websocket API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BinanceWsApiUserDataStreamSubscription {
     pub api_key: String,
     pub timestamp_ms: u64,
     pub recv_window_ms: Option<u64>,
     pub signature: String,
+}
+
+impl fmt::Debug for BinanceWsApiUserDataStreamSubscription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BinanceWsApiUserDataStreamSubscription")
+            .field("api_key", &"<redacted>")
+            .field("timestamp_ms", &self.timestamp_ms)
+            .field("recv_window_ms", &self.recv_window_ms)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BinanceWsApiUserDataStreamSubscription {
@@ -1356,13 +1368,27 @@ fn classify_mutating_response(
     client_order_id: Option<uuid::Uuid>,
     operation_key: ExchangeOperationKey,
 ) -> Result<RemoteHttpResponse, ExchangeError> {
-    let response = result.map_err(|_| ExchangeError::AmbiguousOutcome {
-        operation,
-        client_order_id,
-        operation_key: Some(operation_key.clone()),
-        reason: "authenticated request reached the transport but no outcome was returned; reconcile before retrying"
-            .to_owned(),
-    })?;
+    let response = match result {
+        Ok(response) => response,
+        Err(
+            ref error @ ExchangeError::RemoteFailure {
+                status,
+                ref metadata,
+                ..
+            },
+        ) if metadata.retry_after.is_some() || matches!(status, Some(418 | 429)) => {
+            return Err(error.clone());
+        }
+        Err(_) => {
+            return Err(ExchangeError::AmbiguousOutcome {
+                operation,
+                client_order_id,
+                operation_key: Some(operation_key.clone()),
+                reason: "authenticated request reached the transport but no outcome was returned; reconcile before retrying"
+                    .to_owned(),
+            });
+        }
+    };
     let exchange_error = serde_json::from_slice::<BinanceErrorWire>(response.body()).ok();
     if response.status() == 408
         || response.status() >= 500
@@ -1849,7 +1875,7 @@ fn parse_notional_filter(
     let missing_field = |field: &str| {
         ExchangeError::invalid_response(
             EXCHANGE,
-            format!("Binance exchangeInfo symbol {requested_wire_symbol} is missing {field}",),
+            format!("Binance exchangeInfo symbol {requested_wire_symbol} is missing {field}"),
         )
     };
     let (apply_min_notional_to_market, apply_max_notional_to_market, average_price_minutes) = match (

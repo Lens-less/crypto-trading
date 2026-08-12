@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the verified Crypto Trading journal backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=crypto-trading-journal-backup.service
+
+[Install]
+WantedBy=timers.target

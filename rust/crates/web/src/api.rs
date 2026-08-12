@@ -29,6 +29,7 @@ use crypto_trading_control_plane::{
     ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
     RecoveryDirective, ReleaseStage, VirtualGridScannerReadModel,
 };
+use crypto_trading_domain::{operational_metrics_snapshot, render_prometheus_metrics};
 use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -420,6 +421,7 @@ fn api_routes_with_optional_shutdown(
         .route("/settings", get(runtime_settings))
         .route("/executions", get(executions))
         .route("/events", get(events))
+        .route("/metrics", get(metrics))
         .layer(middleware::from_fn_with_state(
             access_state.clone(),
             authorize,
@@ -458,6 +460,18 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
 
 async fn capabilities(State(state): State<ApiState>) -> Json<CapabilityManifest> {
     Json(state.control_plane.capabilities().clone())
+}
+
+async fn metrics() -> Response {
+    let now_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let body = render_prometheus_metrics(&operational_metrics_snapshot(), now_unix_seconds);
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 async fn system(State(state): State<ApiState>) -> Result<Json<SystemResponse>, ApiError> {

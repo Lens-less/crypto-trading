@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use crypto_trading_domain::{operational_metrics_snapshot, render_prometheus_metrics};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -42,6 +44,7 @@ const TASK_CONTROL_STOP_TIMEOUT: Duration = Duration::from_secs(125);
 const TASK_CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const TASK_CONTROL_MAX_LINE_BYTES: usize = 1_024;
 const TASK_CONTROL_MAX_RESPONSE_BYTES: usize = 16 * 1024;
+const TASK_CONTROL_MAX_HTTP_HEADERS: usize = 32;
 
 #[derive(Clone, Eq, PartialEq)]
 struct TaskHostControlToken(String);
@@ -448,6 +451,12 @@ where
             return Ok(None);
         }
     };
+    if auth_line == "GET /metrics HTTP/1.1" {
+        handle_metrics_request(reader, token)
+            .await
+            .map_err(TaskHostServeError::Io)?;
+        return Ok(None);
+    }
     let Some(presented) = auth_line.strip_prefix("auth ") else {
         let mut stream = reader.into_inner();
         let _ = write_response(&mut stream, "error: unauthorized\n").await;
@@ -524,6 +533,81 @@ where
             Ok(None)
         }
     }
+}
+
+async fn handle_metrics_request(
+    mut reader: BufReader<TcpStream>,
+    token: &TaskHostControlToken,
+) -> io::Result<()> {
+    let mut authorization = None;
+    for index in 0..=TASK_CONTROL_MAX_HTTP_HEADERS {
+        let Ok(Some(line)) = read_control_line(&mut reader).await else {
+            let mut stream = reader.into_inner();
+            let _ = write_http_response(&mut stream, 400, "text/plain", "bad request\n").await;
+            return Ok(());
+        };
+        if line.is_empty() {
+            let mut stream = reader.into_inner();
+            let authorized = authorization
+                .as_deref()
+                .and_then(|value: &str| value.strip_prefix("Bearer "))
+                .is_some_and(|presented| token.matches(presented));
+            if !authorized {
+                let _ = write_http_response(
+                    &mut stream,
+                    401,
+                    "text/plain",
+                    "authentication required\n",
+                )
+                .await;
+                return Ok(());
+            }
+            let now_unix_seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let body = render_prometheus_metrics(&operational_metrics_snapshot(), now_unix_seconds);
+            write_http_response(
+                &mut stream,
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                &body,
+            )
+            .await?;
+            return Ok(());
+        }
+        if index == TASK_CONTROL_MAX_HTTP_HEADERS {
+            let mut stream = reader.into_inner();
+            let _ = write_http_response(&mut stream, 400, "text/plain", "bad request\n").await;
+            return Ok(());
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+            && authorization.replace(value.trim().to_owned()).is_some()
+        {
+            let mut stream = reader.into_inner();
+            let _ = write_http_response(&mut stream, 400, "text/plain", "bad request\n").await;
+            return Ok(());
+        }
+    }
+    unreachable!()
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        _ => "Bad Request",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n{body}",
+        body.len()
+    );
+    write_response(stream, &response).await
 }
 
 async fn write_response(stream: &mut TcpStream, response: &str) -> io::Result<()> {
@@ -867,6 +951,63 @@ mod tests {
             outcome,
             TaskHostServeOutcome::StopRequested("stopped")
         ));
+    }
+
+    #[tokio::test]
+    async fn metrics_http_endpoint_requires_bearer_auth_and_keeps_control_available() {
+        let mut host = MockHost::new();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token =
+            TaskHostControlToken::validate("0123456789abcdef0123456789abcdef".to_owned()).unwrap();
+        let server_token = token.clone();
+
+        let server = tokio::spawn(async move {
+            serve_host_with_shutdown_token(
+                &mut host,
+                listener,
+                Duration::from_millis(10),
+                |_| "status\n".to_owned(),
+                |_, exit| format!("exit={exit}\n"),
+                Ok(Box::pin(std::future::pending::<
+                    Result<ShutdownSignal, ShutdownSignalError>,
+                >())),
+                &server_token,
+            )
+            .await
+        });
+
+        let unauthorized =
+            raw_http_request(address, "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(!unauthorized.contains("crypto_trading_process_up"));
+
+        let authorized = raw_http_request(
+            address,
+            "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n",
+        )
+        .await;
+        assert!(authorized.starts_with("HTTP/1.1 200 OK"), "{authorized}");
+        assert!(authorized.contains("Content-Type: text/plain; version=0.0.4"));
+        assert!(authorized.contains("crypto_trading_process_up 1"));
+        assert!(!authorized.contains("0123456789abcdef0123456789abcdef"));
+
+        let response = query_control_with_token(address, TaskHostControlCommand::Stop, &token)
+            .await
+            .unwrap();
+        assert!(response.contains("exit=stopped"), "{response}");
+        assert!(matches!(
+            server.await.unwrap().unwrap(),
+            TaskHostServeOutcome::StopRequested("stopped")
+        ));
+    }
+
+    async fn raw_http_request(address: SocketAddr, request: &str) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
     }
 
     #[tokio::test]

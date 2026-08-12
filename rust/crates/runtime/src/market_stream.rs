@@ -12,6 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use crypto_trading_domain::{
+    OperationalStreamKind, record_stream_frame, record_stream_gap, record_stream_queue_drop,
+    record_stream_reconnect,
+};
 use crypto_trading_exchange::{
     BinancePublicExchange, BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint,
     BinanceTestnetProtocol, ExchangeError,
@@ -31,7 +35,10 @@ use crate::{
 
 const BINANCE_EXCHANGE: &str = "binance";
 const MAX_STREAM_TARGETS: usize = 1_024;
+const MIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 type InitMessageFactory = Arc<dyn Fn() -> Result<Vec<String>, ExchangeError> + Send + Sync>;
+pub(crate) const USER_DATA_SUBSCRIBE_REQUEST_ID: &str = "user-data-subscribe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSocketCloseKind {
@@ -84,8 +91,18 @@ pub struct FixedMarketStreamJitter {
 }
 
 impl FixedMarketStreamJitter {
-    pub fn new(multiplier_bps: u16) -> Self {
-        Self { multiplier_bps }
+    /// Builds a fixed positive reconnect-jitter multiplier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request error when the multiplier is zero.
+    pub fn new(multiplier_bps: u16) -> Result<Self, ExchangeError> {
+        if multiplier_bps == 0 {
+            return Err(ExchangeError::invalid(
+                "market-stream jitter multiplier must be positive",
+            ));
+        }
+        Ok(Self { multiplier_bps })
     }
 }
 
@@ -227,6 +244,7 @@ impl MarketStreamReconnectPolicy {
 #[derive(Debug)]
 struct BroadcastTextWebSocketSession {
     receiver: broadcast::Receiver<TextWebSocketEvent>,
+    abort_handle: tokio::task::AbortHandle,
 }
 
 #[async_trait]
@@ -244,10 +262,19 @@ impl TextWebSocketSession for BroadcastTextWebSocketSession {
     }
 }
 
+impl Drop for BroadcastTextWebSocketSession {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
+
 pub struct TokioTextWebSocketConnector {
     url: reqwest::Url,
     queue_capacity: usize,
     ping_interval: Duration,
+    connect_timeout: Duration,
+    inbound_idle_timeout: Duration,
+    pong_timeout: Duration,
     init_message_factory: Option<InitMessageFactory>,
 }
 
@@ -268,6 +295,9 @@ impl Clone for TokioTextWebSocketConnector {
             url: self.url.clone(),
             queue_capacity: self.queue_capacity,
             ping_interval: self.ping_interval,
+            connect_timeout: self.connect_timeout,
+            inbound_idle_timeout: self.inbound_idle_timeout,
+            pong_timeout: self.pong_timeout,
             init_message_factory: self.init_message_factory.clone(),
         }
     }
@@ -290,10 +320,25 @@ impl TokioTextWebSocketConnector {
                 "websocket ping interval must be positive",
             ));
         }
+        let connect_timeout = ping_interval
+            .min(MAX_CONNECT_TIMEOUT)
+            .max(MIN_CONNECT_TIMEOUT);
+        let pong_timeout = ping_interval;
+        let inbound_idle_timeout = ping_interval
+            .checked_mul(3)
+            .unwrap_or(
+                MAX_CONNECT_TIMEOUT
+                    .checked_mul(9)
+                    .unwrap_or(MAX_CONNECT_TIMEOUT),
+            )
+            .max(ping_interval);
         Ok(Self {
             url,
             queue_capacity: queue_capacity.get(),
             ping_interval,
+            connect_timeout,
+            inbound_idle_timeout,
+            pong_timeout,
             init_message_factory: None,
         })
     }
@@ -420,7 +465,7 @@ impl TokioTextWebSocketConnector {
                 );
                 Ok(vec![
                     serde_json::json!({
-                        "id": "user-data-subscribe",
+                        "id": USER_DATA_SUBSCRIBE_REQUEST_ID,
                         "method": "userDataStream.subscribe.signature",
                         "params": params,
                     })
@@ -434,10 +479,17 @@ impl TokioTextWebSocketConnector {
 
 #[async_trait]
 impl TextWebSocketConnector for TokioTextWebSocketConnector {
+    // Keep socket ownership, heartbeat, and watchdog exits in one task so an
+    // early session drop always aborts the complete connection lifecycle.
+    #[allow(clippy::too_many_lines)]
     async fn connect(&self) -> Result<Box<dyn TextWebSocketSession>, ExchangeError> {
-        let (mut socket, _) = tokio_tungstenite::connect_async(self.url.as_str())
-            .await
-            .map_err(|error| ExchangeError::unavailable(error.to_string()))?;
+        let (mut socket, _) = tokio::time::timeout(
+            self.connect_timeout,
+            tokio_tungstenite::connect_async(self.url.as_str()),
+        )
+        .await
+        .map_err(|_| ExchangeError::unavailable("websocket connect timed out"))?
+        .map_err(|error| ExchangeError::unavailable(error.to_string()))?;
         let init_messages = self
             .init_message_factory
             .as_ref()
@@ -450,12 +502,18 @@ impl TextWebSocketConnector for TokioTextWebSocketConnector {
         }
         let (sender, receiver) = broadcast::channel(self.queue_capacity);
         let ping_interval = self.ping_interval;
-        tokio::spawn(async move {
+        let inbound_idle_timeout = self.inbound_idle_timeout;
+        let pong_timeout = self.pong_timeout;
+        let join = tokio::spawn(async move {
             let mut interval = tokio::time::interval_at(
                 tokio::time::Instant::now() + ping_interval,
                 ping_interval,
             );
+            let mut last_inbound_at = tokio::time::Instant::now();
+            let mut awaiting_pong_since = None;
             loop {
+                let idle_deadline = last_inbound_at + inbound_idle_timeout;
+                let mut idle_sleep = std::pin::pin!(tokio::time::sleep_until(idle_deadline));
                 tokio::select! {
                     _ = interval.tick() => {
                         if sender.receiver_count() == 0 {
@@ -465,12 +523,28 @@ impl TextWebSocketConnector for TokioTextWebSocketConnector {
                             let _ = sender.send(TextWebSocketEvent::Closed { kind: WebSocketCloseKind::Protocol });
                             break;
                         }
+                        awaiting_pong_since.get_or_insert(tokio::time::Instant::now());
+                    }
+                    () = &mut idle_sleep => {
+                        let _ = sender.send(TextWebSocketEvent::Closed { kind: WebSocketCloseKind::Protocol });
+                        break;
+                    }
+                    () = async {
+                        if let Some(started_at) = awaiting_pong_since {
+                            tokio::time::sleep_until(started_at + pong_timeout).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if awaiting_pong_since.is_some() => {
+                        let _ = sender.send(TextWebSocketEvent::Closed { kind: WebSocketCloseKind::Protocol });
+                        break;
                     }
                     message = socket.next() => {
                         let Some(message) = message else {
                             let _ = sender.send(TextWebSocketEvent::Closed { kind: WebSocketCloseKind::Remote });
                             break;
                         };
+                        last_inbound_at = tokio::time::Instant::now();
                         match message {
                             Ok(Message::Text(text)) => {
                                 if sender.send(TextWebSocketEvent::Text(text.to_string())).is_err() {
@@ -484,12 +558,13 @@ impl TextWebSocketConnector for TokioTextWebSocketConnector {
                                 }
                             }
                             Ok(Message::Pong(_)) => {
+                                awaiting_pong_since = None;
                                 if sender.send(TextWebSocketEvent::Heartbeat).is_err() {
                                     break;
                                 }
                             }
                             Ok(Message::Close(frame)) => {
-                                let kind = classify_close_kind(frame.as_ref().map(|close| close.reason.as_ref()));
+                                let kind = classify_close_kind(frame.as_ref());
                                 let _ = sender.send(TextWebSocketEvent::Closed { kind });
                                 break;
                             }
@@ -506,7 +581,10 @@ impl TextWebSocketConnector for TokioTextWebSocketConnector {
                 }
             }
         });
-        Ok(Box::new(BroadcastTextWebSocketSession { receiver }))
+        Ok(Box::new(BroadcastTextWebSocketSession {
+            receiver,
+            abort_handle: join.abort_handle(),
+        }))
     }
 }
 
@@ -634,6 +712,9 @@ impl BinanceBookTickerStreamSource {
                             .connection_generation
                             .checked_add(1)
                             .ok_or(MarketDataError::GenerationExhausted)?;
+                        for route in self.routes.values_mut() {
+                            route.last_source_sequence = None;
+                        }
                     }
                     Err(error) => {
                         return Ok(Some(self.schedule_reconnect(&error, false)?));
@@ -647,16 +728,16 @@ impl BinanceBookTickerStreamSource {
                     actual: "market websocket session disappeared".to_owned(),
                 });
             };
-            let event = session.next_event().await.map_err(|error| {
-                MarketDataError::SourceIdentityMismatch {
-                    expected: BINANCE_EXCHANGE.to_owned(),
-                    actual: error.to_string(),
-                }
-            })?;
+            let event = match session.next_event().await {
+                Ok(event) => event,
+                Err(error) => return Ok(Some(self.schedule_reconnect(&error, true)?)),
+            };
             match event {
                 TextWebSocketEvent::Text(text) => return self.handle_text(&text, observed_at),
                 TextWebSocketEvent::Heartbeat => {}
                 TextWebSocketEvent::Lagged { skipped } => {
+                    record_stream_gap(OperationalStreamKind::Market);
+                    record_stream_queue_drop(OperationalStreamKind::Market, skipped);
                     return Ok(Some(MarketDataEvent::source_gap(
                         BINANCE_EXCHANGE,
                         skipped,
@@ -673,44 +754,39 @@ impl BinanceBookTickerStreamSource {
         text: &str,
         observed_at: DateTime<Utc>,
     ) -> Result<Option<MarketDataEvent>, MarketDataError> {
-        let observation = BinancePublicExchange::parse_book_ticker_stream_observation(
+        let observation = match BinancePublicExchange::parse_book_ticker_stream_observation(
             text.as_bytes(),
             observed_at,
-        )
-        .map_err(|error| MarketDataError::SourceIdentityMismatch {
-            expected: BINANCE_EXCHANGE.to_owned(),
-            actual: error.to_string(),
-        })?;
-        let wire_symbol = observation.snapshot.symbol.as_str().to_owned();
-        let Some(route) = self.routes.get_mut(&wire_symbol) else {
-            self.pending_events.push_back(MarketDataEvent::source_gap(
-                BINANCE_EXCHANGE,
-                1,
-                observed_at,
-            )?);
-            self.session = None;
-            return Ok(Some(MarketDataEvent::source_unavailable(
-                BINANCE_EXCHANGE,
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                let _ = error;
+                return Ok(Some(self.schedule_local_reconnect(
+                    MarketDataSourceFailure::InvalidPayload,
+                    true,
+                )?));
+            }
+        };
+        let Some(source_sequence) = observation.source_sequence else {
+            return Ok(Some(self.schedule_local_reconnect(
                 MarketDataSourceFailure::InvalidPayload,
-                observed_at,
+                true,
             )?));
         };
-        if let Some(source_sequence) = observation.source_sequence
-            && route
-                .last_source_sequence
-                .is_some_and(|last_sequence| source_sequence <= last_sequence)
-        {
-            self.session = None;
-            self.pending_events.push_back(MarketDataEvent::source_gap(
-                BINANCE_EXCHANGE,
-                1,
-                observed_at,
-            )?);
-            self.pending_retry = Some(self.reconnect_policy.retry_delay(1, self.jitter.as_ref()));
-            return Ok(Some(MarketDataEvent::source_unavailable(
-                BINANCE_EXCHANGE,
+        let wire_symbol = observation.snapshot.symbol.as_str().to_owned();
+        let Some(route) = self.routes.get_mut(&wire_symbol) else {
+            return Ok(Some(self.schedule_local_reconnect(
                 MarketDataSourceFailure::InvalidPayload,
-                observed_at,
+                true,
+            )?));
+        };
+        if route
+            .last_source_sequence
+            .is_some_and(|last_sequence| source_sequence <= last_sequence)
+        {
+            return Ok(Some(self.schedule_local_reconnect(
+                MarketDataSourceFailure::InvalidPayload,
+                true,
             )?));
         }
         self.consecutive_failures = 0;
@@ -719,17 +795,22 @@ impl BinanceBookTickerStreamSource {
             .revision
             .checked_add(1)
             .ok_or(MarketDataError::RevisionExhausted)?;
-        route.last_source_sequence = observation.source_sequence;
+        route.last_source_sequence = Some(source_sequence);
         let mut snapshot = observation.snapshot;
         snapshot.symbol = route.route.instrument().symbol.clone();
         snapshot.market_type = route.route.instrument().market_type;
+        record_stream_frame(
+            OperationalStreamKind::Market,
+            self.connection_generation,
+            unix_seconds(observed_at),
+        );
         Ok(Some(MarketDataEvent::Observation(
             MarketDataObservation::with_source_metadata_and_generation(
                 snapshot,
                 route.revision,
                 observed_at,
                 MarketTimestampProvenance::LocalReceipt,
-                observation.source_sequence,
+                Some(source_sequence),
                 Some(self.connection_generation),
             )?,
         )))
@@ -756,17 +837,36 @@ impl BinanceBookTickerStreamSource {
         error: &ExchangeError,
         transport_gap: bool,
     ) -> Result<MarketDataEvent, MarketDataError> {
+        self.schedule_failure(classify_exchange_failure(error), transport_gap)
+    }
+
+    fn schedule_local_reconnect(
+        &mut self,
+        failure: MarketDataSourceFailure,
+        transport_gap: bool,
+    ) -> Result<MarketDataEvent, MarketDataError> {
+        self.schedule_failure(failure, transport_gap)
+    }
+
+    fn schedule_failure(
+        &mut self,
+        failure: MarketDataSourceFailure,
+        transport_gap: bool,
+    ) -> Result<MarketDataEvent, MarketDataError> {
         self.session = None;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let observed_at = self.clock.now();
-        if transport_gap {
+        let exhausted = self.reconnect_policy.exhausted(self.consecutive_failures);
+        record_stream_reconnect(OperationalStreamKind::Market);
+        if transport_gap && !exhausted {
+            record_stream_gap(OperationalStreamKind::Market);
             self.pending_events.push_back(MarketDataEvent::source_gap(
                 BINANCE_EXCHANGE,
                 1,
                 observed_at,
             )?);
         }
-        if self.reconnect_policy.exhausted(self.consecutive_failures) {
+        if exhausted {
             self.exhausted = true;
         } else {
             self.pending_retry = Some(
@@ -774,11 +874,7 @@ impl BinanceBookTickerStreamSource {
                     .retry_delay(self.consecutive_failures, self.jitter.as_ref()),
             );
         }
-        MarketDataEvent::source_unavailable(
-            BINANCE_EXCHANGE,
-            classify_exchange_failure(error),
-            observed_at,
-        )
+        MarketDataEvent::source_unavailable(BINANCE_EXCHANGE, failure, observed_at)
     }
 }
 
@@ -792,10 +888,24 @@ impl MarketDataEventSource for BinanceBookTickerStreamSource {
     }
 }
 
-fn classify_close_kind(reason: Option<&str>) -> WebSocketCloseKind {
-    let Some(reason) = reason else {
+fn classify_close_kind(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> WebSocketCloseKind {
+    let Some(frame) = frame else {
         return WebSocketCloseKind::Remote;
     };
+    if matches!(
+        frame.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Protocol
+            | tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Invalid
+            | tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Unsupported
+    ) {
+        return WebSocketCloseKind::Protocol;
+    }
+    if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Restart {
+        return WebSocketCloseKind::ServerShutdown;
+    }
+    let reason = frame.reason.to_string();
     if reason.contains("serverShutdown") {
         WebSocketCloseKind::ServerShutdown
     } else if reason.contains("expired") || reason.contains("24h") {
@@ -807,4 +917,8 @@ fn classify_close_kind(reason: Option<&str>) -> WebSocketCloseKind {
 
 fn current_timestamp_ms() -> u64 {
     u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0)
+}
+
+fn unix_seconds(observed_at: DateTime<Utc>) -> u64 {
+    u64::try_from(observed_at.timestamp()).unwrap_or(0)
 }

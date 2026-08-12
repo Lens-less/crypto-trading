@@ -52,6 +52,9 @@ pub enum Command {
     PriceAlert(PriceAlertArgs),
     /// Rank symbols with the virtual-grid scanner.
     Scanner(ScannerArgs),
+    /// Run one deterministic bar-driven paper owner over closed spot bars.
+    #[command(name = "paper-bar")]
+    PaperBar(PaperBarArgs),
     /// Parse and validate existing YAML configuration files.
     #[command(name = "config-check")]
     ConfigCheck(ConfigCheckArgs),
@@ -686,6 +689,87 @@ pub struct ConfigCheckArgs {
     /// Emit machine-readable JSON summaries.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PaperBarArgs {
+    /// Stable owner identity recorded on journaled reservations.
+    #[arg(long)]
+    pub task_id: String,
+    /// Optional closed-bar history replayed for indicator warmup only.
+    #[arg(long, value_name = "PATH")]
+    pub warmup_bars_csv: Option<PathBuf>,
+    /// Headerless Binance-style kline CSV with closed bars only.
+    #[arg(long, value_name = "PATH")]
+    pub bars_csv: PathBuf,
+    /// Canonical spot symbol traded by this owner.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub symbol: String,
+    /// Paper exchange identity written onto intents and receipts.
+    #[arg(long, default_value = "paper")]
+    pub exchange: String,
+    /// Append paper-bar decisions and execution facts to this JSONL journal.
+    #[arg(long, default_value = "var/history/paper-bar.jsonl")]
+    pub history_path: PathBuf,
+    /// Starting quote balance for the dedicated paper account.
+    #[arg(long, default_value = "1000")]
+    pub initial_available: Decimal,
+    /// Optional bounded account-risk limits for entry-side admissions.
+    #[arg(long, value_name = "PATH")]
+    pub paper_account_risk_config: Option<PathBuf>,
+    /// Absolute dataset index of the first supplied bar.
+    #[arg(long, default_value_t = 0)]
+    pub start_bar_index: usize,
+    /// Per-fill fee used by both reservation budgeting and exact settlement.
+    #[arg(long, default_value_t = 0)]
+    pub fee_bps: u32,
+    /// Conservative paper-only funding buffer reserved but not settled.
+    #[arg(long, default_value_t = 0)]
+    pub funding_buffer_bps: u32,
+    /// Conservative paper-only slippage buffer reserved and applied to fills.
+    #[arg(long, default_value_t = 0)]
+    pub slippage_bps: u32,
+    /// Half-spread component applied to synthetic paper fills.
+    #[arg(long, default_value_t = 0)]
+    pub half_spread_bps: u32,
+    /// Latency impact component applied to synthetic paper fills.
+    #[arg(long, default_value_t = 0)]
+    pub latency_bps: u32,
+    #[command(subcommand)]
+    pub strategy: PaperBarStrategyArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PaperBarStrategyArgs {
+    Cash,
+    #[command(name = "buy-and-hold")]
+    BuyAndHold,
+    #[command(name = "slow-time-series-momentum")]
+    SlowTimeSeriesMomentum {
+        #[arg(long)]
+        lookback_bars: usize,
+        #[arg(long)]
+        rebalance_every_bars: usize,
+    },
+    #[command(name = "long-only-donchian")]
+    LongOnlyDonchian {
+        #[arg(long)]
+        lookback_bars: usize,
+    },
+    #[command(name = "capped-volatility-target")]
+    CappedVolatilityTarget {
+        #[arg(long)]
+        lookback_returns: usize,
+        #[arg(long)]
+        annual_target: Decimal,
+        #[arg(long)]
+        rebalance_band: Decimal,
+        #[arg(long)]
+        rebalance_every_bars: usize,
+        /// Explicit annualization for non-daily bars.
+        #[arg(long)]
+        periods_per_year: Option<Decimal>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

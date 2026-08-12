@@ -152,6 +152,13 @@ machine-readable output under `artifacts/strategy-evaluation/`. It must not add
 an exchange adapter or alter these execution semantics after reading holdout
 results.
 
+`SelectedExperiment::persist_selection_with` is an explicit trust boundary,
+not proof of durable storage. The type-state transition proves only that the
+supplied callback returned success before holdout access became possible. A
+production runner must write the selection artifact atomically, sync it before
+returning success, and verify the rerun hashes; a no-op callback such as
+`|_, _| Ok(())` is suitable only for tests that exercise ordering semantics.
+
 ## Known Model Risk
 
 - Daily klines contain no historical bid/ask, queue, or executable depth;

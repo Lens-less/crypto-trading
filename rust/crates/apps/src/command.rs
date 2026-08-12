@@ -70,11 +70,12 @@ use crate::alert::{
 };
 use crate::cli::{
     ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
-    MonitorLiveTransport, MonitorMode, PaperCommand, PaperMutationArgs, PaperOperation,
-    PaperStartArgs, PaperStatusArgs, PaperTaskArgs, PriceAlertArgs, PriceAlertMode, ScannerArgs,
-    ScannerMode, TestnetLifecycleArgs, TestnetLifecycleExpected, TestnetLifecycleMarket,
-    TestnetLifecycleSide, TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs,
-    TestnetSoakArgs, TestnetSoakMode, VolumeMakerArgs,
+    MonitorLiveTransport, MonitorMode, PaperBarArgs, PaperBarStrategyArgs, PaperCommand,
+    PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs, PaperTaskArgs,
+    PriceAlertArgs, PriceAlertMode, ScannerArgs, ScannerMode, TestnetLifecycleArgs,
+    TestnetLifecycleExpected, TestnetLifecycleMarket, TestnetLifecycleSide,
+    TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs,
+    TestnetSoakMode, VolumeMakerArgs,
 };
 use crate::continuous_alert::{
     ContinuousAlertTask, ContinuousAlertTaskConfig, ContinuousAlertTaskExit,
@@ -98,8 +99,8 @@ use crate::monitor::{
 };
 use crate::shutdown::{ShutdownSignalFuture, install_shutdown_signal};
 use crate::task_host::{
-    TaskHostControlCommand, TaskHostControlError, TaskHostServeOutcome, control_addr,
-    ensure_control_token_configured, query_control, serve_host_with_shutdown,
+    TaskHostControlCommand, TaskHostControlError, TaskHostServeError, TaskHostServeOutcome,
+    control_addr, ensure_control_token_configured, query_control, serve_host_with_shutdown,
 };
 use crate::testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TestnetLifecycleConfig, TestnetLifecycleObservation,
@@ -115,19 +116,26 @@ use crate::testnet_soak::{
     MAX_TESTNET_SOAK_EVIDENCE_RECORDS, TESTNET_SOAK_SCHEMA_VERSION, TESTNET_SOAK_TASK_KIND,
     TestnetSoakEvidenceRequirements, TestnetSoakProbe, TestnetSoakProbeFailure,
     TestnetSoakProbeFuture, TestnetSoakSample, TestnetSoakTask, TestnetSoakTaskConfig,
-    TestnetSoakTaskExit, TestnetSoakTaskFailure, TestnetSoakTaskStatus,
+    TestnetSoakTaskError, TestnetSoakTaskExit, TestnetSoakTaskFailure, TestnetSoakTaskStatus,
     verify_testnet_soak_evidence,
 };
 // Volume-maker task-host imports are grouped here so the four-mode CLI wiring
 // stays one coherent seam.
 use crate::cli::VolumeMakerRunMode;
+use crate::paper_bar_task::{PaperBarAction, PaperBarTask, PaperBarTaskState};
 use crate::paper_volume_maker_task::{
     VolumeMakerPaperExecutionFuture, VolumeMakerPaperExecutor, VolumeMakerPaperTask,
     VolumeMakerPaperTaskConfig, VolumeMakerPaperTaskExit, VolumeMakerPaperTaskStatus,
 };
 use crypto_trading_config::VolumeMakerConfig;
-use crypto_trading_runtime::{AccountRiskAuthority, PaperCostModel};
-use crypto_trading_strategy::AccountRiskPolicy;
+use crypto_trading_runtime::{
+    AccountRiskAdmission, AccountRiskAuthority, AccountRiskCandidate, PaperCostModel,
+    PaperReservationLeg, PaperReservationRequest,
+};
+use crypto_trading_strategy::{
+    AccountRiskPolicy, Bar, BarStrategy, BuyAndHoldStrategy, CappedVolatilityTarget, CashStrategy,
+    LongOnlyDonchian, SlowTimeSeriesMomentum, TargetExposure,
+};
 use rust_decimal::prelude::ToPrimitive;
 
 /// Runs one parsed CLI command.
@@ -150,7 +158,726 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::VolumeMaker(args) => run_volume_maker(&args).await,
         Command::PriceAlert(args) => run_price_alert(&args).await,
         Command::Scanner(args) => run_scanner(&args).await,
+        Command::PaperBar(args) => run_paper_bar(&args).await,
         Command::Paper(args) => run_paper(args).await,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnedPaperBarStrategy {
+    Cash(CashStrategy),
+    BuyAndHold(BuyAndHoldStrategy),
+    SlowTimeSeriesMomentum(SlowTimeSeriesMomentum),
+    LongOnlyDonchian(LongOnlyDonchian),
+    CappedVolatilityTarget(CappedVolatilityTarget),
+}
+
+impl BarStrategy for OwnedPaperBarStrategy {
+    fn target_exposure(
+        &mut self,
+        context: &crypto_trading_strategy::BarStrategyContext<'_>,
+    ) -> std::result::Result<TargetExposure, crypto_trading_strategy::StrategyError> {
+        match self {
+            Self::Cash(strategy) => strategy.target_exposure(context),
+            Self::BuyAndHold(strategy) => strategy.target_exposure(context),
+            Self::SlowTimeSeriesMomentum(strategy) => strategy.target_exposure(context),
+            Self::LongOnlyDonchian(strategy) => strategy.target_exposure(context),
+            Self::CappedVolatilityTarget(strategy) => strategy.target_exposure(context),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaperBarFillModel {
+    cost_model: PaperCostModel,
+    impact_bps: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaperBarPosition {
+    current_target: TargetExposure,
+    position_quantity: Decimal,
+    equity: Money,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_paper_bar(args: &PaperBarArgs) -> Result<()> {
+    ensure_paper_bar_history_is_fresh(&args.history_path)?;
+    let warmup_bars = load_paper_bar_bars(args.warmup_bars_csv.as_deref())?;
+    let bars = load_paper_bar_bars(Some(&args.bars_csv))?;
+    let symbol =
+        Symbol::new(&args.symbol).with_context(|| format!("invalid symbol {}", args.symbol))?;
+    if market_type_for_one_shot_symbol(&symbol) != MarketType::Spot {
+        bail!("paper-bar currently supports spot symbols only");
+    }
+    let strategy = build_paper_bar_strategy(&args.strategy)
+        .context("paper-bar strategy parameters are invalid")?;
+    let fill_model = build_paper_bar_fill_model(args)?;
+    let history = JsonlHistory::new(&args.history_path);
+    let account = PaperAccountAuthority::planned(
+        history.clone(),
+        PaperAccountConfig::new(
+            format!("paper-bar:{}", args.task_id),
+            Money::new(args.initial_available),
+        )
+        .map_err(anyhow::Error::new)?,
+    )
+    .map_err(anyhow::Error::new)
+    .context("failed to plan the paper-bar account")?;
+    let account_risk = build_paper_bar_account_risk(args, &account, &history)?;
+    account
+        .ensure_initialized()
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to initialize the paper-bar account")?;
+
+    let warmup_start_bar_index = args
+        .start_bar_index
+        .checked_sub(warmup_bars.len())
+        .context("paper-bar warmup bars exceed the configured start_bar_index")?;
+    let mut task = PaperBarTask::with_state(
+        strategy,
+        PaperBarTaskState {
+            next_bar_index: warmup_start_bar_index,
+            current_target: TargetExposure::ZERO,
+        },
+    );
+    let mut pending_target =
+        warmup_paper_bar_task(&mut task, &warmup_bars).context("paper-bar warmup failed")?;
+    // Match the causal evaluator exactly: `current_target` is the achieved
+    // exposure immediately after the most recent rebalance. It is not
+    // re-marked on every later bar unless another rebalance is attempted.
+    let mut current_target = TargetExposure::ZERO;
+    let mut execution_count = 0_u64;
+
+    for bar in &bars {
+        if let Some(target) = pending_target.take()
+            && target != current_target
+        {
+            if execute_paper_bar_rebalance(
+                &args.task_id,
+                &symbol,
+                args.exchange.as_str(),
+                &account,
+                account_risk.as_ref(),
+                &history,
+                fill_model,
+                bar.open,
+                bar.open_time,
+                target,
+            )
+            .await?
+            {
+                execution_count = execution_count
+                    .checked_add(1)
+                    .context("paper-bar execution count overflowed")?;
+            }
+            current_target = paper_bar_position(&account, bar.open).await?.current_target;
+        }
+        let decision = task
+            .on_bar_with_current_target(bar.clone(), current_target)
+            .map_err(anyhow::Error::new)
+            .context("paper-bar strategy evaluation failed")?;
+        history
+            .append(&DecisionRecord {
+                timestamp: decision.decided_at,
+                strategy: "paper_bar".to_owned(),
+                symbol: symbol.to_string(),
+                decision: "paper_bar_decided".to_owned(),
+                details: json!({
+                    "schema_version": 1,
+                    "task_id": args.task_id,
+                    "bar_index": decision.bar_index,
+                    "decided_at": decision.decided_at,
+                    "close": bar.close,
+                    "current_target": current_target.as_decimal(),
+                    "target": decision.target.as_decimal(),
+                    "action": paper_bar_action_json(&decision.action),
+                }),
+            })
+            .await
+            .context("failed to append paper-bar decision")?;
+        pending_target = Some(decision.target);
+    }
+
+    let terminal_bar = bars.last().context("paper-bar requires at least one bar")?;
+    if execute_paper_bar_rebalance(
+        &args.task_id,
+        &symbol,
+        args.exchange.as_str(),
+        &account,
+        account_risk.as_ref(),
+        &history,
+        fill_model,
+        terminal_bar.close,
+        terminal_bar.close_time,
+        TargetExposure::ZERO,
+    )
+    .await?
+    {
+        execution_count = execution_count
+            .checked_add(1)
+            .context("paper-bar execution count overflowed")?;
+    }
+
+    let final_position = paper_bar_position(&account, terminal_bar.close).await?;
+    let snapshot = account
+        .decision_snapshot()
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to load final paper-bar account snapshot")?;
+    println!(
+        "paper-bar complete: task_id={} bars={} executions={} final_target={} available={} settled_equity_base={} committed_exposure={}",
+        args.task_id,
+        bars.len(),
+        execution_count,
+        final_position.current_target.as_decimal(),
+        snapshot.available,
+        snapshot.settled_equity_base,
+        snapshot.committed_exposure,
+    );
+    Ok(())
+}
+
+fn build_paper_bar_strategy(args: &PaperBarStrategyArgs) -> Result<OwnedPaperBarStrategy> {
+    Ok(match args {
+        PaperBarStrategyArgs::Cash => OwnedPaperBarStrategy::Cash(CashStrategy),
+        PaperBarStrategyArgs::BuyAndHold => {
+            OwnedPaperBarStrategy::BuyAndHold(BuyAndHoldStrategy::default())
+        }
+        PaperBarStrategyArgs::SlowTimeSeriesMomentum {
+            lookback_bars,
+            rebalance_every_bars,
+        } => OwnedPaperBarStrategy::SlowTimeSeriesMomentum(
+            SlowTimeSeriesMomentum::new(*lookback_bars, *rebalance_every_bars)
+                .map_err(anyhow::Error::new)?,
+        ),
+        PaperBarStrategyArgs::LongOnlyDonchian { lookback_bars } => {
+            OwnedPaperBarStrategy::LongOnlyDonchian(
+                LongOnlyDonchian::new(*lookback_bars).map_err(anyhow::Error::new)?,
+            )
+        }
+        PaperBarStrategyArgs::CappedVolatilityTarget {
+            lookback_returns,
+            annual_target,
+            rebalance_band,
+            rebalance_every_bars,
+            periods_per_year,
+        } => OwnedPaperBarStrategy::CappedVolatilityTarget(
+            match periods_per_year {
+                Some(periods_per_year) => CappedVolatilityTarget::new_with_periods_per_year(
+                    *lookback_returns,
+                    *annual_target,
+                    *rebalance_band,
+                    *rebalance_every_bars,
+                    *periods_per_year,
+                ),
+                None => CappedVolatilityTarget::new(
+                    *lookback_returns,
+                    *annual_target,
+                    *rebalance_band,
+                    *rebalance_every_bars,
+                ),
+            }
+            .map_err(anyhow::Error::new)?,
+        ),
+    })
+}
+
+fn build_paper_bar_fill_model(args: &PaperBarArgs) -> Result<PaperBarFillModel> {
+    let impact_bps = Decimal::from(args.half_spread_bps)
+        .checked_add(Decimal::from(args.slippage_bps))
+        .and_then(|value| value.checked_add(Decimal::from(args.latency_bps)))
+        .context("paper-bar impact basis points overflowed")?;
+    Ok(PaperBarFillModel {
+        cost_model: PaperCostModel::v1(args.fee_bps, args.funding_buffer_bps, args.slippage_bps)
+            .map_err(anyhow::Error::new)?,
+        impact_bps,
+    })
+}
+
+fn build_paper_bar_account_risk(
+    args: &PaperBarArgs,
+    account: &PaperAccountAuthority,
+    history: &JsonlHistory,
+) -> Result<Option<AccountRiskAuthority>> {
+    let Some(path) = args.paper_account_risk_config.as_ref() else {
+        return Ok(None);
+    };
+    let config = load_account_risk_config(path).with_context(|| {
+        format!(
+            "failed to load paper-bar account risk config {}",
+            path.display()
+        )
+    })?;
+    let policy = AccountRiskPolicy::try_from(&config).with_context(|| {
+        format!(
+            "failed to validate paper-bar account risk config {}",
+            path.display()
+        )
+    })?;
+    AccountRiskAuthority::new(account.journal_id(), history.clone(), "paper", policy)
+        .map(Some)
+        .map_err(anyhow::Error::new)
+}
+
+fn ensure_paper_bar_history_is_fresh(history_path: &Path) -> Result<()> {
+    match std::fs::metadata(history_path) {
+        Ok(metadata) if metadata.len() > 0 => {
+            bail!(
+                "paper-bar does not support journal recovery; refuse to reuse non-empty history {}",
+                history_path.display()
+            );
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect paper-bar history path {}",
+                history_path.display()
+            )
+        }),
+    }
+}
+
+fn load_paper_bar_bars(path: Option<&Path>) -> Result<Vec<Bar>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let body = read_bounded_config(path)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("failed to read bar CSV {}", path.display()))?;
+    parse_paper_bar_csv(&body).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn warmup_paper_bar_task<S>(
+    task: &mut PaperBarTask<S>,
+    warmup_bars: &[Bar],
+) -> Result<Option<TargetExposure>>
+where
+    S: BarStrategy,
+{
+    let mut pending_target = None;
+    for bar in warmup_bars {
+        let decision = task
+            .on_bar_with_current_target(bar.clone(), TargetExposure::ZERO)
+            .map_err(anyhow::Error::new)?;
+        pending_target = Some(decision.target);
+    }
+    Ok(pending_target)
+}
+
+fn parse_paper_bar_csv(body: &str) -> Result<Vec<Bar>> {
+    let mut bars = Vec::new();
+    for (line_number, raw_line) in body.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+        if line_number == 0
+            && fields
+                .first()
+                .is_some_and(|value| value.parse::<i64>().is_err())
+        {
+            continue;
+        }
+        if fields.len() < 9 {
+            bail!(
+                "bar CSV line {} has {} columns; expected at least 9",
+                line_number + 1,
+                fields.len()
+            );
+        }
+        bars.push(Bar::new(
+            parse_bar_timestamp(fields[0])
+                .with_context(|| format!("line {} has an invalid open_time", line_number + 1))?,
+            parse_bar_timestamp(fields[6])
+                .with_context(|| format!("line {} has an invalid close_time", line_number + 1))?,
+            Price::new(fields[1].parse::<Decimal>()?)?,
+            Price::new(fields[2].parse::<Decimal>()?)?,
+            Price::new(fields[3].parse::<Decimal>()?)?,
+            Price::new(fields[4].parse::<Decimal>()?)?,
+            fields[5].parse::<Decimal>()?,
+            fields[7].parse::<Decimal>()?,
+            fields[8].parse::<u64>()?,
+        )?);
+    }
+    if bars.is_empty() {
+        bail!("bar CSV did not contain any closed bars");
+    }
+    Ok(bars)
+}
+
+fn parse_bar_timestamp(value: &str) -> Result<chrono::DateTime<Utc>> {
+    let raw = value.parse::<i64>()?;
+    if let Some(timestamp) = chrono::DateTime::<Utc>::from_timestamp_millis(raw) {
+        return Ok(timestamp);
+    }
+    chrono::DateTime::<Utc>::from_timestamp_micros(raw)
+        .context("timestamp is outside chrono's supported range")
+}
+
+async fn paper_bar_position(
+    account: &PaperAccountAuthority,
+    mark: Price,
+) -> Result<PaperBarPosition> {
+    let snapshot = account
+        .decision_snapshot()
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to read paper-bar account state")?;
+    let position_quantity = snapshot
+        .open_lots
+        .iter()
+        .try_fold(Decimal::ZERO, |total, lot| {
+            total.checked_add(lot.remaining_quantity.as_decimal())
+        })
+        .context("paper-bar position quantity overflowed")?;
+    let marked_notional = position_quantity
+        .checked_mul(mark.as_decimal())
+        .map(Money::new)
+        .context("paper-bar marked notional overflowed")?;
+    let equity = snapshot
+        .available
+        .as_decimal()
+        .checked_add(marked_notional.as_decimal())
+        .map(Money::new)
+        .context("paper-bar equity overflowed")?;
+    let current_target =
+        if equity.as_decimal() <= Decimal::ZERO || marked_notional <= Money::default() {
+            TargetExposure::ZERO
+        } else {
+            TargetExposure::new(
+                marked_notional
+                    .as_decimal()
+                    .checked_div(equity.as_decimal())
+                    .context("paper-bar target ratio overflowed")?,
+            )
+            .map_err(anyhow::Error::new)?
+        };
+    Ok(PaperBarPosition {
+        current_target,
+        position_quantity,
+        equity,
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_paper_bar_rebalance(
+    owner_task_id: &str,
+    symbol: &Symbol,
+    exchange: &str,
+    account: &PaperAccountAuthority,
+    account_risk: Option<&AccountRiskAuthority>,
+    history: &JsonlHistory,
+    fill_model: PaperBarFillModel,
+    reference_price: Price,
+    occurred_at: chrono::DateTime<Utc>,
+    target_exposure: TargetExposure,
+) -> Result<bool> {
+    let position = paper_bar_position(account, reference_price).await?;
+    let target_notional = position
+        .equity
+        .as_decimal()
+        .max(Decimal::ZERO)
+        .checked_mul(target_exposure.as_decimal())
+        .context("paper-bar target notional overflowed")?;
+    let target_quantity = target_notional
+        .checked_div(reference_price.as_decimal())
+        .context("paper-bar target quantity overflowed")?;
+    let delta = target_quantity
+        .checked_sub(position.position_quantity)
+        .context("paper-bar quantity delta overflowed")?;
+    if delta.is_zero() {
+        return Ok(false);
+    }
+
+    let (side, quantity) = if delta > Decimal::ZERO {
+        let affordable = maximum_affordable_quantity(
+            account,
+            reference_price,
+            fill_model.impact_bps,
+            fill_model.cost_model.fee_bps(),
+        )
+        .await?;
+        let quantity = delta.min(affordable);
+        if quantity <= Decimal::ZERO {
+            return Ok(false);
+        }
+        (Side::Buy, Quantity::new(quantity)?)
+    } else {
+        (Side::Sell, Quantity::new(delta.abs())?)
+    };
+    let fill_price = synthetic_fill_price(reference_price, side, fill_model.impact_bps)?;
+    let fill_notional = fill_price
+        .as_decimal()
+        .checked_mul(quantity.as_decimal())
+        .map(Money::new)
+        .context("paper-bar fill notional overflowed")?;
+    let reference_notional = reference_price
+        .as_decimal()
+        .checked_mul(quantity.as_decimal())
+        .map(Money::new)
+        .context("paper-bar reference notional overflowed")?;
+    let reserved_notional = if fill_notional > reference_notional {
+        fill_notional
+    } else {
+        reference_notional
+    };
+
+    let admission_ticket = if side == Side::Buy {
+        admit_paper_bar_entry(
+            account_risk,
+            owner_task_id,
+            symbol.as_str(),
+            reserved_notional,
+            occurred_at,
+        )
+        .await?
+    } else {
+        None
+    };
+    if side == Side::Buy && account_risk.is_some() && admission_ticket.is_none() {
+        history
+            .append(&DecisionRecord {
+                timestamp: occurred_at,
+                strategy: "paper_bar".to_owned(),
+                symbol: symbol.to_string(),
+                decision: "paper_bar_risk_rejected".to_owned(),
+                details: json!({
+                    "schema_version": 1,
+                    "task_id": owner_task_id,
+                    "target": target_exposure.as_decimal(),
+                    "reference_price": reference_price,
+                    "reserved_notional": reserved_notional,
+                }),
+            })
+            .await
+            .context("failed to append paper-bar risk rejection")?;
+        return Ok(false);
+    }
+
+    let mut intent = OrderIntent::market(
+        exchange.to_owned(),
+        symbol.clone(),
+        MarketType::Spot,
+        side,
+        quantity,
+    );
+    if side == Side::Sell {
+        intent.reduce_only = true;
+    }
+    let batch = ExecutionBatch::planned(vec![intent.clone()])?;
+    let operation_task_id = format!("{owner_task_id}/op/{}", occurred_at.timestamp_millis());
+    let idempotency_key = format!(
+        "paper-bar:{}:{}:{}",
+        occurred_at.timestamp_millis(),
+        side_name(side),
+        target_exposure.as_decimal(),
+    );
+    let mut reservation = PaperReservationRequest::planned(
+        operation_task_id,
+        idempotency_key,
+        batch.id(),
+        fill_model.cost_model,
+        vec![
+            PaperReservationLeg::from_intent(0, &intent, reserved_notional)
+                .map_err(anyhow::Error::new)?,
+        ],
+    )
+    .map_err(anyhow::Error::new)?;
+    if let Some((risk, ticket)) = account_risk.zip(admission_ticket.as_ref()) {
+        reservation = reservation
+            .with_account_risk_admission(risk.scope_id(), ticket)
+            .map_err(anyhow::Error::new)?;
+    }
+    let request = crate::paper_single_leg_saga::PaperSingleLegRequest::new(
+        symbol.clone(),
+        batch.clone(),
+        reservation,
+    )
+    .map_err(anyhow::Error::new)?;
+    let saga = crate::paper_single_leg_saga::DurablePaperSingleLegSaga::new(
+        account.clone(),
+        history.clone(),
+    )
+    .map_err(anyhow::Error::new)?
+    .with_strategy_label("paper_bar");
+    let receipt = synthetic_receipt(&intent, occurred_at, fill_price);
+    match saga
+        .run(request, |_| async move { Ok(vec![receipt]) })
+        .await
+        .map_err(anyhow::Error::new)?
+    {
+        crate::paper_single_leg_saga::PaperSingleLegRun::Completed { .. } => {}
+        crate::paper_single_leg_saga::PaperSingleLegRun::Cancelled { .. } => {
+            bail!("paper-bar synthetic execution cancelled unexpectedly");
+        }
+        crate::paper_single_leg_saga::PaperSingleLegRun::AlreadyTerminal { .. } => {
+            bail!("paper-bar synthetic execution hit an existing terminal reservation");
+        }
+    }
+
+    let updated = paper_bar_position(account, reference_price).await?;
+    if side == Side::Sell
+        && updated.position_quantity.is_zero()
+        && let Some(risk) = account_risk
+    {
+        risk.record_position_closed(owner_task_id, occurred_at)
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to record paper-bar position close")?;
+    }
+    Ok(true)
+}
+
+async fn admit_paper_bar_entry(
+    account_risk: Option<&AccountRiskAuthority>,
+    task_id: &str,
+    symbol: &str,
+    notional: Money,
+    observed_at: chrono::DateTime<Utc>,
+) -> Result<Option<crypto_trading_runtime::AccountRiskAdmissionTicket>> {
+    let Some(risk) = account_risk else {
+        return Ok(None);
+    };
+    let candidate =
+        AccountRiskCandidate::new(task_id, symbol, notional).map_err(anyhow::Error::new)?;
+    match risk
+        .admit(&candidate, observed_at)
+        .await
+        .map_err(anyhow::Error::new)?
+    {
+        AccountRiskAdmission::Admitted { ticket, .. } => Ok(Some(ticket)),
+        AccountRiskAdmission::Rejected(_) => Ok(None),
+    }
+}
+
+async fn maximum_affordable_quantity(
+    account: &PaperAccountAuthority,
+    reference_price: Price,
+    impact_bps: Decimal,
+    fee_bps: u32,
+) -> Result<Decimal> {
+    let snapshot = account
+        .decision_snapshot()
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to read paper-bar buying power")?;
+    let impact = impact_bps
+        .checked_div(Decimal::from(10_000_u32))
+        .context("paper-bar impact division overflowed")?;
+    let fill_price = reference_price
+        .as_decimal()
+        .checked_mul(
+            Decimal::ONE
+                .checked_add(impact)
+                .context("paper-bar fill impact overflowed")?,
+        )
+        .context("paper-bar fill price overflowed")?;
+    let fee_rate = Decimal::from(fee_bps)
+        .checked_div(Decimal::from(10_000_u32))
+        .context("paper-bar fee division overflowed")?;
+    let cost_per_unit = fill_price
+        .checked_mul(
+            Decimal::ONE
+                .checked_add(fee_rate)
+                .context("paper-bar fee rate overflowed")?,
+        )
+        .context("paper-bar cost per unit overflowed")?;
+    let mut quantity = snapshot
+        .available
+        .as_decimal()
+        .checked_div(cost_per_unit)
+        .context("paper-bar affordable quantity overflowed")?;
+    let representable_step = Decimal::new(1, quantity.scale());
+    for _ in 0..=2 {
+        let required = required_buying_power(fill_price, fee_rate, quantity)?;
+        if required <= snapshot.available.as_decimal() {
+            return Ok(quantity.max(Decimal::ZERO));
+        }
+        quantity = quantity
+            .checked_sub(representable_step)
+            .context("paper-bar affordable quantity underflowed")?;
+    }
+    bail!("paper-bar buying power could not be represented safely")
+}
+
+fn required_buying_power(
+    fill_price: Decimal,
+    fee_rate: Decimal,
+    quantity: Decimal,
+) -> Result<Decimal> {
+    let notional = fill_price
+        .checked_mul(quantity)
+        .context("paper-bar buy notional overflowed")?;
+    notional
+        .checked_add(
+            notional
+                .checked_mul(fee_rate)
+                .context("paper-bar fee notional overflowed")?,
+        )
+        .context("paper-bar required buying power overflowed")
+}
+
+fn synthetic_fill_price(reference_price: Price, side: Side, impact_bps: Decimal) -> Result<Price> {
+    let impact = impact_bps
+        .checked_div(Decimal::from(10_000_u32))
+        .context("paper-bar impact division overflowed")?;
+    let price = match side {
+        Side::Buy => reference_price.as_decimal().checked_mul(
+            Decimal::ONE
+                .checked_add(impact)
+                .context("paper-bar buy impact overflowed")?,
+        ),
+        Side::Sell => reference_price.as_decimal().checked_mul(
+            Decimal::ONE
+                .checked_sub(impact)
+                .context("paper-bar sell impact overflowed")?,
+        ),
+    }
+    .context("paper-bar synthetic fill price overflowed")?;
+    Price::new(price).map_err(Into::into)
+}
+
+fn synthetic_receipt(
+    intent: &OrderIntent,
+    occurred_at: chrono::DateTime<Utc>,
+    fill_price: Price,
+) -> TradingReceipt {
+    TradingReceipt::Submitted {
+        order: crypto_trading_domain::Order {
+            id: format!(
+                "{}:{}:{}",
+                intent.exchange, intent.symbol, intent.client_order_id
+            ),
+            intent: intent.clone(),
+            filled_quantity: intent.quantity,
+            average_fill_price: Some(fill_price),
+            status: crypto_trading_domain::OrderStatus::Filled,
+            created_at: occurred_at,
+            updated_at: occurred_at,
+        },
+        disposition: SubmissionDisposition::Filled,
+    }
+}
+
+fn paper_bar_action_json(action: &PaperBarAction) -> Value {
+    match action {
+        PaperBarAction::Hold => json!({"kind": "hold"}),
+        PaperBarAction::Rebalance { side, target } => json!({
+            "kind": "rebalance",
+            "side": side,
+            "target": target.as_decimal(),
+        }),
+    }
+}
+
+const fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
     }
 }
 
@@ -1424,6 +2151,7 @@ struct ProductionBinanceTestnetSoakProbe {
     user_stream: BinanceUserDataStreamSource,
     owner: ContinuousTestnetOwner<BinanceTestnetExchange>,
     lifecycle_run_pending: bool,
+    pending_user_item: Option<BinanceUserDataStreamItem>,
     next_step: usize,
 }
 
@@ -1557,14 +2285,14 @@ impl ProductionBinanceTestnetSoakProbe {
             user_stream,
             owner,
             lifecycle_run_pending,
+            pending_user_item: None,
             next_step: 0,
         })
     }
 
     async fn next_probe(&mut self) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
         let step = self.next_step;
-        self.next_step = (self.next_step + 1) % 3;
-        match step {
+        let result = match step {
             0 => self.next_market_stream_sample().await,
             1 => self.next_user_stream_sample().await,
             _ => {
@@ -1574,7 +2302,12 @@ impl ProductionBinanceTestnetSoakProbe {
                     .map_err(classify_continuous_testnet_owner_failure)?;
                 Ok(TestnetSoakSample::AuthenticatedReconcile)
             }
-        }
+        };
+        // Advancing after the awaited work is the cancellation-safety seam:
+        // a dropped timeout future retries the same lane instead of silently
+        // skipping it in the three-way rotation.
+        self.next_step = (self.next_step + 1) % 3;
+        result
     }
 
     async fn next_market_stream_sample(
@@ -1598,11 +2331,33 @@ impl ProductionBinanceTestnetSoakProbe {
     async fn next_user_stream_sample(
         &mut self,
     ) -> Result<TestnetSoakSample, TestnetSoakProbeFailure> {
+        if matches!(
+            self.owner.status().phase,
+            ContinuousTestnetOwnerPhase::CampaignRunning
+                | ContinuousTestnetOwnerPhase::Reconciling
+                | ContinuousTestnetOwnerPhase::RecoveryRequired
+        ) {
+            self.owner
+                .resume_interrupted_work()
+                .await
+                .map_err(classify_continuous_testnet_owner_failure)?;
+            // Recovery completes the durable lifecycle that was interrupted by
+            // the bounded probe timeout. Do not submit it a second time after
+            // the cached user-stream item is acknowledged below.
+            self.lifecycle_run_pending = false;
+        }
+        if self.pending_user_item.is_none() {
+            self.pending_user_item = Some(
+                self.user_stream
+                    .next_item()
+                    .await
+                    .map_err(|_| TestnetSoakProbeFailure::Protocol)?
+                    .ok_or(TestnetSoakProbeFailure::Unavailable)?,
+            );
+        }
         let item = self
-            .user_stream
-            .next_item()
-            .await
-            .map_err(|_| TestnetSoakProbeFailure::Protocol)?
+            .pending_user_item
+            .clone()
             .ok_or(TestnetSoakProbeFailure::Unavailable)?;
         let recovery_failure = match &item {
             BinanceUserDataStreamItem::TransportGap { .. } => TestnetSoakProbeFailure::Transport,
@@ -1628,9 +2383,11 @@ impl ProductionBinanceTestnetSoakProbe {
                         .map_err(classify_continuous_testnet_owner_failure)?;
                     self.lifecycle_run_pending = false;
                 }
+                self.pending_user_item = None;
                 Ok(TestnetSoakSample::UserDataStream)
             }
             ContinuousTestnetUserDataOutcome::ReconciledAwaitingSubscription(_) => {
+                self.pending_user_item = None;
                 Err(recovery_failure)
             }
         }
@@ -1674,6 +2431,14 @@ const fn classify_market_stream_failure(
 }
 
 impl TestnetSoakProbe for ProductionBinanceTestnetSoakProbe {
+    fn planned_sample(&self) -> Option<TestnetSoakSample> {
+        Some(match self.next_step {
+            0 => TestnetSoakSample::MarketStream,
+            1 => TestnetSoakSample::UserDataStream,
+            _ => TestnetSoakSample::AuthenticatedReconcile,
+        })
+    }
+
     fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
         Box::pin(async move { self.next_probe().await })
     }
@@ -1979,7 +2744,7 @@ where
         args.history_path.display()
     );
 
-    let outcome = serve_host_with_shutdown(
+    let outcome = match serve_host_with_shutdown(
         &mut task,
         listener,
         StdDuration::from_millis(args.control_poll_interval_ms.max(1)),
@@ -1988,7 +2753,10 @@ where
         Ok(shutdown),
     )
     .await
-    .map_err(|error| anyhow::Error::new(error).context("testnet soak control host failed"))?;
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(stop_testnet_soak_task_after_serve_error(&mut task, error).await),
+    };
 
     match outcome {
         TaskHostServeOutcome::StopRequested(exit) => {
@@ -2008,6 +2776,24 @@ where
         }
     }
     Ok(())
+}
+
+async fn stop_testnet_soak_task_after_serve_error(
+    task: &mut TestnetSoakTask,
+    error: TaskHostServeError<TestnetSoakTaskError>,
+) -> anyhow::Error {
+    let requires_cleanup =
+        !matches!(error, TaskHostServeError::Task(_)) && !task.status().is_terminal();
+    let serve_error = anyhow::Error::new(error).context("testnet soak control host failed");
+    if !requires_cleanup {
+        return serve_error;
+    }
+    match task.stop().await {
+        Ok(_) => serve_error,
+        Err(stop_error) => serve_error.context(format!(
+            "failed to stop testnet soak task after control host failure: {stop_error}"
+        )),
+    }
 }
 
 async fn run_testnet_soak_status(args: &TestnetSoakArgs) -> Result<()> {
@@ -2210,8 +2996,13 @@ fn project_testnet_soak_status(
             "testnet_soak_probe_succeeded" => {
                 projected.successful_probe_count =
                     projected.successful_probe_count.saturating_add(1);
-                projected.consecutive_failure_count = 0;
-                overwrite_string(&mut projected.last_probe_failure, "none");
+                projected.consecutive_failure_count = observation["consecutive_failure_count"]
+                    .as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(0);
+                if projected.consecutive_failure_count == 0 {
+                    overwrite_string(&mut projected.last_probe_failure, "none");
+                }
                 overwrite_string(
                     &mut projected.last_sample,
                     observation["sample"].as_str().unwrap_or("none"),
@@ -2223,8 +3014,10 @@ fn project_testnet_soak_status(
             }
             "testnet_soak_probe_failed" => {
                 projected.failed_probe_count = projected.failed_probe_count.saturating_add(1);
-                projected.consecutive_failure_count =
-                    projected.consecutive_failure_count.saturating_add(1);
+                projected.consecutive_failure_count = observation["consecutive_failure_count"]
+                    .as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or_else(|| projected.consecutive_failure_count.saturating_add(1));
                 overwrite_string(
                     &mut projected.last_probe_failure,
                     observation["probe_failure"].as_str().unwrap_or("none"),
@@ -2461,6 +3254,7 @@ fn testnet_soak_task_failure_name(failure: TestnetSoakTaskFailure) -> String {
         TestnetSoakTaskFailure::TaskPanicked => "task_panicked",
         TestnetSoakTaskFailure::TaskCancelled => "task_cancelled",
         TestnetSoakTaskFailure::ProbeShutdown => "probe_shutdown",
+        TestnetSoakTaskFailure::EvidenceIntegrity => "evidence_integrity",
     }
     .to_owned()
 }
@@ -6460,10 +7254,14 @@ mod tests {
         collect_config_report, config_summary, execution_batch, execution_error_summary,
         finish_arbitrage_execution, finish_execution, inspect_config, paper_runtime_schema_issues,
         plan_grid_intents, receipt_summary, render_config_summary,
-        start_after_shutdown_registration,
+        start_after_shutdown_registration, stop_testnet_soak_task_after_serve_error,
     };
+    use crate::task_host::{TaskHostControlTokenError, TaskHostServeError};
     use crate::testnet_lifecycle::{TestnetLifecycleConfig, TestnetLifecycleObservation};
-    use crate::testnet_soak::TestnetSoakSample;
+    use crate::testnet_soak::{
+        TestnetSoakProbe, TestnetSoakProbeFuture, TestnetSoakSample, TestnetSoakTask,
+        TestnetSoakTaskConfig, TestnetSoakTaskPhase,
+    };
     use crypto_trading_config::reject_yaml_anchors_and_aliases;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
@@ -6502,6 +7300,14 @@ mod tests {
     #[async_trait]
     impl MarketStreamSleeper for NoopStreamSleeper {
         async fn sleep(&self, _duration: StdDuration) {}
+    }
+
+    struct PendingSoakProbe;
+
+    impl TestnetSoakProbe for PendingSoakProbe {
+        fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
+            Box::pin(std::future::pending())
+        }
     }
 
     #[derive(Debug)]
@@ -6556,6 +7362,41 @@ mod tests {
         responses: Mutex<VecDeque<Result<RemoteHttpResponse, ExchangeError>>>,
     }
 
+    #[derive(Debug)]
+    enum CancellationSafeHttpAction {
+        Response(Result<RemoteHttpResponse, ExchangeError>),
+        Pending,
+    }
+
+    #[derive(Debug)]
+    struct CancellationSafeHttpTransport {
+        requests: Mutex<Vec<RemoteHttpRequest>>,
+        actions: Mutex<VecDeque<CancellationSafeHttpAction>>,
+    }
+
+    #[async_trait]
+    impl RemoteHttpTransport for CancellationSafeHttpTransport {
+        async fn send(
+            &self,
+            request: RemoteHttpRequest,
+        ) -> Result<RemoteHttpResponse, ExchangeError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            let action = self
+                .actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("scripted cancellation-safe transport ran out of actions");
+            match action {
+                CancellationSafeHttpAction::Response(response) => response,
+                CancellationSafeHttpAction::Pending => std::future::pending().await,
+            }
+        }
+    }
+
     #[async_trait]
     impl RemoteHttpTransport for ScriptedHttpTransport {
         async fn send(
@@ -6586,7 +7427,9 @@ mod tests {
             now: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
         });
         let sleeper: Arc<dyn MarketStreamSleeper> = Arc::new(NoopStreamSleeper);
-        let jitter = Arc::new(FixedMarketStreamJitter::new(10_000));
+        let jitter = Arc::new(
+            FixedMarketStreamJitter::new(10_000).expect("non-zero fixed jitter must be valid"),
+        );
         let reconnect = MarketStreamReconnectPolicy::new(
             StdDuration::from_millis(1),
             StdDuration::from_secs(1),
@@ -6691,6 +7534,118 @@ mod tests {
         assert!(journal.contains("continuous_testnet_user_stream_subscribed"));
         assert!(journal.contains("continuous_testnet_reconcile_verified"));
         assert!(!journal.contains("continuous_testnet_campaign_recovery_verified"));
+        let path = history.path().to_owned();
+        drop(probe);
+        drop(history);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn production_soak_retries_a_cancelled_lifecycle_query_first_without_losing_the_ack() {
+        let symbols = BinanceSmokeSymbols {
+            spot: Symbol::new("BTC-USDT-SPOT").unwrap(),
+            perpetual: Symbol::new("BTC-USDT-PERP").unwrap(),
+            wire_symbol: "BTCUSDT".to_owned(),
+        };
+        let config = soak_lifecycle_config(&symbols);
+        let open = binance_order_response("NEW");
+        let cancelled = binance_order_response("CANCELED");
+        let mut actions = (0..6)
+            .map(|_| {
+                CancellationSafeHttpAction::Response(Ok(
+                    RemoteHttpResponse::new(200, br"[]").unwrap()
+                ))
+            })
+            .collect::<VecDeque<_>>();
+        actions.push_back(CancellationSafeHttpAction::Pending);
+        actions.extend([
+            CancellationSafeHttpAction::Response(Ok(
+                RemoteHttpResponse::new(200, open.as_bytes()).unwrap()
+            )),
+            CancellationSafeHttpAction::Response(Ok(RemoteHttpResponse::new(
+                200,
+                cancelled.as_bytes(),
+            )
+            .unwrap())),
+            CancellationSafeHttpAction::Response(Ok(RemoteHttpResponse::new(
+                200,
+                cancelled.as_bytes(),
+            )
+            .unwrap())),
+        ]);
+        actions.extend((0..6).map(|_| {
+            CancellationSafeHttpAction::Response(Ok(RemoteHttpResponse::new(200, br"[]").unwrap()))
+        }));
+        let http = Arc::new(CancellationSafeHttpTransport {
+            requests: Mutex::new(Vec::new()),
+            actions: Mutex::new(actions),
+        });
+        let transport: Arc<dyn RemoteHttpTransport> = http.clone();
+        let (market, user) = scripted_soak_streams(&symbols, 91);
+        let history = JsonlHistory::new(temp_path("production-soak-cancel-resume"));
+        let mut probe = ProductionBinanceTestnetSoakProbe::from_parts(
+            market,
+            user,
+            mutation_exchange(&symbols, transport),
+            "production-soak-cancel-resume",
+            history.clone(),
+            TestnetSoakLifecycleOwnerMode::Fresh(config),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(1), probe.next_user_stream_sample())
+                .await
+                .is_err()
+        );
+        assert!(probe.pending_user_item.is_some());
+        assert_eq!(
+            http.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|request| request.method() == RemoteHttpMethod::Post)
+                .count(),
+            1,
+            "the cancelled attempt must reach the durable planned -> submit boundary"
+        );
+        assert_eq!(
+            tokio::time::timeout(StdDuration::from_secs(2), probe.next_user_stream_sample())
+                .await
+                .expect("query-first recovery must be bounded")
+                .unwrap(),
+            TestnetSoakSample::UserDataStream
+        );
+        assert!(probe.pending_user_item.is_none());
+
+        let requests = http
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut mutating = requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request.method(),
+                    RemoteHttpMethod::Post | RemoteHttpMethod::Delete
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutating
+                .iter()
+                .filter(|request| request.method() == RemoteHttpMethod::Post)
+                .count(),
+            1
+        );
+        assert_eq!(mutating.remove(0).method(), RemoteHttpMethod::Post);
+        assert_eq!(mutating.remove(0).method(), RemoteHttpMethod::Delete);
+        drop(requests);
+        let journal = std::fs::read_to_string(history.path()).unwrap();
+        assert!(journal.contains("continuous_testnet_campaign_recovery_verified"));
+        assert!(journal.contains("continuous_testnet_user_stream_subscribed"));
         let path = history.path().to_owned();
         drop(probe);
         drop(history);
@@ -6823,7 +7778,9 @@ mod tests {
             now: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
         });
         let sleeper: Arc<dyn MarketStreamSleeper> = Arc::new(NoopStreamSleeper);
-        let jitter = Arc::new(FixedMarketStreamJitter::new(10_000));
+        let jitter = Arc::new(
+            FixedMarketStreamJitter::new(10_000).expect("non-zero fixed jitter must be valid"),
+        );
         let reconnect = MarketStreamReconnectPolicy::new(
             StdDuration::from_millis(1),
             StdDuration::from_secs(1),
@@ -6957,6 +7914,40 @@ mod tests {
         assert!(started);
         assert_eq!(*steps.lock().unwrap(), ["registered", "started"]);
         drop(shutdown);
+    }
+
+    #[tokio::test]
+    async fn serve_error_cleanup_stops_the_testnet_soak_task() {
+        let path = temp_path("serve-error-cleanup.jsonl");
+        let mut task = TestnetSoakTask::start(
+            TestnetSoakTaskConfig::new(
+                "serve-error-cleanup",
+                StdDuration::from_secs(1),
+                StdDuration::from_secs(1),
+                3,
+            )
+            .unwrap(),
+            PendingSoakProbe,
+            JsonlHistory::new(&path),
+        )
+        .await
+        .unwrap();
+
+        let error = stop_testnet_soak_task_after_serve_error(
+            &mut task,
+            TaskHostServeError::ControlToken(TaskHostControlTokenError::Missing("fixture")),
+        )
+        .await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("testnet soak control host failed")
+        );
+        assert_eq!(task.status().phase, TestnetSoakTaskPhase::Stopped);
+        let journal = std::fs::read_to_string(&path).unwrap();
+        assert!(journal.contains("testnet_soak_stopped"), "{journal}");
+        let _ = std::fs::remove_file(path);
     }
 
     fn test_intent(exchange: &str) -> OrderIntent {

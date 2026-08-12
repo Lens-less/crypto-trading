@@ -486,11 +486,15 @@ impl<'a> SelectedExperiment<'a> {
         &self.selection
     }
 
-    /// Persists the sealed selection summary before any holdout access is possible.
+    /// Confirms that the caller persisted the sealed selection summary before
+    /// any holdout access is possible.
     ///
     /// The callback receives the exact frozen plan and complete selection
-    /// summary. A failed callback consumes no holdout state and returns its
-    /// typed error unchanged.
+    /// summary. It is a trust boundary: this library can enforce call order,
+    /// but cannot prove that an arbitrary callback performed durable I/O. A
+    /// production caller must atomically write and sync the artifact before
+    /// returning `Ok(())`. A failed callback consumes no holdout state and
+    /// returns its typed error unchanged.
     ///
     /// # Errors
     ///
@@ -508,7 +512,7 @@ impl<'a> SelectedExperiment<'a> {
     }
 }
 
-/// Selection state whose complete artifact persistence callback succeeded.
+/// Selection state whose trusted artifact-persistence callback succeeded.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PersistedSelection<'a> {
     plan: ExperimentPlan,

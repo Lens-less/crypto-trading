@@ -2,12 +2,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
+use crypto_trading_domain::record_operational_clock_skew_milliseconds;
 
 use crate::{
     BinanceProduct, BinanceServerOrderRef, BinanceTestnetBalance, BinanceTestnetProtocol,
-    CancellationDisposition, ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode,
-    ExchangeStatus, ForeignOrder, MarketSubscription, ReconcileReceipt, ReconcileScope,
-    RemoteHttpResponse, RemoteHttpTransport, SubscriptionReceipt, TradingCommand, TradingReceipt,
+    CancellationDisposition, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeStatus,
+    ForeignOrder, MarketSubscription, ReconcileReceipt, ReconcileScope, RemoteHttpResponse,
+    RemoteHttpTransport, SubscriptionReceipt, TradingCommand, TradingReceipt,
+    remote::{BinanceRateBudgetState, BinanceRateLimitPolicy},
 };
 
 const EXCHANGE: &str = "binance";
@@ -38,6 +40,8 @@ pub struct BinanceTestnetExchange {
     protocol: BinanceTestnetProtocol,
     transport: Arc<dyn RemoteHttpTransport>,
     clock: Arc<Clock>,
+    rate_budget: Mutex<BinanceRateBudgetState>,
+    rate_limit_policy: BinanceRateLimitPolicy,
     time_offset_ms: Mutex<i64>,
     observed_at: Mutex<DateTime<Utc>>,
 }
@@ -72,6 +76,8 @@ impl BinanceTestnetExchange {
             protocol,
             transport,
             clock: Arc::new(clock),
+            rate_budget: Mutex::new(BinanceRateBudgetState::default()),
+            rate_limit_policy: BinanceRateLimitPolicy::default(),
             time_offset_ms: Mutex::new(0),
             observed_at: Mutex::new(now),
         }
@@ -195,9 +201,10 @@ impl BinanceTestnetExchange {
         let response = self
             .dispatch_with_clock_retry(product, |timestamp_ms| {
                 let intent = intent.clone();
+                let transport = self.rate_limited_transport();
                 async move {
                     self.protocol
-                        .dispatch_order(&*self.transport, &intent, intent.price, timestamp_ms)
+                        .dispatch_order(&transport, &intent, intent.price, timestamp_ms)
                         .await
                 }
             })
@@ -218,15 +225,10 @@ impl BinanceTestnetExchange {
         let response = self
             .dispatch_with_clock_retry(product, |timestamp_ms| {
                 let symbol = symbol.clone();
+                let transport = self.rate_limited_transport();
                 async move {
                     self.protocol
-                        .dispatch_cancel(
-                            &*self.transport,
-                            &symbol,
-                            market_type,
-                            order_id,
-                            timestamp_ms,
-                        )
+                        .dispatch_cancel(&transport, &symbol, market_type, order_id, timestamp_ms)
                         .await
                 }
             })
@@ -275,9 +277,10 @@ impl BinanceTestnetExchange {
         let response = self
             .dispatch_with_clock_retry(product, |timestamp_ms| {
                 let symbol = symbol.clone();
+                let transport = self.rate_limited_transport();
                 async move {
                     self.protocol
-                        .dispatch_cancel_all(&*self.transport, &symbol, market_type, timestamp_ms)
+                        .dispatch_cancel_all(&transport, &symbol, market_type, timestamp_ms)
                         .await
                 }
             })
@@ -344,13 +347,15 @@ impl BinanceTestnetExchange {
         F: Fn(u64) -> Result<crate::RemoteHttpRequest, ExchangeError>,
     {
         let mut request = build_request(self.timestamp_ms()?)?;
-        let mut response = self.transport.send(request).await?;
+        let transport = self.rate_limited_transport();
+        let mut response = transport.send(request).await?;
         if !response.is_success() {
             let error = BinanceTestnetProtocol::remote_failure_from_response(&response);
             if BinanceTestnetProtocol::is_clock_skew_error(&error) {
                 self.sync_server_time(product).await?;
                 request = build_request(self.timestamp_ms()?)?;
-                response = self.transport.send(request).await?;
+                let transport = self.rate_limited_transport();
+                response = transport.send(request).await?;
             }
         }
         Ok(response)
@@ -361,7 +366,8 @@ impl BinanceTestnetExchange {
         product: BinanceProduct,
     ) -> Result<DateTime<Utc>, ExchangeError> {
         let request = self.protocol.build_server_time_request(product)?;
-        let response = self.transport.send(request).await?;
+        let transport = self.rate_limited_transport();
+        let response = transport.send(request).await?;
         if !response.is_success() {
             return Err(BinanceTestnetProtocol::remote_failure_from_response(
                 &response,
@@ -381,12 +387,22 @@ impl BinanceTestnetExchange {
                 "Binance server time differs from local time beyond the accepted clock offset",
             ));
         }
+        record_operational_clock_skew_milliseconds(offset);
         *self
             .time_offset_ms
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = offset;
         self.observe_at(server_time);
         Ok(server_time)
+    }
+
+    fn rate_limited_transport(&self) -> BinanceRateLimitedTransport<'_> {
+        BinanceRateLimitedTransport {
+            inner: &*self.transport,
+            budget: &self.rate_budget,
+            policy: self.rate_limit_policy,
+            clock: &*self.clock,
+        }
     }
 
     fn timestamp_ms(&self) -> Result<u64, ExchangeError> {
@@ -620,10 +636,49 @@ impl ExchangeHandle for BinanceTestnetExchange {
         Ok(ExchangeStatus {
             exchange: EXCHANGE.to_owned(),
             mode: ExchangeMode::Testnet,
-            availability: ExchangeAvailability::Ready,
+            availability: self
+                .rate_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .availability((self.clock)()),
             latest_market_timestamp: None,
             open_orders: 0,
         })
+    }
+}
+
+struct BinanceRateLimitedTransport<'a> {
+    inner: &'a dyn RemoteHttpTransport,
+    budget: &'a Mutex<BinanceRateBudgetState>,
+    policy: BinanceRateLimitPolicy,
+    clock: &'a Clock,
+}
+
+#[async_trait]
+impl RemoteHttpTransport for BinanceRateLimitedTransport<'_> {
+    async fn send(
+        &self,
+        request: crate::RemoteHttpRequest,
+    ) -> Result<RemoteHttpResponse, ExchangeError> {
+        let now = (self.clock)();
+        if let Some(error) = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_rejection(now)
+        {
+            return Err(error);
+        }
+        let response = self.inner.send(request).await?;
+        let observed_at = response.server_time().unwrap_or_else(|| (self.clock)());
+        self.budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_response(
+                response.binance_rate_limit_snapshot(observed_at),
+                self.policy,
+            );
+        Ok(response)
     }
 }
 

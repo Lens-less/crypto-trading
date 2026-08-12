@@ -15,8 +15,9 @@ use crypto_trading_exchange::{
 use crypto_trading_runtime::{
     BinanceBookTickerStreamSource, BinancePollingRoute, FixedMarketStreamJitter, MarketDataClock,
     MarketDataEvent, MarketDataEventSource, MarketDataObservation, MarketDataSourceFailure,
-    MarketStreamReconnectPolicy, MarketStreamSleeper, TextWebSocketConnector, TextWebSocketEvent,
-    TextWebSocketSession, TokioTextWebSocketConnector, WebSocketCloseKind,
+    MarketStreamReconnectPolicy, MarketStreamSleeper, MarketSupervisor, MarketSupervisorConfig,
+    MarketSupervisorExit, TextWebSocketConnector, TextWebSocketEvent, TextWebSocketSession,
+    TokioTextWebSocketConnector, WebSocketCloseKind,
 };
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ impl MarketStreamSleeper for RecordingSleeper {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(duration);
+        tokio::task::yield_now().await;
     }
 }
 
@@ -126,7 +128,7 @@ async fn stream_source_reconnects_fail_closed_and_marks_the_transport_gap() {
             .unwrap(),
         Arc::clone(&clock),
         sleeper,
-        Arc::new(FixedMarketStreamJitter::new(10_000)),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
     )
     .unwrap();
 
@@ -188,7 +190,7 @@ async fn stream_source_converts_transport_lag_into_an_explicit_gap() {
             .unwrap(),
         Arc::clone(&clock),
         Arc::new(RecordingSleeper::default()),
-        Arc::new(FixedMarketStreamJitter::new(10_000)),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
     )
     .unwrap();
 
@@ -225,7 +227,7 @@ async fn stream_source_applies_the_jittered_backoff_before_retrying() {
             .unwrap(),
         clock,
         sleeper.clone(),
-        Arc::new(FixedMarketStreamJitter::new(12_500)),
+        Arc::new(FixedMarketStreamJitter::new(12_500).unwrap()),
     )
     .unwrap();
 
@@ -291,7 +293,7 @@ async fn stream_source_keeps_exponential_backoff_when_connections_close_before_d
             .with_max_reconnect_attempts(3),
         Arc::clone(&clock),
         sleeper.clone(),
-        Arc::new(FixedMarketStreamJitter::new(10_000)),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
     )
     .unwrap();
 
@@ -345,7 +347,7 @@ async fn stream_source_surfaces_server_shutdown_as_fail_closed_gap_and_unavailab
             .unwrap(),
         Arc::clone(&clock),
         Arc::new(RecordingSleeper::default()),
-        Arc::new(FixedMarketStreamJitter::new(10_000)),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
     )
     .unwrap();
 
@@ -360,6 +362,314 @@ async fn stream_source_surfaces_server_shutdown_as_fail_closed_gap_and_unavailab
         source.next_event().await.unwrap().unwrap(),
         MarketDataEvent::SourceGap { skipped: 1, .. }
     ));
+}
+
+#[tokio::test]
+async fn stream_source_rejects_frames_without_source_sequence() {
+    let clock = Arc::new(FixedClock {
+        now: timestamp("2026-08-12T00:00:00Z"),
+    });
+    let sleeper = Arc::new(RecordingSleeper::default());
+    let mut source = BinanceBookTickerStreamSource::new(
+        BinancePublicExchange::new().unwrap(),
+        vec![route("BNB-USDT", "BNBUSDT")],
+        Arc::new(ScriptedConnector::new(vec![
+            Ok(ScriptedSession {
+                events: vec![
+                    Ok(TextWebSocketEvent::Text(
+                        r#"{"u":7,"s":"BNBUSDT","b":"1.0","B":"2.0","a":"1.1","A":"3.0"}"#
+                            .to_owned(),
+                    )),
+                    Ok(TextWebSocketEvent::Text(
+                        r#"{"s":"BNBUSDT","b":"1.2","B":"2.2","a":"1.3","A":"3.3"}"#.to_owned(),
+                    )),
+                ]
+                .into(),
+            }),
+            Ok(ScriptedSession {
+                events: vec![Ok(TextWebSocketEvent::Text(
+                    r#"{"u":8,"s":"BNBUSDT","b":"1.4","B":"2.4","a":"1.5","A":"3.5"}"#.to_owned(),
+                ))]
+                .into(),
+            }),
+        ])),
+        MarketStreamReconnectPolicy::new(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            .unwrap(),
+        Arc::clone(&clock),
+        sleeper.clone(),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(MarketDataObservation {
+            source_sequence: Some(7),
+            source_generation: Some(1),
+            ..
+        })
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceUnavailable {
+            failure: MarketDataSourceFailure::InvalidPayload,
+            ..
+        }
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceGap { skipped: 1, .. }
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(MarketDataObservation {
+            revision: 2,
+            source_sequence: Some(8),
+            source_generation: Some(2),
+            ..
+        })
+    ));
+    assert_eq!(
+        sleeper
+            .durations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+        vec![StdDuration::from_millis(50)]
+    );
+}
+
+#[tokio::test]
+async fn stream_source_malformed_frame_reconnects_instead_of_failing_the_supervisor_contract() {
+    let clock = Arc::new(FixedClock {
+        now: timestamp("2026-08-12T00:00:00Z"),
+    });
+    let source = BinanceBookTickerStreamSource::new(
+        BinancePublicExchange::new().unwrap(),
+        vec![route("BNB-USDT", "BNBUSDT")],
+        Arc::new(ScriptedConnector::new(vec![
+            Ok(ScriptedSession {
+                events: vec![Ok(TextWebSocketEvent::Text("{not-json".to_owned()))].into(),
+            }),
+            Ok(ScriptedSession {
+                events: vec![Ok(TextWebSocketEvent::Text(
+                    r#"{"u":8,"s":"BNBUSDT","b":"1.4","B":"2.4","a":"1.5","A":"3.5"}"#.to_owned(),
+                ))]
+                .into(),
+            }),
+        ])),
+        MarketStreamReconnectPolicy::new(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            .unwrap(),
+        Arc::clone(&clock),
+        Arc::new(RecordingSleeper::default()),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
+    )
+    .unwrap();
+    let mut supervisor =
+        MarketSupervisor::start_new(source, MarketSupervisorConfig::default()).unwrap();
+
+    assert!(matches!(
+        supervisor.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceUnavailable {
+            failure: MarketDataSourceFailure::InvalidPayload,
+            ..
+        }
+    ));
+    assert_eq!(
+        supervisor.status().phase,
+        crypto_trading_runtime::MarketSupervisorPhase::Running
+    );
+    assert_eq!(
+        supervisor.stop().await.unwrap(),
+        MarketSupervisorExit::StopRequested
+    );
+}
+
+#[tokio::test]
+async fn stream_source_unknown_symbol_uses_counted_backoff_instead_of_busy_reconnect_loop() {
+    let clock = Arc::new(FixedClock {
+        now: timestamp("2026-08-12T00:00:00Z"),
+    });
+    let sleeper = Arc::new(RecordingSleeper::default());
+    let mut source = BinanceBookTickerStreamSource::new(
+        BinancePublicExchange::new().unwrap(),
+        vec![route("BNB-USDT", "BNBUSDT")],
+        Arc::new(ScriptedConnector::new(vec![
+            Ok(ScriptedSession {
+                events: vec![Ok(TextWebSocketEvent::Text(
+                    r#"{"u":9,"s":"BTCUSDT","b":"1.0","B":"2.0","a":"1.1","A":"3.0"}"#.to_owned(),
+                ))]
+                .into(),
+            }),
+            Ok(ScriptedSession {
+                events: vec![Ok(TextWebSocketEvent::Text(
+                    r#"{"u":10,"s":"BNBUSDT","b":"1.2","B":"2.2","a":"1.3","A":"3.3"}"#.to_owned(),
+                ))]
+                .into(),
+            }),
+        ])),
+        MarketStreamReconnectPolicy::new(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            .unwrap(),
+        Arc::clone(&clock),
+        sleeper.clone(),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceUnavailable {
+            failure: MarketDataSourceFailure::InvalidPayload,
+            ..
+        }
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceGap { skipped: 1, .. }
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(MarketDataObservation {
+            source_generation: Some(2),
+            ..
+        })
+    ));
+    assert_eq!(
+        sleeper
+            .durations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+        vec![StdDuration::from_millis(50)]
+    );
+}
+
+#[tokio::test]
+async fn stream_source_sequence_regression_uses_failure_budget_and_resets_on_new_connection() {
+    let clock = Arc::new(FixedClock {
+        now: timestamp("2026-08-12T00:00:00Z"),
+    });
+    let sleeper = Arc::new(RecordingSleeper::default());
+    let mut source = BinanceBookTickerStreamSource::new(
+        BinancePublicExchange::new().unwrap(),
+        vec![route("BNB-USDT", "BNBUSDT")],
+        Arc::new(ScriptedConnector::new(vec![
+            Ok(ScriptedSession {
+                events: vec![
+                    Ok(TextWebSocketEvent::Text(
+                        r#"{"u":7,"s":"BNBUSDT","b":"1.0","B":"2.0","a":"1.1","A":"3.0"}"#
+                            .to_owned(),
+                    )),
+                    Ok(TextWebSocketEvent::Text(
+                        r#"{"u":6,"s":"BNBUSDT","b":"1.2","B":"2.2","a":"1.3","A":"3.3"}"#
+                            .to_owned(),
+                    )),
+                ]
+                .into(),
+            }),
+            Ok(ScriptedSession {
+                events: vec![
+                    Ok(TextWebSocketEvent::Text(
+                        r#"{"u":6,"s":"BNBUSDT","b":"1.4","B":"2.4","a":"1.5","A":"3.5"}"#
+                            .to_owned(),
+                    )),
+                    Ok(TextWebSocketEvent::Text(
+                        r#"{"u":9,"s":"BNBUSDT","b":"1.6","B":"2.6","a":"1.7","A":"3.7"}"#
+                            .to_owned(),
+                    )),
+                ]
+                .into(),
+            }),
+        ])),
+        MarketStreamReconnectPolicy::new(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            .unwrap()
+            .with_max_reconnect_attempts(3),
+        Arc::clone(&clock),
+        sleeper.clone(),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(MarketDataObservation {
+            source_sequence: Some(7),
+            source_generation: Some(1),
+            ..
+        })
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceUnavailable {
+            failure: MarketDataSourceFailure::InvalidPayload,
+            ..
+        }
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceGap { skipped: 1, .. }
+    ));
+    assert!(matches!(
+        source.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::Observation(MarketDataObservation {
+            revision: 2,
+            source_sequence: Some(6),
+            source_generation: Some(2),
+            ..
+        })
+    ));
+    assert_eq!(
+        sleeper
+            .durations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+        vec![StdDuration::from_millis(50)]
+    );
+}
+
+#[tokio::test]
+async fn supervisor_distinguishes_reconnect_exhaustion_from_normal_source_end() {
+    let clock = Arc::new(FixedClock {
+        now: timestamp("2026-08-12T00:00:00Z"),
+    });
+    let source = BinanceBookTickerStreamSource::new(
+        BinancePublicExchange::new().unwrap(),
+        vec![route("BNB-USDT", "BNBUSDT")],
+        Arc::new(ScriptedConnector::new(vec![Ok(ScriptedSession {
+            events: vec![Ok(TextWebSocketEvent::Closed {
+                kind: WebSocketCloseKind::Remote,
+            })]
+            .into(),
+        })])),
+        MarketStreamReconnectPolicy::new(StdDuration::from_millis(50), StdDuration::from_secs(1))
+            .unwrap()
+            .with_max_reconnect_attempts(1),
+        Arc::clone(&clock),
+        Arc::new(RecordingSleeper::default()),
+        Arc::new(FixedMarketStreamJitter::new(10_000).unwrap()),
+    )
+    .unwrap();
+    let mut supervisor =
+        MarketSupervisor::start_new(source, MarketSupervisorConfig::default()).unwrap();
+
+    assert!(matches!(
+        supervisor.next_event().await.unwrap().unwrap(),
+        MarketDataEvent::SourceUnavailable {
+            failure: MarketDataSourceFailure::Disconnected,
+            ..
+        }
+    ));
+    assert!(supervisor.next_event().await.unwrap().is_none());
+    assert_eq!(
+        supervisor.status().exit,
+        Some(MarketSupervisorExit::ReconnectExhausted)
+    );
+}
+
+#[test]
+fn fixed_market_stream_jitter_rejects_zero_bps() {
+    assert!(FixedMarketStreamJitter::new(0).is_err());
 }
 
 fn route(canonical_symbol: &str, wire_symbol: &str) -> BinancePollingRoute {

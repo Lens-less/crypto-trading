@@ -3,11 +3,13 @@
 use std::{
     env,
     error::Error,
+    ffi::OsString,
     fmt::Write as _,
     fs::{self, File},
     io::{self, Write as _},
     ops::Range,
     path::{Path, PathBuf},
+    process,
     str::FromStr,
 };
 
@@ -602,9 +604,7 @@ fn expected_month(
         TimestampUnit::Microseconds
     };
     let last_close = match timestamp_unit {
-        TimestampUnit::Milliseconds => {
-            next_open - Duration::microseconds(protocol.interval_micros / 1_000 - 1)
-        }
+        TimestampUnit::Milliseconds => next_open - Duration::milliseconds(1),
         TimestampUnit::Microseconds => next_open - Duration::microseconds(1),
     };
     let interval_hours = protocol.interval_micros / 3_600_000_000;
@@ -834,9 +834,61 @@ fn decimal(value: &str) -> Result<Decimal, rust_decimal::Error> {
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = temporary_write_path(path)?;
+
+    let write_result = (|| -> Result<(), io::Error> {
+        let mut file = File::options()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        atomic_replace(&temp_path, path)?;
+        sync_parent_dir(parent)
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn temporary_write_path(path: &Path) -> Result<PathBuf, io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(OsString::from)
+        .ok_or_else(|| invalid_input("artifact path must include a file name"))?;
+    for attempt in 0..1_000_u32 {
+        let mut candidate = file_name.clone();
+        candidate.push(format!(".tmp-{}-{attempt}", process::id()));
+        let candidate = parent.join(candidate);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(invalid_input(format!(
+        "could not allocate a temporary artifact path for {}",
+        path.display()
+    )))
+}
+
+fn atomic_replace(temp_path: &Path, destination: &Path) -> Result<(), io::Error> {
+    fs::rename(temp_path, destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), io::Error> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(path: &Path) -> Result<(), io::Error> {
+    // Windows does not expose the Unix directory-fsync primitive through
+    // `std`, but still validate that the replacement's parent remains
+    // reachable before reporting the artifact write as complete.
+    fs::metadata(path).map(|_| ())
 }
 
 fn render_selection_artifact(
@@ -1375,16 +1427,17 @@ fn render_markdown_report(
     protocol: FrozenResearchProtocol,
 ) -> Result<String, std::fmt::Error> {
     let mut report = String::new();
-    writeln!(
-        report,
-        "# {} BTCUSDT Spot {} Offline Evaluation",
-        if protocol.id == G005_PROTOCOL_ID {
-            "G-005"
-        } else {
-            "W1"
-        },
-        protocol.cadence.label()
-    )?;
+    let protocol_label = if protocol.id == G005_PROTOCOL_ID {
+        "G-005".to_owned()
+    } else {
+        format!("W1 {}", protocol.cadence.label())
+    };
+    let selection_window_label = if protocol.expected_window_count == 9 {
+        "nine".to_owned()
+    } else {
+        protocol.expected_window_count.to_string()
+    };
+    writeln!(report, "# {protocol_label} BTCUSDT Spot Offline Evaluation")?;
     writeln!(report)?;
     writeln!(report, "- Protocol: `{}`", protocol.id)?;
     writeln!(
@@ -1411,7 +1464,7 @@ fn render_markdown_report(
     writeln!(
         report,
         "- Evaluation: {} selection OOS windows, one consuming {}-bar final holdout, 1x/2x costs",
-        protocol.expected_window_count, protocol.split.final_holdout_len
+        selection_window_label, protocol.split.final_holdout_len
     )?;
     writeln!(report)?;
     writeln!(
@@ -1756,6 +1809,7 @@ fn selection_persistence_error(error: &io::Error) -> ExperimentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn quoted_tsv_parser_is_strict_and_handles_escaped_quotes() {
@@ -1816,6 +1870,52 @@ mod tests {
         assert_eq!((last.year, last.month, last.bar_count), (2026, 7, 31));
         assert_eq!(first.timestamp_unit, TimestampUnit::Milliseconds);
         assert_eq!(last.timestamp_unit, TimestampUnit::Microseconds);
+    }
+
+    #[test]
+    fn embedded_g005_calendar_matches_the_real_frozen_lock_first_row() {
+        let lock = fs::read_to_string(g005_lock_path()).unwrap();
+        let first_row = parse_provenance_lock(&lock).unwrap().remove(0);
+        let protocol = g005_protocol();
+        let calendar = expected_month(0, protocol).unwrap();
+        let retrieved_at = validate_provenance_row(
+            &first_row,
+            &calendar,
+            protocol,
+            Some(parse_datetime(G005_FROZEN_RETRIEVED_AT).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            retrieved_at,
+            parse_datetime(G005_FROZEN_RETRIEVED_AT).unwrap()
+        );
+        assert_eq!(
+            calendar
+                .last_close
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+            "2018-01-31T23:59:59.999Z"
+        );
+    }
+
+    #[test]
+    fn write_synced_replaces_existing_artifacts_without_leaving_temp_files() {
+        let temp_dir = unique_test_directory("atomic-write");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let artifact = temp_dir.join("artifact.json");
+        fs::write(&artifact, b"old").unwrap();
+
+        write_synced(&artifact, b"new").unwrap();
+
+        assert_eq!(fs::read(&artifact).unwrap(), b"new");
+        let leftover_temps = fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftover_temps, 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
@@ -1937,5 +2037,21 @@ mod tests {
                 .to_string()
                 .contains("unknown argument `--provenance-lock-sha256`")
         );
+    }
+
+    fn g005_lock_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../artifacts/strategy-evaluation/g005-btcusdt-provenance.tsv")
+    }
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "crypto-trading-backtest-{label}-{}-{nonce}",
+            process::id()
+        ))
     }
 }

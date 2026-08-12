@@ -1,0 +1,10 @@
+# Deterministic browser-lifecycle fixture. Position-age enforcement is omitted
+# because the checked-in market replay has historical timestamps while this
+# test verifies operator start/stop semantics against the current wall clock.
+max_symbol_exposure: "1000"
+max_total_exposure: "2000"
+min_balance_warning: "1000"
+min_balance_close_position: "500"
+max_daily_trades: 10000
+disabled_symbols: []
+high_risk_symbols: []

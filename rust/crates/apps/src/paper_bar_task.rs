@@ -25,11 +25,19 @@ pub enum PaperBarTaskError {
     Strategy(StrategyError),
 }
 
+/// Resume state for one bar-driven paper owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaperBarTaskState {
+    pub next_bar_index: usize,
+    pub current_target: TargetExposure,
+}
+
 /// Minimal in-memory owner that consumes one shared pure bar strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaperBarTask<S> {
     strategy: S,
     history: Vec<Bar>,
+    next_bar_index: usize,
     current_target: TargetExposure,
 }
 
@@ -39,10 +47,30 @@ where
 {
     #[must_use]
     pub fn new(strategy: S) -> Self {
+        Self::with_state(
+            strategy,
+            PaperBarTaskState {
+                next_bar_index: 0,
+                current_target: TargetExposure::ZERO,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn with_state(strategy: S, state: PaperBarTaskState) -> Self {
         Self {
             strategy,
             history: Vec::new(),
-            current_target: TargetExposure::ZERO,
+            next_bar_index: state.next_bar_index,
+            current_target: state.current_target,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> PaperBarTaskState {
+        PaperBarTaskState {
+            next_bar_index: self.next_bar_index,
+            current_target: self.current_target,
         }
     }
 
@@ -52,26 +80,55 @@ where
     ///
     /// Propagates pure strategy failures without introducing I/O.
     pub fn on_bar(&mut self, bar: Bar) -> Result<PaperBarDecision, PaperBarTaskError> {
+        let decision = self.evaluate_bar(bar, self.current_target)?;
+        // The convenience API assumes the requested target is achieved before
+        // the next bar. Real owners use `on_bar_with_current_target` instead.
+        self.current_target = decision.target;
+        Ok(decision)
+    }
+
+    /// Feeds one completed bar through the shared strategy contract while the
+    /// caller supplies the currently achieved target.
+    ///
+    /// # Errors
+    ///
+    /// Propagates pure strategy failures without introducing I/O.
+    pub fn on_bar_with_current_target(
+        &mut self,
+        bar: Bar,
+        current_target: TargetExposure,
+    ) -> Result<PaperBarDecision, PaperBarTaskError> {
+        let decision = self.evaluate_bar(bar, current_target)?;
+        self.current_target = current_target;
+        Ok(decision)
+    }
+
+    fn evaluate_bar(
+        &mut self,
+        bar: Bar,
+        current_target: TargetExposure,
+    ) -> Result<PaperBarDecision, PaperBarTaskError> {
         if self.history.last().is_some_and(|previous| {
             previous.open_time >= bar.open_time || previous.close_time >= bar.open_time
         }) {
             return Err(PaperBarTaskError::InvalidBarSequence);
         }
+        let bar_index = self.next_bar_index;
         self.history.push(bar);
-        let bar_index = self.history.len() - 1;
-        let decided_at = self.history[bar_index].close_time;
+        let decided_at = self
+            .history
+            .last()
+            .expect("history contains the pushed bar")
+            .close_time;
         let next_target =
             self.strategy
                 .target_exposure(&crypto_trading_strategy::BarStrategyContext {
                     history: &self.history,
                     decided_at,
                     bar_index,
-                    current_target: self.current_target.as_decimal(),
+                    current_target: current_target.as_decimal(),
                 })?;
-        let action = match next_target
-            .as_decimal()
-            .cmp(&self.current_target.as_decimal())
-        {
+        let action = match next_target.as_decimal().cmp(&current_target.as_decimal()) {
             Ordering::Greater => PaperBarAction::Rebalance {
                 side: Side::Buy,
                 target: next_target,
@@ -82,7 +139,12 @@ where
             },
             Ordering::Equal => PaperBarAction::Hold,
         };
-        self.current_target = next_target;
+        self.next_bar_index =
+            self.next_bar_index
+                .checked_add(1)
+                .ok_or(PaperBarTaskError::Strategy(
+                    StrategyError::InvalidFinancialValue("bar"),
+                ))?;
         Ok(PaperBarDecision {
             bar_index,
             decided_at,

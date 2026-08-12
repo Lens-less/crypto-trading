@@ -202,6 +202,35 @@ describe("/strategies 写能力门控", () => {
       screen.getAllByText(/在 \/api\/v1\/tasks 恢复 complete 之前禁止提交/).length,
     ).toBeGreaterThan(0);
   });
+
+  it.each(["stopped", "failed"] as const)(
+    "目标任务 phase=%s → stop/cancel 禁用,但 restart 保留",
+    async (phase) => {
+      stubStrategies(
+        tasksModel([task({ phase })]),
+        settingsModel("local-paper-operator"),
+      );
+      renderWithQueryClient(<StrategiesPage />);
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "启动网格" })).toBeTruthy();
+      });
+      const start = screen.getByRole("button", {
+        name: "启动网格",
+      }) as HTMLButtonElement;
+      const stop = screen.getAllByRole("button", {
+        name: "停止任务",
+      })[0] as HTMLButtonElement;
+      const cancel = screen.getAllByRole("button", {
+        name: "取消任务",
+      })[0] as HTMLButtonElement;
+      expect(start.disabled).toBe(false);
+      expect(stop.disabled).toBe(true);
+      expect(cancel.disabled).toBe(true);
+      expect(
+        screen.getByText(/目标任务已处于持久终态;停止与取消已禁用/),
+      ).toBeTruthy();
+    },
+  );
 });
 
 describe("/strategies 提交流程", () => {

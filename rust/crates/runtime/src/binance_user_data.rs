@@ -1,10 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
 use crypto_trading_domain::Quantity;
+use crypto_trading_domain::{
+    OperationalStreamKind, record_stream_frame, record_stream_gap, record_stream_queue_drop,
+    record_stream_reconnect,
+};
 use crypto_trading_exchange::{
     BinanceAccountUpdateEvent, BinanceExecutionReportEvent, BinanceUserDataBalance,
     BinanceUserDataEvent,
@@ -17,11 +21,12 @@ use crate::{
     },
     market_stream::{
         MarketStreamJitter, MarketStreamReconnectPolicy, MarketStreamSleeper,
-        TextWebSocketConnector, TextWebSocketEvent, WebSocketCloseKind,
+        TextWebSocketConnector, TextWebSocketEvent, USER_DATA_SUBSCRIBE_REQUEST_ID,
+        WebSocketCloseKind,
     },
 };
 
-type ExecutionFingerprint = (u64, Option<u64>, DateTime<Utc>, DateTime<Utc>);
+type ExecutionKey = (u64, Option<u64>, DateTime<Utc>, DateTime<Utc>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamEnvelope<T> {
@@ -119,7 +124,7 @@ pub struct BinanceUserDataState {
     last_event_time: Option<DateTime<Utc>>,
     last_account_update_time: Option<DateTime<Utc>>,
     last_account_update_event_time: Option<DateTime<Utc>>,
-    seen_execution_fingerprints: HashSet<ExecutionFingerprint>,
+    seen_execution_fills: HashMap<ExecutionKey, Quantity>,
     orders: HashMap<u64, BinanceUserDataOrderState>,
     balances: HashMap<String, BinanceUserDataBalanceState>,
     reconcile_required: Option<BinanceUserDataReconcileReason>,
@@ -193,7 +198,10 @@ impl BinanceUserDataStreamSource {
                 match self.connector.connect().await {
                     Ok(session) => {
                         self.session = Some(session);
-                        self.connection_generation = self.connection_generation.saturating_add(1);
+                        self.connection_generation = self
+                            .connection_generation
+                            .checked_add(1)
+                            .ok_or(MarketDataError::GenerationExhausted)?;
                         self.local_sequence = 0;
                     }
                     Err(error) => {
@@ -208,12 +216,10 @@ impl BinanceUserDataStreamSource {
                     actual: "user-data websocket session disappeared".to_owned(),
                 });
             };
-            let event = session.next_event().await.map_err(|error| {
-                MarketDataError::SourceIdentityMismatch {
-                    expected: "binance".to_owned(),
-                    actual: error.to_string(),
-                }
-            })?;
+            let event = match session.next_event().await {
+                Ok(event) => event,
+                Err(error) => return Ok(Some(self.schedule_reconnect(&error, true))),
+            };
             match event {
                 TextWebSocketEvent::Text(text) => {
                     if let Some(item) = self.handle_text(&text, observed_at)? {
@@ -221,15 +227,21 @@ impl BinanceUserDataStreamSource {
                     }
                 }
                 TextWebSocketEvent::Heartbeat => {
-                    self.consecutive_failures = 0;
-                    self.exhausted = false;
+                    record_stream_frame(
+                        OperationalStreamKind::UserData,
+                        self.connection_generation,
+                        unix_seconds(observed_at),
+                    );
                     return Ok(Some(BinanceUserDataStreamItem::Heartbeat { observed_at }));
                 }
                 TextWebSocketEvent::Lagged { skipped } => {
-                    return Ok(Some(BinanceUserDataStreamItem::TransportGap {
-                        skipped,
-                        observed_at,
-                    }));
+                    record_stream_queue_drop(OperationalStreamKind::UserData, skipped);
+                    return Ok(Some(self.schedule_reconnect_with_gap(
+                        &crypto_trading_exchange::ExchangeError::unavailable(
+                            "user-data websocket queue lagged",
+                        ),
+                        Some(skipped),
+                    )));
                 }
                 TextWebSocketEvent::Closed { kind } => {
                     return Ok(Some(self.handle_closed(kind, observed_at)));
@@ -243,30 +255,54 @@ impl BinanceUserDataStreamSource {
         text: &str,
         observed_at: DateTime<Utc>,
     ) -> Result<Option<BinanceUserDataStreamItem>, MarketDataError> {
-        if let Some(item) = parse_subscription_ack(text, observed_at)? {
-            self.consecutive_failures = 0;
-            self.exhausted = false;
-            return Ok(Some(item));
+        match parse_subscription_ack(text, observed_at) {
+            Ok(Some(item)) => {
+                self.consecutive_failures = 0;
+                self.exhausted = false;
+                record_stream_frame(
+                    OperationalStreamKind::UserData,
+                    self.connection_generation,
+                    unix_seconds(observed_at),
+                );
+                return Ok(Some(item));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Ok(Some(self.schedule_local_reconnect(
+                    MarketDataSourceFailure::InvalidPayload,
+                    true,
+                )));
+            }
         }
-        let payload =
+        let Ok(payload) =
             crypto_trading_exchange::BinanceTestnetProtocol::parse_user_data_event(text.as_bytes())
-                .map_err(|error| MarketDataError::SourceIdentityMismatch {
-                    expected: "binance".to_owned(),
-                    actual: error.to_string(),
-                })?;
+        else {
+            return Ok(Some(self.schedule_local_reconnect(
+                MarketDataSourceFailure::InvalidPayload,
+                true,
+            )));
+        };
         self.local_sequence = self
             .local_sequence
             .checked_add(1)
             .ok_or(MarketDataError::RevisionExhausted)?;
+        let Ok(payload) = normalize_execution_trade_id(text, payload) else {
+            return Ok(Some(self.schedule_local_reconnect(
+                MarketDataSourceFailure::InvalidPayload,
+                true,
+            )));
+        };
         if matches!(payload, BinanceUserDataEvent::StreamTerminated(_)) {
             self.session = None;
-            self.pending_retry = Some(self.reconnect_policy.retry_delay(1, self.jitter.as_ref()));
-            return Ok(Some(BinanceUserDataStreamItem::StreamExpired {
-                observed_at,
-            }));
+            return Ok(Some(self.schedule_stream_expired(observed_at)));
         }
         self.consecutive_failures = 0;
         self.exhausted = false;
+        record_stream_frame(
+            OperationalStreamKind::UserData,
+            self.connection_generation,
+            unix_seconds(observed_at),
+        );
         Ok(Some(BinanceUserDataStreamItem::Event(StreamEnvelope::new(
             self.connection_generation,
             self.local_sequence,
@@ -283,9 +319,7 @@ impl BinanceUserDataStreamSource {
         self.session = None;
         match kind {
             WebSocketCloseKind::Expired | WebSocketCloseKind::ServerShutdown => {
-                self.pending_retry =
-                    Some(self.reconnect_policy.retry_delay(1, self.jitter.as_ref()));
-                BinanceUserDataStreamItem::StreamExpired { observed_at }
+                self.schedule_stream_expired(observed_at)
             }
             WebSocketCloseKind::Remote | WebSocketCloseKind::Protocol => self.schedule_reconnect(
                 &crypto_trading_exchange::ExchangeError::unavailable("user-data websocket closed"),
@@ -299,17 +333,44 @@ impl BinanceUserDataStreamSource {
         error: &crypto_trading_exchange::ExchangeError,
         transport_gap: bool,
     ) -> BinanceUserDataStreamItem {
+        self.schedule_reconnect_with_gap(error, transport_gap.then_some(1))
+    }
+
+    fn schedule_local_reconnect(
+        &mut self,
+        failure: MarketDataSourceFailure,
+        transport_gap: bool,
+    ) -> BinanceUserDataStreamItem {
+        self.schedule_failure(failure, transport_gap.then_some(1))
+    }
+
+    fn schedule_reconnect_with_gap(
+        &mut self,
+        error: &crypto_trading_exchange::ExchangeError,
+        transport_gap: Option<u64>,
+    ) -> BinanceUserDataStreamItem {
+        self.schedule_failure(classify_exchange_failure(error), transport_gap)
+    }
+
+    fn schedule_failure(
+        &mut self,
+        failure: MarketDataSourceFailure,
+        transport_gap: Option<u64>,
+    ) -> BinanceUserDataStreamItem {
         self.session = None;
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let observed_at = self.clock.now();
-        if transport_gap {
+        let exhausted = self.reconnect_policy.exhausted(self.consecutive_failures);
+        record_stream_reconnect(OperationalStreamKind::UserData);
+        if let Some(skipped) = transport_gap.filter(|_| !exhausted) {
+            record_stream_gap(OperationalStreamKind::UserData);
             self.pending_items
                 .push_back(BinanceUserDataStreamItem::TransportGap {
-                    skipped: 1,
+                    skipped,
                     observed_at,
                 });
         }
-        if self.reconnect_policy.exhausted(self.consecutive_failures) {
+        if exhausted {
             self.exhausted = true;
         } else {
             self.pending_retry = Some(
@@ -318,9 +379,29 @@ impl BinanceUserDataStreamSource {
             );
         }
         BinanceUserDataStreamItem::SourceUnavailable {
-            failure: classify_exchange_failure(error),
+            failure,
             observed_at,
         }
+    }
+
+    fn schedule_stream_expired(&mut self, observed_at: DateTime<Utc>) -> BinanceUserDataStreamItem {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        record_stream_reconnect(OperationalStreamKind::UserData);
+        if self.reconnect_policy.exhausted(self.consecutive_failures) {
+            self.exhausted = true;
+            self.pending_retry = None;
+        } else {
+            self.pending_retry = Some(
+                self.reconnect_policy
+                    .retry_delay(self.consecutive_failures, self.jitter.as_ref()),
+            );
+        }
+        record_stream_frame(
+            OperationalStreamKind::UserData,
+            self.connection_generation,
+            unix_seconds(observed_at),
+        );
+        BinanceUserDataStreamItem::StreamExpired { observed_at }
     }
 }
 
@@ -339,6 +420,19 @@ fn parse_subscription_ack(
     let Some(status) = value.get("status").and_then(serde_json::Value::as_u64) else {
         return Ok(None);
     };
+    let request_id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| MarketDataError::SourceIdentityMismatch {
+            expected: "binance".to_owned(),
+            actual: "Binance user-data subscription ack is missing id".to_owned(),
+        })?;
+    if request_id != USER_DATA_SUBSCRIBE_REQUEST_ID {
+        return Err(MarketDataError::SourceIdentityMismatch {
+            expected: USER_DATA_SUBSCRIBE_REQUEST_ID.to_owned(),
+            actual: request_id.to_owned(),
+        });
+    }
     if status != 200 {
         return Err(MarketDataError::SourceIdentityMismatch {
             expected: "binance".to_owned(),
@@ -419,15 +513,21 @@ impl BinanceUserDataState {
         {
             return self.fail(BinanceUserDataReconcileReason::EventTimeRegression);
         }
-        let fingerprint = (
+        let execution_key = (
             event.order_id,
             event.execution_id,
             event.event_time,
             event.transaction_time,
         );
-        if !self.seen_execution_fingerprints.insert(fingerprint) {
-            return BinanceUserDataApply::Duplicate;
+        if let Some(previous_fill) = self.seen_execution_fills.get(&execution_key) {
+            return if *previous_fill == event.cumulative_filled_quantity {
+                BinanceUserDataApply::Duplicate
+            } else {
+                self.fail(BinanceUserDataReconcileReason::ExecutionRegression)
+            };
         }
+        self.seen_execution_fills
+            .insert(execution_key, event.cumulative_filled_quantity);
         let order = self
             .orders
             .entry(event.order_id)
@@ -499,5 +599,88 @@ impl BinanceUserDataState {
     fn fail(&mut self, reason: BinanceUserDataReconcileReason) -> BinanceUserDataApply {
         self.reconcile_required = Some(reason.clone());
         BinanceUserDataApply::ReconcileRequired(reason)
+    }
+}
+
+fn normalize_execution_trade_id(
+    text: &str,
+    payload: BinanceUserDataEvent,
+) -> Result<BinanceUserDataEvent, serde_json::Error> {
+    let BinanceUserDataEvent::ExecutionReport(mut event) = payload else {
+        return Ok(payload);
+    };
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    event.execution_id = value
+        .get("event")
+        .and_then(|event| event.get("t"))
+        .and_then(serde_json::Value::as_u64);
+    Ok(BinanceUserDataEvent::ExecutionReport(event))
+}
+
+fn unix_seconds(observed_at: DateTime<Utc>) -> u64 {
+    u64::try_from(observed_at.timestamp()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct OverflowSession;
+
+    #[async_trait]
+    impl crate::market_stream::TextWebSocketSession for OverflowSession {
+        async fn next_event(
+            &mut self,
+        ) -> Result<TextWebSocketEvent, crypto_trading_exchange::ExchangeError> {
+            Ok(TextWebSocketEvent::Closed {
+                kind: WebSocketCloseKind::Remote,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct OverflowConnector;
+
+    #[async_trait]
+    impl TextWebSocketConnector for OverflowConnector {
+        async fn connect(
+            &self,
+        ) -> Result<
+            Box<dyn crate::market_stream::TextWebSocketSession>,
+            crypto_trading_exchange::ExchangeError,
+        > {
+            Ok(Box::new(OverflowSession))
+        }
+    }
+
+    #[test]
+    fn stream_generation_overflow_fails_closed() {
+        let mut source = BinanceUserDataStreamSource {
+            connector: Arc::new(OverflowConnector),
+            clock: Arc::new(crate::market_data::SystemMarketDataClock),
+            sleeper: Arc::new(crate::market_stream::TokioMarketStreamSleeper),
+            jitter: Arc::new(crate::market_stream::FixedMarketStreamJitter::new(10_000).unwrap()),
+            reconnect_policy: MarketStreamReconnectPolicy::new(
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap(),
+            session: None,
+            pending_items: VecDeque::new(),
+            connection_generation: u64::MAX,
+            local_sequence: 0,
+            consecutive_failures: 0,
+            pending_retry: None,
+            exhausted: false,
+        };
+
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { source.next_item().await.unwrap_err() });
+        assert_eq!(error, MarketDataError::GenerationExhausted);
     }
 }

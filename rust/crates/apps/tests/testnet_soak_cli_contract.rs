@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -8,6 +9,7 @@ use std::{
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
+use crypto_trading_domain::sha256_digest;
 use crypto_trading_runtime::DecisionRecord;
 use serde_json::{Value, json};
 
@@ -108,6 +110,53 @@ fn write_history(path: &Path, records: &[DecisionRecord]) {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(path, format!("{body}\n")).unwrap();
+}
+
+fn write_production_evidence_history(path: &Path, records: &mut [DecisionRecord]) {
+    let mut head = [0_u8; 32];
+    let mut segment_started_at = None;
+    for record in records.iter_mut() {
+        if record.strategy != "testnet_soak" {
+            continue;
+        }
+        let elapsed = match record.decision.as_str() {
+            "testnet_soak_started" => {
+                segment_started_at = Some(record.timestamp);
+                0
+            }
+            "testnet_soak_unclean_restart_detected" => 0,
+            _ => u64::try_from(
+                record
+                    .timestamp
+                    .signed_duration_since(segment_started_at.unwrap())
+                    .num_milliseconds(),
+            )
+            .unwrap(),
+        };
+        record.details["elapsed_milliseconds"] = json!(elapsed);
+        let encoded = serde_json::to_vec(record).unwrap();
+        let mut preimage = b"crypto-trading/testnet-soak-evidence/v1\0".to_vec();
+        preimage.extend_from_slice(&head);
+        preimage.extend_from_slice(&encoded);
+        let digest = sha256_digest(&preimage);
+        record.details["integrity"] = json!({
+            "algorithm": "sha256",
+            "previous_hash": hex(&head),
+            "record_hash": hex(&digest),
+        });
+        head = digest;
+    }
+    write_history(path, records);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing into a String cannot fail");
+            output
+        },
+    )
 }
 
 fn fact(
@@ -492,61 +541,59 @@ fn verify_accepts_full_production_sample_coverage() {
     let history = temp_path("testnet-soak-verify-pass", "jsonl");
     let task_id = "binance-testnet-soak-verify-pass";
     let started_at = Utc::now() - ChronoDuration::hours(25);
-    write_history(
-        &history,
-        &[
-            fact(
-                started_at,
-                task_id,
-                "testnet_soak_started",
-                "running",
-                &Value::Null,
-            ),
-            fact(
-                started_at + ChronoDuration::hours(6),
-                task_id,
-                "testnet_soak_probe_succeeded",
-                "running",
-                &json!({"sample": "market_stream", "successful_probe_count": 1, "failed_probe_count": 0, "consecutive_failure_count": 0}),
-            ),
-            fact(
-                started_at + ChronoDuration::hours(12),
-                task_id,
-                "testnet_soak_probe_succeeded",
-                "running",
-                &json!({"sample": "user_data_stream", "successful_probe_count": 2, "failed_probe_count": 0, "consecutive_failure_count": 0}),
-            ),
-            owner_recovery_fact(started_at + ChronoDuration::hours(12), task_id),
-            fact(
-                started_at + ChronoDuration::hours(12),
-                task_id,
-                "testnet_soak_unclean_restart_detected",
-                "unclean_restart_detected",
-                &Value::Null,
-            ),
-            fact(
-                started_at + ChronoDuration::hours(12),
-                task_id,
-                "testnet_soak_started",
-                "running",
-                &Value::Null,
-            ),
-            fact(
-                started_at + ChronoDuration::hours(25),
-                task_id,
-                "testnet_soak_probe_succeeded",
-                "running",
-                &json!({"sample": "authenticated_reconcile", "successful_probe_count": 3, "failed_probe_count": 0, "consecutive_failure_count": 0}),
-            ),
-            fact(
-                started_at + ChronoDuration::hours(25),
-                task_id,
-                "testnet_soak_stopped",
-                "stopped",
-                &json!({"exit": "stop_requested", "successful_probe_count": 3, "failed_probe_count": 0, "unclean_restart_count": 1}),
-            ),
-        ],
-    );
+    let mut records = vec![
+        fact(
+            started_at,
+            task_id,
+            "testnet_soak_started",
+            "running",
+            &Value::Null,
+        ),
+        fact(
+            started_at + ChronoDuration::hours(6),
+            task_id,
+            "testnet_soak_probe_succeeded",
+            "running",
+            &json!({"sample": "market_stream", "successful_probe_count": 1, "failed_probe_count": 0, "consecutive_failure_count": 0}),
+        ),
+        fact(
+            started_at + ChronoDuration::hours(12),
+            task_id,
+            "testnet_soak_probe_succeeded",
+            "running",
+            &json!({"sample": "user_data_stream", "successful_probe_count": 2, "failed_probe_count": 0, "consecutive_failure_count": 0}),
+        ),
+        owner_recovery_fact(started_at + ChronoDuration::hours(12), task_id),
+        fact(
+            started_at + ChronoDuration::hours(12),
+            task_id,
+            "testnet_soak_unclean_restart_detected",
+            "unclean_restart_detected",
+            &Value::Null,
+        ),
+        fact(
+            started_at + ChronoDuration::hours(12),
+            task_id,
+            "testnet_soak_started",
+            "running",
+            &Value::Null,
+        ),
+        fact(
+            started_at + ChronoDuration::hours(25),
+            task_id,
+            "testnet_soak_probe_succeeded",
+            "running",
+            &json!({"sample": "authenticated_reconcile", "successful_probe_count": 3, "failed_probe_count": 0, "consecutive_failure_count": 0}),
+        ),
+        fact(
+            started_at + ChronoDuration::hours(25),
+            task_id,
+            "testnet_soak_stopped",
+            "stopped",
+            &json!({"exit": "stop_requested", "successful_probe_count": 3, "failed_probe_count": 0, "unclean_restart_count": 1}),
+        ),
+    ];
+    write_production_evidence_history(&history, &mut records);
 
     let output = Command::new(binary())
         .current_dir(repo_root())

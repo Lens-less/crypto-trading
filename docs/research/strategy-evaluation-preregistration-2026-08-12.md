@@ -202,5 +202,12 @@ The runner must execute exactly:
    report; and
 8. rerun the locked command and compare the result bytes/fingerprint.
 
+The library type-state gate treats the selection-persistence callback as a
+trusted boundary: it enforces sequencing but cannot inspect whether the caller
+performed durable I/O. The official runner must therefore use atomic artifact
+replacement, return callback success only after the write is synced, and prove
+reproducibility by comparing the frozen output hashes. A no-op callback is not
+valid release evidence.
+
 Reports must not contain raw price rows, credentials, or claims of Paper,
 Testnet, mainnet, investment, or production readiness.

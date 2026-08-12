@@ -15,11 +15,12 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use crypto_trading_domain::{OperationalOwnerPhase, set_operational_owner_phase};
 use crypto_trading_exchange::{ExchangeError, ExchangeHandle, ReconcileReceipt, ReconcileScope};
 use crypto_trading_runtime::{
     BinanceUserDataApply, BinanceUserDataReconcileReason, BinanceUserDataState,
-    BinanceUserDataStreamItem, DecisionRecord, HistoryError, JournalReadError, JsonlHistory,
-    read_journal_chain,
+    BinanceUserDataStreamItem, DecisionRecord, HistoryError, HistoryTailRepairOutcome,
+    JournalReadError, JsonlHistory, normalized_lock_key, read_journal_chain,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -47,6 +48,8 @@ const CAMPAIGN_COMPLETED: &str = "continuous_testnet_campaign_completed";
 const RECOVERY_REQUIRED: &str = "continuous_testnet_recovery_required";
 const KILL_SWITCH_ENGAGED: &str = "continuous_testnet_kill_switch_engaged";
 const KILLED_CLEAN: &str = "continuous_testnet_killed_clean";
+const HISTORY_REPAIR_STRATEGY: &str = "history_repair_audit";
+const HISTORY_TAIL_REPAIRED: &str = "history_tail_repaired";
 const MAX_OWNER_ID_BYTES: usize = 128;
 
 type OwnerLockRegistry = StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>;
@@ -138,7 +141,7 @@ where
         venue: Arc<V>,
         history: JsonlHistory,
     ) -> Result<Self, ContinuousTestnetOwnerError> {
-        Self::start_inner(owner_id.into(), Some(config), venue, history).await
+        Self::start_inner(owner_id.into(), Some(config), venue, history, false).await
     }
 
     /// Starts an owner for authenticated stream projection and stable account
@@ -154,7 +157,7 @@ where
         venue: Arc<V>,
         history: JsonlHistory,
     ) -> Result<Self, ContinuousTestnetOwnerError> {
-        Self::start_inner(owner_id.into(), None, venue, history).await
+        Self::start_inner(owner_id.into(), None, venue, history, false).await
     }
 
     /// Starts an owner with recovery-only authority for an exact lifecycle
@@ -171,13 +174,7 @@ where
         venue: Arc<V>,
         history: JsonlHistory,
     ) -> Result<Self, ContinuousTestnetOwnerError> {
-        if !matches!(
-            testnet_lifecycle_recovery_state(&config, &history)?,
-            TestnetLifecycleRecoveryState::Pending { .. }
-        ) {
-            return Err(ContinuousTestnetOwnerError::RecoveryPlanMissing);
-        }
-        Self::start_inner(owner_id.into(), Some(config), venue, history).await
+        Self::start_inner(owner_id.into(), Some(config), venue, history, true).await
     }
 
     async fn start_inner(
@@ -185,6 +182,7 @@ where
         config: Option<TestnetLifecycleConfig>,
         venue: Arc<V>,
         history: JsonlHistory,
+        recovery_only: bool,
     ) -> Result<Self, ContinuousTestnetOwnerError> {
         let owner_id = validate_owner_id(&owner_id)?;
         let owner_lock = shared_owner_lock(history.path());
@@ -192,6 +190,18 @@ where
             .try_lock_owned()
             .map_err(|_| ContinuousTestnetOwnerError::OwnerBusy)?;
         let campaign_id = config.as_ref().map(TestnetLifecycleConfig::campaign_id);
+        repair_owner_history(&history, &owner_id, campaign_id).await?;
+        if recovery_only
+            && !matches!(
+                config
+                    .as_ref()
+                    .map(|config| testnet_lifecycle_recovery_state(config, &history))
+                    .transpose()?,
+                Some(TestnetLifecycleRecoveryState::Pending { .. })
+            )
+        {
+            return Err(ContinuousTestnetOwnerError::RecoveryPlanMissing);
+        }
         let projected = project_owner(history.path(), &owner_id, campaign_id)?;
         let now = Utc::now();
         let mut owner = Self {
@@ -203,7 +213,8 @@ where
                 } else {
                     ContinuousTestnetOwnerPhase::Reconciling
                 },
-                kill_switch_latched: projected.kill_switch_latched,
+                kill_switch_latched: projected.kill_switch_latched
+                    || projected.kill_switch_cleanup_pending,
                 user_stream_active: false,
                 balance_projection_observed: false,
                 last_recorded_at: projected.last_recorded_at.unwrap_or(now),
@@ -215,7 +226,22 @@ where
             user_data: BinanceUserDataState::default(),
             _owner_lease: owner_lease,
         };
+        owner.set_phase(owner.status.phase);
         if owner.status.kill_switch_latched {
+            if projected.kill_switch_cleanup_pending {
+                let residue = owner.stable_reconcile_clean_account().await?;
+                owner.set_phase(ContinuousTestnetOwnerPhase::KilledClean);
+                owner
+                    .append(
+                        KILLED_CLEAN,
+                        "killed_clean",
+                        json!({
+                            "recovered_from_kill_switch_engaged": true,
+                            "residue": residue,
+                        }),
+                    )
+                    .await?;
+            }
             return Ok(owner);
         }
 
@@ -233,10 +259,10 @@ where
         {
             return Ok(owner);
         }
-        owner.status.phase = ContinuousTestnetOwnerPhase::Reconciling;
+        owner.set_phase(ContinuousTestnetOwnerPhase::Reconciling);
         match owner.stable_reconcile().await {
             Ok(()) => {
-                owner.status.phase = ContinuousTestnetOwnerPhase::AwaitingUserStream;
+                owner.set_phase(ContinuousTestnetOwnerPhase::AwaitingUserStream);
                 owner
                     .append(
                         USER_STREAM_AWAITED,
@@ -246,7 +272,7 @@ where
                     .await?;
             }
             Err(error) => {
-                owner.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+                owner.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
                 owner
                     .append(
                         RECOVERY_REQUIRED,
@@ -299,7 +325,7 @@ where
                 }
                 self.user_data = BinanceUserDataState::default();
                 self.status.user_stream_active = true;
-                self.status.phase = ContinuousTestnetOwnerPhase::ReadyUnarmed;
+                self.set_phase(ContinuousTestnetOwnerPhase::ReadyUnarmed);
                 self.append(
                     USER_STREAM_SUBSCRIBED,
                     "ready_unarmed",
@@ -383,7 +409,7 @@ where
         &mut self,
         reason: ContinuousTestnetRecoveryReason,
     ) -> Result<(), ContinuousTestnetOwnerError> {
-        self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+        self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
         self.status.user_stream_active = false;
         self.status.balance_projection_observed = false;
         self.append(
@@ -399,13 +425,13 @@ where
         ) {
             self.run_lifecycle_inner().await?;
         }
-        self.status.phase = ContinuousTestnetOwnerPhase::Reconciling;
+        self.set_phase(ContinuousTestnetOwnerPhase::Reconciling);
         if let Err(error) = self.stable_reconcile().await {
-            self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+            self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
             return Err(error);
         }
         self.user_data = BinanceUserDataState::default();
-        self.status.phase = ContinuousTestnetOwnerPhase::AwaitingUserStream;
+        self.set_phase(ContinuousTestnetOwnerPhase::AwaitingUserStream);
         self.append(
             USER_STREAM_RECOVERED,
             "awaiting_user_stream",
@@ -432,13 +458,74 @@ where
         if self.status.kill_switch_latched {
             return Err(ContinuousTestnetOwnerError::KillSwitchLatched);
         }
-        if self.status.phase != ContinuousTestnetOwnerPhase::ReadyUnarmed {
+        if !matches!(
+            self.status.phase,
+            ContinuousTestnetOwnerPhase::ReadyUnarmed
+                | ContinuousTestnetOwnerPhase::CampaignRunning
+                | ContinuousTestnetOwnerPhase::RecoveryRequired
+        ) {
             return Err(ContinuousTestnetOwnerError::NotReady);
         }
         if self.config.is_none() {
             return Err(ContinuousTestnetOwnerError::LifecycleAuthorityUnavailable);
         }
         self.run_lifecycle_inner().await
+    }
+
+    /// Resumes a probe future that was cancelled by its outer deadline. Every
+    /// mutation is rediscovered from the durable lifecycle before remote I/O;
+    /// account state is then reconciled twice and a fresh subscription ACK is
+    /// required. This makes cancellation a retry boundary rather than an
+    /// in-memory wedge.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded owner error when durable lifecycle recovery or stable
+    /// reconciliation cannot be completed.
+    pub async fn resume_interrupted_work(&mut self) -> Result<(), ContinuousTestnetOwnerError> {
+        if self.status.kill_switch_latched {
+            return Err(ContinuousTestnetOwnerError::KillSwitchLatched);
+        }
+        if matches!(
+            self.status.phase,
+            ContinuousTestnetOwnerPhase::ReadyUnarmed
+                | ContinuousTestnetOwnerPhase::AwaitingUserStream
+        ) {
+            return Ok(());
+        }
+        if self.config.is_some()
+            && matches!(
+                self.status.phase,
+                ContinuousTestnetOwnerPhase::CampaignRunning
+                    | ContinuousTestnetOwnerPhase::RecoveryRequired
+            )
+        {
+            self.run_lifecycle_inner().await?;
+        }
+        self.set_phase(ContinuousTestnetOwnerPhase::Reconciling);
+        if let Err(error) = self.stable_reconcile().await {
+            self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
+            self.append(
+                RECOVERY_REQUIRED,
+                "recovery_required",
+                json!({"reason": error.reason_label()}),
+            )
+            .await?;
+            return Err(error);
+        }
+        self.set_phase(ContinuousTestnetOwnerPhase::AwaitingUserStream);
+        self.status.user_stream_active = false;
+        self.status.balance_projection_observed = false;
+        self.user_data = BinanceUserDataState::default();
+        self.append(
+            USER_STREAM_AWAITED,
+            "awaiting_user_stream",
+            json!({
+                "reason": "interrupted_probe_resumed",
+                "reconciliation": reconciliation_scope_observation(),
+            }),
+        )
+        .await
     }
 
     async fn run_lifecycle_inner(
@@ -453,7 +540,7 @@ where
             TestnetLifecycleRecoveryState::Pending { query_count } => Some(query_count),
             _ => None,
         };
-        self.status.phase = ContinuousTestnetOwnerPhase::CampaignRunning;
+        self.set_phase(ContinuousTestnetOwnerPhase::CampaignRunning);
         if matches!(recovery_state, TestnetLifecycleRecoveryState::Fresh) {
             self.append(
                 CAMPAIGN_PLANNED,
@@ -470,7 +557,7 @@ where
                         .checked_sub(query_count_before)
                         .ok_or(ContinuousTestnetOwnerError::RecoveryQueryMissing)?;
                     if query_delta == 0 {
-                        self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+                        self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
                         return Err(ContinuousTestnetOwnerError::RecoveryQueryMissing);
                     }
                     self.append(
@@ -486,7 +573,7 @@ where
                     )
                     .await?;
                 }
-                self.status.phase = ContinuousTestnetOwnerPhase::ReadyUnarmed;
+                self.set_phase(ContinuousTestnetOwnerPhase::ReadyUnarmed);
                 self.append(
                     CAMPAIGN_COMPLETED,
                     "ready_unarmed",
@@ -500,7 +587,7 @@ where
                 Ok(report)
             }
             Err(error) => {
-                self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+                self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
                 self.append(
                     RECOVERY_REQUIRED,
                     "recovery_required",
@@ -536,19 +623,85 @@ where
             self.run_lifecycle_inner().await?;
             self.status.kill_switch_latched = true;
         }
-        self.status.phase = ContinuousTestnetOwnerPhase::Reconciling;
-        if let Err(error) = self.stable_reconcile().await {
-            self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
-            self.append(
-                RECOVERY_REQUIRED,
-                "recovery_required",
-                json!({"reason": error.reason_label()}),
-            )
-            .await?;
-            return Err(error);
+        self.set_phase(ContinuousTestnetOwnerPhase::Reconciling);
+        let residue = match self.stable_reconcile_clean_account().await {
+            Ok(residue) => residue,
+            Err(error) => {
+                self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
+                self.append(
+                    RECOVERY_REQUIRED,
+                    "recovery_required",
+                    json!({"reason": error.reason_label()}),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        self.set_phase(ContinuousTestnetOwnerPhase::KilledClean);
+        self.append(
+            KILLED_CLEAN,
+            "killed_clean",
+            json!({
+                "recovered_from_kill_switch_engaged": false,
+                "residue": residue,
+            }),
+        )
+        .await
+    }
+
+    fn set_phase(&mut self, phase: ContinuousTestnetOwnerPhase) {
+        self.status.phase = phase;
+        set_operational_owner_phase(match phase {
+            ContinuousTestnetOwnerPhase::Reconciling => OperationalOwnerPhase::Reconciling,
+            ContinuousTestnetOwnerPhase::AwaitingUserStream => {
+                OperationalOwnerPhase::AwaitingStreams
+            }
+            ContinuousTestnetOwnerPhase::ReadyUnarmed => OperationalOwnerPhase::ReadyUnarmed,
+            ContinuousTestnetOwnerPhase::CampaignRunning => OperationalOwnerPhase::CampaignRunning,
+            ContinuousTestnetOwnerPhase::RecoveryRequired => {
+                OperationalOwnerPhase::RecoveryRequired
+            }
+            ContinuousTestnetOwnerPhase::KilledClean => OperationalOwnerPhase::KilledClean,
+        });
+    }
+
+    async fn stable_reconcile_receipts(
+        &self,
+    ) -> Result<(ReconcileReceipt, ReconcileReceipt), ContinuousTestnetOwnerError> {
+        let first = self.venue.reconcile(ReconcileScope::All).await?;
+        let second = self.venue.reconcile(ReconcileScope::All).await?;
+        if !first.foreign_orders.is_empty() || !second.foreign_orders.is_empty() {
+            return Err(ContinuousTestnetOwnerError::ForeignActivity);
         }
-        self.status.phase = ContinuousTestnetOwnerPhase::KilledClean;
-        self.append(KILLED_CLEAN, "killed_clean", json!({})).await
+        if !same_authoritative_state(&first, &second) {
+            return Err(ContinuousTestnetOwnerError::UnstableReconciliation);
+        }
+        Ok((first, second))
+    }
+
+    async fn stable_reconcile_clean_account(&self) -> Result<Value, ContinuousTestnetOwnerError> {
+        let (first, second) = self.stable_reconcile_receipts().await?;
+        if !first.orders.is_empty()
+            || !second.orders.is_empty()
+            || !first.positions.is_empty()
+            || !second.positions.is_empty()
+        {
+            return Err(ContinuousTestnetOwnerError::UnstableReconciliation);
+        }
+        Ok(json!({
+            "owned_open_orders_first": first.orders.len(),
+            "owned_open_orders_second": second.orders.len(),
+            "foreign_open_orders_first": first.foreign_orders.len(),
+            "foreign_open_orders_second": second.foreign_orders.len(),
+            "positions_first": first.positions.len(),
+            "positions_second": second.positions.len(),
+            "balance_projection_observed": self.status.balance_projection_observed,
+            "spot_balance_authority": "unavailable_in_reconcile_receipt",
+        }))
+    }
+
+    async fn stable_reconcile(&self) -> Result<(), ContinuousTestnetOwnerError> {
+        self.stable_reconcile_receipts().await.map(|_| ())
     }
 
     /// Proves two identical authoritative REST snapshots through the same
@@ -567,7 +720,7 @@ where
             return Err(ContinuousTestnetOwnerError::NotReady);
         }
         if let Err(error) = self.stable_reconcile().await {
-            self.status.phase = ContinuousTestnetOwnerPhase::RecoveryRequired;
+            self.set_phase(ContinuousTestnetOwnerPhase::RecoveryRequired);
             self.append(
                 RECOVERY_REQUIRED,
                 "recovery_required",
@@ -594,26 +747,26 @@ where
     /// Returns a bounded owner error when pending lifecycle cleanup or the
     /// final stable reconciliation cannot be proven durably.
     pub async fn shutdown_cleanly(&mut self) -> Result<(), ContinuousTestnetOwnerError> {
-        if matches!(
+        let must_latch_kill_switch = matches!(
+            self.status.phase,
+            ContinuousTestnetOwnerPhase::CampaignRunning
+                | ContinuousTestnetOwnerPhase::RecoveryRequired
+        ) || matches!(
             self.lifecycle_recovery_state()?,
             Some(TestnetLifecycleRecoveryState::Pending { .. })
+        );
+        if must_latch_kill_switch {
+            return self.engage_kill_switch().await;
+        }
+        if matches!(
+            self.status.phase,
+            ContinuousTestnetOwnerPhase::CampaignRunning
+                | ContinuousTestnetOwnerPhase::Reconciling
+                | ContinuousTestnetOwnerPhase::RecoveryRequired
         ) {
-            self.engage_kill_switch().await
-        } else {
-            self.verify_stable_reconcile().await
+            self.resume_interrupted_work().await?;
         }
-    }
-
-    async fn stable_reconcile(&self) -> Result<(), ContinuousTestnetOwnerError> {
-        let first = self.venue.reconcile(ReconcileScope::All).await?;
-        let second = self.venue.reconcile(ReconcileScope::All).await?;
-        if !first.foreign_orders.is_empty() || !second.foreign_orders.is_empty() {
-            return Err(ContinuousTestnetOwnerError::ForeignActivity);
-        }
-        if !same_authoritative_state(&first, &second) {
-            return Err(ContinuousTestnetOwnerError::UnstableReconciliation);
-        }
-        Ok(())
+        self.verify_stable_reconcile().await
     }
 
     fn lifecycle_recovery_state(
@@ -737,6 +890,7 @@ const fn market_type_rank(market_type: crypto_trading_domain::MarketType) -> u8 
 #[derive(Default)]
 struct ProjectedOwner {
     kill_switch_latched: bool,
+    kill_switch_cleanup_pending: bool,
     last_recorded_at: Option<DateTime<Utc>>,
 }
 
@@ -781,11 +935,59 @@ fn project_owner(
             return Err(ContinuousTestnetOwnerError::InvalidJournal);
         }
         projected.last_recorded_at = Some(record.timestamp);
-        if matches!(record.decision.as_str(), KILL_SWITCH_ENGAGED | KILLED_CLEAN) {
-            projected.kill_switch_latched = true;
+        match record.decision.as_str() {
+            KILL_SWITCH_ENGAGED => projected.kill_switch_cleanup_pending = true,
+            KILLED_CLEAN => {
+                projected.kill_switch_latched = true;
+                projected.kill_switch_cleanup_pending = false;
+            }
+            _ => {}
         }
     }
     Ok(projected)
+}
+
+async fn repair_owner_history(
+    history: &JsonlHistory,
+    owner_id: &str,
+    campaign_id: Option<&str>,
+) -> Result<(), ContinuousTestnetOwnerError> {
+    let observation = match history.repair_recoverable_tail().await? {
+        HistoryTailRepairOutcome::Unchanged { .. } => return Ok(()),
+        HistoryTailRepairOutcome::Quarantined {
+            retained_bytes,
+            quarantined_bytes,
+            quarantine_path,
+            pruned_files,
+            pruned_bytes,
+        } => json!({
+            "repair": "quarantined",
+            "retained_bytes": retained_bytes,
+            "quarantined_bytes": quarantined_bytes,
+            "quarantine_path": quarantine_path,
+            "pruned_files": pruned_files,
+            "pruned_bytes": pruned_bytes,
+        }),
+        HistoryTailRepairOutcome::TerminatorRestored { retained_bytes } => json!({
+            "repair": "terminator_restored",
+            "retained_bytes": retained_bytes,
+        }),
+    };
+    history
+        .append(&DecisionRecord {
+            timestamp: Utc::now(),
+            strategy: HISTORY_REPAIR_STRATEGY.to_owned(),
+            symbol: OWNER_SYMBOL.to_owned(),
+            decision: HISTORY_TAIL_REPAIRED.to_owned(),
+            details: json!({
+                "component": "continuous_testnet_owner",
+                "owner_id": owner_id,
+                "campaign_id": campaign_id,
+                "observation": observation,
+            }),
+        })
+        .await?;
+    Ok(())
 }
 
 fn validate_owner_id(owner_id: &str) -> Result<String, ContinuousTestnetOwnerError> {
@@ -802,7 +1004,7 @@ fn validate_owner_id(owner_id: &str) -> Result<String, ContinuousTestnetOwnerErr
 }
 
 fn shared_owner_lock(path: &Path) -> Arc<Mutex<()>> {
-    let key = absolute_path(path);
+    let key = normalized_lock_key(path);
     let registry = OWNER_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
@@ -814,14 +1016,6 @@ fn shared_owner_lock(path: &Path) -> Arc<Mutex<()>> {
     let lock = Arc::new(Mutex::new(()));
     registry.insert(key, Arc::downgrade(&lock));
     lock
-}
-
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir().map_or_else(|_| path.to_owned(), |cwd| cwd.join(path))
-    }
 }
 
 #[derive(Debug)]

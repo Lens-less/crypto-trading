@@ -15,13 +15,14 @@ pub(crate) struct HmacSha256Key {
 
 impl HmacSha256Key {
     pub(crate) fn new(secret: &[u8]) -> Self {
-        let normalized = if secret.len() > BLOCK_BYTES {
+        let mut normalized = if secret.len() > BLOCK_BYTES {
             sha256_digest(secret).to_vec()
         } else {
             secret.to_vec()
         };
         let mut block = [0_u8; BLOCK_BYTES];
         block[..normalized.len()].copy_from_slice(&normalized);
+        normalized.fill(0);
         Self { block }
     }
 
@@ -29,14 +30,24 @@ impl HmacSha256Key {
         let mut inner = Vec::with_capacity(BLOCK_BYTES.saturating_add(payload.len()));
         inner.extend(self.block.iter().map(|byte| byte ^ 0x36));
         inner.extend_from_slice(payload);
-        let inner_digest = sha256_digest(&inner);
+        let mut inner_digest = sha256_digest(&inner);
+        inner.fill(0);
 
         let mut outer = [0_u8; BLOCK_BYTES + DIGEST_BYTES];
         for (target, key) in outer[..BLOCK_BYTES].iter_mut().zip(self.block) {
             *target = key ^ 0x5c;
         }
         outer[BLOCK_BYTES..].copy_from_slice(&inner_digest);
-        sha256_digest(&outer)
+        let digest = sha256_digest(&outer);
+        inner_digest.fill(0);
+        outer.fill(0);
+        digest
+    }
+}
+
+impl Drop for HmacSha256Key {
+    fn drop(&mut self) {
+        self.block.fill(0);
     }
 }
 
@@ -103,5 +114,13 @@ mod tests {
             hex(&long.sign(b"Test Using Larger Than Block-Size Key - Hash Key First")),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
+    }
+
+    #[test]
+    fn scratch_zeroization_does_not_corrupt_repeat_signing() {
+        let key = HmacSha256Key::new(b"test-secret");
+        let first = key.sign(b"payload");
+        let second = key.sign(b"payload");
+        assert_eq!(first, second);
     }
 }

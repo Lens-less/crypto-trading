@@ -238,6 +238,23 @@ fn websocket_user_data_subscription_signature_uses_plain_alphabetical_params() {
 }
 
 #[test]
+fn websocket_user_data_subscription_debug_redacts_api_key_and_signature() {
+    let signer = Arc::new(CapturingSigner::new());
+    let protocol = protocol(signer);
+    let subscription = protocol
+        .build_user_data_stream_subscribe_signature(1_723_422_222_000, Some(5_000))
+        .unwrap();
+
+    let diagnostic = format!("{subscription:?}");
+
+    assert!(diagnostic.contains("timestamp_ms"));
+    assert!(diagnostic.contains("recv_window_ms"));
+    assert!(!diagnostic.contains("offline-api-key"));
+    assert!(!diagnostic.contains("offline-signature/+"));
+    assert!(diagnostic.contains("<redacted>"));
+}
+
+#[test]
 fn websocket_user_data_subscription_signature_matches_hmac_sha256_vector() {
     let signer = Arc::new(BinanceHmacSha256Signer::new("test-key", "test-secret").unwrap());
     let protocol = protocol_with_signer(signer);

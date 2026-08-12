@@ -15,3 +15,7 @@ rust/fixtures/** text eol=lf
 # the Rust binary, and pnpm verifies pnpm-lock.yaml against content hashes,
 # so a CRLF checkout on Windows would change build output and lockfile bytes.
 frontend/** text=auto eol=lf
+
+# Shell entry points must remain directly executable on Unix even when the
+# repository is edited from Windows.
+deploy/*.sh text eol=lf

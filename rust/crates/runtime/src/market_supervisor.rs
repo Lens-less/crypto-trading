@@ -81,6 +81,7 @@ pub enum MarketSupervisorHealth {
 pub enum MarketSupervisorExit {
     StopRequested,
     SourceEnded,
+    ReconnectExhausted,
     ShutdownTimedOut,
 }
 
@@ -296,10 +297,15 @@ impl MarketSupervisor {
                                 task_status_sender.send_replace(current.clone());
                             }
                             Ok(None) => {
+                                let exit = if current.consecutive_source_failures > 0 {
+                                    MarketSupervisorExit::ReconnectExhausted
+                                } else {
+                                    MarketSupervisorExit::SourceEnded
+                                };
                                 return Ok(finish_supervisor(
                                     &task_status_sender,
                                     current,
-                                    MarketSupervisorExit::SourceEnded,
+                                    exit,
                                 ));
                             }
                             Err(error) => {
@@ -393,6 +399,7 @@ impl MarketSupervisor {
     ) -> Result<Option<MarketDataEvent>, MarketSupervisorError> {
         match self.settle_join().await? {
             MarketSupervisorExit::SourceEnded
+            | MarketSupervisorExit::ReconnectExhausted
             | MarketSupervisorExit::StopRequested
             | MarketSupervisorExit::ShutdownTimedOut => Ok(None),
         }

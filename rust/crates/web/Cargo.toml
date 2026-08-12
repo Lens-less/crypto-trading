@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 axum.workspace = true
 crypto-trading-control-plane = { path = "../control-plane" }
+crypto-trading-domain = { path = "../domain" }
 futures-util.workspace = true
 include_dir.workspace = true
 serde.workspace = true

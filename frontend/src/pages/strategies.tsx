@@ -31,6 +31,7 @@ import {
   createSubmitFormState,
   latestTaskForKind,
   postSubmitEnvelope,
+  submitActionGate,
   submitFormReducer,
   submitGate,
   submitWriteCapability,
@@ -307,10 +308,34 @@ function StrategyControlCard({
 
   const gate = submitGate(form, capability, tasks.data);
   const latestTask = latestTaskForKind(tasks.data, definition.taskKind);
+  const targetTask =
+    tasks.data?.tasks.find(
+      (task) =>
+        task.task_id === form.taskId.trim() && task.kind === definition.taskKind,
+    ) ?? null;
 
   const runSubmit = async (action: SubmitAction): Promise<void> => {
     const generation = currentSessionGeneration();
     const current = formRef.current;
+    const actionGate = submitActionGate(
+      current,
+      capability,
+      tasks.data,
+      definition.taskKind,
+      action,
+    );
+    if (!actionGate.allowed) {
+      if (actionGate.reason === "task_terminal") {
+        dispatch({
+          type: "submit_failed",
+          problem: new SubmitProblem(
+            "task_terminal",
+            "目标任务已处于持久终态;停止或取消不会再次提交。需要新生命周期时请显式启动。",
+          ),
+        });
+      }
+      return;
+    }
     let submission;
     try {
       const baselineTask =
@@ -389,6 +414,8 @@ function StrategyControlCard({
     ? "当前表单因 outcome_unknown 被锁定;请先核对 /api/v1/tasks,或者明确修改 task_id / strategy_id / strategy_revision 后再生成新 ID。"
     : gate.reason === "readback_blocked"
       ? "任务投影尚未就绪或已降级;在 /api/v1/tasks 恢复 complete 之前禁止提交。"
+      : targetTask?.phase === "stopped" || targetTask?.phase === "failed"
+        ? "目标任务已处于持久终态;停止与取消已禁用。启动会创建新的受信生命周期。"
       : "首次动作会生成 UUID command_id 和幂等键;仅在提交中、网络结果未知或 durable receipt 为 outcome_unknown 时,未修改的同动作重试才复用原身份。已拒绝 / 已写入属于闭合结果,再次点击会生成新指令。";
 
   return (
@@ -456,6 +483,13 @@ function StrategyControlCard({
       <div className="flex flex-wrap gap-2">
         {(["start", "stop", "cancel"] as const).map((action) => {
           const busy = form.inFlight && form.pendingAction === action;
+          const actionGate = submitActionGate(
+            form,
+            capability,
+            tasks.data,
+            definition.taskKind,
+            action,
+          );
           const lockedToAnotherAction =
             form.pendingSubmission !== null &&
             !form.lockedByOutcomeUnknown &&
@@ -464,7 +498,7 @@ function StrategyControlCard({
             <button
               key={action}
               type="button"
-              disabled={!gate.allowed || lockedToAnotherAction}
+              disabled={!actionGate.allowed || lockedToAnotherAction}
               aria-busy={busy || undefined}
               onClick={() => requestAction(action)}
               className="min-h-10 rounded-md border border-border px-3 py-1.5 text-sm transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
@@ -494,6 +528,15 @@ function StrategyControlCard({
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
+              disabled={
+                !submitActionGate(
+                  form,
+                  capability,
+                  tasks.data,
+                  definition.taskKind,
+                  confirmingAction,
+                ).allowed
+              }
               onClick={() => {
                 const action = confirmingAction;
                 setConfirmingAction(null);

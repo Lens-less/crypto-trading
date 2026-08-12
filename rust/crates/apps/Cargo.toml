@@ -39,6 +39,7 @@ uuid.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 clap.workspace = true
+crypto-trading-backtest = { path = "../backtest" }
 
 [lints]
 workspace = true

@@ -1,14 +1,21 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use crypto_trading_domain::record_operational_rest_transport_error;
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Quantity, Symbol};
 use serde::Deserialize;
 
-use crate::remote::metadata_from_reqwest_headers;
+use crate::remote::{
+    BinanceRateBudgetState, BinanceRateLimitPolicy, metadata_from_reqwest_headers,
+    observation_from_response, retained_metadata_headers,
+};
 use crate::{
-    ExchangeAvailability, ExchangeError, ExchangeHandle, ExchangeMode, ExchangeOperation,
-    ExchangeStatus, MarketSubscription, ReconcileReceipt, ReconcileScope, SubscriptionReceipt,
+    ExchangeError, ExchangeHandle, ExchangeMode, ExchangeOperation, ExchangeStatus,
+    MarketSubscription, ReconcileReceipt, ReconcileScope, RemoteHttpResponse, SubscriptionReceipt,
     TradingCommand, TradingReceipt,
 };
 
@@ -23,6 +30,8 @@ const MAX_ERROR_REASON_TEXT_BYTES: usize = 256;
 pub struct BinancePublicExchange {
     client: reqwest::Client,
     book_ticker_url: reqwest::Url,
+    rate_budget: Arc<Mutex<BinanceRateBudgetState>>,
+    rate_limit_policy: BinanceRateLimitPolicy,
 }
 
 /// One public Binance book-ticker observation plus the bounded source metadata
@@ -112,6 +121,8 @@ impl BinancePublicExchange {
         Ok(Self {
             client,
             book_ticker_url,
+            rate_budget: Arc::new(Mutex::new(BinanceRateBudgetState::default())),
+            rate_limit_policy: BinanceRateLimitPolicy::default(),
         })
     }
 
@@ -148,23 +159,35 @@ impl BinancePublicExchange {
         symbol: &Symbol,
         received_at: DateTime<Utc>,
     ) -> Result<BinancePublicObservation, ExchangeError> {
+        self.apply_rate_limit_gate()?;
+        let started_at = Instant::now();
         let response = self
             .client
             .get(self.book_ticker_url.clone())
             .query(&[("symbol", symbol.as_str())])
             .send()
             .await
-            .map_err(|error| ExchangeError::remote_failure(EXCHANGE, None, error.to_string()))?;
+            .map_err(|error| {
+                record_operational_rest_transport_error(elapsed_micros(started_at));
+                ExchangeError::remote_failure(EXCHANGE, None, error.to_string())
+            })?;
         let status = response.status();
         let failure_metadata = metadata_from_reqwest_headers(response.headers());
-        let payload = Self::read_response_body(response).await?;
+        let headers = retained_metadata_headers(response.headers());
+        let payload = Self::read_response_body(response, started_at).await?;
+        let response = RemoteHttpResponse::new_with_headers(status.as_u16(), headers, payload)?;
+        self.observe_rate_limit_response(&response, received_at);
+        crypto_trading_domain::record_operational_rest_response(observation_from_response(
+            &response,
+            received_at,
+            elapsed_micros(started_at),
+        ));
 
         if !status.is_success() {
-            return Err(
-                Self::map_remote_failure(status, &payload).with_remote_metadata(failure_metadata)
-            );
+            return Err(Self::map_remote_failure(status, response.body())
+                .with_remote_metadata(failure_metadata));
         }
-        let observation = Self::parse_book_ticker_observation(&payload, received_at)?;
+        let observation = Self::parse_book_ticker_observation(response.body(), received_at)?;
         if observation.snapshot.symbol != *symbol {
             return Err(ExchangeError::invalid_response(
                 EXCHANGE,
@@ -177,7 +200,10 @@ impl BinancePublicExchange {
         Ok(observation)
     }
 
-    async fn read_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, ExchangeError> {
+    async fn read_response_body(
+        mut response: reqwest::Response,
+        started_at: Instant,
+    ) -> Result<Vec<u8>, ExchangeError> {
         let status = response.status();
         if let Some(content_length) = response.content_length() {
             let requested = usize::try_from(content_length).unwrap_or(usize::MAX);
@@ -191,6 +217,7 @@ impl BinancePublicExchange {
         }
         let mut payload = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
+            record_operational_rest_transport_error(elapsed_micros(started_at));
             ExchangeError::remote_failure(EXCHANGE, Some(status.as_u16()), error.to_string())
         })? {
             let requested = payload.len().checked_add(chunk.len()).ok_or_else(|| {
@@ -213,6 +240,27 @@ impl BinancePublicExchange {
             payload.extend_from_slice(&chunk);
         }
         Ok(payload)
+    }
+
+    fn apply_rate_limit_gate(&self) -> Result<(), ExchangeError> {
+        let now = Utc::now();
+        self.rate_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_rejection(now)
+            .map_or(Ok(()), Err)
+    }
+
+    fn observe_rate_limit_response(
+        &self,
+        response: &RemoteHttpResponse,
+        observed_at: DateTime<Utc>,
+    ) {
+        let snapshot = response.binance_rate_limit_snapshot(observed_at);
+        self.rate_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_response(snapshot, self.rate_limit_policy);
     }
 
     fn map_remote_failure(status: reqwest::StatusCode, payload: &[u8]) -> ExchangeError {
@@ -456,9 +504,17 @@ impl ExchangeHandle for BinancePublicExchange {
         Ok(ExchangeStatus {
             exchange: EXCHANGE.to_owned(),
             mode: ExchangeMode::ReadOnly,
-            availability: ExchangeAvailability::Ready,
+            availability: self
+                .rate_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .availability(Utc::now()),
             latest_market_timestamp: None,
             open_orders: 0,
         })
     }
+}
+
+fn elapsed_micros(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
 }

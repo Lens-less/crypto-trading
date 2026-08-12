@@ -739,6 +739,10 @@ async fn external_failure_degrades_the_book_and_recovery_restores_a_fresh_quote(
     let retry_started = StdInstant::now();
     book.apply(supervisor.next_event().await.unwrap().unwrap())
         .unwrap();
+    if book.view().instrument(&key).unwrap().continuity != MarketContinuity::Continuous {
+        book.apply(supervisor.next_event().await.unwrap().unwrap())
+            .unwrap();
+    }
     assert!(retry_started.elapsed() >= StdDuration::from_millis(900));
     let recovered = book.view();
     let recovered_row = recovered.instrument(&key).unwrap();

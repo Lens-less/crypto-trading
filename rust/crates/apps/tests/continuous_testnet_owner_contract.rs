@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use crypto_trading_cli::{
     continuous_testnet::{
-        ContinuousTestnetOwner, ContinuousTestnetOwnerPhase, ContinuousTestnetUserDataOutcome,
+        ContinuousTestnetOwner, ContinuousTestnetOwnerError, ContinuousTestnetOwnerPhase,
+        ContinuousTestnetUserDataOutcome,
     },
     testnet_lifecycle::{
         TestnetLifecycleConfig, TestnetLifecycleObservation, TestnetLifecycleVenue,
@@ -273,6 +274,131 @@ async fn clean_shutdown_recovers_and_cancels_an_interrupted_fresh_lifecycle() {
 }
 
 #[tokio::test]
+async fn restarted_owner_finishes_pending_kill_switch_cleanup() {
+    let history = history();
+    let first_venue = Arc::new(FixtureVenue::with_reconcile(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![
+            Ok(empty_reconcile_receipt()),
+            Ok(empty_reconcile_receipt()),
+            Err(ExchangeError::unavailable("fixture cleanup interrupted")),
+        ],
+    ));
+    let owner_id = "testnet-owner-kill-restart";
+    let mut first = ContinuousTestnetOwner::start_read_only(
+        owner_id,
+        Arc::clone(&first_venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
+    subscribe(&mut first, 17, 1).await;
+    assert!(first.engage_kill_switch().await.is_err());
+    assert_eq!(
+        first.status().phase,
+        ContinuousTestnetOwnerPhase::RecoveryRequired
+    );
+    drop(first);
+
+    let venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    let restarted =
+        ContinuousTestnetOwner::start_read_only(owner_id, Arc::clone(&venue), history.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        restarted.status().phase,
+        ContinuousTestnetOwnerPhase::KilledClean
+    );
+    assert!(restarted.status().kill_switch_latched);
+
+    let body = std::fs::read_to_string(history.path()).unwrap();
+    assert!(body.contains("continuous_testnet_killed_clean"));
+    assert!(body.contains("\"recovered_from_kill_switch_engaged\":true"));
+    assert!(body.contains("\"spot_balance_authority\":\"unavailable_in_reconcile_receipt\""));
+    cleanup(history);
+}
+
+#[tokio::test]
+async fn kill_switch_fails_closed_when_owned_open_orders_remain() {
+    let history = history();
+    let config = lifecycle_config();
+    let venue = Arc::new(FixtureVenue::with_reconcile(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![
+            Ok(empty_reconcile_receipt()),
+            Ok(empty_reconcile_receipt()),
+            Ok(reconcile_receipt_with_orders(vec![order(
+                &config,
+                OrderStatus::Open,
+            )])),
+            Ok(reconcile_receipt_with_orders(vec![order(
+                &config,
+                OrderStatus::Open,
+            )])),
+        ],
+    ));
+    let mut owner = ContinuousTestnetOwner::start(
+        "testnet-owner-kill-open-orders",
+        config,
+        Arc::clone(&venue),
+        history.clone(),
+    )
+    .await
+    .unwrap();
+    subscribe(&mut owner, 19, 1).await;
+
+    let error = owner.engage_kill_switch().await.unwrap_err();
+    assert!(matches!(
+        error,
+        ContinuousTestnetOwnerError::UnstableReconciliation
+    ));
+    assert_eq!(
+        owner.status().phase,
+        ContinuousTestnetOwnerPhase::RecoveryRequired
+    );
+
+    let body = std::fs::read_to_string(history.path()).unwrap();
+    assert!(body.contains("continuous_testnet_kill_switch_engaged"));
+    assert!(body.contains("continuous_testnet_recovery_required"));
+    assert!(!body.contains("continuous_testnet_killed_clean"));
+    cleanup(history);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_case_aliases_share_one_owner_lane() {
+    let path = std::env::temp_dir().join(format!(
+        "crypto-trading-continuous-testnet-case-{}-\u{00C4}.jsonl",
+        Uuid::new_v4()
+    ));
+    let upper_history = JsonlHistory::new(path.to_string_lossy().to_ascii_uppercase());
+    let lower_history = JsonlHistory::new(path.to_string_lossy().to_lowercase());
+    let venue = Arc::new(FixtureVenue::new(Vec::new(), Vec::new(), Vec::new()));
+    let owner = ContinuousTestnetOwner::start_read_only(
+        "testnet-owner-case-fold",
+        Arc::clone(&venue),
+        upper_history.clone(),
+    )
+    .await
+    .unwrap();
+
+    let second =
+        ContinuousTestnetOwner::start_read_only("testnet-owner-case-fold", venue, lower_history)
+            .await;
+
+    assert!(matches!(
+        second,
+        Err(ContinuousTestnetOwnerError::OwnerBusy)
+    ));
+    drop(owner);
+    cleanup(upper_history);
+}
+
+#[tokio::test]
 async fn user_stream_faults_reconcile_and_require_a_fresh_subscription() {
     let config = lifecycle_config();
     let history = history();
@@ -415,6 +541,7 @@ struct FixtureVenue {
     submit: Mutex<VecDeque<Result<Order, ExchangeError>>>,
     query: Mutex<VecDeque<Result<Order, ExchangeError>>>,
     cancel: Mutex<VecDeque<Result<Order, ExchangeError>>>,
+    reconcile: Mutex<VecDeque<Result<ReconcileReceipt, ExchangeError>>>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -424,10 +551,20 @@ impl FixtureVenue {
         query: Vec<Result<Order, ExchangeError>>,
         cancel: Vec<Result<Order, ExchangeError>>,
     ) -> Self {
+        Self::with_reconcile(submit, query, cancel, Vec::new())
+    }
+
+    fn with_reconcile(
+        submit: Vec<Result<Order, ExchangeError>>,
+        query: Vec<Result<Order, ExchangeError>>,
+        cancel: Vec<Result<Order, ExchangeError>>,
+        reconcile: Vec<Result<ReconcileReceipt, ExchangeError>>,
+    ) -> Self {
         Self {
             submit: Mutex::new(submit.into()),
             query: Mutex::new(query.into()),
             cancel: Mutex::new(cancel.into()),
+            reconcile: Mutex::new(reconcile.into()),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -470,13 +607,11 @@ impl ExchangeHandle for FixtureVenue {
 
     async fn reconcile(&self, scope: ReconcileScope) -> Result<ReconcileReceipt, ExchangeError> {
         self.calls.lock().unwrap().push("reconcile");
-        Ok(ReconcileReceipt {
-            scope,
-            orders: Vec::new(),
-            foreign_orders: Vec::new(),
-            positions: Vec::new(),
-            observed_at: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
-        })
+        self.reconcile
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Ok(empty_reconcile_receipt_for_scope(scope)))
     }
 
     async fn subscribe(
@@ -528,6 +663,27 @@ fn order(config: &TestnetLifecycleConfig, status: OrderStatus) -> Order {
         status,
         created_at: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
         updated_at: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 1).unwrap(),
+    }
+}
+
+fn empty_reconcile_receipt() -> ReconcileReceipt {
+    empty_reconcile_receipt_for_scope(ReconcileScope::All)
+}
+
+fn empty_reconcile_receipt_for_scope(scope: ReconcileScope) -> ReconcileReceipt {
+    ReconcileReceipt {
+        scope,
+        orders: Vec::new(),
+        foreign_orders: Vec::new(),
+        positions: Vec::new(),
+        observed_at: Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap(),
+    }
+}
+
+fn reconcile_receipt_with_orders(orders: Vec<Order>) -> ReconcileReceipt {
+    ReconcileReceipt {
+        orders,
+        ..empty_reconcile_receipt()
     }
 }
 

@@ -749,6 +749,21 @@ async fn start_stop_restart_and_cancel_flow_projects_only_through_tasks_endpoint
     let stopped = wait_for_task(&fixture.router, "paper-grid-owner", "stopped").await;
     assert_eq!(stopped["exit"], "stop_requested");
 
+    let repeated_stop = submit(
+        &fixture.router,
+        &mutation(
+            Uuid::new_v4(),
+            "grid-stop-terminal",
+            "paper-grid-owner",
+            SubmitCommand::StopTask,
+        ),
+    )
+    .await;
+    assert_eq!(
+        repeated_stop["status"], "rejected",
+        "a terminal task cannot consume a second stop command"
+    );
+
     let restarted = submit(
         &fixture.router,
         &grid_start(

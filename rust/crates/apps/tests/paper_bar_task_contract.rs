@@ -1,5 +1,5 @@
 use chrono::{Duration, TimeZone, Utc};
-use crypto_trading_cli::{PaperBarAction, PaperBarTask, PaperBarTaskError};
+use crypto_trading_cli::{PaperBarAction, PaperBarTask, PaperBarTaskError, PaperBarTaskState};
 use crypto_trading_domain::{Price, Side};
 use crypto_trading_strategy::{
     Bar, BarStrategy, BarStrategyContext, SlowTimeSeriesMomentum, TargetExposure,
@@ -42,6 +42,18 @@ fn expected_action(previous: Decimal, next: Decimal) -> PaperBarAction {
             target: TargetExposure::new(next).unwrap(),
         },
         Ordering::Equal => PaperBarAction::Hold,
+    }
+}
+
+#[derive(Debug)]
+struct FixedTargetStrategy(TargetExposure);
+
+impl BarStrategy for FixedTargetStrategy {
+    fn target_exposure(
+        &mut self,
+        _context: &BarStrategyContext<'_>,
+    ) -> Result<TargetExposure, crypto_trading_strategy::StrategyError> {
+        Ok(self.0)
     }
 }
 
@@ -106,4 +118,26 @@ fn paper_bar_task_rejects_duplicate_out_of_order_and_overlapping_bars() {
         paper.on_bar(out_of_order),
         Err(PaperBarTaskError::InvalidBarSequence)
     );
+}
+
+#[test]
+fn paper_bar_task_accepts_absolute_bar_indexes_and_external_actual_targets() {
+    let actual_target = TargetExposure::new(decimal("0.6")).unwrap();
+    let requested_target = TargetExposure::new(decimal("0.9")).unwrap();
+    let mut paper = PaperBarTask::with_state(
+        FixedTargetStrategy(requested_target),
+        PaperBarTaskState {
+            next_bar_index: 5,
+            current_target: TargetExposure::new(decimal("0.25")).unwrap(),
+        },
+    );
+
+    let decision = paper
+        .on_bar_with_current_target(bar(0, "100"), actual_target)
+        .unwrap();
+
+    assert_eq!(decision.bar_index, 5);
+    assert_eq!(decision.target, requested_target);
+    assert_eq!(paper.state().next_bar_index, 6);
+    assert_eq!(paper.state().current_target, actual_target);
 }

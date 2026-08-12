@@ -955,6 +955,52 @@ async fn optional_auth_never_prints_the_token_and_protects_every_route() {
 }
 
 #[tokio::test]
+async fn metrics_are_protected_and_export_only_fixed_operational_dimensions() {
+    let app = fixture_app(
+        Vec::new(),
+        WebAccessPolicy::bearer(TOKEN.to_owned()).unwrap(),
+    );
+
+    let unauthorized = app.clone().oneshot(get("/api/v1/metrics")).await.unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(authenticated_get("/api/v1/metrics"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_security_headers(&response);
+    assert!(
+        response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for expected in [
+        "crypto_trading_process_up 1",
+        "crypto_trading_stream_age_seconds{stream=\"market\"}",
+        "crypto_trading_stream_age_seconds{stream=\"user_data\"}",
+        "crypto_trading_rest_request_total",
+        "crypto_trading_binance_used_weight",
+        "crypto_trading_clock_skew_milliseconds",
+        "crypto_trading_owner_phase{phase=\"recovery_required\"}",
+        "crypto_trading_journal_append_total",
+    ] {
+        assert!(body.contains(expected), "missing {expected}: {body}");
+    }
+    assert!(!body.contains(TOKEN));
+    assert!(!body.contains("account_id"));
+    assert!(!body.contains("api_key"));
+}
+
+#[tokio::test]
 async fn sse_emits_atomic_pages_and_resumes_from_last_event_id_without_payloads() {
     let bytes = jsonl(&[
         decision_record(&json!({"api_key": "first-secret"})),

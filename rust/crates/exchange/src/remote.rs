@@ -1,11 +1,15 @@
 use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Timelike, Utc};
+use crypto_trading_domain::{
+    OperationalRestObservation, record_operational_rest_response,
+    record_operational_rest_transport_error,
+};
 use reqwest::Url;
 
 use crate::{
-    ExchangeError,
+    ExchangeAvailability, ExchangeError,
     error::{RemoteFailureMetadata, RemoteRetryAfter},
 };
 
@@ -13,6 +17,191 @@ const MAX_REMOTE_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_REMOTE_METADATA_HEADERS: usize = 8;
 const MAX_REMOTE_HEADER_NAME_BYTES: usize = 64;
 const MAX_REMOTE_HEADER_VALUE_BYTES: usize = 512;
+const BINANCE_OPERATOR_USED_WEIGHT_HIGH_WATER_1M: u64 = 240;
+
+/// Small local margin after the next UTC minute boundary before requests can
+/// resume from the repo's conservative used-weight gate.
+const BINANCE_HIGH_WATER_SAFETY_MARGIN: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinanceRateLimitSnapshot {
+    observed_at: DateTime<Utc>,
+    retry_after: Option<RemoteRetryAfter>,
+    retry_after_deadline: Option<DateTime<Utc>>,
+    used_weight: Option<u64>,
+    used_weight_1m: Option<u64>,
+    order_count_10s: Option<u64>,
+    order_count_1m: Option<u64>,
+    order_count_1d: Option<u64>,
+}
+
+impl BinanceRateLimitSnapshot {
+    fn from_headers<'a>(
+        headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        let mut snapshot = Self {
+            observed_at,
+            retry_after: None,
+            retry_after_deadline: None,
+            used_weight: None,
+            used_weight_1m: None,
+            order_count_10s: None,
+            order_count_1m: None,
+            order_count_1d: None,
+        };
+        for (name, value) in headers {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "retry-after" => {
+                    snapshot.retry_after = parse_retry_after(value);
+                    snapshot.retry_after_deadline = snapshot
+                        .retry_after
+                        .as_ref()
+                        .and_then(|retry_after| retry_after_deadline(retry_after, observed_at));
+                }
+                "x-mbx-used-weight" => {
+                    snapshot.used_weight = parse_header_counter(value);
+                }
+                "x-mbx-used-weight-1m" => {
+                    snapshot.used_weight_1m = parse_header_counter(value);
+                }
+                "x-mbx-order-count-10s" => {
+                    snapshot.order_count_10s = parse_header_counter(value);
+                }
+                "x-mbx-order-count-1m" => {
+                    snapshot.order_count_1m = parse_header_counter(value);
+                }
+                "x-mbx-order-count-1d" => {
+                    snapshot.order_count_1d = parse_header_counter(value);
+                }
+                _ => {}
+            }
+        }
+        snapshot
+    }
+
+    pub(crate) fn used_weight_watermark(&self) -> Option<u64> {
+        self.used_weight_1m.or(self.used_weight)
+    }
+
+    pub(crate) fn order_count_watermark(&self) -> Option<u64> {
+        self.order_count_10s
+            .or(self.order_count_1m)
+            .or(self.order_count_1d)
+    }
+
+    pub(crate) fn retry_after_deadline(&self) -> Option<DateTime<Utc>> {
+        self.retry_after_deadline
+    }
+
+    fn is_high_water(&self, policy: BinanceRateLimitPolicy) -> bool {
+        policy.used_weight_1m_high_water.is_some_and(|limit| {
+            self.used_weight_1m
+                .or(self.used_weight)
+                .is_some_and(|value| value >= limit)
+        }) || policy
+            .order_count_10s_high_water
+            .is_some_and(|limit| self.order_count_10s.is_some_and(|value| value >= limit))
+            || policy
+                .order_count_1m_high_water
+                .is_some_and(|limit| self.order_count_1m.is_some_and(|value| value >= limit))
+            || policy
+                .order_count_1d_high_water
+                .is_some_and(|limit| self.order_count_1d.is_some_and(|value| value >= limit))
+    }
+
+    fn retry_after_unix_seconds(&self) -> Option<u64> {
+        self.retry_after_deadline.and_then(datetime_to_unix_seconds)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BinanceRateLimitPolicy {
+    pub(crate) used_weight_1m_high_water: Option<u64>,
+    pub(crate) order_count_10s_high_water: Option<u64>,
+    pub(crate) order_count_1m_high_water: Option<u64>,
+    pub(crate) order_count_1d_high_water: Option<u64>,
+    pub(crate) high_water_safety_margin: Duration,
+}
+
+impl Default for BinanceRateLimitPolicy {
+    fn default() -> Self {
+        Self {
+            used_weight_1m_high_water: Some(BINANCE_OPERATOR_USED_WEIGHT_HIGH_WATER_1M),
+            order_count_10s_high_water: None,
+            order_count_1m_high_water: None,
+            order_count_1d_high_water: None,
+            high_water_safety_margin: BINANCE_HIGH_WATER_SAFETY_MARGIN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct BinanceRateBudgetState {
+    latest: Option<BinanceRateLimitSnapshot>,
+    throttle_until: Option<DateTime<Utc>>,
+}
+
+impl BinanceRateBudgetState {
+    pub(crate) fn observe_response(
+        &mut self,
+        snapshot: BinanceRateLimitSnapshot,
+        policy: BinanceRateLimitPolicy,
+    ) {
+        let throttle_until = snapshot
+            .retry_after_deadline()
+            .or_else(|| {
+                if snapshot.is_high_water(policy) {
+                    next_utc_minute_boundary(snapshot.observed_at, policy.high_water_safety_margin)
+                } else {
+                    None
+                }
+            })
+            .map(|candidate| match self.throttle_until {
+                Some(current) => current.max(candidate),
+                None => candidate,
+            });
+        self.latest = Some(snapshot);
+        self.throttle_until = throttle_until.or(self.throttle_until);
+    }
+
+    pub(crate) fn availability(&self, now: DateTime<Utc>) -> ExchangeAvailability {
+        if self.throttle_until.is_some_and(|deadline| deadline > now) {
+            ExchangeAvailability::Unavailable
+        } else {
+            ExchangeAvailability::Ready
+        }
+    }
+
+    pub(crate) fn active_rejection(&self, now: DateTime<Utc>) -> Option<ExchangeError> {
+        let snapshot = self.latest.as_ref()?;
+        let deadline = self.throttle_until?;
+        if deadline <= now {
+            return None;
+        }
+        let retry_after = snapshot
+            .retry_after
+            .clone()
+            .or(Some(RemoteRetryAfter::At(deadline)));
+        let reason = if snapshot
+            .retry_after_deadline()
+            .is_some_and(|value| value > now)
+        {
+            "Binance retry-after gate is still active; remote calls are blocked until the durable deadline elapses"
+        } else {
+            "Binance local used-weight gate is still active; remote calls are blocked until the next UTC minute window opens"
+        };
+        Some(
+            ExchangeError::remote_failure("binance", Some(429), reason).with_remote_metadata(
+                RemoteFailureMetadata {
+                    exchange_code: None,
+                    retry_after,
+                    server_time: Some(snapshot.observed_at),
+                },
+            ),
+        )
+    }
+}
 
 /// Minimal HTTP methods required by exchange REST protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +395,13 @@ impl RemoteHttpResponse {
             server_time: self.server_time(),
         }
     }
+
+    pub(crate) fn binance_rate_limit_snapshot(
+        &self,
+        observed_at: DateTime<Utc>,
+    ) -> BinanceRateLimitSnapshot {
+        BinanceRateLimitSnapshot::from_headers(self.headers(), observed_at)
+    }
 }
 
 /// Injectable asynchronous transport used by offline protocol tests and later
@@ -255,6 +451,7 @@ impl ReqwestHttpTransport {
 #[async_trait]
 impl RemoteHttpTransport for ReqwestHttpTransport {
     async fn send(&self, request: RemoteHttpRequest) -> Result<RemoteHttpResponse, ExchangeError> {
+        let started_at = std::time::Instant::now();
         let method = match request.method {
             RemoteHttpMethod::Get => reqwest::Method::GET,
             RemoteHttpMethod::Post => reqwest::Method::POST,
@@ -272,6 +469,7 @@ impl RemoteHttpTransport for ReqwestHttpTransport {
             builder = builder.body(request.body);
         }
         let mut response = builder.send().await.map_err(|error| {
+            record_operational_rest_transport_error(elapsed_micros(started_at));
             if error.is_timeout() {
                 ExchangeError::unavailable("remote HTTP request timed out")
             } else {
@@ -290,24 +488,11 @@ impl RemoteHttpTransport for ReqwestHttpTransport {
             }
         }
         let mut body = Vec::new();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                if !is_retained_metadata_header(name.as_str()) {
-                    return None;
-                }
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
-            })
-            .collect::<Vec<_>>();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| ExchangeError::unavailable("remote HTTP response body failed"))?
-        {
+        let headers = retained_metadata_headers(response.headers());
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            record_operational_rest_transport_error(elapsed_micros(started_at));
+            ExchangeError::unavailable("remote HTTP response body failed")
+        })? {
             let requested = body.len().checked_add(chunk.len()).ok_or_else(|| {
                 ExchangeError::resource_limit(
                     "remote HTTP response body",
@@ -327,7 +512,13 @@ impl RemoteHttpTransport for ReqwestHttpTransport {
             })?;
             body.extend_from_slice(&chunk);
         }
-        RemoteHttpResponse::new_with_headers(status, headers, body)
+        let response = RemoteHttpResponse::new_with_headers(status, headers, body)?;
+        record_operational_rest_response(observation_from_response(
+            &response,
+            response.server_time().unwrap_or_else(Utc::now),
+            elapsed_micros(started_at),
+        ));
+        Ok(response)
     }
 }
 
@@ -342,6 +533,45 @@ fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc2822(value)
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn parse_header_counter(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+fn retry_after_deadline(
+    retry_after: &RemoteRetryAfter,
+    observed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match retry_after {
+        RemoteRetryAfter::Seconds(seconds) => {
+            let delay = TimeDelta::seconds(i64::try_from(*seconds).ok()?);
+            observed_at.checked_add_signed(delay)
+        }
+        RemoteRetryAfter::At(deadline) => Some(*deadline),
+    }
+}
+
+fn next_utc_minute_boundary(
+    observed_at: DateTime<Utc>,
+    safety_margin: Duration,
+) -> Option<DateTime<Utc>> {
+    let seconds_into_minute = i64::from(observed_at.second());
+    let nanos_into_second = i64::from(observed_at.nanosecond());
+    let truncated = observed_at
+        .checked_sub_signed(TimeDelta::seconds(seconds_into_minute))?
+        .checked_sub_signed(TimeDelta::nanoseconds(nanos_into_second))?;
+    let boundary = truncated.checked_add_signed(TimeDelta::minutes(1))?;
+    let margin = TimeDelta::from_std(safety_margin).ok()?;
+    boundary.checked_add_signed(margin)
+}
+
+fn datetime_to_unix_seconds(value: DateTime<Utc>) -> Option<u64> {
+    u64::try_from(value.timestamp()).ok()
+}
+
+fn elapsed_micros(started_at: std::time::Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn metadata_from_reqwest_headers(
@@ -359,6 +589,38 @@ pub(crate) fn metadata_from_reqwest_headers(
         exchange_code: None,
         retry_after,
         server_time,
+    }
+}
+
+pub(crate) fn retained_metadata_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            if !is_retained_metadata_header(name.as_str()) {
+                return None;
+            }
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+pub(crate) fn observation_from_response(
+    response: &RemoteHttpResponse,
+    observed_at: DateTime<Utc>,
+    latency_micros: u64,
+) -> OperationalRestObservation {
+    let snapshot = response.binance_rate_limit_snapshot(observed_at);
+    OperationalRestObservation {
+        latency_micros,
+        status: response.status(),
+        used_weight: snapshot.used_weight_watermark(),
+        order_count: snapshot.order_count_watermark(),
+        retry_after_unix_seconds: snapshot.retry_after_unix_seconds(),
     }
 }
 

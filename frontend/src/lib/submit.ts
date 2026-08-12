@@ -517,7 +517,8 @@ export interface SubmitGate {
     | "write_disabled"
     | "readback_blocked"
     | "in_flight"
-    | "outcome_unknown_locked";
+    | "outcome_unknown_locked"
+    | "task_terminal";
 }
 
 /**
@@ -542,6 +543,33 @@ export function submitGate(
     return { allowed: false, reason: "in_flight" };
   }
   return { allowed: true, reason: null };
+}
+
+/**
+ * Action-specific lifecycle gate. A durable terminal projection makes a
+ * subsequent stop/cancel a deterministic rejection at the trusted dispatcher,
+ * so the browser must not offer that stale intervention. Start remains
+ * available because a terminal owner identity is explicitly restartable.
+ */
+export function submitActionGate(
+  form: SubmitFormState,
+  capability: SubmitWriteCapability,
+  tasksModel: ReadOnlyTaskReadModel | null | undefined,
+  taskKind: ReadOnlyTaskKind,
+  action: SubmitAction,
+): SubmitGate {
+  const gate = submitGate(form, capability, tasksModel);
+  if (!gate.allowed || action === "start") {
+    return gate;
+  }
+  const taskId = form.taskId.trim();
+  const target = tasksModel?.tasks.find(
+    (task) => task.task_id === taskId && task.kind === taskKind,
+  );
+  if (target?.phase === "stopped" || target?.phase === "failed") {
+    return { allowed: false, reason: "task_terminal" };
+  }
+  return gate;
 }
 
 /* ------------------------------------------------------------ POST 封装 */

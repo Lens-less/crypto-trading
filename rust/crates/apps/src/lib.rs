@@ -35,7 +35,9 @@ pub use paper_arbitrage_task::{
     ArbitragePaperTaskConfig, ArbitragePaperTaskError, ArbitragePaperTaskExit,
     ArbitragePaperTaskFailure, ArbitragePaperTaskPhase, ArbitragePaperTaskStatus,
 };
-pub use paper_bar_task::{PaperBarAction, PaperBarDecision, PaperBarTask, PaperBarTaskError};
+pub use paper_bar_task::{
+    PaperBarAction, PaperBarDecision, PaperBarTask, PaperBarTaskError, PaperBarTaskState,
+};
 pub use paper_grid_task::{
     GRID_PAPER_TASK_STATUS_SCHEMA_VERSION, GridPaperExecutionFuture, GridPaperExecutor,
     GridPaperObservationFuture, GridPaperTask, GridPaperTaskConfig, GridPaperTaskError,

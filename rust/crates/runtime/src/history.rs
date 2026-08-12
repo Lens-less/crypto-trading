@@ -11,6 +11,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use crypto_trading_domain::record_journal_append;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -347,7 +348,7 @@ struct AppendReceiptEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum HistoryTailRepairOutcome {
+pub enum HistoryTailRepairOutcome {
     Unchanged {
         retained_bytes: u64,
     },
@@ -551,9 +552,12 @@ impl JsonlHistory {
     /// preserved by writing and syncing that terminator. Complete malformed
     /// records remain fail-closed. An incomplete UTF-8 code point is
     /// recoverable only inside an otherwise EOF-incomplete record string.
-    pub(crate) async fn repair_recoverable_tail(
-        &self,
-    ) -> Result<HistoryTailRepairOutcome, HistoryError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded history error when the writer lease, tail scan,
+    /// quarantine, truncation, or durability sync cannot be completed.
+    pub async fn repair_recoverable_tail(&self) -> Result<HistoryTailRepairOutcome, HistoryError> {
         let _guard = self.path_lock.lock().await;
         let _lease = self.active_cross_process_lease()?;
         let mut file = match tokio::fs::OpenOptions::new()
@@ -664,7 +668,10 @@ impl JsonlHistory {
         let started_at = Instant::now();
         let mut stats = AppendBatchStats::default();
         let result = self.append_batch_inner(records, &mut stats).await;
-        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed = started_at.elapsed();
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let elapsed_micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        record_journal_append(elapsed_micros, result.is_ok());
 
         match &result {
             Ok(()) if stats.rotated => warn!(
@@ -1341,7 +1348,8 @@ fn absolute_key(path: &Path) -> PathBuf {
 /// Two spellings of one path — case differences on Windows, or a relative
 /// versus absolute form — must resolve to the same key, or separate locks
 /// would each believe they hold exclusive access to the same journal.
-pub(crate) fn normalized_lock_key(path: &Path) -> PathBuf {
+#[must_use]
+pub fn normalized_lock_key(path: &Path) -> PathBuf {
     normalize_key_case(path)
 }
 

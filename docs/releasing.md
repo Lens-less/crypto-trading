@@ -22,18 +22,46 @@ statement is machine-readable and archived, not just described in prose.
 
 ## 2. Gate
 
-The full matrix must pass on both Ubuntu and Windows, on both `1.89.0` and
-stable. CI covers this; run it locally first:
+CI is split across four lanes, and the current matrix is not symmetric:
+
+- frontend bundle: Ubuntu only, once;
+- frontend quality gates: Ubuntu and Windows;
+- Rust verify: Ubuntu `1.89.0`, Ubuntu stable, and Windows `1.89.0`;
+- Rust quality, clean-build, audit, supply-chain, and deployment: Ubuntu only.
+
+Run the matching local commands first. Do not invent a Windows-stable lane;
+CI does not have one.
 
 ```bash
+# Frontend bundle and browser contract
+cd frontend
+corepack enable
+pnpm install --frozen-lockfile
+pnpm build
+pnpm typecheck
+pnpm lint
+pnpm test -- --run
+pnpm exec playwright install --with-deps chromium
+pnpm e2e
+
+# Rust verify and quality gates
 cd rust
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo test --doc --workspace --all-features --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features --locked
-cargo build --release --workspace --all-features --locked
+cargo +1.89.0 check --workspace --all-targets --all-features --locked
+cargo +1.89.0 test --workspace --all-targets --all-features --locked
+cargo +stable check --workspace --all-targets --all-features --locked
+cargo +stable test --workspace --all-targets --all-features --locked
+cargo +stable fmt --all -- --check
+cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +stable doc --no-deps --workspace --all-features --locked
+cargo +stable build --release --workspace --all-features --locked
+
+# Rust clean-build lane
+cargo +1.89.0 fmt --all -- --check
+cargo +1.89.0 check --workspace --all-targets --all-features --locked
+cargo +1.89.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.89.0 test --workspace --all-targets --all-features --locked
+cargo +1.89.0 test --doc --workspace --all-features --locked
+cargo +1.89.0 build --release --workspace --all-features --locked
 cargo audit --file Cargo.lock
 cargo deny --manifest-path Cargo.toml check bans licenses sources
 ```
@@ -59,15 +87,21 @@ A tagged release additionally requires the four gates in
 their evidence archived:
 
 - [ ] Binance Testnet order lifecycle: open-order, controlled partial fill, and
-      kill/restart recovery, each as a separate campaign.
+      kill/restart recovery, each as a separate campaign. Archive the journal,
+      process logs, command arguments, and verifier output together.
 - [ ] Binance Testnet account reconciliation, for every product in scope.
-- [ ] 24-hour soak, with one forced-termination recovery drill and a clean stop.
-- [ ] Journal backup and restore drill.
+- [ ] 24-hour soak, with one forced-termination recovery drill and a clean
+      stop. This is an external credentialed run, not a local harness result.
+      Archive the journal, process logs, status captures, evidence bundle, and
+      checksum manifest together.
+- [ ] Journal backup and restore drill. Treat it as a release gate, not an ad
+      hoc maintenance task.
 
 A local deterministic harness does not substitute for credentialed Testnet
-evidence. Archive the candidate binary checksums, redacted command arguments,
-CLI JSON outputs, and journals. **Never archive credentials or an environment
-dump.**
+evidence, backup/restore evidence, or the 24-hour soak. The release is still
+closed to mainnet and edge until all four external gates pass. Archive the
+candidate binary checksums, redacted command arguments, CLI JSON outputs, and
+journals. **Never archive credentials or an environment dump.**
 
 ## 4. Tag and publish
 

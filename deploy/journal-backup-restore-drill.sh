@@ -30,12 +30,27 @@ command -v sha256sum >/dev/null 2>&1 || {
     echo "sha256sum is required for byte-integrity verification" >&2
     exit 69
 }
+command -v flock >/dev/null 2>&1 || {
+    echo "flock is required to prove the journal writer is quiescent" >&2
+    exit 69
+}
 
 mkdir -p "$backup_root" "$drill_root"
 
 journal_abs=$(cd "$(dirname "$journal")" && pwd -P)/$(basename "$journal")
 backup_abs=$(cd "$backup_root" && pwd -P)
 drill_abs=$(cd "$drill_root" && pwd -P)
+lock_path="$journal_abs.jsonl.lock"
+
+[ ! -L "$lock_path" ] || {
+    echo "refusing symlinked journal writer lock: $lock_path" >&2
+    exit 65
+}
+exec 9>>"$lock_path"
+flock -n 9 || {
+    echo "journal writer lease is active; quiesce the owner or use a filesystem snapshot" >&2
+    exit 75
+}
 
 [ "$backup_abs" != "$drill_abs" ] || {
     echo "backup and drill directories must be distinct" >&2
@@ -52,10 +67,12 @@ manifest="$backup.sha256"
 }
 
 size_before=$(wc -c <"$journal_abs")
+source_hash_before=$(sha256sum "$journal_abs" | awk '{print $1}')
 copy_tmp="$backup.tmp"
 cp -- "$journal_abs" "$copy_tmp"
 size_after=$(wc -c <"$journal_abs")
-if [ "$size_before" -ne "$size_after" ]; then
+source_hash_after=$(sha256sum "$journal_abs" | awk '{print $1}')
+if [ "$size_before" -ne "$size_after" ] || [ "$source_hash_before" != "$source_hash_after" ]; then
     rm -f -- "$copy_tmp"
     echo "journal changed during backup; retry after quiescing writes or taking a filesystem snapshot" >&2
     exit 75

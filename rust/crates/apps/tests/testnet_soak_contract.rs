@@ -88,6 +88,68 @@ struct ShutdownAwareProbe {
     called: Arc<AtomicBool>,
 }
 
+struct KindScriptedProbe {
+    results: VecDeque<(
+        TestnetSoakSample,
+        Result<TestnetSoakSample, TestnetSoakProbeFailure>,
+    )>,
+}
+
+impl KindScriptedProbe {
+    fn new(
+        results: impl IntoIterator<
+            Item = (
+                TestnetSoakSample,
+                Result<TestnetSoakSample, TestnetSoakProbeFailure>,
+            ),
+        >,
+    ) -> Self {
+        Self {
+            results: results.into_iter().collect(),
+        }
+    }
+}
+
+impl TestnetSoakProbe for KindScriptedProbe {
+    fn planned_sample(&self) -> Option<TestnetSoakSample> {
+        self.results.front().map(|(sample, _)| *sample)
+    }
+
+    fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
+        let result = self.results.pop_front().map_or(
+            Ok(TestnetSoakSample::AuthenticatedReconcile),
+            |(_, result)| result,
+        );
+        Box::pin(async move { result })
+    }
+}
+
+struct SlowPreservingProbe {
+    started: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+}
+
+impl TestnetSoakProbe for SlowPreservingProbe {
+    fn planned_sample(&self) -> Option<TestnetSoakSample> {
+        Some(TestnetSoakSample::UserDataStream)
+    }
+
+    fn preserve_in_flight_probe(&self) -> bool {
+        true
+    }
+
+    fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
+        let started = Arc::clone(&self.started);
+        let completed = Arc::clone(&self.completed);
+        Box::pin(async move {
+            started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            completed.store(true, Ordering::SeqCst);
+            Ok(TestnetSoakSample::UserDataStream)
+        })
+    }
+}
+
 impl TestnetSoakProbe for ShutdownAwareProbe {
     fn probe(&mut self) -> TestnetSoakProbeFuture<'_> {
         Box::pin(std::future::pending())
@@ -521,6 +583,8 @@ async fn legacy_rest_samples_do_not_satisfy_the_streaming_policy() {
         summary.violations,
         vec![
             TestnetSoakEvidenceViolation::OwnerCampaignRecoveryMissing,
+            TestnetSoakEvidenceViolation::IntegrityChainMissing,
+            TestnetSoakEvidenceViolation::MonotonicElapsedMissing,
             TestnetSoakEvidenceViolation::MarketStreamMissing,
             TestnetSoakEvidenceViolation::UserDataStreamMissing,
         ]
@@ -643,6 +707,281 @@ async fn a_clean_stop_from_an_older_campaign_does_not_cover_the_latest_run() {
         summary.violations,
         vec![TestnetSoakEvidenceViolation::CleanStopMissing]
     );
+}
+
+#[tokio::test]
+async fn verifier_rejects_sparse_required_stream_kinds_despite_total_duration() {
+    let path = history_path("soak-required-kind-gap");
+    let history = JsonlHistory::new(&path);
+    let task_id = "binance-testnet-required-kind-gap";
+    let started_at = Utc::now() - ChronoDuration::seconds(30);
+    history
+        .append_batch(&[
+            fact(started_at, task_id, "testnet_soak_started", Value::Null),
+            fact(
+                started_at,
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "market_stream"}),
+            ),
+            fact(
+                started_at + ChronoDuration::seconds(1),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "user_data_stream"}),
+            ),
+            fact(
+                started_at + ChronoDuration::seconds(2),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "authenticated_reconcile"}),
+            ),
+            fact(
+                started_at + ChronoDuration::seconds(20),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "market_stream"}),
+            ),
+            fact(
+                started_at + ChronoDuration::seconds(21),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "user_data_stream"}),
+            ),
+            fact(
+                started_at + ChronoDuration::seconds(22),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "authenticated_reconcile"}),
+            ),
+            fact(
+                started_at + ChronoDuration::seconds(22),
+                task_id,
+                "testnet_soak_stopped",
+                json!({"exit": "stop_requested"}),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let requirements = TestnetSoakEvidenceRequirements::new(
+        Duration::from_secs(20),
+        6,
+        true,
+        false,
+        TestnetSoakSampleCoverageRequirement::StreamingPath,
+    )
+    .unwrap()
+    .with_required_kind_density(2, Duration::from_secs(5))
+    .unwrap();
+    let summary = verify_testnet_soak_evidence(&path, task_id, requirements).unwrap();
+    assert!(!summary.requirements_met);
+    assert!(
+        summary
+            .violations
+            .contains(&TestnetSoakEvidenceViolation::MarketStreamGapExceeded)
+    );
+    assert!(
+        summary
+            .violations
+            .contains(&TestnetSoakEvidenceViolation::UserDataStreamGapExceeded)
+    );
+    assert!(
+        summary
+            .violations
+            .contains(&TestnetSoakEvidenceViolation::AuthenticatedReconcileGapExceeded)
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn verifier_recomputes_the_hash_chain_and_rejects_valid_json_tampering() {
+    let path = history_path("soak-integrity-tamper");
+    let task_id = "binance-testnet-integrity-tamper";
+    let mut task = TestnetSoakTask::start(
+        TestnetSoakTaskConfig::new(
+            task_id,
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            3,
+        )
+        .unwrap(),
+        ScriptedProbe::new([Ok(TestnetSoakSample::MarketStream)]),
+        JsonlHistory::new(&path),
+    )
+    .await
+    .unwrap();
+    wait_until(Duration::from_secs(1), || {
+        task.status().successful_probe_count == 1
+    })
+    .await;
+    task.stop().await.unwrap();
+
+    let mut records = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<DecisionRecord>(line).unwrap())
+        .collect::<Vec<_>>();
+    let probe = records
+        .iter_mut()
+        .find(|record| record.decision == "testnet_soak_probe_succeeded")
+        .unwrap();
+    probe.details["observation"]["sample"] = Value::String("user_data_stream".to_owned());
+    let mut tampered = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    tampered.push('\n');
+    fs::write(&path, tampered).unwrap();
+
+    let requirements = TestnetSoakEvidenceRequirements::new(
+        Duration::ZERO,
+        0,
+        false,
+        false,
+        TestnetSoakSampleCoverageRequirement::NotRequired,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_testnet_soak_evidence(&path, task_id, requirements),
+        Err(TestnetSoakEvidenceError::IntegrityMismatch)
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn rotating_probe_successes_do_not_hide_a_dead_required_lane() {
+    let path = history_path("soak-per-kind-failure");
+    let history = JsonlHistory::new(&path);
+    let mut task = TestnetSoakTask::start(
+        TestnetSoakTaskConfig::new(
+            "binance-testnet-per-kind-failure",
+            Duration::from_millis(1),
+            Duration::from_millis(50),
+            2,
+        )
+        .unwrap(),
+        KindScriptedProbe::new([
+            (
+                TestnetSoakSample::MarketStream,
+                Err(TestnetSoakProbeFailure::Transport),
+            ),
+            (
+                TestnetSoakSample::UserDataStream,
+                Ok(TestnetSoakSample::UserDataStream),
+            ),
+            (
+                TestnetSoakSample::AuthenticatedReconcile,
+                Ok(TestnetSoakSample::AuthenticatedReconcile),
+            ),
+            (
+                TestnetSoakSample::MarketStream,
+                Err(TestnetSoakProbeFailure::Transport),
+            ),
+        ]),
+        history,
+    )
+    .await
+    .unwrap();
+
+    wait_until(Duration::from_secs(1), || task.status().is_terminal()).await;
+    let status = task.status();
+    assert_eq!(status.phase, TestnetSoakTaskPhase::Failed);
+    assert_eq!(status.consecutive_failure_count, 2);
+    assert_eq!(status.consecutive_failure_counts.market_stream, 2);
+    assert_eq!(status.consecutive_failure_counts.user_data_stream, 0);
+    assert!(matches!(
+        task.stop().await,
+        Err(TestnetSoakTaskError::ProbeFailureThreshold(
+            TestnetSoakProbeFailure::Transport
+        ))
+    ));
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn stop_does_not_drop_an_in_flight_mutation_aware_probe() {
+    let path = history_path("soak-preserve-in-flight");
+    let started = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicBool::new(false));
+    let mut task = TestnetSoakTask::start(
+        TestnetSoakTaskConfig::new(
+            "binance-testnet-preserve-in-flight",
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            10,
+        )
+        .unwrap(),
+        SlowPreservingProbe {
+            started: Arc::clone(&started),
+            completed: Arc::clone(&completed),
+        },
+        JsonlHistory::new(&path),
+    )
+    .await
+    .unwrap();
+
+    wait_until(Duration::from_secs(1), || started.load(Ordering::SeqCst)).await;
+    assert_eq!(
+        task.stop().await.unwrap(),
+        TestnetSoakTaskExit::StopRequested
+    );
+    assert!(completed.load(Ordering::SeqCst));
+    let journal = fs::read_to_string(&path).unwrap();
+    assert!(journal.contains("testnet_soak_stopped"));
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn verifier_repairs_a_recoverable_partial_tail_before_projection() {
+    let path = history_path("soak-tail-repair");
+    let history = JsonlHistory::new(&path);
+    let task_id = "binance-testnet-tail-repair";
+    let started_at = Utc::now() - ChronoDuration::minutes(5);
+    history
+        .append_batch(&[
+            fact(started_at, task_id, "testnet_soak_started", Value::Null),
+            fact(
+                started_at + ChronoDuration::minutes(1),
+                task_id,
+                "testnet_soak_probe_succeeded",
+                json!({"sample": "spot_book_ticker"}),
+            ),
+            fact(
+                started_at + ChronoDuration::minutes(2),
+                task_id,
+                "testnet_soak_stopped",
+                json!({"exit": "stop_requested"}),
+            ),
+        ])
+        .await
+        .unwrap();
+    {
+        use std::io::Write as _;
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"truncated\":").unwrap();
+        file.flush().unwrap();
+    }
+
+    let summary = verify_testnet_soak_evidence(
+        &path,
+        task_id,
+        TestnetSoakEvidenceRequirements::new(
+            Duration::ZERO,
+            1,
+            true,
+            false,
+            TestnetSoakSampleCoverageRequirement::NotRequired,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(summary.requirements_met);
+
+    let repaired = fs::read_to_string(path).unwrap();
+    assert!(repaired.contains("history_tail_repaired"));
 }
 
 #[test]
