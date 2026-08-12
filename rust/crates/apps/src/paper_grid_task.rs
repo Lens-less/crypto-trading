@@ -2293,15 +2293,24 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
-                _ = risk_poll.tick(), if policy.risk.is_some() => {
+                // Poll the risk read as part of this select branch. The saga
+                // can hold the shared authority lock across journal I/O; if a
+                // completed tick won first and awaited directives outside the
+                // select, the suspended saga could never release that lock.
+                directives = async {
                     let risk = policy.risk.expect("risk poll is guarded by is_some");
-                    match risk.directives(Utc::now()).await {
+                    risk_poll.tick().await;
+                    let observed_at = Utc::now();
+                    (observed_at, risk.directives(observed_at).await)
+                }, if policy.risk.is_some() => {
+                    let (observed_at, directives) = directives;
+                    match directives {
                         Ok(directives) => {
                             if let Some(reason) = account_risk_exit_reason(&directives, policy.owner_task_id) {
                                 break OperationOutcome::RiskInterrupted {
                                     request: cancel_request,
                                     reason,
-                                    detected_at: Utc::now(),
+                                    detected_at: observed_at,
                                 };
                             }
                         }

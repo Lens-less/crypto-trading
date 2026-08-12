@@ -1283,12 +1283,17 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
-                _ = risk_poll.tick(), if interrupt_on_account_risk && risk.is_some() => {
+                // Keep the authority read inside the selected future so the
+                // saga remains polled while it holds the shared lock across
+                // journal I/O. Awaiting directives after the tick wins would
+                // otherwise self-deadlock this owner.
+                directives = async {
+                    let risk = risk.as_ref().expect("risk poll is guarded by is_some");
+                    risk_poll.tick().await;
                     let observed_at = Utc::now();
-                    let Some(risk) = risk.as_ref() else {
-                        continue;
-                    };
-                    let directives = risk.directives(observed_at).await;
+                    (observed_at, risk.directives(observed_at).await)
+                }, if interrupt_on_account_risk && risk.is_some() => {
+                    let (observed_at, directives) = directives;
                     match directives {
                         Ok(directives) => {
                             if let Some(reason) = account_risk_exit_reason(&directives, &owner_task_id) {
