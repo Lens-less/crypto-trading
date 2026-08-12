@@ -28,10 +28,10 @@ use crypto_trading_domain::{
     TimeInForce,
 };
 use crypto_trading_exchange::{
-    BinanceHmacSha256Signer, BinanceProduct, BinancePublicExchange, BinanceRequestSigner,
-    BinanceTestnetEndpoints, BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError,
-    ExchangeHandle, ExchangeSymbol, ExchangeSymbolCatalog, HyperliquidPublicEndpoint,
-    HyperliquidPublicExchange, InstrumentRuleCatalog, InstrumentRules, PaperExchange,
+    BinanceExchangeInfoSymbol, BinanceHmacSha256Signer, BinanceProduct, BinancePublicExchange,
+    BinanceRequestSigner, BinanceTestnetEndpoints, BinanceTestnetExchange, BinanceTestnetProtocol,
+    ExchangeError, ExchangeHandle, ExchangeSymbol, ExchangeSymbolCatalog,
+    HyperliquidPublicEndpoint, HyperliquidPublicExchange, InstrumentRuleCatalog, PaperExchange,
     ReconcileScope, RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition,
     TradingReceipt, hyperliquid_usdt_symbol_catalog,
 };
@@ -94,7 +94,8 @@ use crate::task_host::{
 };
 use crate::testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TestnetLifecycleConfig, TestnetLifecycleObservation,
-    run_testnet_lifecycle,
+    TestnetLifecycleReport, run_testnet_lifecycle, testnet_lifecycle_requires_submission,
+    testnet_lifecycle_wire_symbol,
 };
 use crate::testnet_reconciliation::{
     TESTNET_RECONCILIATION_APPLY_ACKNOWLEDGEMENT, TestnetReconciliationConfig,
@@ -778,6 +779,9 @@ struct BinanceSmokeSymbols {
     wire_symbol: String,
 }
 
+const BINANCE_TESTNET_SPOT_BASE_URL_ENV: &str = "CRYPTO_TRADING_BINANCE_TESTNET_SPOT_BASE_URL";
+const BINANCE_TESTNET_USDM_BASE_URL_ENV: &str = "CRYPTO_TRADING_BINANCE_TESTNET_USDM_BASE_URL";
+
 async fn run_testnet_smoke(args: &TestnetSmokeArgs) -> Result<()> {
     if !args.call_book_ticker && !args.call_reconcile {
         bail!(
@@ -835,7 +839,7 @@ async fn run_testnet_lifecycle_command(args: &TestnetLifecycleArgs) -> Result<()
         bail!("testnet-lifecycle --reduce-only is only valid with --market usdm");
     }
 
-    let symbols = BinanceSmokeSymbols {
+    let mut symbols = BinanceSmokeSymbols {
         spot: Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?,
         perpetual: Symbol::new(args.perpetual_symbol.clone())
             .context("invalid --perpetual-symbol")?,
@@ -866,26 +870,54 @@ async fn run_testnet_lifecycle_command(args: &TestnetLifecycleArgs) -> Result<()
     let config = TestnetLifecycleConfig::new(
         args.campaign_id.clone(),
         intent.clone(),
+        args.wire_symbol.clone(),
         expected_observation,
         StdDuration::from_millis(args.poll_interval_ms),
         args.maximum_queries,
     )?;
 
-    let (api_key, api_secret) = load_binance_testnet_credentials()?;
-    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
-    let protocol = build_binance_testnet_protocol(signer, &symbols)?;
-    let preflight_timestamp = u64::try_from(Utc::now().timestamp_millis())
-        .context("current timestamp is outside the Binance millisecond range")?;
-    protocol
-        .build_order_request(&intent, Some(price), preflight_timestamp)
-        .context("testnet lifecycle order failed local protocol validation")?;
+    let history = JsonlHistory::new(&args.history_path);
+    let durable_wire_symbol = testnet_lifecycle_wire_symbol(&config, &history)
+        .context("failed to recover the durable Binance lifecycle wire symbol")?;
+    let config = config.with_wire_symbol(durable_wire_symbol.clone())?;
+    symbols.wire_symbol = durable_wire_symbol;
     let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
         StdDuration::from_millis(args.timeout_ms),
     )?);
+    let (api_key, api_secret) = load_binance_testnet_credentials()?;
+    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+    let requires_submission = testnet_lifecycle_requires_submission(&config, &history)
+        .context("failed to inspect durable Binance testnet lifecycle state")?;
+    let protocol = if requires_submission {
+        let protocol = build_binance_mutation_protocol(
+            &*transport,
+            signer,
+            intent.symbol.clone(),
+            intent.market_type,
+            config.wire_symbol(),
+        )
+        .await
+        .context("failed to fetch authoritative Binance testnet instrument metadata")?;
+        let preflight_timestamp = u64::try_from(Utc::now().timestamp_millis())
+            .context("current timestamp is outside the Binance millisecond range")?;
+        protocol
+            .build_order_request(&intent, Some(price), preflight_timestamp)
+            .context("testnet lifecycle order failed local protocol validation")?;
+        protocol
+    } else {
+        build_binance_read_only_protocol(signer, &symbols)
+            .context("failed to build query-first Binance testnet recovery protocol")?
+    };
     let exchange = BinanceTestnetExchange::new(protocol, transport);
-    let history = JsonlHistory::new(&args.history_path);
     let report = run_testnet_lifecycle(&config, &exchange, &history).await?;
 
+    print_testnet_lifecycle_report(args, &report)
+}
+
+fn print_testnet_lifecycle_report(
+    args: &TestnetLifecycleArgs,
+    report: &TestnetLifecycleReport,
+) -> Result<()> {
     let expected = lifecycle_observation_label(report.expected_observation);
     let final_status = lifecycle_order_status_label(report.final_status);
     if args.json {
@@ -980,7 +1012,7 @@ async fn run_testnet_reconciliation_command(args: &TestnetReconciliationArgs) ->
 
     let (api_key, api_secret) = load_binance_testnet_credentials()?;
     let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
-    let protocol = build_binance_testnet_protocol(signer, &symbols)?;
+    let protocol = build_binance_read_only_protocol(signer, &symbols)?;
     let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
         StdDuration::from_millis(args.timeout_ms),
     )?);
@@ -1109,7 +1141,7 @@ async fn run_book_ticker_check(
         "offline-api-key",
         "offline-api-secret",
     )?);
-    let protocol = build_binance_testnet_protocol(signer, symbols)?;
+    let protocol = build_binance_read_only_protocol(signer, symbols)?;
     let spot =
         fetch_binance_book_ticker(&protocol, &**transport, &symbols.spot, MarketType::Spot).await?;
     let perpetual = fetch_binance_book_ticker(
@@ -1132,7 +1164,7 @@ async fn run_reconcile_check(
 ) -> Result<Value> {
     let (api_key, api_secret) = load_binance_testnet_credentials()?;
     let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
-    let protocol = build_binance_testnet_protocol(signer, symbols)?;
+    let protocol = build_binance_read_only_protocol(signer, symbols)?;
     let exchange = BinanceTestnetExchange::new(protocol, transport.clone());
     let spot_orders = exchange
         .reconcile(ReconcileScope::Orders {
@@ -1213,58 +1245,111 @@ fn load_binance_testnet_credentials() -> Result<(String, String)> {
     Ok((api_key, api_secret))
 }
 
-fn build_binance_testnet_protocol<S>(
+fn build_binance_symbol_catalog(symbols: &BinanceSmokeSymbols) -> Result<ExchangeSymbolCatalog> {
+    Ok(ExchangeSymbolCatalog::new(vec![
+        ExchangeSymbol::new(
+            "binance",
+            symbols.spot.clone(),
+            MarketType::Spot,
+            &symbols.wire_symbol,
+        )?,
+        ExchangeSymbol::new(
+            "binance",
+            symbols.perpetual.clone(),
+            MarketType::Perpetual,
+            &symbols.wire_symbol,
+        )?,
+    ])?)
+}
+
+fn build_binance_read_only_protocol<S>(
     signer: Arc<S>,
     symbols: &BinanceSmokeSymbols,
 ) -> Result<BinanceTestnetProtocol>
 where
     S: BinanceRequestSigner + 'static,
 {
-    let tick_size = Price::new(Decimal::new(1, 1)).expect("0.1 must be valid");
-    let spot_quantity = Quantity::new(Decimal::new(1, 4)).expect("0.0001 must be valid");
-    let perpetual_quantity = Quantity::new(Decimal::new(1, 3)).expect("0.001 must be valid");
-    let min_notional = Money::new(Decimal::new(5, 0));
-    let catalog = ExchangeSymbolCatalog::new(vec![
-        ExchangeSymbol::new(
-            "binance",
-            symbols.spot.clone(),
-            MarketType::Spot,
-            &symbols.wire_symbol,
-        )?,
-        ExchangeSymbol::new(
-            "binance",
-            symbols.perpetual.clone(),
-            MarketType::Perpetual,
-            &symbols.wire_symbol,
-        )?,
-    ])?;
-    let rules = InstrumentRuleCatalog::new(vec![
-        InstrumentRules::new(
-            "binance",
-            symbols.spot.clone(),
-            MarketType::Spot,
-            tick_size,
-            spot_quantity,
-            spot_quantity,
-            min_notional,
-        )?,
-        InstrumentRules::new(
-            "binance",
-            symbols.perpetual.clone(),
-            MarketType::Perpetual,
-            tick_size,
-            perpetual_quantity,
-            perpetual_quantity,
-            min_notional,
-        )?,
-    ])?;
+    let catalog = build_binance_symbol_catalog(symbols)?;
     BinanceTestnetProtocol::authenticated(
-        BinanceTestnetEndpoints::official(),
+        binance_testnet_endpoints()?,
         catalog,
-        rules,
+        InstrumentRuleCatalog::default(),
         signer,
     )
-    .context("failed to build Binance testnet smoke protocol")
+    .context("failed to build Binance testnet read-only protocol")
+}
+
+async fn build_binance_mutation_protocol<S>(
+    transport: &(dyn RemoteHttpTransport + Send + Sync),
+    signer: Arc<S>,
+    symbol: Symbol,
+    market_type: MarketType,
+    wire_symbol: &str,
+) -> Result<BinanceTestnetProtocol>
+where
+    S: BinanceRequestSigner + 'static,
+{
+    let endpoints = binance_testnet_endpoints()?;
+    let BinanceExchangeInfoSymbol {
+        symbol: exchange_symbol,
+        rules,
+    } = fetch_binance_authoritative_symbol(transport, &endpoints, symbol, market_type, wire_symbol)
+        .await?;
+    BinanceTestnetProtocol::authenticated(
+        endpoints,
+        ExchangeSymbolCatalog::new(vec![exchange_symbol])?,
+        InstrumentRuleCatalog::new(vec![rules])?,
+        signer,
+    )
+    .context("failed to build Binance testnet mutation protocol")
+}
+
+async fn fetch_binance_authoritative_symbol(
+    transport: &(dyn RemoteHttpTransport + Send + Sync),
+    endpoints: &BinanceTestnetEndpoints,
+    symbol: Symbol,
+    market_type: MarketType,
+    wire_symbol: &str,
+) -> Result<BinanceExchangeInfoSymbol> {
+    let product = match market_type {
+        MarketType::Spot => BinanceProduct::Spot,
+        MarketType::Perpetual => BinanceProduct::UsdM,
+    };
+    let request =
+        BinanceTestnetProtocol::build_exchange_info_request(endpoints, product, wire_symbol)?;
+    let response = transport.send(request).await?;
+    if !response.is_success() {
+        return Err(BinanceTestnetProtocol::remote_failure_from_response(&response).into());
+    }
+    BinanceTestnetProtocol::parse_exchange_info_symbol(
+        product,
+        response.body(),
+        symbol,
+        wire_symbol,
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn binance_testnet_endpoints() -> Result<BinanceTestnetEndpoints> {
+    let spot = testnet_env_value(BINANCE_TESTNET_SPOT_BASE_URL_ENV)?;
+    let usdm = testnet_env_value(BINANCE_TESTNET_USDM_BASE_URL_ENV)?;
+    match (spot, usdm) {
+        (None, None) => Ok(BinanceTestnetEndpoints::official()),
+        (Some(spot), Some(usdm)) => BinanceTestnetEndpoints::loopback(&spot, &usdm)
+            .context("invalid Binance testnet loopback endpoint override"),
+        _ => bail!(
+            "{BINANCE_TESTNET_SPOT_BASE_URL_ENV} and {BINANCE_TESTNET_USDM_BASE_URL_ENV} must be set together"
+        ),
+    }
+}
+
+fn testnet_env_value(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => bail!("{name} must not be blank"),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+    }
 }
 
 async fn fetch_binance_book_ticker(
@@ -1313,8 +1398,8 @@ impl ProductionBinanceTestnetSoakProbe {
         api_secret: String,
     ) -> Result<Self> {
         let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
-        let protocol = build_binance_testnet_protocol(Arc::clone(&signer), &symbols)?;
-        let exchange_protocol = build_binance_testnet_protocol(signer, &symbols)?;
+        let protocol = build_binance_read_only_protocol(Arc::clone(&signer), &symbols)?;
+        let exchange_protocol = build_binance_read_only_protocol(signer, &symbols)?;
         let exchange = BinanceTestnetExchange::new(exchange_protocol, Arc::clone(&transport));
         Ok(Self {
             protocol,
@@ -3768,7 +3853,7 @@ fn resolve_arbitrage_snapshots(
     Ok([
         market_snapshot(
             left_exchange,
-            left_symbol,
+            &left_symbol,
             args.market.left_bid.context("--once requires --left-bid")?,
             args.market.left_ask.context("--once requires --left-ask")?,
             args.market
@@ -3780,7 +3865,7 @@ fn resolve_arbitrage_snapshots(
         )?,
         market_snapshot(
             right_exchange,
-            right_symbol,
+            &right_symbol,
             args.market
                 .right_bid
                 .context("--once requires --right-bid")?,
@@ -3799,7 +3884,7 @@ fn resolve_arbitrage_snapshots(
 
 fn market_snapshot(
     exchange: &str,
-    symbol: Symbol,
+    symbol: &Symbol,
     bid: Decimal,
     ask: Decimal,
     bid_quantity: Decimal,
@@ -3807,8 +3892,8 @@ fn market_snapshot(
 ) -> Result<MarketSnapshot> {
     let mut snapshot = MarketSnapshot::new(
         exchange,
-        symbol,
-        MarketType::Perpetual,
+        symbol.clone(),
+        market_type_for_one_shot_symbol(symbol),
         Price::new(bid).context("paper bid must be greater than zero")?,
         Price::new(ask).context("paper ask must be greater than zero")?,
         Utc::now(),
@@ -3820,6 +3905,13 @@ fn market_snapshot(
     Ok(snapshot)
 }
 
+fn market_type_for_one_shot_symbol(symbol: &Symbol) -> MarketType {
+    match symbol.as_str().rsplit_once('-') {
+        Some((_, "SPOT")) => MarketType::Spot,
+        _ => MarketType::Perpetual,
+    }
+}
+
 #[derive(Debug)]
 struct ArbitrageExecutionPolicy {
     strategy_key: Symbol,
@@ -3828,7 +3920,7 @@ struct ArbitrageExecutionPolicy {
     monitor_symbols: Vec<Symbol>,
     configured_exchanges: Vec<String>,
     configured_symbols: Vec<Symbol>,
-    leg_markets: Vec<(String, Symbol)>,
+    leg_markets: Vec<(String, Symbol, MarketType)>,
 }
 
 fn resolve_arbitrage_policy(
@@ -3843,13 +3935,16 @@ fn resolve_arbitrage_policy(
     if config.monitor_only {
         bail!("arbitrage execution is blocked by monitor-only mode");
     }
+    if snapshots[0].symbol != snapshots[1].symbol {
+        bail!(
+            "one-shot arbitrage execution requires identical leg symbols until multi-symbol admission and replay are supported"
+        );
+    }
 
     let strategy_key = if let Some(value) = args.market.strategy_key.as_deref() {
         Symbol::new(value).context("--strategy-key must not be empty")?
-    } else if snapshots[0].symbol == snapshots[1].symbol {
-        snapshots[0].symbol.clone()
     } else {
-        bail!("--strategy-key is required when arbitrage leg symbols differ");
+        snapshots[0].symbol.clone()
     };
 
     let policy = ArbitrageExecutionPolicy {
@@ -3861,7 +3956,13 @@ fn resolve_arbitrage_policy(
         configured_symbols: config.symbols.clone(),
         leg_markets: snapshots
             .iter()
-            .map(|snapshot| (snapshot.exchange().to_owned(), snapshot.symbol.clone()))
+            .map(|snapshot| {
+                (
+                    snapshot.exchange().to_owned(),
+                    snapshot.symbol.clone(),
+                    snapshot.market_type,
+                )
+            })
             .collect(),
     };
     policy.validate_snapshots(args, snapshots)?;
@@ -3875,6 +3976,13 @@ impl ArbitrageExecutionPolicy {
         args: &ArbitrageArgs,
         snapshots: &[MarketSnapshot; 2],
     ) -> Result<()> {
+        if !ArbitrageStrategy::symbols_share_hedge_identity(
+            &snapshots[0].symbol,
+            &snapshots[1].symbol,
+        ) {
+            bail!("arbitrage legs do not share a hedge identity");
+        }
+
         for snapshot in snapshots {
             if !self
                 .monitor_exchanges
@@ -3936,12 +4044,17 @@ impl ArbitrageExecutionPolicy {
             if !self
                 .leg_markets
                 .iter()
-                .any(|(exchange, symbol)| exchange == &intent.exchange && symbol == &intent.symbol)
+                .any(|(exchange, symbol, market_type)| {
+                    exchange == &intent.exchange
+                        && symbol == &intent.symbol
+                        && market_type == &intent.market_type
+                })
             {
                 bail!(
-                    "intent {}/{} is outside the authorized arbitrage legs",
+                    "intent {}/{}/{:?} is outside the authorized arbitrage legs",
                     intent.exchange,
-                    intent.symbol
+                    intent.symbol,
+                    intent.market_type
                 );
             }
             if !self
@@ -4055,9 +4168,13 @@ fn authorize_arbitrage_risk(
         max_position_value,
         max_snapshot_age,
     })?;
+    // This one-shot paper helper has no durable account truth. Until the
+    // shipped paper account authority is threaded into this path, reuse the
+    // explicit paper-only `max_position_value` as a synthetic full-notional
+    // opening budget. Mainnet order authority remains unavailable elsewhere.
     let account = AccountRiskSnapshot {
-        equity: Money::default(),
-        available_balance: Money::default(),
+        equity: Money::new(max_position_value),
+        available_balance: Money::new(max_position_value),
         kill_switch: false,
         timestamp: now,
     };
@@ -4065,7 +4182,9 @@ fn authorize_arbitrage_risk(
     match engine.authorize_batch(intents, &account, &[], &markets, now) {
         RiskDecision::Authorized => Ok(()),
         RiskDecision::Rejected(rejection) => {
-            bail!("arbitrage risk rejected the batch: {rejection:?}")
+            bail!(
+                "arbitrage risk rejected the batch: {rejection:?}; paper-only once execution uses max_position_value as a synthetic full-notional account budget"
+            )
         }
     }
 }
@@ -5818,11 +5937,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use chrono::{TimeZone, Utc};
-    use crypto_trading_config::load_grid_config_from_str;
+    use chrono::{Duration, TimeZone, Utc};
+    use crypto_trading_config::{
+        ArbitrageConfig, load_arbitrage_config_from_str, load_grid_config_from_str,
+    };
     use crypto_trading_domain::{
-        MarketType, Money, Order, OrderIntent, OrderStatus, OrderType, Position, PositionSide,
-        Price, Quantity, Side, Symbol, TimeInForce,
+        MarketSnapshot, MarketType, Money, Order, OrderIntent, OrderStatus, OrderType, Position,
+        PositionSide, Price, Quantity, Side, Symbol, TimeInForce,
     };
     use crypto_trading_exchange::{
         ExchangeError, ForeignOrder, ReconcileReceipt, ReconcileScope, SubmissionDisposition,
@@ -5893,6 +6014,74 @@ mod tests {
             Side::Buy,
             Quantity::new(Decimal::ONE).unwrap(),
         )
+    }
+
+    fn test_arbitrage_config(max_position_value: &str) -> ArbitrageConfig {
+        load_arbitrage_config_from_str(&format!(
+            r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [paper-left, paper-right]
+symbols: [ETH-USDC-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.1
+    grid_step: 0.1
+    max_segments: 1
+  quantity_config:
+    base_quantity: 1
+  risk_config:
+    max_position_value: {max_position_value}
+symbol_configs:
+  ETH-USDC-PERP:
+    enabled: true
+"
+        ))
+        .unwrap()
+    }
+
+    fn test_arbitrage_markets(now: chrono::DateTime<Utc>) -> [MarketSnapshot; 2] {
+        [
+            MarketSnapshot::new(
+                "paper-left",
+                Symbol::new("ETH-USDC-PERP").unwrap(),
+                MarketType::Perpetual,
+                Price::new(Decimal::new(99, 0)).unwrap(),
+                Price::new(Decimal::new(100, 0)).unwrap(),
+                now,
+            )
+            .unwrap(),
+            MarketSnapshot::new(
+                "paper-right",
+                Symbol::new("ETH-USDC-PERP").unwrap(),
+                MarketType::Perpetual,
+                Price::new(Decimal::new(101, 0)).unwrap(),
+                Price::new(Decimal::new(102, 0)).unwrap(),
+                now,
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn test_arbitrage_intents() -> [OrderIntent; 2] {
+        [
+            OrderIntent::market(
+                "paper-left",
+                Symbol::new("ETH-USDC-PERP").unwrap(),
+                MarketType::Perpetual,
+                Side::Buy,
+                Quantity::new(Decimal::ONE).unwrap(),
+            ),
+            OrderIntent::market(
+                "paper-right",
+                Symbol::new("ETH-USDC-PERP").unwrap(),
+                MarketType::Perpetual,
+                Side::Sell,
+                Quantity::new(Decimal::ONE).unwrap(),
+            ),
+        ]
     }
 
     fn test_order(index: usize) -> Order {
@@ -5970,6 +6159,86 @@ grid_system:
                 Decimal::new(10, 1),
             ]
         );
+    }
+
+    #[test]
+    fn paper_once_arbitrage_uses_max_position_value_as_synthetic_buying_power_budget() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+        let config = test_arbitrage_config("201");
+        let markets = test_arbitrage_markets(now);
+        let intents = test_arbitrage_intents();
+
+        let result = super::authorize_arbitrage_risk(
+            &config,
+            &intents,
+            [&markets[0], &markets[1]],
+            now,
+            Duration::seconds(5),
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn paper_once_arbitrage_rejects_when_the_synthetic_budget_is_too_small() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+        let config = test_arbitrage_config("200");
+        let markets = test_arbitrage_markets(now);
+        let intents = test_arbitrage_intents();
+
+        let error = super::authorize_arbitrage_risk(
+            &config,
+            &intents,
+            [&markets[0], &markets[1]],
+            now,
+            Duration::seconds(5),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("OpeningNotionalExceedsBuyingPower"),
+            "{error}"
+        );
+        assert!(
+            error.contains("synthetic full-notional account budget"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn paper_once_snapshot_derives_market_type_from_symbol_suffix() {
+        let spot = super::market_snapshot(
+            "paper-left",
+            &Symbol::new("ETH-USDC-SPOT").unwrap(),
+            Decimal::new(99, 0),
+            Decimal::new(100, 0),
+            Decimal::ONE,
+            Decimal::ONE,
+        )
+        .unwrap();
+        let perp = super::market_snapshot(
+            "paper-right",
+            &Symbol::new("ETH-USDC-PERP").unwrap(),
+            Decimal::new(101, 0),
+            Decimal::new(102, 0),
+            Decimal::ONE,
+            Decimal::ONE,
+        )
+        .unwrap();
+        let legacy = super::market_snapshot(
+            "paper-legacy",
+            &Symbol::new("ETH-USDC").unwrap(),
+            Decimal::new(101, 0),
+            Decimal::new(102, 0),
+            Decimal::ONE,
+            Decimal::ONE,
+        )
+        .unwrap();
+
+        assert_eq!(spot.market_type, MarketType::Spot);
+        assert_eq!(perp.market_type, MarketType::Perpetual);
+        assert_eq!(legacy.market_type, MarketType::Perpetual);
     }
 
     #[test]

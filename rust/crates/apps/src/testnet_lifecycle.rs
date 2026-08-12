@@ -1,11 +1,12 @@
 use std::{fmt, future::Future, io, path::Path, pin::Pin, time::Duration};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crypto_trading_domain::{
     MarketType, Order, OrderIntent, OrderStatus, OrderType, Symbol, TimeInForce,
 };
 use crypto_trading_exchange::{
-    BinanceTestnetExchange, ExchangeError, ExchangeHandle, TradingCommand, TradingReceipt,
+    BinanceTestnetExchange, ExchangeError, ExchangeHandle, RemoteRetryAfter, TradingCommand,
+    TradingReceipt,
 };
 use crypto_trading_runtime::{
     DecisionRecord, FileJournalSnapshotSource, HistoryError, JournalPageBoundary, JournalReadError,
@@ -15,7 +16,7 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-pub const TESTNET_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
+pub const TESTNET_LIFECYCLE_SCHEMA_VERSION: u16 = 2;
 pub const TESTNET_LIFECYCLE_ACKNOWLEDGEMENT: &str = "I AUTHORIZE BINANCE TESTNET ORDER LIFECYCLE";
 
 const STRATEGY: &str = "binance_testnet_lifecycle";
@@ -30,6 +31,7 @@ const OUTCOME_UNKNOWN: &str = "testnet_lifecycle_outcome_unknown";
 const COMPLETED: &str = "testnet_lifecycle_completed";
 const FAILED: &str = "testnet_lifecycle_failed";
 const MAX_CAMPAIGN_ID_BYTES: usize = 128;
+const MAX_WIRE_SYMBOL_BYTES: usize = 64;
 const MAX_QUERY_ATTEMPTS_PER_CAMPAIGN: u16 = 1_000;
 const MIN_QUERY_ATTEMPTS_PER_CAMPAIGN: u16 = 3;
 const CLEANUP_QUERY_RESERVE: u32 = 2;
@@ -139,6 +141,7 @@ impl CancelReason {
 pub struct TestnetLifecycleConfig {
     campaign_id: String,
     intent: OrderIntent,
+    wire_symbol: String,
     expected_observation: TestnetLifecycleObservation,
     poll_interval: Duration,
     maximum_queries: u16,
@@ -154,12 +157,15 @@ impl TestnetLifecycleConfig {
     pub fn new(
         campaign_id: impl Into<String>,
         intent: OrderIntent,
+        wire_symbol: impl Into<String>,
         expected_observation: TestnetLifecycleObservation,
         poll_interval: Duration,
         maximum_queries: u16,
     ) -> Result<Self, TestnetLifecycleError> {
         let campaign_id = campaign_id.into();
+        let wire_symbol = wire_symbol.into();
         if !valid_campaign_id(&campaign_id)
+            || !valid_wire_symbol(&wire_symbol)
             || !intent.exchange.eq_ignore_ascii_case("binance")
             || intent.client_order_id.is_nil()
             || intent.order_type != OrderType::Limit
@@ -179,6 +185,7 @@ impl TestnetLifecycleConfig {
         Ok(Self {
             campaign_id,
             intent,
+            wire_symbol,
             expected_observation,
             poll_interval,
             maximum_queries,
@@ -193,6 +200,29 @@ impl TestnetLifecycleConfig {
     #[must_use]
     pub const fn intent(&self) -> &OrderIntent {
         &self.intent
+    }
+
+    #[must_use]
+    pub fn wire_symbol(&self) -> &str {
+        &self.wire_symbol
+    }
+
+    /// Rebinds a caller-supplied mapping to the exact durable recovery symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestnetLifecycleError::InvalidConfig`] for an invalid Binance
+    /// wire symbol.
+    pub fn with_wire_symbol(
+        mut self,
+        wire_symbol: impl Into<String>,
+    ) -> Result<Self, TestnetLifecycleError> {
+        let wire_symbol = wire_symbol.into();
+        if !valid_wire_symbol(&wire_symbol) {
+            return Err(TestnetLifecycleError::InvalidConfig);
+        }
+        self.wire_symbol = wire_symbol;
+        Ok(self)
     }
 
     #[must_use]
@@ -211,6 +241,39 @@ pub struct TestnetLifecycleReport {
     pub final_status: OrderStatus,
     pub query_count: u32,
     pub recovered: bool,
+}
+
+/// Reports whether the durable campaign can still enter its one submit branch.
+///
+/// Once `planned` is durable, callers must construct only query/cancel recovery
+/// authority; current metadata availability must not block cleanup.
+///
+/// # Errors
+///
+/// Returns an error when the bounded journal cannot be projected safely.
+pub fn testnet_lifecycle_requires_submission(
+    config: &TestnetLifecycleConfig,
+    history: &JsonlHistory,
+) -> Result<bool, TestnetLifecycleError> {
+    Ok(!project_campaign(history.path(), config)?.planned)
+}
+
+/// Returns the exact wire symbol from the durable submit plan, or the
+/// validated caller mapping for a fresh campaign.
+///
+/// Recovery composition must call this before constructing its query/cancel
+/// catalog so a rerun cannot redirect the durable client order ID.
+///
+/// # Errors
+///
+/// Returns an error when the bounded journal cannot be projected safely.
+pub fn testnet_lifecycle_wire_symbol(
+    config: &TestnetLifecycleConfig,
+    history: &JsonlHistory,
+) -> Result<String, TestnetLifecycleError> {
+    Ok(project_campaign(history.path(), config)?
+        .wire_symbol
+        .unwrap_or_else(|| config.wire_symbol.clone()))
 }
 
 /// Runs or recovers one submit-query-cancel-query Testnet lifecycle.
@@ -236,6 +299,18 @@ where
     }
     if projected.failed {
         return Err(TestnetLifecycleError::PreviouslyFailed);
+    }
+    if projected
+        .wire_symbol
+        .as_deref()
+        .is_some_and(|wire_symbol| wire_symbol != config.wire_symbol)
+    {
+        return Err(TestnetLifecycleError::ConfigConflict);
+    }
+    if let Some(not_before) = projected.retry_not_before
+        && not_before > Utc::now()
+    {
+        return Err(TestnetLifecycleError::RetryDeferred { not_before });
     }
     let active = establish_active_lifecycle(config, venue, history, projected).await?;
     finish_active_lifecycle(config, venue, history, active).await
@@ -275,6 +350,7 @@ where
                 "planned",
                 json!({
                     "intent": config.intent,
+                    "wire_symbol": config.wire_symbol,
                     "expected_observation": config.expected_observation.label(),
                     "poll_interval_ms": poll_interval_millis(config)?,
                     "maximum_queries": config.maximum_queries,
@@ -588,6 +664,9 @@ where
         }
         Err(error) => {
             append_outcome_unknown(config, history, "cancel_dispatch", &error).await?;
+            if should_defer_cancel_confirmation(&error) {
+                return Err(TestnetLifecycleError::OutcomeUnknown);
+            }
         }
     }
 
@@ -651,7 +730,7 @@ async fn append_outcome_unknown(
             config,
             OUTCOME_UNKNOWN,
             phase,
-            json!({ "failure": exchange_failure_bucket(error) }),
+            outcome_unknown_details(error),
         ))
         .await?;
     Ok(())
@@ -784,7 +863,7 @@ fn project_campaign(
     loop {
         let page = LegacyJsonlJournalReader::read_page(&snapshot, cursor.as_ref())?;
         for event in page.events() {
-            project_event(config, event.payload(), &mut projected)?;
+            project_event(config, event.recorded_at(), event.payload(), &mut projected)?;
         }
         match page.boundary() {
             JournalPageBoundary::SnapshotEnd => break,
@@ -804,6 +883,7 @@ fn project_campaign(
 
 fn project_event(
     config: &TestnetLifecycleConfig,
+    recorded_at: DateTime<Utc>,
     payload: &Value,
     projected: &mut ProjectedCampaign,
 ) -> Result<(), TestnetLifecycleError> {
@@ -837,11 +917,12 @@ fn project_event(
             project_order_event(config, decision, details, projected)?;
         }
         CANCEL_PLANNED => project_cancel_plan(details, projected)?,
-        RESUMED | OUTCOME_UNKNOWN => {
+        RESUMED => {
             if !projected.planned || projected.completed.is_some() || projected.failed {
                 return Err(TestnetLifecycleError::CorruptHistory);
             }
         }
+        OUTCOME_UNKNOWN => project_outcome_unknown(recorded_at, details, projected)?,
         FAILED => {
             if !projected.planned || projected.failed || projected.completed.is_some() {
                 return Err(TestnetLifecycleError::CorruptHistory);
@@ -873,6 +954,11 @@ fn project_planned_event(
         .and_then(Value::as_str)
         .and_then(TestnetLifecycleObservation::parse)
         .ok_or(TestnetLifecycleError::CorruptHistory)?;
+    let wire_symbol = details
+        .get("wire_symbol")
+        .and_then(Value::as_str)
+        .filter(|value| valid_wire_symbol(value))
+        .ok_or(TestnetLifecycleError::CorruptHistory)?;
     let poll_interval_ms = details
         .get("poll_interval_ms")
         .and_then(Value::as_u64)
@@ -890,6 +976,46 @@ fn project_planned_event(
         return Err(TestnetLifecycleError::ConfigConflict);
     }
     projected.planned = true;
+    projected.wire_symbol = Some(wire_symbol.to_owned());
+    Ok(())
+}
+
+fn project_outcome_unknown(
+    recorded_at: DateTime<Utc>,
+    details: &Value,
+    projected: &mut ProjectedCampaign,
+) -> Result<(), TestnetLifecycleError> {
+    if !projected.planned || projected.completed.is_some() || projected.failed {
+        return Err(TestnetLifecycleError::CorruptHistory);
+    }
+    let Some(retry_after) = details.get("retry_after") else {
+        return Ok(());
+    };
+    let not_before = match retry_after.get("kind").and_then(Value::as_str) {
+        Some("seconds") => {
+            let seconds = retry_after
+                .get("seconds")
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or(TestnetLifecycleError::CorruptHistory)?;
+            recorded_at
+                .checked_add_signed(chrono::Duration::seconds(seconds))
+                .ok_or(TestnetLifecycleError::CorruptHistory)?
+        }
+        Some("at") => serde_json::from_value::<DateTime<Utc>>(
+            retry_after
+                .get("at")
+                .cloned()
+                .ok_or(TestnetLifecycleError::CorruptHistory)?,
+        )
+        .map_err(|_| TestnetLifecycleError::CorruptHistory)?,
+        _ => return Err(TestnetLifecycleError::CorruptHistory),
+    };
+    projected.retry_not_before = Some(
+        projected
+            .retry_not_before
+            .map_or(not_before, |existing| existing.max(not_before)),
+    );
     Ok(())
 }
 
@@ -957,6 +1083,7 @@ fn project_order_event(
         return Err(TestnetLifecycleError::CorruptHistory);
     }
     let order = projected_order(config, details)?;
+    projected.retry_not_before = None;
     if let Some(existing_id) = projected.server_order_id.as_deref()
         && existing_id != order.id
     {
@@ -1101,6 +1228,14 @@ fn valid_campaign_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
+fn valid_wire_symbol(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_WIRE_SYMBOL_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
 const fn exchange_failure_bucket(error: &ExchangeError) -> &'static str {
     match error {
         ExchangeError::InvalidRequest { .. } => "invalid_request",
@@ -1117,9 +1252,57 @@ const fn exchange_failure_bucket(error: &ExchangeError) -> &'static str {
     }
 }
 
+fn outcome_unknown_details(error: &ExchangeError) -> Value {
+    let mut details = json!({ "failure": exchange_failure_bucket(error) });
+    let Some(fields) = details.as_object_mut() else {
+        return details;
+    };
+    if let ExchangeError::RemoteFailure {
+        status, metadata, ..
+    } = error
+    {
+        if let Some(http_status) = status {
+            fields.insert("http_status".to_owned(), json!(http_status));
+        }
+        if let Some(exchange_code) = metadata.exchange_code.as_deref() {
+            fields.insert("exchange_code".to_owned(), json!(exchange_code));
+        }
+        if let Some(retry_after) = remote_retry_after_value(metadata.retry_after.as_ref()) {
+            fields.insert("retry_after".to_owned(), retry_after);
+        }
+        if let Some(server_time) = metadata.server_time {
+            fields.insert("server_time".to_owned(), json!(server_time.to_rfc3339()));
+        }
+    }
+    details
+}
+
+fn remote_retry_after_value(retry_after: Option<&RemoteRetryAfter>) -> Option<Value> {
+    match retry_after? {
+        RemoteRetryAfter::Seconds(seconds) => {
+            Some(json!({ "kind": "seconds", "seconds": seconds }))
+        }
+        RemoteRetryAfter::At(deadline) => {
+            Some(json!({ "kind": "at", "at": deadline.to_rfc3339() }))
+        }
+    }
+}
+
+fn should_defer_cancel_confirmation(error: &ExchangeError) -> bool {
+    matches!(
+        error,
+        ExchangeError::RemoteFailure {
+            status,
+            metadata,
+            ..
+        } if metadata.retry_after.is_some() || matches!(status, Some(418 | 429))
+    )
+}
+
 #[derive(Default)]
 struct ProjectedCampaign {
     planned: bool,
+    wire_symbol: Option<String>,
     cancel_reason: Option<CancelReason>,
     observation_satisfied: bool,
     failed: bool,
@@ -1127,6 +1310,7 @@ struct ProjectedCampaign {
     server_order_id: Option<String>,
     query_count: u32,
     last_observed_query_sequence: Option<u32>,
+    retry_not_before: Option<DateTime<Utc>>,
 }
 
 struct ActiveLifecycle {
@@ -1151,6 +1335,7 @@ pub enum TestnetLifecycleError {
     ObservationNotReached,
     UnsafeTerminal(OrderStatus),
     OutcomeUnknown,
+    RetryDeferred { not_before: DateTime<Utc> },
     QueryBudgetExhausted,
     PreviouslyFailed,
     ProtocolViolation,
@@ -1178,6 +1363,9 @@ impl fmt::Display for TestnetLifecycleError {
             Self::OutcomeUnknown => {
                 "the testnet lifecycle outcome is unresolved; rerun the same campaign to query first"
             }
+            Self::RetryDeferred { .. } => {
+                "the durable Binance retry-after deadline has not elapsed"
+            }
             Self::QueryBudgetExhausted => {
                 "the durable testnet lifecycle query budget is exhausted; reconcile manually"
             }
@@ -1201,6 +1389,7 @@ impl std::error::Error for TestnetLifecycleError {
             | Self::ObservationNotReached
             | Self::UnsafeTerminal(_)
             | Self::OutcomeUnknown
+            | Self::RetryDeferred { .. }
             | Self::QueryBudgetExhausted
             | Self::PreviouslyFailed
             | Self::ProtocolViolation
@@ -1233,7 +1422,9 @@ mod tests {
     use crypto_trading_domain::{
         MarketType, OrderIntent, OrderStatus, Price, Quantity, Side, Symbol, TimeInForce,
     };
-    use crypto_trading_exchange::{ExchangeOperation, ExchangeOperationKey};
+    use crypto_trading_exchange::{
+        ExchangeOperation, ExchangeOperationKey, RemoteFailureMetadata, RemoteRetryAfter,
+    };
     use rust_decimal::Decimal;
 
     use super::*;
@@ -1296,6 +1487,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submission_probe_switches_off_after_the_durable_plan() {
+        let config = config(TestnetLifecycleObservation::Open, "submission-probe");
+        let history = test_history("submission-probe");
+        assert!(testnet_lifecycle_requires_submission(&config, &history).unwrap());
+
+        let interrupted = FakeVenue::new(
+            vec![Err(ambiguous_submit(&config))],
+            vec![Err(ExchangeError::unavailable("fixture query unavailable"))],
+            Vec::new(),
+        );
+        let error = run_testnet_lifecycle(&config, &interrupted, &history)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TestnetLifecycleError::OutcomeUnknown));
+        assert!(!testnet_lifecycle_requires_submission(&config, &history).unwrap());
+        cleanup_history(history);
+    }
+
+    #[tokio::test]
     async fn fresh_campaign_proves_query_and_cancel_before_completion() {
         let config = config(TestnetLifecycleObservation::Open, "fresh");
         let history = test_history("fresh");
@@ -1342,6 +1552,53 @@ mod tests {
             venue.calls(),
             vec!["submit", "query", "query", "cancel", "query"]
         );
+        cleanup_history(history);
+    }
+
+    #[tokio::test]
+    async fn restart_after_partial_fill_queries_first_and_never_resubmits() {
+        let mut config = config(
+            TestnetLifecycleObservation::PartiallyFilled,
+            "partial-recover",
+        );
+        config.maximum_queries = 5;
+        let history = test_history("partial-recover");
+        let interrupted = FakeVenue::new(
+            vec![Ok(order(&config, OrderStatus::Open, "0"))],
+            vec![
+                Ok(order(&config, OrderStatus::Open, "0")),
+                Ok(order(&config, OrderStatus::PartiallyFilled, "0.0005")),
+                Err(ExchangeError::unavailable(
+                    "fixture cancel confirmation unavailable",
+                )),
+            ],
+            vec![Err(ambiguous_cancel(&config))],
+        );
+
+        let first = run_testnet_lifecycle(&config, &interrupted, &history)
+            .await
+            .unwrap_err();
+        assert!(matches!(first, TestnetLifecycleError::OutcomeUnknown));
+        assert_eq!(
+            interrupted.calls(),
+            vec!["submit", "query", "query", "cancel", "query"]
+        );
+
+        let recovered = FakeVenue::new(
+            Vec::new(),
+            vec![
+                Ok(order(&config, OrderStatus::PartiallyFilled, "0.0005")),
+                Ok(order(&config, OrderStatus::Cancelled, "0.0005")),
+            ],
+            vec![Ok(order(&config, OrderStatus::Cancelled, "0.0005"))],
+        );
+        let report = run_testnet_lifecycle(&config, &recovered, &history)
+            .await
+            .unwrap();
+
+        assert!(report.recovered);
+        assert_eq!(report.final_status, OrderStatus::Cancelled);
+        assert_eq!(recovered.calls(), vec!["query", "cancel", "query"]);
         cleanup_history(history);
     }
 
@@ -1417,6 +1674,124 @@ mod tests {
         let body = std::fs::read_to_string(history.path()).unwrap();
         assert!(body.contains(FAILED));
         assert!(!body.contains(COMPLETED));
+        cleanup_history(history);
+    }
+
+    #[tokio::test]
+    async fn query_rate_limit_preserves_retry_after_in_durable_evidence() {
+        let config = config(TestnetLifecycleObservation::Open, "query-rate-limit");
+        let history = test_history("query-rate-limit");
+        let venue = FakeVenue::new(
+            vec![Ok(order(&config, OrderStatus::Open, "0"))],
+            vec![Err(rate_limited_query(7))],
+            Vec::new(),
+        );
+
+        let error = run_testnet_lifecycle(&config, &venue, &history)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TestnetLifecycleError::OutcomeUnknown));
+        assert_eq!(venue.calls(), vec!["submit", "query"]);
+        let body = std::fs::read_to_string(history.path()).unwrap();
+        assert!(body.contains("\"http_status\":429"), "{body}");
+        assert!(body.contains("\"seconds\":7"), "{body}");
+        assert!(body.contains("\"failure\":\"remote_failure\""), "{body}");
+        assert!(!body.contains(COMPLETED), "{body}");
+        cleanup_history(history);
+    }
+
+    #[tokio::test]
+    async fn durable_wire_symbol_is_recovered_before_any_remote_call() {
+        let config = config(TestnetLifecycleObservation::Open, "durable-wire-symbol");
+        let history = test_history("durable-wire-symbol");
+        assert_eq!(
+            testnet_lifecycle_wire_symbol(&config, &history).unwrap(),
+            "BTCUSDT"
+        );
+        let interrupted = FakeVenue::new(
+            vec![Err(ambiguous_submit(&config))],
+            vec![Err(ExchangeError::unavailable("fixture query unavailable"))],
+            Vec::new(),
+        );
+        let first = run_testnet_lifecycle(&config, &interrupted, &history)
+            .await
+            .unwrap_err();
+        assert!(matches!(first, TestnetLifecycleError::OutcomeUnknown));
+
+        let changed = config
+            .clone()
+            .with_wire_symbol("ETHUSDT")
+            .expect("alternate CLI mapping must be syntactically valid");
+        let durable = testnet_lifecycle_wire_symbol(&changed, &history).unwrap();
+        assert_eq!(durable, "BTCUSDT");
+        let recovered = changed.with_wire_symbol(durable).unwrap();
+        let venue = FakeVenue::new(
+            Vec::new(),
+            vec![
+                Ok(order(&recovered, OrderStatus::Open, "0")),
+                Ok(order(&recovered, OrderStatus::Cancelled, "0")),
+            ],
+            vec![Ok(order(&recovered, OrderStatus::Cancelled, "0"))],
+        );
+        let report = run_testnet_lifecycle(&recovered, &venue, &history)
+            .await
+            .unwrap();
+        assert!(report.recovered);
+        assert_eq!(venue.calls(), vec!["query", "cancel", "query"]);
+        cleanup_history(history);
+    }
+
+    #[tokio::test]
+    async fn persisted_retry_after_blocks_immediate_restart_before_remote_calls() {
+        let config = config(TestnetLifecycleObservation::Open, "retry-deferred");
+        let history = test_history("retry-deferred");
+        let interrupted = FakeVenue::new(
+            vec![Ok(order(&config, OrderStatus::Open, "0"))],
+            vec![Err(rate_limited_query(3_600))],
+            Vec::new(),
+        );
+        let first = run_testnet_lifecycle(&config, &interrupted, &history)
+            .await
+            .unwrap_err();
+        assert!(matches!(first, TestnetLifecycleError::OutcomeUnknown));
+
+        let no_remote = FakeVenue::new(Vec::new(), Vec::new(), Vec::new());
+        let second = run_testnet_lifecycle(&config, &no_remote, &history)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(second, TestnetLifecycleError::RetryDeferred { .. }),
+            "unexpected restart result: {second:?}"
+        );
+        assert!(no_remote.calls().is_empty());
+        cleanup_history(history);
+    }
+
+    #[tokio::test]
+    async fn cancel_rate_limit_preserves_retry_after_and_defers_confirmation_to_recovery() {
+        let config = config(TestnetLifecycleObservation::Open, "cancel-rate-limit");
+        let history = test_history("cancel-rate-limit");
+        let venue = FakeVenue::new(
+            vec![Ok(order(&config, OrderStatus::Open, "0"))],
+            vec![
+                Ok(order(&config, OrderStatus::Open, "0")),
+                Ok(order(&config, OrderStatus::Cancelled, "0")),
+            ],
+            vec![Err(rate_limited_cancel(11))],
+        );
+
+        let error = run_testnet_lifecycle(&config, &venue, &history)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TestnetLifecycleError::OutcomeUnknown));
+        assert_eq!(venue.calls(), vec!["submit", "query", "cancel"]);
+        let body = std::fs::read_to_string(history.path()).unwrap();
+        assert!(body.contains("\"http_status\":429"), "{body}");
+        assert!(body.contains("\"seconds\":11"), "{body}");
+        assert!(body.contains("\"phase\":\"cancel_dispatch\""), "{body}");
+        assert!(!body.contains(COMPLETED), "{body}");
         cleanup_history(history);
     }
 
@@ -1556,6 +1931,26 @@ mod tests {
         }
     }
 
+    fn rate_limited_query(retry_after_seconds: u64) -> ExchangeError {
+        ExchangeError::RemoteFailure {
+            exchange: "binance".to_owned(),
+            status: Some(429),
+            reason: "query rate limited".to_owned(),
+            metadata: RemoteFailureMetadata::default(),
+        }
+        .with_retry_after(RemoteRetryAfter::Seconds(retry_after_seconds))
+    }
+
+    fn rate_limited_cancel(retry_after_seconds: u64) -> ExchangeError {
+        ExchangeError::RemoteFailure {
+            exchange: "binance".to_owned(),
+            status: Some(429),
+            reason: "cancel rate limited".to_owned(),
+            metadata: RemoteFailureMetadata::default(),
+        }
+        .with_retry_after(RemoteRetryAfter::Seconds(retry_after_seconds))
+    }
+
     fn config(
         expected_observation: TestnetLifecycleObservation,
         suffix: &str,
@@ -1573,6 +1968,7 @@ mod tests {
         TestnetLifecycleConfig::new(
             format!("campaign-{suffix}"),
             intent,
+            "BTCUSDT",
             expected_observation,
             Duration::from_millis(1),
             4,

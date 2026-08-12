@@ -1663,12 +1663,6 @@ impl PaperAccountAuthority {
         if reservation.phase != PaperReservationPhase::Committed {
             return Err(PaperAccountError::InvalidTransition);
         }
-        validate_reconciliation_evidence(
-            &proof,
-            &snapshot,
-            &reservation,
-            PaperReconciliationVerdict::Mismatch,
-        )?;
         if matches_reconciliation(
             reservation.reconciliation.as_ref(),
             PaperReconciliationOutcome::Failed,
@@ -1676,6 +1670,12 @@ impl PaperAccountAuthority {
         ) {
             return Ok(reservation.clone());
         }
+        validate_reconciliation_evidence(
+            &proof,
+            &snapshot,
+            &reservation,
+            PaperReconciliationVerdict::Mismatch,
+        )?;
         validate_reconciliation_progress(
             reservation.reconciliation.as_ref(),
             PaperReconciliationOutcome::Failed,
@@ -3396,15 +3396,10 @@ fn validate_reconciliation_progress(
     outcome: PaperReconciliationOutcome,
     proof: &PaperReconciliationProof,
 ) -> Result<(), PaperAccountError> {
-    if let Some(current) = current {
-        if proof.snapshot_sequence() < current.proof.snapshot_sequence() {
-            return Err(PaperAccountError::InvalidTransition);
-        }
-        if proof.snapshot_sequence() == current.proof.snapshot_sequence()
-            && (current.proof != *proof || outcome != current.outcome)
-        {
-            return Err(PaperAccountError::InvalidTransition);
-        }
+    if let Some(current) = current
+        && (current.proof != *proof || outcome != current.outcome)
+    {
+        return Err(PaperAccountError::InvalidTransition);
     }
     Ok(())
 }
@@ -3423,15 +3418,10 @@ fn apply_reconciliation_record(
     proof: &PaperReconciliationProof,
     evidence_sequence: u64,
 ) -> Result<(), ()> {
-    if let Some(existing) = current {
-        if proof.snapshot_sequence() < existing.proof.snapshot_sequence() {
-            return Err(());
-        }
-        if proof.snapshot_sequence() == existing.proof.snapshot_sequence()
-            && (existing.proof != *proof || outcome != existing.outcome)
-        {
-            return Err(());
-        }
+    if let Some(existing) = current
+        && (existing.proof != *proof || outcome != existing.outcome)
+    {
+        return Err(());
     }
     *current = Some(PaperReconciliationRecord {
         outcome,

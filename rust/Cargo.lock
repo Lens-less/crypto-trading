@@ -509,6 +509,7 @@ dependencies = [
  "clap",
  "crypto-trading-apps",
  "crypto-trading-control-plane",
+ "crypto-trading-domain",
  "crypto-trading-runtime",
  "crypto-trading-web",
  "serde",

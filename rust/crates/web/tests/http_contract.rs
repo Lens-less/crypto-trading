@@ -817,6 +817,25 @@ async fn authenticated_api_requests_fail_with_retry_after_when_the_window_is_exh
 }
 
 #[tokio::test]
+async fn readiness_probe_budget_is_isolated_from_authenticated_reads() {
+    let app = fixture_app(
+        Vec::new(),
+        WebAccessPolicy::bearer(TOKEN.to_owned()).unwrap(),
+    );
+
+    for _ in 0..crypto_trading_web::WEB_REQUEST_LIMIT_PER_MINUTE {
+        let response = app.clone().oneshot(get("/api/v1/health")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let system = app
+        .oneshot(authenticated_get("/api/v1/system"))
+        .await
+        .unwrap();
+    assert_eq!(system.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn executions_use_cursor_as_a_change_watermark_without_exposing_payloads() {
     let bytes = jsonl(&[decision_record(&json!({
         "api_key": "super-secret",
@@ -1044,6 +1063,14 @@ fn fixture_app(bytes: Vec<u8>, access: WebAccessPolicy) -> Router {
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn authenticated_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn assert_security_headers(response: &Response<Body>) {

@@ -35,6 +35,10 @@ pub enum RiskRejection {
     StalePositionData,
     MarketMismatch,
     InvalidQuantity,
+    InvalidAccountState {
+        field: &'static str,
+        value: Decimal,
+    },
     ReduceOnlyWouldIncrease,
     ArithmeticOverflow,
     InputLimitExceeded {
@@ -45,6 +49,14 @@ pub enum RiskRejection {
     MaxPositionValue {
         projected: Decimal,
         limit: Decimal,
+    },
+    OpeningNotionalExceedsBuyingPower {
+        required: Decimal,
+        buying_power: Decimal,
+    },
+    SpotShortOpenUnsupported {
+        opening: Decimal,
+        projected: Decimal,
     },
 }
 
@@ -97,6 +109,12 @@ struct ProjectedPosition {
     signed_quantity: Decimal,
     stale: bool,
     observed_side: Option<DirectionalPositionSide>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectionCheck {
+    projected_quantity: Decimal,
+    opening_notional: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +186,15 @@ impl RiskEngine {
             Err(rejection) => return RiskDecision::Rejected(rejection),
         };
         match self.authorize_projected(intent, market, current, now) {
-            Ok(_) => RiskDecision::Authorized,
+            Ok(check) => {
+                match Self::ensure_buying_power(
+                    check.opening_notional,
+                    Self::opening_buying_power(account),
+                ) {
+                    Ok(()) => RiskDecision::Authorized,
+                    Err(rejection) => RiskDecision::Rejected(rejection),
+                }
+            }
             Err(rejection) => RiskDecision::Rejected(rejection),
         }
     }
@@ -236,6 +262,8 @@ impl RiskEngine {
             }
         }
 
+        let buying_power = Self::opening_buying_power(account);
+        let mut required_opening_notional = Decimal::ZERO;
         for intent in intents {
             let key = InstrumentKey::from_intent(intent);
             let Some(market) = market_by_key.get(&key).copied() else {
@@ -246,14 +274,24 @@ impl RiskEngine {
                 stale: false,
                 observed_side: None,
             });
-            let next = match self.authorize_projected(intent, market, current, now) {
-                Ok(next) => next,
+            let check = match self.authorize_projected(intent, market, current, now) {
+                Ok(check) => check,
                 Err(rejection) => return RiskDecision::Rejected(rejection),
             };
+            required_opening_notional =
+                match required_opening_notional.checked_add(check.opening_notional) {
+                    Some(total) => total,
+                    None => return RiskDecision::Rejected(RiskRejection::ArithmeticOverflow),
+                };
+            if let Err(rejection) =
+                Self::ensure_buying_power(required_opening_notional, buying_power)
+            {
+                return RiskDecision::Rejected(rejection);
+            }
             projected.insert(
                 key,
                 ProjectedPosition {
-                    signed_quantity: next,
+                    signed_quantity: check.projected_quantity,
                     stale: false,
                     observed_side: None,
                 },
@@ -274,6 +312,14 @@ impl RiskEngine {
     ) -> Result<(), RiskRejection> {
         if account.kill_switch {
             return Err(RiskRejection::KillSwitchActive);
+        }
+        for (field, value) in [
+            ("equity", account.equity.as_decimal()),
+            ("available_balance", account.available_balance.as_decimal()),
+        ] {
+            if value < Decimal::ZERO {
+                return Err(RiskRejection::InvalidAccountState { field, value });
+            }
         }
         if self.is_stale(account.timestamp, now) {
             return Err(RiskRejection::StaleAccountData);
@@ -336,13 +382,50 @@ impl RiskEngine {
         }
     }
 
+    fn opening_buying_power(account: &AccountRiskSnapshot) -> Decimal {
+        account
+            .equity
+            .as_decimal()
+            .max(Decimal::ZERO)
+            .min(account.available_balance.as_decimal().max(Decimal::ZERO))
+    }
+
+    fn ensure_buying_power(
+        required_opening_notional: Decimal,
+        buying_power: Decimal,
+    ) -> Result<(), RiskRejection> {
+        if required_opening_notional > buying_power {
+            return Err(RiskRejection::OpeningNotionalExceedsBuyingPower {
+                required: required_opening_notional,
+                buying_power,
+            });
+        }
+        Ok(())
+    }
+
+    fn opening_quantity(
+        current_quantity: Decimal,
+        order_quantity: Decimal,
+    ) -> Result<Decimal, RiskRejection> {
+        if current_quantity.is_zero()
+            || current_quantity.is_sign_positive() == order_quantity.is_sign_positive()
+        {
+            return Ok(order_quantity.abs());
+        }
+        order_quantity
+            .abs()
+            .checked_sub(current_quantity.abs())
+            .map(|quantity| quantity.max(Decimal::ZERO))
+            .ok_or(RiskRejection::ArithmeticOverflow)
+    }
+
     fn authorize_projected(
         &self,
         intent: &OrderIntent,
         market: &MarketSnapshot,
         current: ProjectedPosition,
         now: DateTime<Utc>,
-    ) -> Result<Decimal, RiskRejection> {
+    ) -> Result<ProjectionCheck, RiskRejection> {
         if self.is_stale(market.timestamp, now) {
             return Err(RiskRejection::StaleMarketData);
         }
@@ -378,7 +461,16 @@ impl RiskEngine {
             return Err(RiskRejection::ReduceOnlyWouldIncrease);
         }
         if intent.reduce_only {
-            return Ok(projected_quantity);
+            return Ok(ProjectionCheck {
+                projected_quantity,
+                opening_notional: Decimal::ZERO,
+            });
+        }
+        if strictly_reduces {
+            return Ok(ProjectionCheck {
+                projected_quantity,
+                opening_notional: Decimal::ZERO,
+            });
         }
 
         let executable_price = match intent.side {
@@ -403,6 +495,22 @@ impl RiskEngine {
                 limit: self.limits.max_position_value,
             });
         }
-        Ok(projected_quantity)
+        let opening_quantity = Self::opening_quantity(current.signed_quantity, order_quantity)?;
+        if intent.market_type == MarketType::Spot
+            && projected_quantity.is_sign_negative()
+            && opening_quantity > Decimal::ZERO
+        {
+            return Err(RiskRejection::SpotShortOpenUnsupported {
+                opening: opening_quantity,
+                projected: projected_quantity.abs(),
+            });
+        }
+        let opening_notional = opening_quantity
+            .checked_mul(valuation_price.as_decimal())
+            .ok_or(RiskRejection::ArithmeticOverflow)?;
+        Ok(ProjectionCheck {
+            projected_quantity,
+            opening_notional,
+        })
     }
 }

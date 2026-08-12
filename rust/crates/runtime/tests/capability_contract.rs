@@ -11,7 +11,7 @@ fn current_manifest_is_deterministic_valid_and_live_closed() {
     let manifest = current_capability_manifest();
 
     manifest.validate().unwrap();
-    assert_eq!(manifest.schema_version, 2);
+    assert_eq!(manifest.schema_version, 3);
     assert_eq!(manifest.release_stage, ReleaseStage::PaperOnly);
     assert!(!manifest.live_trading_enabled);
 
@@ -68,6 +68,15 @@ fn manifest_distinguishes_strategy_logic_from_runtime_authority() {
             .evidence
             .iter()
             .any(|evidence| evidence.ends_with("strategy/tests/grid_protection.rs"))
+    );
+    assert!(
+        grid_strategy.blockers.iter().any(|blocker| {
+            blocker.contains("quantity_precision")
+                && blocker.contains("leverage")
+                && blocker.contains("fee_rate")
+                && blocker.contains("must be supplied by a future execution model")
+        }),
+        "parsed-but-unmodeled execution controls must stay explicit"
     );
 
     let grid_runtime = manifest.capability("runtime.grid").unwrap();
@@ -239,6 +248,9 @@ fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
     let reconciliation = manifest
         .capability("runtime.testnet-reconciliation")
         .unwrap();
+    let reconciliation_apply = manifest
+        .capability("runtime.testnet-reconciliation-apply")
+        .unwrap();
     let soak = manifest.capability("runtime.testnet-soak").unwrap();
 
     assert_eq!(lifecycle.level, CapabilityLevel::Available);
@@ -267,7 +279,7 @@ fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
     );
     assert_eq!(
         reconciliation.scope.access,
-        CapabilityAccess::TestnetTrading
+        CapabilityAccess::TestnetReadOnly
     );
     assert!(reconciliation.summary.contains("balances"));
     assert!(reconciliation.summary.contains("open orders"));
@@ -284,12 +296,30 @@ fn testnet_soak_is_read_only_and_keeps_external_release_evidence_explicit() {
             .contains(&"rust/crates/apps/src/testnet_reconciliation.rs".to_owned())
     );
 
+    assert_eq!(reconciliation_apply.level, CapabilityLevel::Available);
+    assert_eq!(
+        reconciliation_apply.scope.environments,
+        vec![CapabilityEnvironment::Paper, CapabilityEnvironment::Testnet]
+    );
+    assert_eq!(
+        reconciliation_apply.scope.access,
+        CapabilityAccess::PaperTrading
+    );
+    assert!(reconciliation_apply.summary.contains("Paper"));
+    assert!(reconciliation_apply.summary.contains("never submits"));
+    assert!(
+        reconciliation_apply
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("credentialed apply"))
+    );
+
     assert_eq!(soak.level, CapabilityLevel::ReadOnly);
     assert_eq!(
         soak.scope.environments,
         vec![CapabilityEnvironment::Testnet]
     );
-    assert_eq!(soak.scope.access, CapabilityAccess::TestnetTrading);
+    assert_eq!(soak.scope.access, CapabilityAccess::TestnetReadOnly);
     assert!(
         soak.summary
             .contains("without submitting or cancelling orders")
@@ -413,6 +443,14 @@ fn research_kernels_are_visible_but_fail_closed_as_library_only() {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("not a profitability claim"))
+    );
+    assert!(
+        backtest.blockers.iter().any(|blocker| {
+            blocker.contains("identified perpetual")
+                && blocker.contains("fail closed")
+                && blocker.contains("margin/liquidation/funding model")
+        }),
+        "identified perpetual snapshot seams must stay explicitly blocked until a real derivatives model exists"
     );
 
     let indicators = manifest.capability("research.indicators").unwrap();
@@ -568,6 +606,24 @@ fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("offline historical estimates"))
+    );
+    assert!(
+        scanner.blockers.iter().any(|blocker| {
+            blocker.contains("every crossed virtual level")
+                && blocker.contains("no order-book depth")
+                && blocker.contains("not execution-quality")
+        }),
+        "optimistic sparse-jump fill semantics must stay explicit"
+    );
+
+    let scanner_strategy = manifest.capability("strategy.scanner").unwrap();
+    assert!(
+        scanner_strategy.blockers.iter().any(|blocker| {
+            blocker.contains("every crossed pending level")
+                && blocker.contains("without depth")
+                && blocker.contains("not execution-quality")
+        }),
+        "the virtual-grid scorer must not be advertised as an execution simulator"
     );
     assert!(!manifest.live_trading_enabled);
 }
@@ -946,7 +1002,7 @@ fn manifest_serialization_is_a_stable_machine_contract() {
     let manifest = current_capability_manifest();
     let value = serde_json::to_value(&manifest).unwrap();
 
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], 3);
     assert_eq!(value["release_stage"], "paper-only");
     assert_eq!(value["live_trading_enabled"], false);
     assert_eq!(

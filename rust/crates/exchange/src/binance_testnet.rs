@@ -10,9 +10,10 @@ use serde::Deserialize;
 
 use crate::{
     BinanceProduct, BinanceTestnetEndpoints, ExchangeError, ExchangeOperation,
-    ExchangeOperationKey, ExchangeSymbolCatalog, ForeignOrder, InstrumentRuleCatalog,
-    RemoteHttpMethod, RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport,
-    SubmissionDisposition, TradingReceipt, sha256::HmacSha256Key,
+    ExchangeOperationKey, ExchangeSymbol, ExchangeSymbolCatalog, ForeignOrder,
+    InstrumentRuleCatalog, InstrumentRuleOptions, InstrumentRules, RemoteHttpMethod,
+    RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport, SubmissionDisposition,
+    TradingReceipt, sha256::HmacSha256Key,
 };
 
 const EXCHANGE: &str = "binance";
@@ -24,6 +25,7 @@ const MAX_SIGNATURE_BYTES: usize = 2_048;
 const MAX_SERVER_ORDER_REF_BYTES: usize = 128;
 const MAX_ACCOUNT_BALANCES: usize = 4_096;
 const MAX_ASSET_BYTES: usize = 32;
+const MAX_EXCHANGE_INFO_SYMBOLS: usize = 16;
 
 /// Credential-backed signing seam for Binance authenticated requests.
 ///
@@ -107,6 +109,13 @@ pub struct BinanceTestnetBalance {
     pub locked_balance: Option<Decimal>,
 }
 
+/// One exact Binance exchangeInfo selection resolved into shared symbol/rule types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceExchangeInfoSymbol {
+    pub symbol: ExchangeSymbol,
+    pub rules: InstrumentRules,
+}
+
 /// Deterministic Binance Spot and USDⓈ-M testnet request protocol.
 pub struct BinanceTestnetProtocol {
     endpoints: BinanceTestnetEndpoints,
@@ -151,6 +160,59 @@ struct BinanceErrorWire {
 #[serde(rename_all = "camelCase")]
 struct BinanceServerTimeWire {
     server_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceExchangeInfoWire {
+    #[serde(default)]
+    symbols: Vec<BinanceExchangeInfoSymbolWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceExchangeInfoSymbolWire {
+    symbol: String,
+    status: String,
+    #[serde(default)]
+    base_asset: Option<String>,
+    #[serde(default)]
+    quote_asset: Option<String>,
+    #[serde(default)]
+    pair: Option<String>,
+    #[serde(default)]
+    contract_type: Option<String>,
+    #[serde(default)]
+    filters: Vec<BinanceExchangeInfoFilterWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceExchangeInfoFilterWire {
+    filter_type: String,
+    #[serde(default)]
+    min_price: Option<String>,
+    #[serde(default)]
+    max_price: Option<String>,
+    #[serde(default)]
+    tick_size: Option<String>,
+    #[serde(default)]
+    min_qty: Option<String>,
+    #[serde(default)]
+    max_qty: Option<String>,
+    #[serde(default)]
+    step_size: Option<String>,
+    #[serde(default, alias = "notional")]
+    min_notional: Option<String>,
+    #[serde(default)]
+    max_notional: Option<String>,
+    #[serde(default)]
+    apply_to_market: Option<bool>,
+    #[serde(default)]
+    apply_min_to_market: Option<bool>,
+    #[serde(default)]
+    apply_max_to_market: Option<bool>,
+    #[serde(default)]
+    avg_price_mins: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,11 +486,15 @@ impl BinanceTestnetProtocol {
             MarketType::Spot => "spot",
             MarketType::Perpetual => "usdm",
         };
+        let wire_symbol = self.symbols.to_wire(EXCHANGE, symbol, market_type)?;
+        validate_binance_wire_symbol(wire_symbol)?;
         classify_mutating_response(
             transport.send(request).await,
             ExchangeOperation::CancelOrder,
             None,
-            ExchangeOperationKey::OrderId(format!("{EXCHANGE}:{market_label}:{symbol}:{order_id}")),
+            ExchangeOperationKey::OrderId(format!(
+                "{EXCHANGE}:{market_label}:{wire_symbol}:{order_id}"
+            )),
         )
     }
 
@@ -662,6 +728,110 @@ impl BinanceTestnetProtocol {
             Vec::new(),
             Vec::new(),
         ))
+    }
+
+    /// Builds an unsigned exact-symbol `exchangeInfo` request for one Binance product.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected product route or requested wire
+    /// symbol is invalid.
+    pub fn build_exchange_info_request(
+        endpoints: &BinanceTestnetEndpoints,
+        product: BinanceProduct,
+        wire_symbol: &str,
+    ) -> Result<RemoteHttpRequest, ExchangeError> {
+        validate_binance_wire_symbol(wire_symbol)?;
+        let path = match product {
+            BinanceProduct::Spot => "/api/v3/exchangeInfo",
+            BinanceProduct::UsdM => "/fapi/v1/exchangeInfo",
+        };
+        let mut url = endpoints.rest_url(product, path)?;
+        url.query_pairs_mut().append_pair("symbol", wire_symbol);
+        Ok(RemoteHttpRequest::new(
+            RemoteHttpMethod::Get,
+            url,
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
+    /// Parses one exact symbol from a Binance `exchangeInfo` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidResponse`] for malformed filters,
+    /// duplicate/missing symbols, mismatched asset identity, disabled trading
+    /// status, or a non-perpetual USD-M contract.
+    pub fn parse_exchange_info_symbol(
+        product: BinanceProduct,
+        payload: &[u8],
+        standard_symbol: Symbol,
+        requested_wire_symbol: &str,
+    ) -> Result<BinanceExchangeInfoSymbol, ExchangeError> {
+        validate_binance_wire_symbol(requested_wire_symbol)?;
+        let wire: BinanceExchangeInfoWire = serde_json::from_slice(payload)
+            .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        bounded_exchange_info_symbol_count(wire.symbols.len())?;
+        let mut matches = wire
+            .symbols
+            .into_iter()
+            .filter(|candidate| candidate.symbol == requested_wire_symbol);
+        let selected = matches.next().ok_or_else(|| {
+            ExchangeError::invalid_response(
+                EXCHANGE,
+                format!(
+                    "Binance exchangeInfo did not return the exact requested symbol {requested_wire_symbol}",
+                ),
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                format!(
+                    "Binance exchangeInfo returned duplicate exact symbol entries for {requested_wire_symbol}",
+                ),
+            ));
+        }
+        if selected.status != "TRADING" {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                format!(
+                    "Binance exchangeInfo symbol {requested_wire_symbol} is not trading (status={})",
+                    selected.status
+                ),
+            ));
+        }
+        if product == BinanceProduct::UsdM && selected.contract_type.as_deref() != Some("PERPETUAL")
+        {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                format!(
+                    "Binance USD-M exchangeInfo symbol {requested_wire_symbol} is not a perpetual contract",
+                ),
+            ));
+        }
+        validate_exchange_info_identity(
+            product,
+            &selected,
+            &standard_symbol,
+            requested_wire_symbol,
+        )?;
+        let market_type = market_for_product(product);
+        let symbol = ExchangeSymbol::new(
+            EXCHANGE,
+            standard_symbol.clone(),
+            market_type,
+            requested_wire_symbol,
+        )
+        .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))?;
+        let rules = parse_exchange_info_rules(
+            standard_symbol,
+            market_type,
+            requested_wire_symbol,
+            &selected,
+        )?;
+        Ok(BinanceExchangeInfoSymbol { symbol, rules })
     }
 
     /// Parses a Spot or USDⓈ-M `bookTicker` response through the exact reverse
@@ -1189,6 +1359,17 @@ fn bounded_account_balance_count(count: usize) -> Result<(), ExchangeError> {
     Ok(())
 }
 
+fn bounded_exchange_info_symbol_count(count: usize) -> Result<(), ExchangeError> {
+    if count > MAX_EXCHANGE_INFO_SYMBOLS {
+        return Err(ExchangeError::resource_limit(
+            "Binance exchangeInfo symbols",
+            MAX_EXCHANGE_INFO_SYMBOLS,
+            count,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_balance_decimal(
     label: &str,
     value: &str,
@@ -1233,6 +1414,450 @@ fn parse_quantity(value: &str) -> Result<Quantity, ExchangeError> {
         .map_err(|error: crypto_trading_domain::DomainError| {
             ExchangeError::invalid_response(EXCHANGE, error.to_string())
         })
+}
+
+fn parse_optional_price_bound(
+    label: &str,
+    value: Option<&str>,
+) -> Result<Option<Price>, ExchangeError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if decimal_is_zero(value) {
+        return Ok(None);
+    }
+    parse_price(value).map(Some).map_err(|_| {
+        ExchangeError::invalid_response(EXCHANGE, format!("Binance {label} is not a valid price"))
+    })
+}
+
+fn parse_optional_quantity_bound(
+    label: &str,
+    value: Option<&str>,
+) -> Result<Option<Quantity>, ExchangeError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if decimal_is_zero(value) {
+        return Ok(None);
+    }
+    parse_quantity(value).map(Some).map_err(|_| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!("Binance {label} is not a valid quantity"),
+        )
+    })
+}
+
+fn parse_optional_money_bound(
+    label: &str,
+    value: Option<&str>,
+) -> Result<Option<Money>, ExchangeError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if decimal_is_zero(value) {
+        return Ok(None);
+    }
+    let decimal = value.parse::<Decimal>().map_err(|_| {
+        ExchangeError::invalid_response(EXCHANGE, format!("Binance {label} is not a valid decimal"))
+    })?;
+    if decimal.is_sign_negative() {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!("Binance {label} must not be negative"),
+        ));
+    }
+    Ok(Some(Money::new(decimal)))
+}
+
+fn required_filter<'a>(
+    wire_symbol: &str,
+    filter_type: &str,
+    filter: Option<&'a BinanceExchangeInfoFilterWire>,
+) -> Result<&'a BinanceExchangeInfoFilterWire, ExchangeError> {
+    filter.ok_or_else(|| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!("Binance exchangeInfo symbol {wire_symbol} is missing {filter_type}"),
+        )
+    })
+}
+
+struct SelectedExchangeInfoFilters<'a> {
+    price: &'a BinanceExchangeInfoFilterWire,
+    lot_size: &'a BinanceExchangeInfoFilterWire,
+    market_lot_size: Option<&'a BinanceExchangeInfoFilterWire>,
+    notional: &'a BinanceExchangeInfoFilterWire,
+}
+
+struct ParsedQuantityRules {
+    step: Quantity,
+    minimum: Quantity,
+    maximum: Option<Quantity>,
+    market_step: Option<Quantity>,
+    market_minimum: Option<Quantity>,
+    market_maximum: Option<Quantity>,
+}
+
+struct ParsedNotionalRules {
+    minimum: Money,
+    maximum: Option<Money>,
+    apply_minimum_to_market: bool,
+    apply_maximum_to_market: bool,
+    average_price_minutes: Option<u32>,
+}
+
+fn select_exchange_info_filters<'a>(
+    requested_wire_symbol: &str,
+    selected: &'a BinanceExchangeInfoSymbolWire,
+) -> Result<SelectedExchangeInfoFilters<'a>, ExchangeError> {
+    let mut price_filter = None;
+    let mut lot_size = None;
+    let mut market_lot_size = None;
+    let mut min_notional = None;
+    let mut notional = None;
+    for filter in &selected.filters {
+        match filter.filter_type.as_str() {
+            "PRICE_FILTER" => assign_filter_once(
+                requested_wire_symbol,
+                "PRICE_FILTER",
+                &mut price_filter,
+                filter,
+            )?,
+            "LOT_SIZE" => {
+                assign_filter_once(requested_wire_symbol, "LOT_SIZE", &mut lot_size, filter)?;
+            }
+            "MARKET_LOT_SIZE" => assign_filter_once(
+                requested_wire_symbol,
+                "MARKET_LOT_SIZE",
+                &mut market_lot_size,
+                filter,
+            )?,
+            "MIN_NOTIONAL" => assign_filter_once(
+                requested_wire_symbol,
+                "MIN_NOTIONAL",
+                &mut min_notional,
+                filter,
+            )?,
+            "NOTIONAL" => {
+                assign_filter_once(requested_wire_symbol, "NOTIONAL", &mut notional, filter)?;
+            }
+            unknown => {
+                return Err(ExchangeError::invalid_response(
+                    EXCHANGE,
+                    format!(
+                        "Binance exchangeInfo symbol {requested_wire_symbol} returned unsupported filter {unknown}",
+                    ),
+                ));
+            }
+        }
+    }
+    if min_notional.is_some() && notional.is_some() {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance exchangeInfo symbol {requested_wire_symbol} returned both MIN_NOTIONAL and NOTIONAL filters",
+            ),
+        ));
+    }
+
+    Ok(SelectedExchangeInfoFilters {
+        price: required_filter(requested_wire_symbol, "PRICE_FILTER", price_filter)?,
+        lot_size: required_filter(requested_wire_symbol, "LOT_SIZE", lot_size)?,
+        market_lot_size,
+        notional: required_filter(
+            requested_wire_symbol,
+            "MIN_NOTIONAL or NOTIONAL",
+            min_notional.or(notional),
+        )?,
+    })
+}
+
+fn parse_price_filter(
+    requested_wire_symbol: &str,
+    price_filter: &BinanceExchangeInfoFilterWire,
+) -> Result<(Price, Option<Price>, Option<Price>), ExchangeError> {
+    let price_tick = parse_price(
+        price_filter
+            .tick_size
+            .as_deref()
+            .ok_or_else(|| {
+                ExchangeError::invalid_response(
+                    EXCHANGE,
+                    format!(
+                        "Binance exchangeInfo symbol {requested_wire_symbol} is missing PRICE_FILTER.tickSize",
+                    ),
+                )
+            })?,
+    )?;
+    let min_price =
+        parse_optional_price_bound("PRICE_FILTER.minPrice", price_filter.min_price.as_deref())?;
+    let max_price =
+        parse_optional_price_bound("PRICE_FILTER.maxPrice", price_filter.max_price.as_deref())?;
+    Ok((price_tick, min_price, max_price))
+}
+
+fn parse_quantity_filters(
+    requested_wire_symbol: &str,
+    lot_size: &BinanceExchangeInfoFilterWire,
+    market_lot_size: Option<&BinanceExchangeInfoFilterWire>,
+) -> Result<ParsedQuantityRules, ExchangeError> {
+    let quantity_step = parse_quantity(lot_size.step_size.as_deref().ok_or_else(|| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance exchangeInfo symbol {requested_wire_symbol} is missing LOT_SIZE.stepSize",
+            ),
+        )
+    })?)?;
+    let min_quantity = parse_quantity(lot_size.min_qty.as_deref().ok_or_else(|| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance exchangeInfo symbol {requested_wire_symbol} is missing LOT_SIZE.minQty",
+            ),
+        )
+    })?)?;
+    let max_quantity =
+        parse_optional_quantity_bound("LOT_SIZE.maxQty", lot_size.max_qty.as_deref())?;
+
+    let market_quantity_step = market_lot_size
+        .map(|filter| {
+            parse_optional_quantity_bound(
+                "MARKET_LOT_SIZE.stepSize",
+                filter.step_size.as_deref(),
+            )?
+            .ok_or_else(|| {
+                ExchangeError::invalid_response(
+                    EXCHANGE,
+                    format!(
+                        "Binance exchangeInfo symbol {requested_wire_symbol} has a disabled MARKET_LOT_SIZE.stepSize",
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    let market_min_quantity = market_lot_size
+        .map(|filter| {
+            parse_optional_quantity_bound(
+                "MARKET_LOT_SIZE.minQty",
+                filter.min_qty.as_deref(),
+            )?
+            .ok_or_else(|| {
+                ExchangeError::invalid_response(
+                    EXCHANGE,
+                    format!(
+                        "Binance exchangeInfo symbol {requested_wire_symbol} has a disabled MARKET_LOT_SIZE.minQty",
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    let market_max_quantity = market_lot_size
+        .map(|filter| {
+            parse_optional_quantity_bound("MARKET_LOT_SIZE.maxQty", filter.max_qty.as_deref())
+        })
+        .transpose()?
+        .flatten();
+    Ok(ParsedQuantityRules {
+        step: quantity_step,
+        minimum: min_quantity,
+        maximum: max_quantity,
+        market_step: market_quantity_step,
+        market_minimum: market_min_quantity,
+        market_maximum: market_max_quantity,
+    })
+}
+
+fn parse_notional_filter(
+    requested_wire_symbol: &str,
+    market_type: MarketType,
+    notional_filter: &BinanceExchangeInfoFilterWire,
+) -> Result<ParsedNotionalRules, ExchangeError> {
+    let min_notional_value = parse_optional_money_bound(
+        "notional minimum",
+        notional_filter.min_notional.as_deref(),
+    )?
+    .ok_or_else(|| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance exchangeInfo symbol {requested_wire_symbol} is missing a positive notional minimum",
+            ),
+        )
+    })?;
+    let max_notional =
+        parse_optional_money_bound("notional maximum", notional_filter.max_notional.as_deref())?;
+    let missing_field = |field: &str| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!("Binance exchangeInfo symbol {requested_wire_symbol} is missing {field}",),
+        )
+    };
+    let (apply_min_notional_to_market, apply_max_notional_to_market, average_price_minutes) = match (
+        market_type,
+        notional_filter.filter_type.as_str(),
+    ) {
+        (MarketType::Spot, "NOTIONAL") => (
+            notional_filter
+                .apply_min_to_market
+                .ok_or_else(|| missing_field("NOTIONAL.applyMinToMarket"))?,
+            notional_filter
+                .apply_max_to_market
+                .ok_or_else(|| missing_field("NOTIONAL.applyMaxToMarket"))?,
+            Some(
+                notional_filter
+                    .avg_price_mins
+                    .ok_or_else(|| missing_field("NOTIONAL.avgPriceMins"))?,
+            ),
+        ),
+        (MarketType::Spot, "MIN_NOTIONAL") => (
+            notional_filter
+                .apply_to_market
+                .ok_or_else(|| missing_field("MIN_NOTIONAL.applyToMarket"))?,
+            true,
+            Some(
+                notional_filter
+                    .avg_price_mins
+                    .ok_or_else(|| missing_field("MIN_NOTIONAL.avgPriceMins"))?,
+            ),
+        ),
+        (MarketType::Perpetual, "MIN_NOTIONAL") => (true, true, None),
+        (MarketType::Perpetual, "NOTIONAL") => {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                format!(
+                    "Binance USD-M exchangeInfo symbol {requested_wire_symbol} returned undocumented NOTIONAL semantics",
+                ),
+            ));
+        }
+        _ => {
+            return Err(ExchangeError::invalid_response(
+                EXCHANGE,
+                format!(
+                    "Binance exchangeInfo symbol {requested_wire_symbol} returned invalid notional metadata",
+                ),
+            ));
+        }
+    };
+    Ok(ParsedNotionalRules {
+        minimum: min_notional_value,
+        maximum: max_notional,
+        apply_minimum_to_market: apply_min_notional_to_market,
+        apply_maximum_to_market: apply_max_notional_to_market,
+        average_price_minutes,
+    })
+}
+
+fn parse_exchange_info_rules(
+    standard_symbol: Symbol,
+    market_type: MarketType,
+    requested_wire_symbol: &str,
+    selected: &BinanceExchangeInfoSymbolWire,
+) -> Result<InstrumentRules, ExchangeError> {
+    let filters = select_exchange_info_filters(requested_wire_symbol, selected)?;
+    let (price_tick, min_price, max_price) =
+        parse_price_filter(requested_wire_symbol, filters.price)?;
+    let quantity = parse_quantity_filters(
+        requested_wire_symbol,
+        filters.lot_size,
+        filters.market_lot_size,
+    )?;
+    let notional = parse_notional_filter(requested_wire_symbol, market_type, filters.notional)?;
+
+    InstrumentRules::with_options(
+        EXCHANGE,
+        standard_symbol,
+        market_type,
+        price_tick,
+        quantity.step,
+        quantity.minimum,
+        InstrumentRuleOptions {
+            min_notional: notional.minimum,
+            min_price,
+            max_price,
+            max_quantity: quantity.maximum,
+            market_quantity_step: quantity.market_step,
+            market_min_quantity: quantity.market_minimum,
+            market_max_quantity: quantity.market_maximum,
+            max_notional: notional.maximum,
+            apply_min_notional_to_market: notional.apply_minimum_to_market,
+            apply_max_notional_to_market: notional.apply_maximum_to_market,
+            market_notional_average_minutes: notional.average_price_minutes,
+            requires_authoritative_market_notional_reference: notional.apply_minimum_to_market
+                || (notional.maximum.is_some() && notional.apply_maximum_to_market),
+        },
+    )
+    .map_err(|error| ExchangeError::invalid_response(EXCHANGE, error.to_string()))
+}
+
+fn assign_filter_once<'a>(
+    wire_symbol: &str,
+    filter_type: &str,
+    slot: &mut Option<&'a BinanceExchangeInfoFilterWire>,
+    filter: &'a BinanceExchangeInfoFilterWire,
+) -> Result<(), ExchangeError> {
+    if slot.replace(filter).is_some() {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance exchangeInfo symbol {wire_symbol} returned duplicate {filter_type} filters",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exchange_info_identity(
+    product: BinanceProduct,
+    selected: &BinanceExchangeInfoSymbolWire,
+    standard_symbol: &Symbol,
+    requested_wire_symbol: &str,
+) -> Result<(), ExchangeError> {
+    let base_asset = required_exchange_info_identity(
+        requested_wire_symbol,
+        "baseAsset",
+        selected.base_asset.as_deref(),
+    )?;
+    let quote_asset = required_exchange_info_identity(
+        requested_wire_symbol,
+        "quoteAsset",
+        selected.quote_asset.as_deref(),
+    )?;
+    let expected_wire_symbol = format!("{base_asset}{quote_asset}");
+    let product_suffix = match product {
+        BinanceProduct::Spot => "SPOT",
+        BinanceProduct::UsdM => "PERP",
+    };
+    let expected_standard_symbol = format!("{base_asset}-{quote_asset}-{product_suffix}");
+    let pair_matches =
+        product != BinanceProduct::UsdM || selected.pair.as_deref() == Some(requested_wire_symbol);
+    if expected_wire_symbol != requested_wire_symbol
+        || standard_symbol.as_str() != expected_standard_symbol
+        || !pair_matches
+    {
+        return Err(ExchangeError::invalid_response(
+            EXCHANGE,
+            format!(
+                "Binance exchangeInfo asset identity does not match {standard_symbol}/{requested_wire_symbol}",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn required_exchange_info_identity<'a>(
+    wire_symbol: &str,
+    field: &str,
+    value: Option<&'a str>,
+) -> Result<&'a str, ExchangeError> {
+    value.filter(|value| !value.is_empty()).ok_or_else(|| {
+        ExchangeError::invalid_response(
+            EXCHANGE,
+            format!("Binance exchangeInfo symbol {wire_symbol} is missing {field}"),
+        )
+    })
 }
 
 fn parse_side(value: &str) -> Result<Side, ExchangeError> {

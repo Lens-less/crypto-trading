@@ -14,11 +14,12 @@ use crate::{
 
 /// Builds the full Web application router with a public shell and authenticated API.
 pub fn app_router(control_plane: Arc<ReadControlPlane>, access: WebAccessPolicy) -> Router {
+    let rate_limiter = WebRequestRateLimiter::default();
     app_router_with_settings(
         control_plane,
         access,
         SettingsResponse::default(),
-        WebRequestRateLimiter::default(),
+        &rate_limiter,
     )
 }
 
@@ -28,7 +29,7 @@ pub fn app_router_with_settings(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
     settings: SettingsResponse,
-    rate_limiter: WebRequestRateLimiter,
+    rate_limiter: &WebRequestRateLimiter,
 ) -> Router {
     Router::new()
         .merge(ui_router())
@@ -46,7 +47,7 @@ pub fn app_router_with_settings_and_shutdown(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
     settings: SettingsResponse,
-    rate_limiter: WebRequestRateLimiter,
+    rate_limiter: &WebRequestRateLimiter,
     shutdown: watch::Receiver<bool>,
 ) -> Router {
     Router::new()

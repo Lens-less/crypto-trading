@@ -8,9 +8,12 @@ use chrono::{TimeZone, Utc};
 use crypto_trading_cli::{
     TestnetReconciliationConfig, TestnetReconciliationMismatch, TestnetReconciliationPlan,
 };
-use crypto_trading_domain::{MarketType, Money, OrderIntent, Quantity, Side, Symbol};
+use crypto_trading_domain::{
+    MarketType, Money, Order, OrderIntent, OrderStatus, OrderType, Position, PositionSide, Price,
+    Quantity, Side, Symbol, TimeInForce,
+};
 use crypto_trading_exchange::{
-    BinanceProduct, BinanceTestnetAccountSnapshot, BinanceTestnetBalance,
+    BinanceProduct, BinanceTestnetAccountSnapshot, BinanceTestnetBalance, ForeignOrder,
 };
 use crypto_trading_runtime::{
     JsonlHistory, PAPER_ACCOUNT_SCHEMA_VERSION, PaperAccountAuthority, PaperAccountConfig,
@@ -105,6 +108,82 @@ fn remote(available: &str) -> BinanceTestnetAccountSnapshot {
     }
 }
 
+fn remote_balance(
+    asset: &str,
+    wallet_balance: &str,
+    available_balance: &str,
+    locked_balance: Option<&str>,
+) -> BinanceTestnetBalance {
+    BinanceTestnetBalance {
+        asset: asset.to_owned(),
+        wallet_balance: decimal(wallet_balance),
+        available_balance: decimal(available_balance),
+        locked_balance: locked_balance.map(decimal),
+    }
+}
+
+fn order(symbol: &Symbol, status: OrderStatus, filled_quantity: &str) -> Order {
+    let mut intent = OrderIntent::limit(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Buy,
+        Quantity::new(decimal("0.001")).unwrap(),
+        Price::new(decimal("100000")).unwrap(),
+    );
+    intent.time_in_force = TimeInForce::Gtc;
+    Order {
+        id: format!("binance:spot:{}:owned-order", symbol.as_str()),
+        intent,
+        filled_quantity: Quantity::new(decimal(filled_quantity)).unwrap(),
+        average_fill_price: (!decimal(filled_quantity).is_zero())
+            .then(|| Price::new(decimal("100000")).unwrap()),
+        status,
+        created_at: Utc.with_ymd_and_hms(2026, 7, 25, 11, 59, 0).unwrap(),
+        updated_at: Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap(),
+    }
+}
+
+fn foreign_order(symbol: &Symbol, id: &str, filled_quantity: &str) -> ForeignOrder {
+    ForeignOrder {
+        id: id.to_owned(),
+        client_order_id: Some(format!("manual-{id}")),
+        exchange: "binance".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Spot,
+        side: Side::Sell,
+        order_type: OrderType::Limit,
+        quantity: Quantity::new(decimal("0.001")).unwrap(),
+        price: Some(Price::new(decimal("99999")).unwrap()),
+        reduce_only: false,
+        time_in_force: TimeInForce::Gtc,
+        filled_quantity: Quantity::new(decimal(filled_quantity)).unwrap(),
+        average_fill_price: (!decimal(filled_quantity).is_zero())
+            .then(|| Price::new(decimal("99999")).unwrap()),
+        status: if decimal(filled_quantity).is_zero() {
+            OrderStatus::Open
+        } else {
+            OrderStatus::PartiallyFilled
+        },
+        created_at: Utc.with_ymd_and_hms(2026, 7, 25, 11, 58, 0).unwrap(),
+        updated_at: Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap(),
+    }
+}
+
+fn position(symbol: &Symbol, side: PositionSide, quantity: &str) -> Position {
+    Position {
+        exchange: "binance".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Spot,
+        side,
+        quantity: Quantity::new(decimal(quantity)).unwrap(),
+        entry_price: Some(Price::new(decimal("100000")).unwrap()),
+        mark_price: Some(Price::new(decimal("100001")).unwrap()),
+        unrealized_pnl: Money::new(decimal("0.1")),
+        updated_at: Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap(),
+    }
+}
+
 #[test]
 fn clean_account_truth_produces_a_deterministic_release_proof() {
     let (_, reservation_id, batch_id) = ids();
@@ -179,6 +258,200 @@ fn balance_mismatch_and_missing_balance_fail_closed_without_losing_proof() {
         untracked.mismatches,
         vec![TestnetReconciliationMismatch::UntrackedAssetBalance]
     );
+}
+
+#[test]
+fn locked_balance_non_zero_fails_closed() {
+    let (_, reservation_id, _) = ids();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+    let plan = TestnetReconciliationPlan::new(
+        TestnetReconciliationConfig::new(BinanceProduct::Spot, "USDT", symbol, reservation_id)
+            .unwrap(),
+        account(&Symbol::new("BTC-USDT-SPOT").unwrap()),
+    )
+    .unwrap();
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 1).unwrap();
+    let mut snapshot = remote("1000");
+    snapshot.balances[0].locked_balance = Some(decimal("0.01"));
+
+    let report = plan.compare(&snapshot, captured_at).unwrap();
+
+    assert_eq!(
+        report.mismatches,
+        vec![TestnetReconciliationMismatch::LockedBalanceNonZero]
+    );
+}
+
+#[test]
+fn wallet_available_divergence_fails_closed_even_when_available_matches() {
+    let (_, reservation_id, _) = ids();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+    let plan = TestnetReconciliationPlan::new(
+        TestnetReconciliationConfig::new(BinanceProduct::Spot, "USDT", symbol, reservation_id)
+            .unwrap(),
+        account(&Symbol::new("BTC-USDT-SPOT").unwrap()),
+    )
+    .unwrap();
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 1).unwrap();
+    let mut snapshot = remote("1000");
+    snapshot.balances[0].wallet_balance = decimal("1000.01");
+
+    let report = plan.compare(&snapshot, captured_at).unwrap();
+
+    assert_eq!(
+        report.mismatches,
+        vec![TestnetReconciliationMismatch::WalletAvailableDivergence]
+    );
+}
+
+#[test]
+fn open_owned_orders_fail_closed_for_partial_fills() {
+    let (_, reservation_id, _) = ids();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+    let plan = TestnetReconciliationPlan::new(
+        TestnetReconciliationConfig::new(
+            BinanceProduct::Spot,
+            "USDT",
+            symbol.clone(),
+            reservation_id,
+        )
+        .unwrap(),
+        account(&symbol),
+    )
+    .unwrap();
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 1).unwrap();
+    let mut snapshot = remote("1000");
+    snapshot.orders.push(order(
+        &Symbol::new("BTC-USDT-SPOT").unwrap(),
+        OrderStatus::PartiallyFilled,
+        "0.0005",
+    ));
+
+    let report = plan.compare(&snapshot, captured_at).unwrap();
+
+    assert_eq!(
+        report.mismatches,
+        vec![TestnetReconciliationMismatch::OpenOwnedOrders]
+    );
+}
+
+#[test]
+fn open_foreign_orders_fail_closed_even_when_balances_match() {
+    let (_, reservation_id, _) = ids();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+    let plan = TestnetReconciliationPlan::new(
+        TestnetReconciliationConfig::new(
+            BinanceProduct::Spot,
+            "USDT",
+            symbol.clone(),
+            reservation_id,
+        )
+        .unwrap(),
+        account(&symbol),
+    )
+    .unwrap();
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 1).unwrap();
+    let mut snapshot = remote("1000");
+    snapshot
+        .foreign_orders
+        .push(foreign_order(&symbol, "binance:spot:BTCUSDT:29", "0"));
+
+    let report = plan.compare(&snapshot, captured_at).unwrap();
+
+    assert_eq!(
+        report.mismatches,
+        vec![TestnetReconciliationMismatch::OpenForeignOrders]
+    );
+}
+
+#[test]
+fn non_flat_positions_fail_closed() {
+    let (_, reservation_id, _) = ids();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+    let plan = TestnetReconciliationPlan::new(
+        TestnetReconciliationConfig::new(
+            BinanceProduct::Spot,
+            "USDT",
+            symbol.clone(),
+            reservation_id,
+        )
+        .unwrap(),
+        account(&symbol),
+    )
+    .unwrap();
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 1).unwrap();
+    let mut snapshot = remote("1000");
+    snapshot
+        .positions
+        .push(position(&symbol, PositionSide::Long, "0.001"));
+
+    let report = plan.compare(&snapshot, captured_at).unwrap();
+
+    assert_eq!(
+        report.mismatches,
+        vec![TestnetReconciliationMismatch::NonFlatPositions]
+    );
+}
+
+#[test]
+fn simultaneous_mismatches_preserve_stable_order_and_proof_digest() {
+    let (_, reservation_id, _) = ids();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
+    let plan = TestnetReconciliationPlan::new(
+        TestnetReconciliationConfig::new(
+            BinanceProduct::Spot,
+            "USDT",
+            symbol.clone(),
+            reservation_id,
+        )
+        .unwrap(),
+        account(&symbol),
+    )
+    .unwrap();
+    let captured_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 1).unwrap();
+    let expected_mismatches = vec![
+        TestnetReconciliationMismatch::UntrackedAssetBalance,
+        TestnetReconciliationMismatch::AvailableBalanceMismatch,
+        TestnetReconciliationMismatch::LockedBalanceNonZero,
+        TestnetReconciliationMismatch::WalletAvailableDivergence,
+        TestnetReconciliationMismatch::OpenOwnedOrders,
+        TestnetReconciliationMismatch::OpenForeignOrders,
+        TestnetReconciliationMismatch::NonFlatPositions,
+    ];
+    let mut owned_open = order(&symbol, OrderStatus::Open, "0");
+    owned_open.id = "binance:spot:BTC-USDT-SPOT:owned-open".to_owned();
+    let mut owned_partial = order(&symbol, OrderStatus::PartiallyFilled, "0.0005");
+    owned_partial.id = "binance:spot:BTC-USDT-SPOT:owned-partial".to_owned();
+    let foreign_open = foreign_order(&symbol, "binance:spot:BTCUSDT:01", "0");
+    let foreign_partial = foreign_order(&symbol, "binance:spot:BTCUSDT:99", "0.0001");
+    let long_position = position(&symbol, PositionSide::Long, "0.001");
+    let short_position = position(&symbol, PositionSide::Short, "0.002");
+
+    let mut left = remote("999");
+    left.balances = vec![
+        remote_balance("USDT", "1001", "999", Some("0.01")),
+        remote_balance("BTC", "0.01", "0.01", Some("0")),
+    ];
+    left.orders = vec![owned_partial.clone(), owned_open.clone()];
+    left.foreign_orders = vec![foreign_partial.clone(), foreign_open.clone()];
+    left.positions = vec![short_position.clone(), long_position.clone()];
+
+    let mut right = remote("999");
+    right.balances = vec![
+        remote_balance("BTC", "0.01", "0.01", Some("0")),
+        remote_balance("USDT", "1001", "999", Some("0.01")),
+    ];
+    right.orders = vec![owned_open, owned_partial];
+    right.foreign_orders = vec![foreign_open, foreign_partial];
+    right.positions = vec![long_position, short_position];
+
+    let left_report = plan.compare(&left, captured_at).unwrap();
+    let right_report = plan.compare(&right, captured_at).unwrap();
+
+    assert_eq!(left_report.mismatches, expected_mismatches);
+    assert_eq!(right_report.mismatches, expected_mismatches);
+    assert_eq!(left_report.proof.digest(), right_report.proof.digest());
+    assert_eq!(left_report.proof, right_report.proof);
 }
 
 #[test]

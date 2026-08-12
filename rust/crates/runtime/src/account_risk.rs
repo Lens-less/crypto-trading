@@ -1223,7 +1223,7 @@ fn settle_legacy_reservation_admissions(
     pending: &mut Vec<OpenAdmission>,
     request: &PaperReservationRequest,
 ) -> Result<(), AccountRiskError> {
-    for leg in request.legs() {
+    for leg in request.legs().iter().filter(|leg| !leg.reduce_only()) {
         let mut matching_scopes = Vec::new();
         for admission in pending.iter().filter(|admission| {
             admission_matches_reservation(admission, request.task_id(), leg.symbol().as_str())
@@ -1285,10 +1285,14 @@ fn settle_open_admission(
         };
         if pending[index].notional > remaining {
             pending[index].notional = checked_sub(pending[index].notional, remaining)?;
+            remaining = Money::default();
             break;
         }
         remaining = checked_sub(remaining, pending[index].notional)?;
         pending.remove(index);
+    }
+    if remaining > Money::default() {
+        return Err(AccountRiskError::DegradedState);
     }
     Ok(())
 }

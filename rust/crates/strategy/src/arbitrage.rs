@@ -226,6 +226,27 @@ struct ArbitrageOperatorScope {
 }
 
 impl ArbitrageStrategy {
+    pub fn symbols_share_hedge_identity(left: &Symbol, right: &Symbol) -> bool {
+        if left == right {
+            return true;
+        }
+
+        match (
+            canonical_hedge_symbol_parts(left),
+            canonical_hedge_symbol_parts(right),
+        ) {
+            (
+                Some((left_base, left_quote, left_product)),
+                Some((right_base, right_quote, right_product)),
+            ) => {
+                left_base == right_base
+                    && left_quote == right_quote
+                    && left_product != right_product
+            }
+            _ => false,
+        }
+    }
+
     /// Validates segmented thresholds and constructs a scope-free pure
     /// arbitrage strategy.
     ///
@@ -330,6 +351,20 @@ impl ArbitrageStrategy {
         left: &MarketSnapshot,
         right: &MarketSnapshot,
     ) -> Result<(), StrategyError> {
+        for snapshot in [left, right] {
+            if !symbol_market_type_matches_suffix(&snapshot.symbol, snapshot.market_type) {
+                return Err(StrategyError::SnapshotMismatch(format!(
+                    "symbol {} does not match market type {:?}",
+                    snapshot.symbol, snapshot.market_type
+                )));
+            }
+        }
+        if !Self::symbols_share_hedge_identity(&left.symbol, &right.symbol) {
+            return Err(StrategyError::SnapshotMismatch(
+                "arbitrage legs do not share a hedge identity".to_owned(),
+            ));
+        }
+
         let Some(scope) = &self.operator_scope else {
             return Ok(());
         };
@@ -482,6 +517,27 @@ impl ArbitrageStrategy {
                     "missing {exchange}/{symbol}/{market_type:?} from arbitrage pair"
                 ))
             })
+    }
+}
+
+fn canonical_hedge_symbol_parts(symbol: &Symbol) -> Option<(&str, &str, &str)> {
+    let mut parts = symbol.as_str().split('-');
+    let (Some(base), Some(quote), Some(product), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if base.is_empty() || quote.is_empty() || !matches!(product, "SPOT" | "PERP") {
+        return None;
+    }
+    Some((base, quote, product))
+}
+
+fn symbol_market_type_matches_suffix(symbol: &Symbol, market_type: MarketType) -> bool {
+    match canonical_hedge_symbol_parts(symbol) {
+        Some((_, _, "SPOT")) => market_type == MarketType::Spot,
+        Some((_, _, "PERP")) => market_type == MarketType::Perpetual,
+        Some(_) | None => true,
     }
 }
 

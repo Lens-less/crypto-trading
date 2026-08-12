@@ -6,6 +6,10 @@
 # Scratch directories a test run can leave behind in the working tree
 /rust/temp-*/
 
+# Local orchestration transcripts are reproducible process output. Durable
+# decisions and verification evidence belong under docs/ and artifacts/.
+/.workflow/
+
 # Python compatibility runtime artifacts
 __pycache__/
 *.py[cod]

@@ -242,6 +242,19 @@ impl WebRequestRateLimiter {
         }
     }
 
+    /// Creates a fresh request bucket with the same threshold configuration.
+    ///
+    /// This keeps the published 240/60s contract stable while letting callers
+    /// isolate readiness, authenticated reads, and trusted submit traffic.
+    #[must_use]
+    pub fn independent_bucket(&self) -> Self {
+        Self {
+            inner: Self::fresh_window(),
+            maximum_requests: self.maximum_requests,
+            window: self.window,
+        }
+    }
+
     /// Consumes one request slot or returns a bounded Retry-After delay.
     ///
     /// # Errors
@@ -270,13 +283,19 @@ impl WebRequestRateLimiter {
 impl Default for WebRequestRateLimiter {
     fn default() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RequestWindow {
-                started_at: Instant::now(),
-                used: 0,
-            })),
+            inner: Self::fresh_window(),
             maximum_requests: WEB_REQUEST_LIMIT_PER_MINUTE,
             window: Duration::from_secs(60),
         }
+    }
+}
+
+impl WebRequestRateLimiter {
+    fn fresh_window() -> Arc<Mutex<RequestWindow>> {
+        Arc::new(Mutex::new(RequestWindow {
+            started_at: Instant::now(),
+            used: 0,
+        }))
     }
 }
 
@@ -330,6 +349,7 @@ fn api_router_with_optional_shutdown(
     settings: SettingsResponse,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Router {
+    let rate_limiter = WebRequestRateLimiter::default();
     Router::new()
         .nest(
             "/api/v1",
@@ -337,7 +357,7 @@ fn api_router_with_optional_shutdown(
                 control_plane,
                 access,
                 settings,
-                WebRequestRateLimiter::default(),
+                &rate_limiter,
                 shutdown,
             ),
         )
@@ -349,7 +369,7 @@ pub(crate) fn api_routes_with_settings(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
     settings: SettingsResponse,
-    rate_limiter: WebRequestRateLimiter,
+    rate_limiter: &WebRequestRateLimiter,
 ) -> Router {
     api_routes_with_optional_shutdown(control_plane, access, settings, rate_limiter, None)
 }
@@ -358,7 +378,7 @@ pub(crate) fn api_routes_with_settings_and_shutdown(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
     settings: SettingsResponse,
-    rate_limiter: WebRequestRateLimiter,
+    rate_limiter: &WebRequestRateLimiter,
     shutdown: watch::Receiver<bool>,
 ) -> Router {
     api_routes_with_optional_shutdown(
@@ -374,7 +394,7 @@ fn api_routes_with_optional_shutdown(
     control_plane: Arc<ReadControlPlane>,
     access: WebAccessPolicy,
     mut settings: SettingsResponse,
-    rate_limiter: WebRequestRateLimiter,
+    rate_limiter: &WebRequestRateLimiter,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Router {
     settings.request_limit = rate_limiter.settings();
@@ -387,7 +407,7 @@ fn api_routes_with_optional_shutdown(
     };
     let access_state = ApiAccessState {
         access,
-        rate_limiter,
+        rate_limiter: rate_limiter.independent_bucket(),
     };
     let protected = Router::new()
         .route("/system", get(system))
@@ -407,9 +427,16 @@ fn api_routes_with_optional_shutdown(
     // The readiness probe stays unauthenticated so a supervisor can reach it,
     // but it is still rate limited: without that it is an unauthenticated
     // route any local process could hammer.
-    let readiness = Router::new()
-        .route("/health", get(health))
-        .layer(middleware::from_fn_with_state(access_state, rate_limit));
+    let readiness =
+        Router::new()
+            .route("/health", get(health))
+            .layer(middleware::from_fn_with_state(
+                ApiAccessState {
+                    access: WebAccessPolicy::loopback_open(),
+                    rate_limiter: rate_limiter.independent_bucket(),
+                },
+                rate_limit,
+            ));
     Router::new()
         .merge(readiness)
         .merge(protected)

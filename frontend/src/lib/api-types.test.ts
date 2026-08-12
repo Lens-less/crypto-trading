@@ -101,12 +101,12 @@ describe("systemResponseSchema", () => {
 
 describe("capabilityManifestSchema", () => {
   const valid = {
-    schema_version: 2,
+    schema_version: 3,
     release_stage: "paper-only",
     live_trading_enabled: false,
   };
 
-  it("接受 capability manifest(注意 schema_version 是 2)", () => {
+  it("接受 capability manifest(注意 schema_version 是 3)", () => {
     expect(capabilityManifestSchema.safeParse(valid).success).toBe(true);
   });
 

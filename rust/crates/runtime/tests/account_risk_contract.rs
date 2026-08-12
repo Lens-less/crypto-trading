@@ -157,6 +157,32 @@ async fn reserve_task_leg(
     account.reserve(request).await.unwrap();
 }
 
+async fn append_legacy_reserved_fact(
+    journal_id: Uuid,
+    path: &std::path::Path,
+    account_id: &str,
+    request: PaperReservationRequest,
+) {
+    let reserved_exposure = request.gross_notional().unwrap();
+    JsonlHistory::new(path)
+        .append(&DecisionRecord {
+            timestamp: at(9, 1),
+            strategy: "paper_account".to_owned(),
+            symbol: account_id.to_owned(),
+            decision: "paper_account_reserved".to_owned(),
+            details: json!({
+                "schema_version": 1,
+                "journal_id": journal_id,
+                "account_id": account_id,
+                "initial_available": money("1000"),
+                "request": request,
+                "reserved_exposure": reserved_exposure,
+            }),
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn daily_trade_cap_counts_admissions_and_resets_at_utc_midnight() {
     let path = temp_path("daily-cap");
@@ -513,6 +539,141 @@ async fn oversized_pre_guard_pending_set_is_replayable_and_durably_recoverable()
     let restarted = authority(journal_id, &path, AccountRiskLimits::default());
     assert!(restarted.state().await.unwrap().open_positions.is_empty());
     assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 130);
+}
+
+#[tokio::test]
+async fn legacy_unbound_reservation_that_exceeds_pending_notional_degrades_replay() {
+    let path = temp_path("legacy-overconsume-degrades");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+
+    assert!(matches!(
+        risk.admit(&candidate("owner-gap", "BTC-USDT", "10"), at(9, 0))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    let intent = OrderIntent::market(
+        "paper-gap",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    let request = PaperReservationRequest::new(
+        Uuid::new_v4(),
+        "owner-gap/op/000001",
+        "legacy-overconsume",
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        vec![PaperReservationLeg::from_intent(0, &intent, money("11")).unwrap()],
+    )
+    .unwrap();
+    append_legacy_reserved_fact(journal_id, &path, "paper-main", request).await;
+
+    let restarted = authority(journal_id, &path, AccountRiskLimits::default());
+    assert!(
+        matches!(
+            restarted.state().await,
+            Err(AccountRiskError::DegradedState)
+        ),
+        "legacy fallback must fail closed when reserved_notional exceeds the matching admission"
+    );
+}
+
+#[tokio::test]
+async fn legacy_fallback_ignores_reduce_only_legs_like_bound_replay() {
+    let path = temp_path("legacy-reduce-only-ignored");
+    let journal_id = Uuid::new_v4();
+    let risk = authority(journal_id, &path, AccountRiskLimits::default());
+    let account = PaperAccountAuthority::new(
+        journal_id,
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        risk.admit(&candidate("owner-legacy", "BTC-USDT", "10"), at(9, 0))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+    assert!(matches!(
+        risk.admit(&candidate("owner-legacy", "BTC-USDT", "10"), at(9, 0))
+            .await
+            .unwrap(),
+        AccountRiskAdmission::Admitted { .. }
+    ));
+
+    let inventory_intent = OrderIntent::market(
+        "paper-grid",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    let inventory_request = PaperReservationRequest::new(
+        Uuid::new_v4(),
+        "inventory-owner/op/000001",
+        "legacy-inventory",
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        vec![PaperReservationLeg::from_intent(0, &inventory_intent, money("10")).unwrap()],
+    )
+    .unwrap();
+    let inventory_reservation_id = inventory_request.reservation_id();
+    account.reserve(inventory_request).await.unwrap();
+    account
+        .settle_execution(
+            inventory_reservation_id,
+            &[TradingReceipt::Submitted {
+                order: Order {
+                    id: "inventory-open".to_owned(),
+                    intent: inventory_intent.clone(),
+                    filled_quantity: Quantity::new(Decimal::ONE).unwrap(),
+                    average_fill_price: Some(Price::new(Decimal::from(10_u32)).unwrap()),
+                    status: OrderStatus::Filled,
+                    created_at: at(9, 0),
+                    updated_at: at(9, 0),
+                },
+                disposition: SubmissionDisposition::Filled,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let opening = OrderIntent::market(
+        "paper-grid",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    let mut reduce_only = OrderIntent::market(
+        "paper-grid",
+        Symbol::new("BTC-USDT").unwrap(),
+        MarketType::Perpetual,
+        Side::Sell,
+        Quantity::new(Decimal::ONE).unwrap(),
+    );
+    reduce_only.reduce_only = true;
+    let request = PaperReservationRequest::new(
+        Uuid::new_v4(),
+        "owner-legacy/op/000001",
+        "legacy-reduce-only",
+        Uuid::new_v4(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        vec![
+            PaperReservationLeg::from_intent(0, &opening, money("10")).unwrap(),
+            PaperReservationLeg::from_intent(1, &reduce_only, money("10")).unwrap(),
+        ],
+    )
+    .unwrap();
+    account.reserve(request).await.unwrap();
+
+    let restarted = authority(journal_id, &path, AccountRiskLimits::default());
+    assert_eq!(restarted.state().await.unwrap().open_positions.len(), 1);
 }
 
 #[tokio::test]

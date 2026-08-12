@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     image: crypto-trading:production-candidate
     restart: unless-stopped
-    stop_grace_period: 70s
+    stop_grace_period: 130s
     healthcheck:
       test:
         - CMD

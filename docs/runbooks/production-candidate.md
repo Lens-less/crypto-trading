@@ -56,10 +56,12 @@ docker compose -f deploy/compose.yaml down
 Compose probes `/api/v1/health` every 30 seconds and rotates container JSON logs
 at 10 MiB with five retained files. The authenticated `/api/v1/risk` and
 `/api/v1/settings` projections are the operator source for Paper account
-reservations, effective paths, configured credential state, and the shared
-240-request/60-second Web limit. They never return credential values. Treat
-HTTP `429` plus `Retry-After` as backpressure; do not bypass it with additional
-clients.
+reservations, effective paths, configured credential state, and the configured
+240-request/60-second per-bucket Web threshold. The unauthenticated readiness
+probe, authenticated read routes, and the trusted Paper submit route (when
+enabled) consume independent buckets with that same threshold. They never
+return credential values. Treat HTTP `429` plus `Retry-After` as backpressure;
+do not bypass it with additional clients.
 
 Treat projection conflicts, `recovery_required`, a journal-integrity error, or a
 capability-manifest validation error as release blockers. Do not work around a
@@ -72,6 +74,20 @@ authority, and that authority is limited to Binance Testnet. Each campaign
 persists its UUID client order ID before submission, uses signed single-order
 queries as the recovery authority, cancels the order, and records the final
 cancelled state. There is no `--live` option.
+
+A fresh campaign first fetches the product-specific public `exchangeInfo` and
+requires an exact wire/base/quote/status/product identity plus only locally
+supported filter semantics. Missing, conflicting, or unknown metadata stops
+before the durable submit plan. Applied MARKET notional rules also stop locally
+until the adapter has an authoritative venue reference-price implementation;
+bookTicker is not substituted. After `planned` is durable, a restart does not
+refetch current trading metadata: it constructs query/cancel-only authority so
+an exchangeInfo outage or later trading halt cannot block recovery of the
+persisted client UUID. The planned fact also binds the exact Binance wire
+symbol; a recovery invocation uses that durable mapping even if its current CLI
+mapping differs, preventing a client UUID from being redirected to another
+instrument. A durable HTTP rate-limit deadline is enforced before recovery
+network I/O, so an immediate restart cannot bypass `Retry-After`.
 
 Build the exact candidate and create a private, dedicated evidence file:
 
@@ -248,6 +264,10 @@ keeps committed exposure held, prints the proof, and exits non-zero. Missing
 assets, non-zero untracked assets, any open or foreign order, any non-flat
 position, unknown wire symbols, rate limiting, partial or unstable HTTP
 samples, projection degradation, or balance differences are release blockers.
+An applied reconciliation outcome is terminal for that reservation: replaying
+the identical proof is idempotent, while a different digest, a newer snapshot,
+or an opposite outcome is rejected. Investigate and retain the original
+evidence; never try to reverse a recorded failure with a later release proof.
 Never edit the journal to force a match, and never archive credentials.
 
 ## Binance Testnet 24-hour soak gate

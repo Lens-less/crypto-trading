@@ -467,6 +467,409 @@ fn book_ticker_requests_are_unsigned_and_select_the_correct_product_route() {
 }
 
 #[test]
+fn exchange_info_requests_are_unsigned_and_product_specific() {
+    let endpoints = BinanceTestnetEndpoints::official();
+
+    let spot = BinanceTestnetProtocol::build_exchange_info_request(
+        &endpoints,
+        BinanceProduct::Spot,
+        "BTCUSDT",
+    )
+    .unwrap();
+    let perpetual = BinanceTestnetProtocol::build_exchange_info_request(
+        &endpoints,
+        BinanceProduct::UsdM,
+        "BTCUSDT",
+    )
+    .unwrap();
+
+    assert_eq!(spot.method(), RemoteHttpMethod::Get);
+    assert_eq!(spot.url().path(), "/api/v3/exchangeInfo");
+    assert_eq!(spot.url().query(), Some("symbol=BTCUSDT"));
+    assert_eq!(spot.header("X-MBX-APIKEY"), None);
+
+    assert_eq!(perpetual.method(), RemoteHttpMethod::Get);
+    assert_eq!(perpetual.url().path(), "/fapi/v1/exchangeInfo");
+    assert_eq!(perpetual.url().query(), Some("symbol=BTCUSDT"));
+    assert_eq!(perpetual.header("X-MBX-APIKEY"), None);
+}
+
+#[test]
+fn spot_exchange_info_maps_notional_and_market_lot_rules() {
+    let parsed = BinanceTestnetProtocol::parse_exchange_info_symbol(
+        BinanceProduct::Spot,
+        include_bytes!("fixtures/binance_spot_exchange_info.json"),
+        Symbol::new("BTC-USDT-SPOT").unwrap(),
+        "BTCUSDT",
+    )
+    .unwrap();
+
+    assert_eq!(
+        parsed.symbol.standard_symbol(),
+        &Symbol::new("BTC-USDT-SPOT").unwrap()
+    );
+    assert_eq!(parsed.symbol.market_type(), MarketType::Spot);
+    assert_eq!(
+        parsed.rules.price_tick().as_decimal(),
+        decimal("0.01000000")
+    );
+    assert_eq!(
+        parsed.rules.min_price().unwrap().as_decimal(),
+        decimal("0.01000000")
+    );
+    assert_eq!(
+        parsed.rules.max_price().unwrap().as_decimal(),
+        decimal("1000000.00000000")
+    );
+    assert_eq!(
+        parsed.rules.quantity_step().as_decimal(),
+        decimal("0.00010000")
+    );
+    assert_eq!(
+        parsed.rules.min_quantity().as_decimal(),
+        decimal("0.00010000")
+    );
+    assert_eq!(
+        parsed.rules.max_quantity().unwrap().as_decimal(),
+        decimal("100.00000000")
+    );
+    assert_eq!(
+        parsed.rules.market_quantity_step().unwrap().as_decimal(),
+        decimal("0.00100000")
+    );
+    assert_eq!(
+        parsed.rules.market_min_quantity().unwrap().as_decimal(),
+        decimal("0.00100000")
+    );
+    assert_eq!(
+        parsed.rules.market_max_quantity().unwrap().as_decimal(),
+        decimal("10.00000000")
+    );
+    assert_eq!(
+        parsed.rules.min_notional().as_decimal(),
+        decimal("10.00000000")
+    );
+    assert_eq!(
+        parsed.rules.max_notional().unwrap().as_decimal(),
+        decimal("100000.00000000")
+    );
+    assert!(!parsed.rules.apply_min_notional_to_market());
+    assert!(parsed.rules.apply_max_notional_to_market());
+    assert_eq!(parsed.rules.market_notional_average_minutes(), Some(5));
+    assert!(
+        parsed
+            .rules
+            .requires_authoritative_market_notional_reference()
+    );
+
+    let catalog = InstrumentRuleCatalog::new(vec![parsed.rules.clone()]).unwrap();
+    let market = OrderIntent::market(
+        "binance",
+        Symbol::new("BTC-USDT-SPOT").unwrap(),
+        MarketType::Spot,
+        Side::Buy,
+        quantity("0.001"),
+    );
+    let error = catalog
+        .validate_order(&market, Some(price("50000")))
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+    assert!(format!("{error}").contains("authoritative market notional reference"));
+}
+
+#[test]
+fn usdm_exchange_info_requires_perpetual_trading_and_supports_min_notional_alias() {
+    let parsed = BinanceTestnetProtocol::parse_exchange_info_symbol(
+        BinanceProduct::UsdM,
+        include_bytes!("fixtures/binance_usdm_exchange_info.json"),
+        Symbol::new("BTC-USDT-PERP").unwrap(),
+        "BTCUSDT",
+    )
+    .unwrap();
+
+    assert_eq!(parsed.symbol.market_type(), MarketType::Perpetual);
+    assert_eq!(parsed.rules.price_tick().as_decimal(), decimal("0.1000"));
+    assert_eq!(parsed.rules.min_notional().as_decimal(), decimal("5"));
+    assert!(parsed.rules.apply_min_notional_to_market());
+    assert_eq!(
+        parsed.rules.market_quantity_step().unwrap().as_decimal(),
+        decimal("0.010")
+    );
+}
+
+#[test]
+fn exchange_info_parser_rejects_missing_or_mismatched_asset_identity() {
+    let payload = include_bytes!("fixtures/binance_spot_exchange_info.json");
+
+    assert!(matches!(
+        BinanceTestnetProtocol::parse_exchange_info_symbol(
+            BinanceProduct::Spot,
+            payload,
+            Symbol::new("ETH-USDT-SPOT").unwrap(),
+            "BTCUSDT",
+        ),
+        Err(ExchangeError::InvalidResponse { .. })
+    ));
+
+    let missing_assets = br#"{
+        "symbols": [{
+            "symbol":"BTCUSDT",
+            "status":"TRADING",
+            "filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true}
+            ]
+        }]
+    }"#;
+    assert!(matches!(
+        BinanceTestnetProtocol::parse_exchange_info_symbol(
+            BinanceProduct::Spot,
+            missing_assets,
+            Symbol::new("BTC-USDT-SPOT").unwrap(),
+            "BTCUSDT",
+        ),
+        Err(ExchangeError::InvalidResponse { .. })
+    ));
+}
+
+#[test]
+fn exchange_info_parser_rejects_unknown_filter_semantics() {
+    let payload = br#"{
+        "symbols": [{
+            "symbol":"BTCUSDT",
+            "status":"TRADING",
+            "baseAsset":"BTC",
+            "quoteAsset":"USDT",
+            "filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true},
+                {"filterType":"FUTURE_UNKNOWN_SAFETY_FILTER","limit":"1"}
+            ]
+        }]
+    }"#;
+
+    assert!(matches!(
+        BinanceTestnetProtocol::parse_exchange_info_symbol(
+            BinanceProduct::Spot,
+            payload,
+            Symbol::new("BTC-USDT-SPOT").unwrap(),
+            "BTCUSDT",
+        ),
+        Err(ExchangeError::InvalidResponse { .. })
+    ));
+}
+
+#[test]
+fn spot_notional_metadata_requires_explicit_market_flags_and_average_window() {
+    let missing_variants: [&[u8]; 3] = [
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","avgPriceMins":5}
+            ]}]
+        }"#,
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"NOTIONAL","minNotional":"5","maxNotional":"100","applyMinToMarket":true,"avgPriceMins":5}
+            ]}]
+        }"#,
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true}
+            ]}]
+        }"#,
+    ];
+
+    for payload in missing_variants {
+        assert!(matches!(
+            BinanceTestnetProtocol::parse_exchange_info_symbol(
+                BinanceProduct::Spot,
+                payload,
+                Symbol::new("BTC-USDT-SPOT").unwrap(),
+                "BTCUSDT",
+            ),
+            Err(ExchangeError::InvalidResponse { .. })
+        ));
+    }
+}
+
+#[test]
+fn exchange_info_parser_rejects_missing_duplicate_conflicting_and_non_trading_filters() {
+    let invalid_payloads: [&[u8]; 4] = [
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5}
+            ]}]
+        }"#,
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5}
+            ]}]
+        }"#,
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5},
+                {"filterType":"NOTIONAL","minNotional":"5","maxNotional":"100","applyMinToMarket":true,"applyMaxToMarket":true,"avgPriceMins":5}
+            ]}]
+        }"#,
+        br#"{
+            "symbols":[{"symbol":"BTCUSDT","status":"HALT","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+                {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true,"avgPriceMins":5}
+            ]}]
+        }"#,
+    ];
+
+    for payload in invalid_payloads {
+        assert!(matches!(
+            BinanceTestnetProtocol::parse_exchange_info_symbol(
+                BinanceProduct::Spot,
+                payload,
+                Symbol::new("BTC-USDT-SPOT").unwrap(),
+                "BTCUSDT",
+            ),
+            Err(ExchangeError::InvalidResponse { .. })
+        ));
+    }
+}
+
+#[test]
+fn disabled_market_maximum_remains_optional_without_disabling_market_step_or_minimum() {
+    let payload = br#"{
+        "symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
+            {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+            {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+            {"filterType":"MARKET_LOT_SIZE","minQty":"0.002","maxQty":"0","stepSize":"0.002"},
+            {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":false,"avgPriceMins":5}
+        ]}]
+    }"#;
+
+    let parsed = BinanceTestnetProtocol::parse_exchange_info_symbol(
+        BinanceProduct::Spot,
+        payload,
+        Symbol::new("BTC-USDT-SPOT").unwrap(),
+        "BTCUSDT",
+    )
+    .unwrap();
+    assert_eq!(
+        parsed.rules.market_quantity_step().unwrap().as_decimal(),
+        decimal("0.002")
+    );
+    assert_eq!(
+        parsed.rules.market_min_quantity().unwrap().as_decimal(),
+        decimal("0.002")
+    );
+    assert_eq!(parsed.rules.market_max_quantity(), None);
+    assert!(
+        !parsed
+            .rules
+            .requires_authoritative_market_notional_reference()
+    );
+}
+
+#[test]
+fn exchange_info_parser_fails_closed_on_missing_duplicate_disabled_and_non_perpetual_metadata() {
+    let missing = br#"{"symbols":[]}"#;
+    let duplicate = br#"{
+        "symbols": [
+            {
+                "symbol":"BTCUSDT",
+                "status":"TRADING",
+                "baseAsset":"BTC",
+                "quoteAsset":"USDT",
+                "filters":[
+                    {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                    {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                    {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true}
+                ]
+            },
+            {
+                "symbol":"BTCUSDT",
+                "status":"TRADING",
+                "baseAsset":"BTC",
+                "quoteAsset":"USDT",
+                "filters":[
+                    {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                    {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                    {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true}
+                ]
+            }
+        ]
+    }"#;
+    let disabled = br#"{
+        "symbols": [
+            {
+                "symbol":"BTCUSDT",
+                "status":"TRADING",
+                "baseAsset":"BTC",
+                "quoteAsset":"USDT",
+                "filters":[
+                    {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0"},
+                    {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                    {"filterType":"MIN_NOTIONAL","minNotional":"5","applyToMarket":true}
+                ]
+            }
+        ]
+    }"#;
+    let wrong_contract = br#"{
+        "symbols": [
+            {
+                "symbol":"BTCUSDT",
+                "pair":"BTCUSDT",
+                "contractType":"CURRENT_QUARTER",
+                "status":"TRADING",
+                "baseAsset":"BTC",
+                "quoteAsset":"USDT",
+                "filters":[
+                    {"filterType":"PRICE_FILTER","minPrice":"0.1","maxPrice":"1000","tickSize":"0.1"},
+                    {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"10","stepSize":"0.001"},
+                    {"filterType":"MIN_NOTIONAL","notional":"5"}
+                ]
+            }
+        ]
+    }"#;
+
+    for payload in [
+        missing.as_slice(),
+        duplicate.as_slice(),
+        disabled.as_slice(),
+    ] {
+        assert!(matches!(
+            BinanceTestnetProtocol::parse_exchange_info_symbol(
+                BinanceProduct::Spot,
+                payload,
+                Symbol::new("BTC-USDT-SPOT").unwrap(),
+                "BTCUSDT",
+            ),
+            Err(ExchangeError::InvalidResponse { .. })
+        ));
+    }
+    assert!(matches!(
+        BinanceTestnetProtocol::parse_exchange_info_symbol(
+            BinanceProduct::UsdM,
+            wrong_contract,
+            Symbol::new("BTC-USDT-PERP").unwrap(),
+            "BTCUSDT",
+        ),
+        Err(ExchangeError::InvalidResponse { .. })
+    ));
+}
+
+#[test]
 fn official_hmac_vector_matches_binance_documentation() {
     let signer = BinanceHmacSha256Signer::new(
         "offline-api-key",

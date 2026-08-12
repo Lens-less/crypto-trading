@@ -314,9 +314,11 @@ impl FillModel {
     /// # Errors
     ///
     /// Returns [`BacktestError::UnsupportedMakerLiquidity`] for maker
-    /// requests, [`BacktestError::OrderInstrumentMismatch`] when an identified
-    /// order and event disagree, and arithmetic or domain errors when the fill
-    /// price or fee cannot be represented.
+    /// requests, [`BacktestError::UnsupportedDerivativesMarginModel`] when the
+    /// event or order identifies a perpetual instrument,
+    /// [`BacktestError::OrderInstrumentMismatch`] when an identified order and
+    /// event disagree, and arithmetic or domain errors when the fill price or
+    /// fee cannot be represented.
     pub fn fill(
         &self,
         event: &MarketEvent,
@@ -324,6 +326,13 @@ impl FillModel {
     ) -> Result<TradeFill, BacktestError> {
         if order.liquidity == Liquidity::Maker {
             return Err(BacktestError::UnsupportedMakerLiquidity);
+        }
+        if [event.instrument(), order.instrument.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|instrument| instrument.market_type == MarketType::Perpetual)
+        {
+            return Err(BacktestError::UnsupportedDerivativesMarginModel);
         }
         if let (Some(event_instrument), Some(order_instrument)) =
             (event.instrument(), order.instrument.as_ref())
@@ -497,13 +506,22 @@ impl BacktestEngine {
     ///
     /// # Errors
     ///
-    /// Returns arithmetic and validation errors propagated from the fill model
-    /// or ledger.
+    /// Returns [`BacktestError::UnsupportedDerivativesMarginModel`] whenever an
+    /// event or order identifies a perpetual instrument until the crate has a
+    /// real derivatives margin model, plus arithmetic and validation errors
+    /// propagated from the fill model or ledger.
     pub fn run<S: Strategy>(
         &self,
         tape: &EventTape,
         strategy: &mut S,
     ) -> Result<BacktestResult, BacktestError> {
+        if tape
+            .instrument()
+            .is_some_and(|instrument| instrument.market_type == MarketType::Perpetual)
+        {
+            return Err(BacktestError::UnsupportedDerivativesMarginModel);
+        }
+
         let mut clock = SimClock::default();
         let mut ledger = Ledger::new(self.initial_cash)?;
         let mut trades = Vec::new();

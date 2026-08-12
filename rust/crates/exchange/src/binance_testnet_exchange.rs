@@ -670,9 +670,82 @@ fn same_account_state(
     left: &BinanceTestnetAccountSnapshot,
     right: &BinanceTestnetAccountSnapshot,
 ) -> bool {
+    let mut left_balances = left.balances.clone();
+    let mut right_balances = right.balances.clone();
+    left_balances.sort_by(|left, right| left.asset.cmp(&right.asset));
+    right_balances.sort_by(|left, right| left.asset.cmp(&right.asset));
+
+    let mut left_orders = left.orders.clone();
+    let mut right_orders = right.orders.clone();
+    left_orders.sort_by(compare_orders_by_identity);
+    right_orders.sort_by(compare_orders_by_identity);
+
+    let mut left_foreign_orders = left.foreign_orders.clone();
+    let mut right_foreign_orders = right.foreign_orders.clone();
+    left_foreign_orders.sort_by(compare_foreign_orders_by_identity);
+    right_foreign_orders.sort_by(compare_foreign_orders_by_identity);
+
+    let mut left_positions = left.positions.clone();
+    let mut right_positions = right.positions.clone();
+    left_positions.sort_by(compare_positions_by_identity);
+    right_positions.sort_by(compare_positions_by_identity);
+
     left.product == right.product
-        && left.balances == right.balances
-        && left.orders == right.orders
-        && left.foreign_orders == right.foreign_orders
-        && left.positions == right.positions
+        && left_balances == right_balances
+        && left_orders == right_orders
+        && left_foreign_orders == right_foreign_orders
+        && left_positions == right_positions
+}
+
+fn compare_orders_by_identity(
+    left: &crypto_trading_domain::Order,
+    right: &crypto_trading_domain::Order,
+) -> std::cmp::Ordering {
+    left.id
+        .cmp(&right.id)
+        .then_with(|| {
+            left.intent
+                .client_order_id
+                .cmp(&right.intent.client_order_id)
+        })
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.updated_at.cmp(&right.updated_at))
+}
+
+fn compare_foreign_orders_by_identity(
+    left: &ForeignOrder,
+    right: &ForeignOrder,
+) -> std::cmp::Ordering {
+    left.id
+        .cmp(&right.id)
+        .then_with(|| left.client_order_id.cmp(&right.client_order_id))
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.updated_at.cmp(&right.updated_at))
+}
+
+fn compare_positions_by_identity(
+    left: &crypto_trading_domain::Position,
+    right: &crypto_trading_domain::Position,
+) -> std::cmp::Ordering {
+    left.exchange
+        .cmp(&right.exchange)
+        .then_with(|| left.symbol.cmp(&right.symbol))
+        .then_with(|| market_type_rank(left.market_type).cmp(&market_type_rank(right.market_type)))
+        .then_with(|| position_side_rank(left.side).cmp(&position_side_rank(right.side)))
+        .then_with(|| left.updated_at.cmp(&right.updated_at))
+}
+
+const fn market_type_rank(market_type: crypto_trading_domain::MarketType) -> u8 {
+    match market_type {
+        crypto_trading_domain::MarketType::Spot => 0,
+        crypto_trading_domain::MarketType::Perpetual => 1,
+    }
+}
+
+const fn position_side_rank(side: crypto_trading_domain::PositionSide) -> u8 {
+    match side {
+        crypto_trading_domain::PositionSide::Long => 0,
+        crypto_trading_domain::PositionSide::Short => 1,
+        crypto_trading_domain::PositionSide::Flat => 2,
+    }
 }

@@ -94,8 +94,13 @@ impl PaperArbitrageRequest {
                 "paper arbitrage legs must contain one buy and one sell",
             ));
         }
+        if intents[0].symbol != intents[1].symbol {
+            return Err(PaperArbitrageSagaError::InvalidRequest(
+                "paper arbitrage legs must use one literal symbol until multi-symbol admission exists",
+            ));
+        }
         for (index, (intent, leg)) in intents.iter().zip(legs).enumerate() {
-            if intent.symbol != self.symbol
+            if self.symbol != intent.symbol
                 || leg.index() != index
                 || leg.exchange() != intent.exchange
                 || leg.symbol() != &intent.symbol

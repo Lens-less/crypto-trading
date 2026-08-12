@@ -34,7 +34,7 @@ use crypto_trading_runtime::{
     PaperReservationPhase, PaperReservationRequest, ReadOnlyTaskFailure, ReadOnlyTaskKind,
     ReadOnlyTaskPhase, ReadOnlyTaskRecovery, SpreadHistoryRecord, SpreadHistoryWriter,
 };
-use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy};
+use crypto_trading_strategy::{AccountRiskLimits, AccountRiskPolicy, RiskRejection};
 use rust_decimal::Decimal;
 use serde_json::json;
 use tokio::sync::{Semaphore, mpsc};
@@ -59,17 +59,31 @@ fn symbol() -> Symbol {
     Symbol::new("BTC-USDT").unwrap()
 }
 
-fn instrument(exchange: &str) -> MarketInstrument {
-    MarketInstrument::new(exchange, symbol(), MarketType::Perpetual).unwrap()
-}
-
 fn monitor() -> ReadOnlyArbitrageMonitor {
     monitor_for("left", "right")
 }
 
 fn monitor_for(left_exchange: &str, right_exchange: &str) -> ReadOnlyArbitrageMonitor {
-    let left = instrument(left_exchange);
-    let right = instrument(right_exchange);
+    monitor_pair(
+        left_exchange,
+        symbol(),
+        MarketType::Perpetual,
+        right_exchange,
+        symbol(),
+        MarketType::Perpetual,
+    )
+}
+
+fn monitor_pair(
+    left_exchange: &str,
+    left_symbol: Symbol,
+    left_market_type: MarketType,
+    right_exchange: &str,
+    right_symbol: Symbol,
+    right_market_type: MarketType,
+) -> ReadOnlyArbitrageMonitor {
+    let left = MarketInstrument::new(left_exchange, left_symbol, left_market_type).unwrap();
+    let right = MarketInstrument::new(right_exchange, right_symbol, right_market_type).unwrap();
     let universe = MarketUniverse::new(vec![left.clone(), right.clone()]).unwrap();
     let book = MarketDataBook::new(
         universe,
@@ -188,6 +202,44 @@ async fn seed_open_pair(task_id: &str, account: &PaperAccountAuthority, history:
         task.stop().await.unwrap(),
         ArbitragePaperTaskExit::StopRequested
     );
+}
+
+async fn settle_losing_round_trip(account: &PaperAccountAuthority) {
+    for (sequence, side, limit, reduce_only) in [
+        ("open", Side::Buy, "100", false),
+        ("close", Side::Sell, "90", true),
+    ] {
+        let mut intent = OrderIntent::limit(
+            "left",
+            symbol(),
+            MarketType::Perpetual,
+            side,
+            quantity("1"),
+            price(limit),
+        );
+        intent.reduce_only = reduce_only;
+        let batch = ExecutionBatch::planned(vec![intent]).unwrap();
+        let leg =
+            PaperReservationLeg::from_intent(0, &batch.intents()[0], Money::new(decimal(limit)))
+                .unwrap();
+        let request = PaperReservationRequest::planned(
+            format!("loss-seed:{sequence}"),
+            format!("loss-seed:{sequence}"),
+            batch.id(),
+            PaperCostModel::v1(10, 0, 0).unwrap(),
+            vec![leg],
+        )
+        .unwrap();
+        let reservation_id = request.reservation_id();
+        account.reserve(request).await.unwrap();
+        account
+            .settle_execution(
+                reservation_id,
+                &filled_receipts(batch.intents().iter().enumerate()),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 async fn seed_legacy_open_pair_without_owner_lease(
@@ -626,6 +678,112 @@ async fn risk_rejection_happens_before_any_reservation() {
     );
 }
 
+#[tokio::test]
+async fn buying_power_rejection_happens_before_any_reservation() {
+    let (account, history, path) = account_with_available("buying-power-rejected", "200");
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config_with_max(
+            "arbitrage:buying-power",
+            StdDuration::from_secs(30),
+            "10000",
+        ),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        task.wait().await.unwrap_err(),
+        ArbitragePaperTaskError::RiskRejected(RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required,
+            buying_power,
+        }) if required == decimal("201.5") && buying_power == decimal("200")
+    ));
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    assert!(
+        !std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"decision\":\"paper_account_reserved\"")
+    );
+}
+
+#[tokio::test]
+async fn buying_power_uses_settled_equity_after_realized_losses_and_fees() {
+    let (account, history, path) = account_with_available("settled-buying-power", "205");
+    settle_losing_round_trip(&account).await;
+    let settled = account.snapshot().await.unwrap();
+    assert_eq!(settled.settled_equity_base, Money::new(decimal("194.81")));
+    assert_eq!(settled.available, Money::new(decimal("194.81")));
+    assert!(settled.open_lots.is_empty());
+
+    let (left_source, left_sender) = ChannelSource::new("left");
+    let (right_source, right_sender) = ChannelSource::new("right");
+    let mut task = ArbitragePaperTask::start(
+        task_config_with_max(
+            "arbitrage:settled-buying-power",
+            StdDuration::from_secs(30),
+            "10000",
+        ),
+        monitor(),
+        left_source,
+        right_source,
+        account.clone(),
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap();
+    left_sender
+        .send(observation("left", "99", "100", 1, base_time()))
+        .await
+        .unwrap();
+    right_sender
+        .send(observation(
+            "right",
+            "101.5",
+            "102",
+            1,
+            base_time() + Duration::seconds(1),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        task.wait().await.unwrap_err(),
+        ArbitragePaperTaskError::RiskRejected(RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required,
+            buying_power,
+        }) if required == decimal("201.5") && buying_power == decimal("194.81")
+    ));
+    assert!(account.snapshot().await.unwrap().reservations.is_empty());
+    assert!(
+        !std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"task_id\":\"arbitrage:settled-buying-power/op/000001\"")
+    );
+}
+
 fn account_risk_authority(
     account: &PaperAccountAuthority,
     history: &JsonlHistory,
@@ -740,7 +898,10 @@ async fn account_risk_pause_skips_opportunities_without_failing_the_owner() {
 
 #[tokio::test]
 async fn reservation_rejection_cancels_the_previously_admitted_account_risk_ticket() {
-    let (account, history, path) = account_with_available("admission-cancelled", "1");
+    // The strategy risk gate charges the exact 201.5 opening notional, while
+    // the downstream reservation also includes the configured paper costs.
+    // This budget deliberately reaches the reservation seam but cannot reserve.
+    let (account, history, path) = account_with_available("admission-cancelled", "201.5");
     let risk = account_risk_authority(&account, &history, AccountRiskLimits::default());
     let executor = Arc::new(FillExecutor::default());
     let (left_source, left_sender) = ChannelSource::new("left");
@@ -2406,25 +2567,9 @@ async fn failed_reconciliation_blocks_a_new_owner_before_registration() {
 
 #[tokio::test]
 async fn source_mismatch_is_zero_write_and_clean_stable_owner_restart_remains_projectable() {
-    let (mismatch_account, mismatch_history, mismatch_path) = account("source-mismatch");
-    let (wrong_left, _wrong_left_sender) = ChannelSource::new("right");
-    let (right, _right_sender) = ChannelSource::new("right");
-    let mismatch = ArbitragePaperTask::start(
-        task_config("arbitrage:mismatch", StdDuration::from_secs(30)),
-        monitor(),
-        wrong_left,
-        right,
-        mismatch_account,
-        mismatch_history,
-        Arc::new(FillExecutor::default()),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(
-        mismatch,
-        ArbitragePaperTaskError::InvalidSourceBinding
-    ));
-    assert!(!mismatch_path.exists());
+    assert_exchange_source_mismatch_fails_closed().await;
+    assert_symbol_identity_mismatch_fails_closed().await;
+    assert_canonical_spot_perp_binding_fails_closed().await;
 
     let (account, history, _) = account("clean-restart");
     let (first_left, _first_left_sender) = ChannelSource::new("left");
@@ -2494,6 +2639,87 @@ async fn source_mismatch_is_zero_write_and_clean_stable_owner_restart_remains_pr
     assert_eq!(durable.sources[0].source_id, "left");
     assert_eq!(durable.sources[1].source_id, "right");
     assert!(account.snapshot().await.unwrap().reservations.is_empty());
+}
+
+async fn assert_exchange_source_mismatch_fails_closed() {
+    let (mismatch_account, mismatch_history, mismatch_path) = account("source-mismatch");
+    let (wrong_left, _wrong_left_sender) = ChannelSource::new("right");
+    let (right, _right_sender) = ChannelSource::new("right");
+    let mismatch = ArbitragePaperTask::start(
+        task_config("arbitrage:mismatch", StdDuration::from_secs(30)),
+        monitor(),
+        wrong_left,
+        right,
+        mismatch_account,
+        mismatch_history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        mismatch,
+        ArbitragePaperTaskError::InvalidSourceBinding
+    ));
+    assert!(!mismatch_path.exists());
+}
+
+async fn assert_symbol_identity_mismatch_fails_closed() {
+    let (account, history, path) = account("symbol-mismatch");
+    let (left, _left_sender) = ChannelSource::new("left");
+    let (right, _right_sender) = ChannelSource::new("right");
+    let mismatch = ArbitragePaperTask::start(
+        task_config("arbitrage:symbol-mismatch", StdDuration::from_secs(30)),
+        monitor_pair(
+            "left",
+            Symbol::new("AAA-PERP").unwrap(),
+            MarketType::Perpetual,
+            "right",
+            Symbol::new("BBB-PERP").unwrap(),
+            MarketType::Perpetual,
+        ),
+        left,
+        right,
+        account,
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        mismatch,
+        ArbitragePaperTaskError::InvalidSourceBinding
+    ));
+    assert!(!path.exists());
+}
+
+async fn assert_canonical_spot_perp_binding_fails_closed() {
+    let (account, history, path) = account("canonical-hedge-restart");
+    let (left, _left_sender) = ChannelSource::new("left");
+    let (right, _right_sender) = ChannelSource::new("right");
+    let error = ArbitragePaperTask::start(
+        task_config("arbitrage:canonical-hedge", StdDuration::from_secs(30)),
+        monitor_pair(
+            "left",
+            Symbol::new("ETH-USDC-SPOT").unwrap(),
+            MarketType::Spot,
+            "right",
+            Symbol::new("ETH-USDC-PERP").unwrap(),
+            MarketType::Perpetual,
+        ),
+        left,
+        right,
+        account,
+        history,
+        Arc::new(FillExecutor::default()),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ArbitragePaperTaskError::InvalidSourceBinding
+    ));
+    assert!(!path.exists());
 }
 
 #[tokio::test]

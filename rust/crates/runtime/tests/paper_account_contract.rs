@@ -473,7 +473,7 @@ async fn uncertain_commit_reconcile_and_safe_release_transitions_survive_restart
         PaperReconciliationOutcome::Failed
     );
 
-    let released = restarted_again
+    let error = restarted_again
         .reconcile_release(reconciliation_match_proof(
             "paper-main",
             reservation_id,
@@ -484,22 +484,88 @@ async fn uncertain_commit_reconcile_and_safe_release_transitions_survive_restart
             money("1000"),
         ))
         .await
-        .unwrap();
-    assert_eq!(released.phase, PaperReservationPhase::Released);
-    assert_eq!(released.held_exposure, Money::default());
+        .unwrap_err();
+    assert!(matches!(error, PaperAccountError::InvalidTransition));
+    let persisted_failed_again = restarted_again.snapshot().await.unwrap();
+    assert_eq!(persisted_failed_again.available, money("850"));
+    assert_eq!(persisted_failed_again.committed_exposure, money("150"));
     assert_eq!(
-        released.reconciliation.as_ref().unwrap().outcome,
-        PaperReconciliationOutcome::Released
+        persisted_failed_again.reservations[0]
+            .reconciliation
+            .as_ref()
+            .unwrap()
+            .outcome,
+        PaperReconciliationOutcome::Failed
     );
-    let released_snapshot = restarted_again.snapshot().await.unwrap();
-    assert_eq!(released_snapshot.available, money("1000"));
-    assert_eq!(released_snapshot.committed_exposure, Money::default());
 
     let records = std::fs::read_to_string(&path).unwrap();
     assert!(records.contains("\"decision\":\"paper_account_reconcile_failed\""));
-    assert!(records.contains("\"decision\":\"paper_account_released\""));
-    assert!(records.contains("\"snapshot_sequence\":42"));
-    assert!(records.contains("\"source_state_digest\":\"fedcba9876543210\""));
+    assert!(!records.contains("\"decision\":\"paper_account_released\""));
+    assert!(!records.contains("\"snapshot_sequence\":42"));
+    assert!(!records.contains("\"source_state_digest\":\"fedcba9876543210\""));
+}
+
+#[tokio::test]
+async fn identical_failed_reconciliation_replay_ignores_unrelated_account_movement() {
+    let path = temp_path("failed-reconciliation-idempotent-after-movement");
+    let journal_id = Uuid::new_v4();
+    let authority = PaperAccountAuthority::new(
+        journal_id,
+        JsonlHistory::new(&path),
+        PaperAccountConfig::new("paper-main", money("1000")).unwrap(),
+    )
+    .unwrap();
+    let request = reservation_request(
+        "arb:failure-a",
+        "open:failure-a",
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let reservation_id = request.reservation_id();
+    let batch_id = request.batch_id();
+
+    authority.reserve(request).await.unwrap();
+    authority
+        .commit(reservation_id, money("150"))
+        .await
+        .unwrap();
+    let proof_a = reconciliation_mismatch_proof(
+        "paper-main",
+        reservation_id,
+        batch_id,
+        "binance/account-2026-07-25T00:40:00Z",
+        43,
+        "0123456789abcdef",
+        money("1000"),
+    );
+    let failed = authority
+        .record_reconciliation_failure(proof_a.clone())
+        .await
+        .unwrap();
+
+    let unrelated = reservation_request(
+        "arb:movement-b",
+        "open:movement-b",
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    authority.reserve(unrelated).await.unwrap();
+    let snapshot_before_replay = authority.snapshot().await.unwrap();
+    assert_eq!(snapshot_before_replay.available, money("649.40"));
+    let journal_before_replay = std::fs::read_to_string(&path).unwrap();
+
+    let replayed = authority
+        .record_reconciliation_failure(proof_a)
+        .await
+        .unwrap();
+
+    assert_eq!(replayed, failed);
+    assert_eq!(authority.snapshot().await.unwrap(), snapshot_before_replay);
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        journal_before_replay,
+        "an identical failure proof must not append another journal fact"
+    );
 }
 
 #[tokio::test]

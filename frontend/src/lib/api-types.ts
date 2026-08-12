@@ -3,7 +3,7 @@
  *
  * 后端事实来源:rust/crates/web/src/api.rs 与 rust/crates/runtime/src/capability.rs。
  * - /api/v1/health、/api/v1/system 顶层 `schema_version: 1`(API_SCHEMA_VERSION);
- * - /api/v1/capabilities 返回 CapabilityManifest,`schema_version: 2`
+ * - /api/v1/capabilities 返回 CapabilityManifest,`schema_version: 3`
  *   (CAPABILITY_SCHEMA_VERSION),注意与 API 版本不同;
  * - 错误响应统一为 `{ schema_version, error: { code, message } }`。
  *
@@ -13,7 +13,7 @@
 import { z } from "zod";
 
 export const API_SCHEMA_VERSION = 1;
-export const CAPABILITY_SCHEMA_VERSION = 2;
+export const CAPABILITY_SCHEMA_VERSION = 3;
 
 /* ---------------------------------------------------------------- 错误封套 */
 
@@ -114,6 +114,7 @@ export type CapabilityAccess =
   | "local"
   | "market-data"
   | "paper-trading"
+  | "testnet-read-only"
   | "testnet-trading"
   | "mainnet-trading";
 

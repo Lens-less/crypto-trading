@@ -9,6 +9,13 @@
 
 ## Operating the software
 
+- [`internal/specs/LIVE_TRADING_V1_SPEC.md`](internal/specs/LIVE_TRADING_V1_SPEC.md)
+  — implementation and promotion contract for the minimal Binance Spot live
+  runtime. Mainnet remains gated until its evidence requirements pass.
+- [`automation/live-trading-v1/goal-automation-runbook.md`](automation/live-trading-v1/goal-automation-runbook.md)
+  — dependency-ordered one-shot Goal prompts, supervised release gates, and the
+  recurring coordination prompt. Its local board is
+  [`automation/live-trading-v1/goal-board.md`](automation/live-trading-v1/goal-board.md).
 - [`adapter-support.md`](adapter-support.md) — which exchange can do what. This
   is a human-readable projection of the capability manifest in
   `rust/crates/runtime/src/capability.rs`, held in sync by a contract test.

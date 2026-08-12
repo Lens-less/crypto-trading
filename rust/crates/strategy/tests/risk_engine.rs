@@ -374,6 +374,163 @@ fn market_sell_at_the_bid_limit_is_authorized() {
 }
 
 #[test]
+fn opening_notional_is_bounded_by_the_lower_of_equity_and_available_balance() {
+    let (now, symbol, market, mut account) = setup();
+    account.equity = Money::new(decimal("1000"));
+    account.available_balance = Money::new(decimal("100"));
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let intent = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("1"),
+    );
+
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &account,
+        &[],
+        &market,
+        now,
+        &RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required: decimal("101"),
+            buying_power: decimal("100"),
+        },
+    );
+}
+
+#[test]
+fn aggressive_buy_limit_uses_limit_price_for_opening_notional() {
+    let (now, symbol, market, mut account) = setup();
+    account.equity = Money::new(decimal("149.99"));
+    account.available_balance = Money::new(decimal("149.99"));
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let intent = OrderIntent::limit(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("1"),
+        price("150"),
+    );
+
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &account,
+        &[],
+        &market,
+        now,
+        &RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required: decimal("150"),
+            buying_power: decimal("149.99"),
+        },
+    );
+}
+
+#[test]
+fn opening_is_rejected_when_equity_is_zero_even_if_available_is_positive() {
+    let (now, symbol, market, account) = setup();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let intent = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("0.5"),
+    );
+
+    let mut constrained = account.clone();
+    constrained.equity = Money::new(decimal("0"));
+    constrained.available_balance = Money::new(decimal("1000"));
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &constrained,
+        &[],
+        &market,
+        now,
+        &RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required: decimal("50.5"),
+            buying_power: Decimal::ZERO,
+        },
+    );
+}
+
+#[test]
+fn negative_account_truth_is_rejected_even_for_reductions() {
+    let (now, symbol, market, mut account) = setup();
+    account.equity = Money::new(decimal("1000"));
+    account.available_balance = Money::new(decimal("1000"));
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let position = Position {
+        exchange: "paper".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Perpetual,
+        side: PositionSide::Long,
+        quantity: quantity("1"),
+        entry_price: Some(price("100")),
+        mark_price: Some(price("100")),
+        unrealized_pnl: Money::default(),
+        updated_at: now,
+    };
+    let reduce = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Sell,
+        quantity("1"),
+    );
+
+    account.equity = Money::new(decimal("-0.01"));
+    assert_rejects_single_and_batch(
+        &engine,
+        &reduce,
+        &account,
+        std::slice::from_ref(&position),
+        &market,
+        now,
+        &RiskRejection::InvalidAccountState {
+            field: "equity",
+            value: decimal("-0.01"),
+        },
+    );
+
+    account.equity = Money::new(decimal("1000"));
+    account.available_balance = Money::new(decimal("-0.01"));
+    assert_rejects_single_and_batch(
+        &engine,
+        &reduce,
+        &account,
+        &[position],
+        &market,
+        now,
+        &RiskRejection::InvalidAccountState {
+            field: "available_balance",
+            value: decimal("-0.01"),
+        },
+    );
+}
+
+#[test]
 fn projected_position_value_is_bounded_while_reduction_is_authorized() {
     let (now, symbol, market, account) = setup();
     let engine = RiskEngine::new(RiskLimits {
@@ -430,6 +587,51 @@ fn projected_position_value_is_bounded_while_reduction_is_authorized() {
 }
 
 #[test]
+fn reductions_remain_authorized_when_buying_power_is_exhausted() {
+    let (now, symbol, market, mut account) = setup();
+    account.equity = Money::default();
+    account.available_balance = Money::default();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let position = Position {
+        exchange: "paper".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Perpetual,
+        side: PositionSide::Long,
+        quantity: quantity("1"),
+        entry_price: Some(price("100")),
+        mark_price: Some(price("100")),
+        unrealized_pnl: Money::default(),
+        updated_at: now,
+    };
+    let reduce = OrderIntent::market(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Sell,
+        quantity("1"),
+    );
+
+    assert_eq!(
+        engine.authorize(
+            &reduce,
+            &account,
+            std::slice::from_ref(&position),
+            &market,
+            now
+        ),
+        RiskDecision::Authorized
+    );
+    assert_eq!(
+        engine.authorize_batch(&[reduce], &account, &[position], &[market], now),
+        RiskDecision::Authorized
+    );
+}
+
+#[test]
 fn reduce_only_order_cannot_cross_through_flat_into_the_opposite_side() {
     let (now, symbol, market, account) = setup();
     let engine = RiskEngine::new(RiskLimits {
@@ -460,6 +662,72 @@ fn reduce_only_order_cannot_cross_through_flat_into_the_opposite_side() {
     assert_eq!(
         engine.authorize(&overshoot, &account, &[position], &market, now),
         RiskDecision::Rejected(RiskRejection::ReduceOnlyWouldIncrease)
+    );
+}
+
+#[test]
+fn crossing_through_flat_only_charges_the_opening_excess() {
+    let (now, symbol, market, mut account) = setup();
+    account.equity = Money::new(decimal("49.5"));
+    account.available_balance = Money::new(decimal("49.5"));
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let position = Position {
+        exchange: "paper".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Perpetual,
+        side: PositionSide::Long,
+        quantity: quantity("1"),
+        entry_price: Some(price("100")),
+        mark_price: Some(price("100")),
+        unrealized_pnl: Money::default(),
+        updated_at: now,
+    };
+    let cross = OrderIntent::market(
+        "paper",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Sell,
+        quantity("1.5"),
+    );
+
+    assert_eq!(
+        engine.authorize(
+            &cross,
+            &account,
+            std::slice::from_ref(&position),
+            &market,
+            now
+        ),
+        RiskDecision::Authorized
+    );
+    assert_eq!(
+        engine.authorize_batch(
+            std::slice::from_ref(&cross),
+            &account,
+            std::slice::from_ref(&position),
+            std::slice::from_ref(&market),
+            now
+        ),
+        RiskDecision::Authorized
+    );
+
+    account.equity = Money::new(decimal("49.4"));
+    account.available_balance = Money::new(decimal("49.4"));
+    assert_rejects_single_and_batch(
+        &engine,
+        &cross,
+        &account,
+        &[position],
+        &market,
+        now,
+        &RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required: decimal("49.5"),
+            buying_power: decimal("49.4"),
+        },
     );
 }
 
@@ -521,6 +789,142 @@ fn strict_reduce_only_exit_is_allowed_when_existing_exposure_is_over_limit() {
     assert_eq!(
         engine.authorize(&reduce, &account, &[position], &market, now),
         RiskDecision::Authorized
+    );
+}
+
+#[test]
+fn partial_reduction_without_reduce_only_is_allowed_when_existing_exposure_is_over_limit() {
+    let (now, symbol, market, account) = setup();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("500"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let position = Position {
+        exchange: "paper".to_owned(),
+        symbol: symbol.clone(),
+        market_type: MarketType::Perpetual,
+        side: PositionSide::Long,
+        quantity: quantity("10"),
+        entry_price: Some(price("100")),
+        mark_price: Some(price("100")),
+        unrealized_pnl: Money::default(),
+        updated_at: now,
+    };
+    let reduce = OrderIntent::limit(
+        "paper",
+        symbol,
+        MarketType::Perpetual,
+        Side::Sell,
+        quantity("1"),
+        price("100"),
+    );
+
+    assert_eq!(
+        engine.authorize(
+            &reduce,
+            &account,
+            std::slice::from_ref(&position),
+            &market,
+            now
+        ),
+        RiskDecision::Authorized
+    );
+    assert_eq!(
+        engine.authorize_batch(&[reduce], &account, &[position], &[market], now),
+        RiskDecision::Authorized
+    );
+}
+
+#[test]
+fn batch_opening_notional_accumulates_across_legs() {
+    let (now, symbol, market, mut account) = setup();
+    account.equity = Money::new(decimal("201"));
+    account.available_balance = Money::new(decimal("201"));
+    let other_symbol = Symbol::new("ETH").unwrap();
+    let other_market = MarketSnapshot::new(
+        "paper-right",
+        other_symbol.clone(),
+        MarketType::Perpetual,
+        price("101"),
+        price("103"),
+        now,
+    )
+    .unwrap();
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let left = OrderIntent::market(
+        "paper",
+        symbol.clone(),
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("1"),
+    );
+    let right = OrderIntent::market(
+        "paper-right",
+        other_symbol,
+        MarketType::Perpetual,
+        Side::Sell,
+        quantity("1"),
+    );
+
+    assert_eq!(
+        engine.authorize(&left, &account, &[], &market, now),
+        RiskDecision::Authorized
+    );
+    assert_eq!(
+        engine.authorize(&right, &account, &[], &other_market, now),
+        RiskDecision::Authorized
+    );
+    assert_eq!(
+        engine.authorize_batch(&[left, right], &account, &[], &[market, other_market], now),
+        RiskDecision::Rejected(RiskRejection::OpeningNotionalExceedsBuyingPower {
+            required: decimal("202"),
+            buying_power: decimal("201"),
+        })
+    );
+}
+
+#[test]
+fn spot_sell_cannot_open_short_inventory() {
+    let now = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+    let symbol = Symbol::new("BTC-USDC").unwrap();
+    let market = MarketSnapshot::new(
+        "paper",
+        symbol.clone(),
+        MarketType::Spot,
+        price("99"),
+        price("101"),
+        now,
+    )
+    .unwrap();
+    let account = AccountRiskSnapshot {
+        equity: Money::new(decimal("1000")),
+        available_balance: Money::new(decimal("1000")),
+        kill_switch: false,
+        timestamp: now,
+    };
+    let engine = RiskEngine::new(RiskLimits {
+        max_position_value: decimal("1000"),
+        max_snapshot_age: Duration::seconds(5),
+    })
+    .unwrap();
+    let intent = OrderIntent::market("paper", symbol, MarketType::Spot, Side::Sell, quantity("1"));
+
+    assert_rejects_single_and_batch(
+        &engine,
+        &intent,
+        &account,
+        &[],
+        &market,
+        now,
+        &RiskRejection::SpotShortOpenUnsupported {
+            opening: Decimal::ONE,
+            projected: Decimal::ONE,
+        },
     );
 }
 

@@ -8,7 +8,7 @@ use crypto_trading_config::{
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_strategy::{
     AlertKind, AlertState, AlertStrategy, ArbitrageState, ArbitrageStrategy, GridDirection,
-    GridPlanner, PairStrategyMachine, VolumeMakerMode, VolumeMakerPlanConfig,
+    GridPlanner, PairStrategyMachine, StrategyError, VolumeMakerMode, VolumeMakerPlanConfig,
 };
 use rust_decimal::Decimal;
 
@@ -211,7 +211,7 @@ symbol_configs:
     .unwrap();
 
     let error = ArbitrageStrategy::try_from(&config).unwrap_err();
-    assert!(error.to_string().contains("execution controls"), "{error}");
+    assert!(matches!(error, StrategyError::InvalidConfig(_)));
 }
 
 #[test]
@@ -259,13 +259,18 @@ symbol_configs:
     let error = strategy
         .evaluate_pair(&ArbitrageState::default(), &unknown_exchange, &right)
         .unwrap_err();
-    assert!(error.to_string().contains("exchange third"), "{error}");
+    assert!(matches!(error, StrategyError::SnapshotMismatch(_)));
 
     let unknown_symbol = snapshot("left", "ETH", "99", "100");
+    let unknown_symbol_right = snapshot("right", "ETH", "102", "103");
     let error = strategy
-        .evaluate_pair(&ArbitrageState::default(), &unknown_symbol, &right)
+        .evaluate_pair(
+            &ArbitrageState::default(),
+            &unknown_symbol,
+            &unknown_symbol_right,
+        )
         .unwrap_err();
-    assert!(error.to_string().contains("symbol ETH"), "{error}");
+    assert!(matches!(error, StrategyError::SnapshotMismatch(_)));
 }
 
 #[test]
@@ -303,7 +308,7 @@ symbol_configs:
     config.max_position_value = Some(Decimal::ZERO);
 
     let error = ArbitrageStrategy::try_from(&config).unwrap_err();
-    assert!(error.to_string().contains("execution controls"), "{error}");
+    assert!(matches!(error, StrategyError::InvalidConfig(_)));
 
     let effective = config.resolve_for_strategy(&selector).unwrap();
     assert_eq!(
@@ -331,6 +336,63 @@ symbol_configs:
 
     let left = snapshot("left", "AAA-PERP", "99", "100");
     let right = snapshot("right", "BBB-PERP", "102", "103");
+    let error = strategy
+        .evaluate_pair(&ArbitrageState::default(), &left, &right)
+        .unwrap_err();
+    assert!(matches!(error, StrategyError::SnapshotMismatch(_)));
+}
+
+#[test]
+fn arbitrage_config_conversion_allows_canonical_spot_perp_pairs() {
+    let config = load_arbitrage_config_from_str(
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [ETH-USDC-SPOT, ETH-USDC-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.5
+    grid_step: 0.2
+    max_segments: 3
+  quantity_config:
+    base_quantity: 2
+symbol_configs:
+  CROSS_PAIR:
+    enabled: true
+    risk_config:
+      max_position_value: 25
+",
+    )
+    .unwrap();
+    let strategy = ArbitrageStrategy::try_from(
+        &config
+            .resolve_for_strategy(&Symbol::new("CROSS_PAIR").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 7, 14, 2, 45, 0).unwrap();
+    let left = MarketSnapshot::new(
+        "left",
+        Symbol::new("ETH-USDC-SPOT").unwrap(),
+        MarketType::Spot,
+        price("99"),
+        price("100"),
+        now,
+    )
+    .unwrap();
+    let right = MarketSnapshot::new(
+        "right",
+        Symbol::new("ETH-USDC-PERP").unwrap(),
+        MarketType::Perpetual,
+        price("102"),
+        price("103"),
+        now,
+    )
+    .unwrap();
+
     strategy
         .evaluate_pair(&ArbitrageState::default(), &left, &right)
         .unwrap();

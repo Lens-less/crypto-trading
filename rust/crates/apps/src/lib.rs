@@ -55,6 +55,7 @@ pub use testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TESTNET_LIFECYCLE_SCHEMA_VERSION, TestnetLifecycleConfig,
     TestnetLifecycleError, TestnetLifecycleObservation, TestnetLifecycleReport,
     TestnetLifecycleVenue, TestnetLifecycleVenueFuture, run_testnet_lifecycle,
+    testnet_lifecycle_requires_submission, testnet_lifecycle_wire_symbol,
 };
 pub use testnet_reconciliation::{
     TESTNET_RECONCILIATION_APPLY_ACKNOWLEDGEMENT, TESTNET_RECONCILIATION_SCHEMA_VERSION,

@@ -677,7 +677,10 @@ async fn one_panicking_adapter_is_isolated_from_the_evaluator_and_other_adapters
         NotificationDispatcherConfig::new(
             4,
             StdDuration::from_secs(5),
-            StdDuration::from_millis(200),
+            // This contract exercises panic isolation and queued healthy-worker
+            // draining, not a sub-second shutdown SLA. Leave enough grace for
+            // Windows journal I/O while the full workspace runs in parallel.
+            StdDuration::from_secs(5),
         )
         .unwrap(),
     );

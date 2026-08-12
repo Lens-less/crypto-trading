@@ -1849,7 +1849,9 @@ fn build_operation(
     ensure_operation_fifo_isolation(account, &config.task_id, &decision.intents)?;
     let positions = strategy_positions(state, pair)?;
     let account_risk = AccountRiskSnapshot {
-        equity: account.initial_available,
+        // Use the live settled equity base, not the bootstrap deposit, so
+        // opening authority shrinks after realized losses and fees.
+        equity: account.settled_equity_base,
         available_balance: account.available,
         kill_switch: false,
         timestamp: pair.observed_at,

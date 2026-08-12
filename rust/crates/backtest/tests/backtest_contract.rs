@@ -132,18 +132,18 @@ fn market_intent_adapter_matches_hand_worked_fee_and_pnl_vector() {
         FillModel::new(Decimal::ZERO, decimal("10"), Decimal::ZERO, Decimal::ZERO).unwrap(),
     )
     .unwrap();
-    let symbol = Symbol::new("BTC-USDT-PERP").unwrap();
+    let symbol = Symbol::new("BTC-USDT-SPOT").unwrap();
     let buy = OrderIntent::market(
         "binance",
         symbol.clone(),
-        MarketType::Perpetual,
+        MarketType::Spot,
         Side::Buy,
         quantity("1"),
     );
     let sell = OrderIntent::market(
         "binance",
         symbol,
-        MarketType::Perpetual,
+        MarketType::Spot,
         Side::Sell,
         quantity("1"),
     );
@@ -168,6 +168,31 @@ fn market_intent_adapter_matches_hand_worked_fee_and_pnl_vector() {
     assert_eq!(result.metrics.performance.win_rate, Some(Decimal::ONE));
     assert_eq!(result.metrics.performance.profit_factor, None);
     assert_eq!(result.metrics.periods_per_year, Some(decimal("31536000")));
+}
+
+#[test]
+fn anonymous_event_tape_rejects_identified_perpetual_order_intents() {
+    let tape = EventTape::new(vec![event(0, "100")]).unwrap();
+    let engine = BacktestEngine::new(
+        money("1000"),
+        FillModel::new(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO).unwrap(),
+    )
+    .unwrap();
+    let intent = OrderIntent::market(
+        "binance",
+        Symbol::new("BTC-USDT-PERP").unwrap(),
+        MarketType::Perpetual,
+        Side::Buy,
+        quantity("1"),
+    );
+    let mut strategy = IntentScript {
+        frames: [adapt_order_intents(&[intent], Liquidity::Taker).unwrap()].into(),
+    };
+
+    assert_eq!(
+        engine.run(&tape, &mut strategy),
+        Err(BacktestError::UnsupportedDerivativesMarginModel)
+    );
 }
 
 #[test]
@@ -293,8 +318,24 @@ fn tape_adapts_market_snapshots_through_the_domain_seam() {
 fn snapshot_tape_executes_taker_buys_at_ask_and_sells_at_bid() {
     let tape = EventTape::from_market_snapshots(
         &[
-            snapshot(0, "99", "101", Some("100")),
-            snapshot(1, "109", "111", Some("110")),
+            snapshot_for(
+                0,
+                "binance",
+                "BTC-USDT-SPOT",
+                MarketType::Spot,
+                "99",
+                "101",
+                Some("100"),
+            ),
+            snapshot_for(
+                1,
+                "binance",
+                "BTC-USDT-SPOT",
+                MarketType::Spot,
+                "109",
+                "111",
+                Some("110"),
+            ),
         ],
         MarketEventPrice::LastOrMid,
     )
@@ -319,6 +360,28 @@ fn snapshot_tape_executes_taker_buys_at_ask_and_sells_at_bid() {
     assert_eq!(result.trades[1].fill.reference_price, price("109"));
     assert_eq!(result.trades[1].fill.fill_price, price("109"));
     assert_eq!(result.metrics.realized_pnl, money("8"));
+}
+
+#[test]
+fn identified_perpetual_snapshot_tapes_fail_closed_without_a_margin_model() {
+    let tape = EventTape::from_market_snapshots(
+        &[
+            snapshot(0, "99", "101", Some("100")),
+            snapshot(1, "109", "111", Some("110")),
+        ],
+        MarketEventPrice::LastOrMid,
+    )
+    .unwrap();
+    let engine = BacktestEngine::new(
+        money("1000"),
+        FillModel::new(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.run(&tape, &mut BuyAndHoldOnce { entered: false }),
+        Err(BacktestError::UnsupportedDerivativesMarginModel)
+    );
 }
 
 #[test]
@@ -431,14 +494,22 @@ fn spot_sell_that_exceeds_inventory_is_rejected_explicitly() {
 #[test]
 fn market_order_identity_must_match_snapshot_tape() {
     let tape = EventTape::from_market_snapshots(
-        &[snapshot(0, "99", "101", Some("100"))],
+        &[snapshot_for(
+            0,
+            "binance",
+            "BTC-USDT-SPOT",
+            MarketType::Spot,
+            "99",
+            "101",
+            Some("100"),
+        )],
         MarketEventPrice::LastOrMid,
     )
     .unwrap();
     let intent = OrderIntent::market(
         "binance",
-        Symbol::new("ETH-USDT-PERP").unwrap(),
-        MarketType::Perpetual,
+        Symbol::new("ETH-USDT-SPOT").unwrap(),
+        MarketType::Spot,
         Side::Buy,
         quantity("1"),
     );

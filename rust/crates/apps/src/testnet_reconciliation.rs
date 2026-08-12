@@ -408,11 +408,9 @@ fn reconciliation_digest(
             .cmp(&right.symbol)
             .then(position_side_label(left.side).cmp(position_side_label(right.side)))
     });
-    let balances = remote
-        .balances
-        .iter()
-        .map(balance_material)
-        .collect::<Vec<_>>();
+    let mut balances = remote.balances.clone();
+    balances.sort_by(|left, right| left.asset.cmp(&right.asset));
+    let balances = balances.iter().map(balance_material).collect::<Vec<_>>();
     let mismatch_codes = mismatches
         .iter()
         .map(|mismatch| mismatch.code())

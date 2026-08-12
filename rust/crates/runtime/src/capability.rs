@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 2;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 3;
 const MAX_CAPABILITIES: usize = 64;
 const MAX_ADAPTERS: usize = 16;
 const MAX_CAPABILITY_TEXT_BYTES: usize = 512;
@@ -105,6 +105,7 @@ pub enum CapabilityAccess {
     Local,
     MarketData,
     PaperTrading,
+    TestnetReadOnly,
     TestnetTrading,
     MainnetTrading,
 }
@@ -115,6 +116,7 @@ impl fmt::Display for CapabilityAccess {
             Self::Local => "local",
             Self::MarketData => "market-data",
             Self::PaperTrading => "paper-trading",
+            Self::TestnetReadOnly => "testnet-read-only",
             Self::TestnetTrading => "testnet-trading",
             Self::MainnetTrading => "mainnet-trading",
         })
@@ -768,6 +770,7 @@ fn research_capabilities() -> Vec<Capability> {
             "Internal library-only deterministic single-instrument SimClock/EventTape kernel with explicit fee/slippage assumptions, ledger outputs, equity curves, performance-metric primitives, and out-of-sample window primitives.",
             &[
                 "Unavailable as a product capability: no shipped binary links this crate, and no supported CLI or HTTP entry point, bounded tape input contract, or production strategy adapter exists.",
+                "identified perpetual production-snapshot seams fail closed until a real margin/liquidation/funding model exists; the current ledger must not be read as realistic derivatives PnL.",
                 "This kernel is not a profitability claim: multi-instrument portfolios, queue priority, depth impact, latency, partial fills, funding, and parity with every paper execution path remain open.",
             ],
             &[
@@ -988,6 +991,7 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
         scanner_capability(),
         testnet_lifecycle_capability(),
         testnet_reconciliation_capability(),
+        testnet_reconciliation_apply_capability(),
         testnet_soak_capability(),
         capability(
             "runtime.volume-maker",
@@ -1026,6 +1030,7 @@ fn scanner_capability() -> Capability {
         &[
             "The CLI service bootstrap is replay-backed only: no real-time market discovery or external continuous market source is wired into the scanner task host, and no continuous supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
             "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
+            "A sparse price jump credits every crossed virtual level as a deterministic fill; no order-book depth, queue priority, latency, partial-fill, or gap-liquidity model exists, so rankings are not execution-quality or profitability evidence.",
             "The JSONL journal enforces a cross-process single-writer lease and rotates through bounded sealed segments with no compaction by design; a full segment chain still fails closed.",
         ],
         &[
@@ -1077,7 +1082,7 @@ fn testnet_reconciliation_capability() -> Capability {
         CapabilityLevel::Available,
         scope(
             &[CapabilityEnvironment::Testnet],
-            CapabilityAccess::TestnetTrading,
+            CapabilityAccess::TestnetReadOnly,
         ),
         "Report-first clean-account gate comparing stable double-sampled Binance Testnet balances, open orders, and positions to one exact committed Paper reservation.",
         &[
@@ -1099,6 +1104,32 @@ fn testnet_reconciliation_capability() -> Capability {
     )
 }
 
+fn testnet_reconciliation_apply_capability() -> Capability {
+    capability(
+        "runtime.testnet-reconciliation-apply",
+        CapabilityArea::Runtime,
+        CapabilityLevel::Available,
+        scope(
+            &[CapabilityEnvironment::Paper, CapabilityEnvironment::Testnet],
+            CapabilityAccess::PaperTrading,
+        ),
+        "Explicitly acknowledged local Paper reconciliation transition driven by stable double-sampled Binance Testnet read-only evidence; it releases one exact reservation or records failure and never submits or cancels a venue order.",
+        &[
+            "A credentialed apply against real Binance Testnet account evidence remains an external supervised release gate and has not been produced in this workspace.",
+            "Write authority is limited to the exact selected Paper account, reservation, and validated reconciliation proof.",
+            "Mainnet account and order authority remain unavailable.",
+        ],
+        &[
+            "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/src/testnet_reconciliation.rs",
+            "rust/crates/apps/tests/testnet_reconciliation_contract.rs",
+            "rust/crates/apps/tests/testnet_reconciliation_cli_contract.rs",
+            "rust/crates/runtime/src/paper_account.rs",
+            "rust/crates/runtime/tests/paper_account_contract.rs",
+        ],
+    )
+}
+
 fn testnet_soak_capability() -> Capability {
     capability(
         "runtime.testnet-soak",
@@ -1106,7 +1137,7 @@ fn testnet_soak_capability() -> Capability {
         CapabilityLevel::ReadOnly,
         scope(
             &[CapabilityEnvironment::Testnet],
-            CapabilityAccess::TestnetTrading,
+            CapabilityAccess::TestnetReadOnly,
         ),
         "Durable Binance Testnet soak owner that cycles Spot and USD-M book tickers plus authenticated reconciliation without submitting or cancelling orders.",
         &[
@@ -1147,7 +1178,9 @@ fn strategy_capabilities() -> Vec<Capability> {
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Deterministic fixed-grid and martingale planning plus pure grid-protection state machines (scalping, capital protection, take profit, price lock, stop loss) without I/O.",
-            &[],
+            &[
+                "The planner does not consume configured quantity_precision, price_decimals, margin_mode, leverage, fee_rate, follow_timeout, or follow_distance; venue normalization, margin, fees, and follow scheduling must be supplied by a future execution model before these plans can support trading or PnL claims.",
+            ],
             &[
                 "rust/crates/strategy/src/grid.rs",
                 "rust/crates/strategy/src/grid_protection.rs",
@@ -1177,7 +1210,9 @@ fn strategy_capabilities() -> Vec<Capability> {
             CapabilityLevel::Available,
             scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
             "Deterministic virtual-grid simulation and volatility scoring.",
-            &[],
+            &[
+                "Sparse price jumps deterministically fill every crossed pending level without depth, queue, latency, partial-fill, or gap-liquidity modeling; this scorer is not execution-quality or profitability evidence.",
+            ],
             &[
                 "rust/crates/strategy/src/virtual_grid.rs",
                 "rust/crates/strategy/tests/virtual_grid_golden.rs",

@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Quantity, Side, Symbol};
 use crypto_trading_strategy::{
     ArbitrageDecisionKind, ArbitrageState, ArbitrageStrategy, PairStrategyMachine,
-    SegmentedArbitrageConfig, SpreadCalculator,
+    SegmentedArbitrageConfig, SpreadCalculator, StrategyError,
 };
 use rust_decimal::Decimal;
 
@@ -22,13 +22,14 @@ fn quantity(value: &str) -> Quantity {
 
 fn snapshot_for_market(
     exchange: &str,
+    symbol: &str,
     market_type: MarketType,
     bid: &str,
     ask: &str,
 ) -> MarketSnapshot {
     MarketSnapshot::new(
         exchange,
-        Symbol::new("BTC").unwrap(),
+        Symbol::new(symbol).unwrap(),
         market_type,
         price(bid),
         price(ask),
@@ -38,7 +39,7 @@ fn snapshot_for_market(
 }
 
 fn snapshot(exchange: &str, bid: &str, ask: &str) -> MarketSnapshot {
-    snapshot_for_market(exchange, MarketType::Perpetual, bid, ask)
+    snapshot_for_market(exchange, "BTC", MarketType::Perpetual, bid, ask)
 }
 
 fn config() -> SegmentedArbitrageConfig {
@@ -120,14 +121,67 @@ fn locked_direction_rejects_snapshots_for_different_market_types() {
         position_quantity: opened.target_quantity,
         direction: Some(direction),
     };
-    let spot_left = snapshot_for_market("left", MarketType::Spot, "99.5", "100");
-    let spot_right = snapshot_for_market("right", MarketType::Spot, "100.1", "100.2");
+    let spot_left = snapshot_for_market("left", "BTC", MarketType::Spot, "99.5", "100");
+    let spot_right = snapshot_for_market("right", "BTC", MarketType::Spot, "100.1", "100.2");
 
     assert!(
         strategy
             .evaluate_pair(&state, &spot_left, &spot_right)
             .is_err()
     );
+}
+
+#[test]
+fn canonical_spot_and_perp_symbols_share_one_hedge_identity() {
+    let strategy = ArbitrageStrategy::new(config()).unwrap();
+    let left = snapshot_for_market("left", "ETH-USDC-SPOT", MarketType::Spot, "99", "100");
+    let right = snapshot_for_market(
+        "right",
+        "ETH-USDC-PERP",
+        MarketType::Perpetual,
+        "102",
+        "103",
+    );
+
+    let opened = strategy
+        .evaluate_pair(&ArbitrageState::default(), &left, &right)
+        .unwrap();
+
+    assert_eq!(opened.kind, ArbitrageDecisionKind::Open);
+    assert_eq!(opened.intents[0].symbol.as_str(), "ETH-USDC-SPOT");
+    assert_eq!(opened.intents[1].symbol.as_str(), "ETH-USDC-PERP");
+}
+
+#[test]
+fn mismatched_cross_asset_symbols_fail_closed() {
+    let strategy = ArbitrageStrategy::new(config()).unwrap();
+    let left = snapshot_for_market("left", "AAA-PERP", MarketType::Perpetual, "99", "100");
+    let right = snapshot_for_market("right", "BBB-PERP", MarketType::Perpetual, "102", "103");
+
+    let error = strategy
+        .evaluate_pair(&ArbitrageState::default(), &left, &right)
+        .unwrap_err();
+
+    assert!(matches!(error, StrategyError::SnapshotMismatch(_)));
+}
+
+#[test]
+fn canonical_suffix_and_market_type_must_agree() {
+    let strategy = ArbitrageStrategy::new(config()).unwrap();
+    let left = snapshot_for_market("left", "ETH-USDC-SPOT", MarketType::Perpetual, "99", "100");
+    let right = snapshot_for_market(
+        "right",
+        "ETH-USDC-PERP",
+        MarketType::Perpetual,
+        "102",
+        "103",
+    );
+
+    let error = strategy
+        .evaluate_pair(&ArbitrageState::default(), &left, &right)
+        .unwrap_err();
+
+    assert!(matches!(error, StrategyError::SnapshotMismatch(_)));
 }
 
 #[test]

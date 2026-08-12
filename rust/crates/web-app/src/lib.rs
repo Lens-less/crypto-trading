@@ -375,10 +375,10 @@ async fn prepare(
             control_plane,
             access,
             settings,
-            rate_limiter,
+            &rate_limiter,
             shutdown,
         ),
-        None => app_router_with_settings(control_plane, access, settings, rate_limiter),
+        None => app_router_with_settings(control_plane, access, settings, &rate_limiter),
     };
     Ok((listener, router, address, None))
 }
@@ -850,6 +850,32 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("owner shutdown deadline"));
+    }
+
+    #[test]
+    fn compose_stop_grace_period_covers_owner_cleanup_budget() {
+        let compose = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../deploy/compose.yaml"),
+        )
+        .unwrap();
+        let configured = compose
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("stop_grace_period:")
+                    .map(str::trim)
+            })
+            .expect("compose file must declare stop_grace_period");
+        let seconds = configured
+            .strip_suffix('s')
+            .expect("stop_grace_period must stay in seconds")
+            .parse::<u64>()
+            .expect("stop_grace_period must be an integer second count");
+        assert!(
+            Duration::from_secs(seconds) >= super::OWNER_CLEANUP_TIMEOUT,
+            "compose stop_grace_period {configured} must cover owner cleanup budget of {}s",
+            super::OWNER_CLEANUP_TIMEOUT.as_secs()
+        );
     }
 
     #[test]

@@ -296,7 +296,7 @@ async fn cancellation_transport_failures_keep_stable_reconciliation_keys() {
             operation: ExchangeOperation::CancelOrder,
             operation_key: Some(ExchangeOperationKey::OrderId(ref key)),
             ..
-        } if key == "binance:spot:BTC-USDC-SPOT:42"
+        } if key == "binance:spot:BTCUSDT:42"
     ));
 
     let hyperliquid = hyperliquid_protocol();

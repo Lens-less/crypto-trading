@@ -210,7 +210,7 @@ async fn bind_trusted_submit_app_with_optional_shutdown(
         service,
         bearer_token: Arc::from(bearer_token.into_bytes()),
         identity,
-        rate_limiter: rate_limiter.clone(),
+        rate_limiter: rate_limiter.independent_bucket(),
     };
     let submit_router = Router::new()
         .route("/api/v1/submit", post(submit))
@@ -225,10 +225,10 @@ async fn bind_trusted_submit_app_with_optional_shutdown(
             control_plane,
             read_access,
             settings,
-            rate_limiter,
+            &rate_limiter,
             shutdown,
         ),
-        None => app_router_with_settings(control_plane, read_access, settings, rate_limiter),
+        None => app_router_with_settings(control_plane, read_access, settings, &rate_limiter),
     };
     let router = read_router
         .merge(submit_router)

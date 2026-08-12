@@ -18,8 +18,8 @@ mod unsupported;
 
 pub use binance::{BinancePublicExchange, BinancePublicObservation};
 pub use binance_testnet::{
-    BinanceHmacSha256Signer, BinanceRequestSigner, BinanceServerOrderRef, BinanceTestnetBalance,
-    BinanceTestnetProtocol,
+    BinanceExchangeInfoSymbol, BinanceHmacSha256Signer, BinanceRequestSigner,
+    BinanceServerOrderRef, BinanceTestnetBalance, BinanceTestnetProtocol,
 };
 pub use binance_testnet_exchange::{BinanceTestnetAccountSnapshot, BinanceTestnetExchange};
 pub use bounded::BoundedExchangeHandle;
@@ -36,7 +36,8 @@ pub use hyperliquid_testnet::{
     HyperliquidSignature, HyperliquidTestnetProtocol,
 };
 pub use instrument::{
-    InstrumentRuleCatalog, InstrumentRules, InstrumentRulesMode, InstrumentRulesStatus,
+    InstrumentRuleCatalog, InstrumentRuleOptions, InstrumentRules, InstrumentRulesMode,
+    InstrumentRulesStatus,
 };
 pub use model::{
     CancellationDisposition, ExchangeAvailability, ExchangeMode, ExchangeOperationKey,

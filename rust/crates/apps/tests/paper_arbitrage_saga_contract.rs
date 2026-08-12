@@ -43,6 +43,21 @@ fn intent(exchange: &str, side: Side) -> OrderIntent {
     )
 }
 
+fn intent_for_market(
+    exchange: &str,
+    symbol: &str,
+    market_type: MarketType,
+    side: Side,
+) -> OrderIntent {
+    OrderIntent::market(
+        exchange,
+        Symbol::new(symbol).unwrap(),
+        market_type,
+        side,
+        Quantity::new(decimal("1")).unwrap(),
+    )
+}
+
 fn request(task_id: &str, idempotency_key: &str) -> PaperArbitrageRequest {
     let batch = ExecutionBatch::planned(vec![
         intent("paper-left", Side::Buy),
@@ -65,6 +80,31 @@ fn request(task_id: &str, idempotency_key: &str) -> PaperArbitrageRequest {
     )
     .unwrap();
     PaperArbitrageRequest::new(Symbol::new("BTC-USDT").unwrap(), batch, reservation).unwrap()
+}
+
+fn request_for_batch(
+    symbol: &str,
+    task_id: &str,
+    idempotency_key: &str,
+    intents: Vec<OrderIntent>,
+) -> Result<PaperArbitrageRequest, PaperArbitrageSagaError> {
+    let batch = ExecutionBatch::planned(intents).unwrap();
+    let reservation = PaperReservationRequest::planned(
+        task_id,
+        idempotency_key,
+        batch.id(),
+        PaperCostModel::v1(10, 5, 15).unwrap(),
+        batch
+            .intents()
+            .iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                PaperReservationLeg::from_intent(index, intent, money("100")).unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    PaperArbitrageRequest::new(Symbol::new(symbol).unwrap(), batch, reservation)
 }
 
 fn saga(
@@ -673,6 +713,39 @@ fn non_exact_or_same_side_pair_is_rejected_before_any_journal_is_selected() {
     )
     .unwrap_err();
     assert!(matches!(error, PaperArbitrageSagaError::InvalidRequest(_)));
+
+    let canonical = request_for_batch(
+        "ETH-USDC-SPOT",
+        "arb:eth",
+        "open:0003",
+        vec![
+            intent_for_market("paper-left", "ETH-USDC-SPOT", MarketType::Spot, Side::Buy),
+            intent_for_market(
+                "paper-right",
+                "ETH-USDC-PERP",
+                MarketType::Perpetual,
+                Side::Sell,
+            ),
+        ],
+    );
+    assert!(matches!(
+        canonical,
+        Err(PaperArbitrageSagaError::InvalidRequest(_))
+    ));
+
+    let cross_asset = request_for_batch(
+        "AAA-PERP",
+        "arb:cross",
+        "open:0004",
+        vec![
+            intent_for_market("paper-left", "AAA-PERP", MarketType::Perpetual, Side::Buy),
+            intent_for_market("paper-right", "BBB-PERP", MarketType::Perpetual, Side::Sell),
+        ],
+    );
+    assert!(matches!(
+        cross_asset,
+        Err(PaperArbitrageSagaError::InvalidRequest(_))
+    ));
 }
 
 fn records(path: &std::path::Path) -> Vec<serde_json::Value> {

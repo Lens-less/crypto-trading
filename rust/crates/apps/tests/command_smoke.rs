@@ -54,7 +54,7 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
 
     assert!(output.status.success(), "{output:?}");
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["schema_version"], 2);
+    assert_eq!(payload["schema_version"], 3);
     assert_eq!(payload["release_stage"], "paper-only");
     assert_eq!(payload["live_trading_enabled"], false);
     let adapters = payload["adapters"].as_array().unwrap();
@@ -101,7 +101,7 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("capabilities schema=2")
+        stdout.contains("capabilities schema=3")
             && stdout.contains("release=paper-only live-trading=false"),
         "{stdout}"
     );
@@ -966,6 +966,57 @@ symbol_configs:
 }
 
 #[test]
+fn arbitrage_once_accumulates_both_opening_legs_against_the_synthetic_budget() {
+    let history = temp_path("arbitrage-buying-power-history", "jsonl");
+    let arbitrage = write_temp(
+        "arbitrage-buying-power",
+        "yaml",
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [paper-left, paper-right]
+symbols: [ETH-USDC-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.1
+    grid_step: 0.1
+    max_segments: 1
+  quantity_config:
+    base_quantity: 1
+  risk_config:
+    max_position_value: 200
+symbol_configs:
+  ETH-USDC-PERP:
+    enabled: true
+",
+    );
+    let monitor = write_temp(
+        "monitor-buying-power",
+        "yaml",
+        "exchanges: [paper-left, paper-right]\nsymbols: [ETH-USDC-PERP]\nhealth_check:\n  data_timeout: 30\n",
+    );
+    let output = paper_arbitrage_command(&arbitrage, &monitor, &history, "1", "1");
+
+    std::fs::remove_file(arbitrage).unwrap();
+    std::fs::remove_file(monitor).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("OpeningNotionalExceedsBuyingPower"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("required: 201"), "{stderr}");
+    assert!(stderr.contains("buying_power: 200"), "{stderr}");
+    assert!(
+        !history.exists(),
+        "unexpected history at {}",
+        history.display()
+    );
+}
+
+#[test]
 fn arbitrage_requires_a_position_value_limit_before_paper_execution() {
     let history = temp_path("arbitrage-missing-risk-history", "jsonl");
     let arbitrage = write_temp(
@@ -1248,7 +1299,7 @@ fn arbitrage_rejects_exchanges_outside_the_monitor_allowlist() {
 }
 
 #[test]
-fn arbitrage_requires_strategy_key_when_leg_symbols_differ() {
+fn arbitrage_rejects_different_literal_leg_symbols_until_multi_symbol_execution_exists() {
     let history = temp_path("arbitrage-different-legs-history", "jsonl");
     let arbitrage = write_temp(
         "arbitrage-different-legs",
@@ -1321,7 +1372,7 @@ symbol_configs:
         .unwrap();
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("--strategy-key"), "{stderr}");
+    assert!(stderr.contains("identical leg symbols"), "{stderr}");
 
     let output = Command::new(binary())
         .current_dir(repo_root())
@@ -1338,10 +1389,102 @@ symbol_configs:
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "{output:?}");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("identical leg symbols"), "{stderr}");
+    assert!(
+        !history.exists(),
+        "unexpected history at {}",
+        history.display()
+    );
+
     std::fs::remove_file(arbitrage).unwrap();
     std::fs::remove_file(monitor).unwrap();
-    std::fs::remove_file(history).unwrap();
+}
+
+#[test]
+fn arbitrage_rejects_canonical_spot_perp_leg_symbols_for_one_shot_execution() {
+    let history = temp_path("arbitrage-canonical-legs-history", "jsonl");
+    let arbitrage = write_temp(
+        "arbitrage-canonical-legs",
+        "yaml",
+        r"
+mode: segmented
+enabled: true
+system_mode:
+  monitor_only: false
+exchanges: [left, right]
+symbols: [ETH-USDC-SPOT, ETH-USDC-PERP]
+default_config:
+  grid_config:
+    initial_spread_threshold: 0.1
+    grid_step: 0.1
+    max_segments: 2
+  quantity_config:
+    base_quantity: 1
+  risk_config:
+    max_position_value: 1000
+symbol_configs:
+  CROSS_PAIR:
+    enabled: true
+",
+    );
+    let monitor = write_temp(
+        "monitor-canonical-legs",
+        "yaml",
+        "exchanges: [left, right]\nsymbols: [ETH-USDC-SPOT, ETH-USDC-PERP]\nhealth_check:\n  data_timeout: 30\n",
+    );
+    let output = Command::new(binary())
+        .current_dir(repo_root())
+        .arg("arbitrage")
+        .arg("--config")
+        .arg(&arbitrage)
+        .arg("--monitor-config")
+        .arg(&monitor)
+        .arg("--strategy-key")
+        .arg("CROSS_PAIR")
+        .arg("--history-path")
+        .arg(&history)
+        .args([
+            "--once",
+            "--left-exchange",
+            "left",
+            "--left-symbol",
+            "ETH-USDC-SPOT",
+            "--left-bid",
+            "99.9",
+            "--left-ask",
+            "100",
+            "--left-bid-quantity",
+            "10",
+            "--left-ask-quantity",
+            "10",
+            "--right-exchange",
+            "right",
+            "--right-symbol",
+            "ETH-USDC-PERP",
+            "--right-bid",
+            "101",
+            "--right-ask",
+            "101.1",
+            "--right-bid-quantity",
+            "10",
+            "--right-ask-quantity",
+            "10",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("identical leg symbols"), "{stderr}");
+    std::fs::remove_file(arbitrage).unwrap();
+    std::fs::remove_file(monitor).unwrap();
+    assert!(
+        !history.exists(),
+        "unexpected history at {}",
+        history.display()
+    );
 }
 
 #[test]

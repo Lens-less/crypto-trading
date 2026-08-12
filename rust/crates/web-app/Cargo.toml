@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+crypto-trading-domain = { path = "../domain" }
 tower.workspace = true
 
 [lints]

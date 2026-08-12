@@ -155,6 +155,39 @@ async fn execute_submit_uses_the_authenticated_protocol_and_parses_partial_fills
 }
 
 #[tokio::test]
+async fn execute_submit_market_without_authoritative_reference_stops_spot_and_usdm_locally() {
+    for (symbol, market_type, order_quantity) in [
+        ("BTC-USDC-SPOT", MarketType::Spot, "0.0001"),
+        ("BTC-USDC-PERP", MarketType::Perpetual, "0.001"),
+    ] {
+        let transport = Arc::new(ScriptedTransport::from_responses(vec![]));
+        let exchange = BinanceTestnetExchange::with_clock(protocol(), transport.clone(), || {
+            Utc.with_ymd_and_hms(2026, 7, 25, 9, 10, 11).unwrap()
+        });
+        let mut intent = OrderIntent::market(
+            "binance",
+            Symbol::new(symbol).unwrap(),
+            market_type,
+            Side::Buy,
+            quantity(order_quantity),
+        );
+        intent.client_order_id =
+            uuid::Uuid::parse_str("0f3c807d-776f-4de4-85d0-93760a82dfcf").unwrap();
+
+        let error = exchange
+            .execute(TradingCommand::Submit(intent))
+            .await
+            .unwrap_err();
+
+        let ExchangeError::Rejected { reason } = error else {
+            panic!("expected local rejection for {market_type:?}, got {error:?}");
+        };
+        assert!(reason.contains("notional validation needs a reference price"));
+        assert!(transport.requests().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn execute_cancel_decodes_server_order_refs_without_hidden_lookup_state() {
     let transport = Arc::new(ScriptedTransport::from_responses(vec![Ok(
         RemoteHttpResponse::new(
@@ -446,6 +479,191 @@ async fn account_snapshot_rejects_state_drift_across_the_double_sample() {
     assert!(matches!(error, ExchangeError::InvalidResponse { .. }));
     assert!(format!("{error}").contains("changed across"));
     assert_eq!(transport.requests().len(), 4);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn account_snapshot_ignores_element_reordering_across_the_double_sample() {
+    let owned_one = "0f3c807d-776f-4de4-85d0-93760a82dfcf";
+    let owned_two = "0f3c807d-776f-4de4-85d0-93760a82dfd0";
+    let transport = Arc::new(ScriptedTransport::from_responses(vec![
+        Ok(RemoteHttpResponse::new(
+            200,
+            br#"[{"asset":"BTC","balance":"0.5","availableBalance":"0.4"},{"asset":"USDT","balance":"1000.00","availableBalance":"999.00"}]"#,
+        )
+        .unwrap()),
+        Ok(RemoteHttpResponse::new(
+            200,
+            format!(
+                r#"[{{
+                    "symbol":"BTCUSDT",
+                    "orderId":101,
+                    "clientOrderId":"{owned_one}",
+                    "transactTime":1722000000123,
+                    "price":"50000.10",
+                    "origQty":"0.0010",
+                    "executedQty":"0.0000",
+                    "status":"NEW",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"BUY"
+                }},{{
+                    "symbol":"BTCUSDT",
+                    "orderId":202,
+                    "clientOrderId":"manual-two",
+                    "transactTime":1722000000124,
+                    "price":"50010.10",
+                    "origQty":"0.0030",
+                    "executedQty":"0.0000",
+                    "status":"NEW",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"SELL",
+                    "reduceOnly":true
+                }},{{
+                    "symbol":"BTCUSDT",
+                    "orderId":102,
+                    "clientOrderId":"{owned_two}",
+                    "transactTime":1722000000125,
+                    "price":"50020.10",
+                    "origQty":"0.0020",
+                    "executedQty":"0.0000",
+                    "status":"NEW",
+                    "timeInForce":"IOC",
+                    "type":"LIMIT",
+                    "side":"SELL",
+                    "reduceOnly":true
+                }},{{
+                    "symbol":"BTCUSDT",
+                    "orderId":201,
+                    "clientOrderId":"manual-one",
+                    "transactTime":1722000000126,
+                    "price":"49990.10",
+                    "origQty":"0.0040",
+                    "executedQty":"0.0010",
+                    "cummulativeQuoteQty":"49.9901",
+                    "status":"PARTIALLY_FILLED",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"BUY",
+                    "reduceOnly":true
+                }}]"#
+            ),
+        )
+        .unwrap()),
+        Ok(RemoteHttpResponse::new(
+            200,
+            br#"[{
+                "symbol":"BTCUSDT",
+                "positionAmt":"0.005",
+                "entryPrice":"50000.1",
+                "markPrice":"50010.1",
+                "updateTime":1722000000456
+            },{
+                "symbol":"BTCUSDT",
+                "positionAmt":"-0.003",
+                "entryPrice":"50100.1",
+                "markPrice":"50090.1",
+                "updateTime":1722000000457
+            }]"#,
+        )
+        .unwrap()),
+        Ok(RemoteHttpResponse::new(
+            200,
+            br#"[{"asset":"USDT","balance":"1000.00","availableBalance":"999.00"},{"asset":"BTC","balance":"0.5","availableBalance":"0.4"}]"#,
+        )
+        .unwrap()),
+        Ok(RemoteHttpResponse::new(
+            200,
+            format!(
+                r#"[{{
+                    "symbol":"BTCUSDT",
+                    "orderId":201,
+                    "clientOrderId":"manual-one",
+                    "transactTime":1722000000126,
+                    "price":"49990.10",
+                    "origQty":"0.0040",
+                    "executedQty":"0.0010",
+                    "cummulativeQuoteQty":"49.9901",
+                    "status":"PARTIALLY_FILLED",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"BUY",
+                    "reduceOnly":true
+                }},{{
+                    "symbol":"BTCUSDT",
+                    "orderId":102,
+                    "clientOrderId":"{owned_two}",
+                    "transactTime":1722000000125,
+                    "price":"50020.10",
+                    "origQty":"0.0020",
+                    "executedQty":"0.0000",
+                    "status":"NEW",
+                    "timeInForce":"IOC",
+                    "type":"LIMIT",
+                    "side":"SELL",
+                    "reduceOnly":true
+                }},{{
+                    "symbol":"BTCUSDT",
+                    "orderId":202,
+                    "clientOrderId":"manual-two",
+                    "transactTime":1722000000124,
+                    "price":"50010.10",
+                    "origQty":"0.0030",
+                    "executedQty":"0.0000",
+                    "status":"NEW",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"SELL",
+                    "reduceOnly":true
+                }},{{
+                    "symbol":"BTCUSDT",
+                    "orderId":101,
+                    "clientOrderId":"{owned_one}",
+                    "transactTime":1722000000123,
+                    "price":"50000.10",
+                    "origQty":"0.0010",
+                    "executedQty":"0.0000",
+                    "status":"NEW",
+                    "timeInForce":"GTC",
+                    "type":"LIMIT",
+                    "side":"BUY"
+                }}]"#
+            ),
+        )
+        .unwrap()),
+        Ok(RemoteHttpResponse::new(
+            200,
+            br#"[{
+                "symbol":"BTCUSDT",
+                "positionAmt":"-0.003",
+                "entryPrice":"50100.1",
+                "markPrice":"50090.1",
+                "updateTime":1722000000457
+            },{
+                "symbol":"BTCUSDT",
+                "positionAmt":"0.005",
+                "entryPrice":"50000.1",
+                "markPrice":"50010.1",
+                "updateTime":1722000000456
+            }]"#,
+        )
+        .unwrap()),
+    ]));
+    let exchange = BinanceTestnetExchange::with_clock(protocol(), transport.clone(), || {
+        Utc.with_ymd_and_hms(2026, 7, 25, 9, 10, 11).unwrap()
+    });
+
+    let snapshot = exchange
+        .account_snapshot(BinanceProduct::UsdM)
+        .await
+        .expect("same logical state in different element order must be accepted");
+
+    assert_eq!(snapshot.balances.len(), 2);
+    assert_eq!(snapshot.orders.len(), 2);
+    assert_eq!(snapshot.foreign_orders.len(), 2);
+    assert_eq!(snapshot.positions.len(), 2);
+    assert_eq!(transport.requests().len(), 6);
 }
 
 #[tokio::test]

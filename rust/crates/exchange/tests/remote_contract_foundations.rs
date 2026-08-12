@@ -2,7 +2,8 @@ use std::str::FromStr;
 
 use crypto_trading_domain::{MarketType, Money, OrderIntent, Price, Quantity, Side, Symbol};
 use crypto_trading_exchange::{
-    ExchangeError, ExchangeSymbol, ExchangeSymbolCatalog, InstrumentRuleCatalog, InstrumentRules,
+    ExchangeError, ExchangeSymbol, ExchangeSymbolCatalog, InstrumentRuleCatalog,
+    InstrumentRuleOptions, InstrumentRules,
 };
 use rust_decimal::Decimal;
 
@@ -163,4 +164,113 @@ fn strict_catalog_validation_reuses_exact_instrument_rules() {
             .unwrap_err(),
         ExchangeError::Rejected { .. }
     ));
+}
+
+#[test]
+fn market_orders_use_market_lot_size_instead_of_limit_lot_size() {
+    let symbol = Symbol::new("BTC-USDC-SPOT").unwrap();
+    let rules = InstrumentRules::with_options(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        price("0.01"),
+        quantity("0.0001"),
+        quantity("0.0001"),
+        InstrumentRuleOptions {
+            market_quantity_step: Some(quantity("0.001")),
+            market_min_quantity: Some(quantity("0.001")),
+            market_max_quantity: Some(quantity("1")),
+            ..InstrumentRuleOptions::new(money("10"))
+        },
+    )
+    .unwrap();
+    let catalog = InstrumentRuleCatalog::new(vec![rules]).unwrap();
+
+    let limit = OrderIntent::limit(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Buy,
+        quantity("0.0005"),
+        price("50000.01"),
+    );
+    catalog
+        .validate_order(&limit, Some(price("50000.01")))
+        .unwrap();
+
+    let market = OrderIntent::market(
+        "binance",
+        symbol,
+        MarketType::Spot,
+        Side::Buy,
+        quantity("0.0015"),
+    );
+    let error = catalog
+        .validate_order(&market, Some(price("50000.01")))
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+    assert!(
+        error.to_string().contains("aligned to step 0.001"),
+        "{error}"
+    );
+}
+
+#[test]
+fn notional_flags_can_skip_market_minimum_but_keep_market_maximum() {
+    let symbol = Symbol::new("BTC-USDC-SPOT").unwrap();
+    let rules = InstrumentRules::with_options(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        price("0.01"),
+        quantity("0.001"),
+        quantity("0.001"),
+        InstrumentRuleOptions {
+            max_notional: Some(money("20")),
+            apply_min_notional_to_market: false,
+            apply_max_notional_to_market: true,
+            ..InstrumentRuleOptions::new(money("10"))
+        },
+    )
+    .unwrap();
+    let catalog = InstrumentRuleCatalog::new(vec![rules]).unwrap();
+
+    let market_below_min = OrderIntent::market(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Buy,
+        quantity("1"),
+    );
+    catalog
+        .validate_order(&market_below_min, Some(price("5")))
+        .unwrap();
+
+    let limit_below_min = OrderIntent::limit(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        Side::Buy,
+        quantity("1"),
+        price("5"),
+    );
+    assert!(matches!(
+        catalog
+            .validate_order(&limit_below_min, Some(price("5")))
+            .unwrap_err(),
+        ExchangeError::Rejected { .. }
+    ));
+
+    let market_above_max = OrderIntent::market(
+        "binance",
+        symbol,
+        MarketType::Spot,
+        Side::Buy,
+        quantity("5"),
+    );
+    let error = catalog
+        .validate_order(&market_above_max, Some(price("5")))
+        .unwrap_err();
+    assert!(matches!(error, ExchangeError::Rejected { .. }));
+    assert!(error.to_string().contains("exceeds maximum"), "{error}");
 }

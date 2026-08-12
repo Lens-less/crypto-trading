@@ -15,7 +15,7 @@ function facet(overrides: Partial<AdapterFacetSupport> = {}): AdapterFacetSuppor
 
 function manifest(overrides: Partial<CapabilityManifest> = {}): CapabilityManifest {
   return {
-    schema_version: 2,
+    schema_version: 3,
     product_version: "0.1.0",
     release_stage: "paper-only",
     live_trading_enabled: false,
