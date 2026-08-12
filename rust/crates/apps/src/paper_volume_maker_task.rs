@@ -1283,6 +1283,9 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
+                () = &mut forced_close_deadline, if !interrupt_on_account_risk => {
+                    break OperationOutcome::Cancelled(cancel_request);
+                }
                 // If settlement releases the authority lock while the risk
                 // read is waiting, finish the terminal saga first. The owner
                 // then observes the directive and closes settled inventory.
@@ -1318,9 +1321,6 @@ async fn run_operation(
                             };
                         }
                     }
-                }
-                () = &mut forced_close_deadline, if !interrupt_on_account_risk => {
-                    break OperationOutcome::Cancelled(cancel_request);
                 }
             }
         }

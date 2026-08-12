@@ -2293,6 +2293,9 @@ async fn run_operation(
                         stop_requested = true;
                     }
                 }
+                () = &mut deadline => {
+                    break OperationOutcome::TimedOut(cancel_request);
+                }
                 // A terminal saga owns the decision when its lock release also
                 // wakes a pending risk read. The outer owner will immediately
                 // observe any directive and close the now-settled position.
@@ -2322,9 +2325,6 @@ async fn run_operation(
                         }
                         Err(_) => break OperationOutcome::RiskUnavailable(cancel_request),
                     }
-                }
-                () = &mut deadline => {
-                    break OperationOutcome::TimedOut(cancel_request);
                 }
             }
         }
