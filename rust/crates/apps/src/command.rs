@@ -4075,6 +4075,14 @@ where
         .context("monitor serve requires a valid loopback control token")?;
     let task_config =
         ContinuousMonitorTaskConfig::new(task_id, supervisor_config(args.shutdown_grace_ms)?)?;
+    // Bind the control socket before the task starts (matching testnet-soak
+    // serve): otherwise a control client can observe the running task through
+    // the journal projection while the loopback endpoint is still unbound,
+    // and a port conflict would surface only after task side effects.
+    let address = control_addr(task_id, &args.history_path, args.control_port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind monitor control socket on {address}"))?;
     let (shutdown, mut task) =
         start_after_shutdown_registration(register_task_host_shutdown, || async move {
             ContinuousMonitorTask::start_with_spread_history(
@@ -4089,10 +4097,6 @@ where
             .context("failed to start continuous monitor task")
         })
         .await?;
-    let address = control_addr(task_id, &args.history_path, args.control_port);
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .with_context(|| format!("failed to bind monitor control socket on {address}"))?;
 
     println!(
         "continuous monitor task started: task_id={} control={} history={} spread_history={}",
