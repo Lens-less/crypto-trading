@@ -4,6 +4,7 @@ pub mod cli;
 pub mod command;
 pub mod continuous_monitor;
 pub mod continuous_testnet;
+pub mod live_lifecycle;
 pub mod monitor;
 mod paper_admission;
 pub mod paper_arbitrage_saga;
@@ -20,6 +21,13 @@ pub mod testnet_soak;
 
 pub use cli::{Cli, Command};
 pub use command::run;
+pub use live_lifecycle::{
+    LIVE_LIFECYCLE_ACKNOWLEDGEMENT, LIVE_LIFECYCLE_SCHEMA_VERSION, LiveAdmissionRefusal,
+    LiveAdmissionTruth, LiveLifecycleConfig, LiveLifecycleError, LiveLifecycleExchangeVenue,
+    LiveLifecycleObservation, LiveLifecycleReport, LiveLifecycleVenue, LiveLifecycleVenueFuture,
+    live_lifecycle_kill_switch_latched, live_lifecycle_requires_submission,
+    live_lifecycle_wire_symbol, run_live_lifecycle,
+};
 pub use paper_arbitrage_saga::{
     DurablePaperArbitrageSaga, PaperArbitragePreservedOutcome, PaperArbitrageRecoveryStage,
     PaperArbitrageRequest, PaperArbitrageRun, PaperArbitrageSagaError,

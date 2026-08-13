@@ -786,7 +786,11 @@ pub enum RuntimeError {
     ExecutionDisabled,
     #[error("monitor-only policy cannot submit orders")]
     MonitorOnlyPolicy,
-    #[error("live execution remains disabled until mandatory risk and reconcile gates are wired")]
+    #[error(
+        "autonomous strategy live execution stays closed until the strategy promotion gate \
+         passes; the only mainnet order authority is the acknowledged one-shot `live-lifecycle` \
+         command"
+    )]
     LiveExecutionUnavailable,
     #[error("invalid execution policy: {0}")]
     InvalidExecutionPolicy(&'static str),

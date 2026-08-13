@@ -1,6 +1,7 @@
 //! Typed exchange boundary with deterministic paper execution.
 
 mod binance;
+mod binance_mainnet_exchange;
 mod binance_testnet;
 mod binance_testnet_exchange;
 mod bounded;
@@ -17,6 +18,9 @@ mod symbol;
 mod unsupported;
 
 pub use binance::{BinancePublicExchange, BinancePublicObservation};
+pub use binance_mainnet_exchange::{
+    BinanceMainnetSpotAccountSnapshot, BinanceMainnetSpotExchange, BinanceMainnetSpotReadExchange,
+};
 pub use binance_testnet::{
     BinanceAccountUpdateEvent, BinanceExchangeInfoSymbol, BinanceExecutionReportEvent,
     BinanceHmacSha256Signer, BinanceRequestSigner, BinanceServerOrderRef,
@@ -27,8 +31,10 @@ pub use binance_testnet::{
 pub use binance_testnet_exchange::{BinanceTestnetAccountSnapshot, BinanceTestnetExchange};
 pub use bounded::BoundedExchangeHandle;
 pub use endpoint::{
-    BinanceProduct, BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint,
-    BinanceTestnetEndpoints, HyperliquidPublicEndpoint, HyperliquidTestnetEndpoint,
+    BinanceMainnetReadEndpoints, BinanceMainnetSpotMarketStreamEndpoint,
+    BinanceMainnetSpotUserDataStreamEndpoint, BinanceMainnetTradeEndpoints, BinanceProduct,
+    BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint, BinanceTestnetEndpoints,
+    HyperliquidPublicEndpoint, HyperliquidTestnetEndpoint,
 };
 pub use error::{ExchangeError, ExchangeOperation, RemoteFailureMetadata, RemoteRetryAfter};
 pub use hyperliquid_public::{

@@ -27,13 +27,14 @@ use crypto_trading_domain::{
     TimeInForce,
 };
 use crypto_trading_exchange::{
-    BinanceExchangeInfoSymbol, BinanceHmacSha256Signer, BinanceProduct, BinancePublicExchange,
-    BinanceRequestSigner, BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint,
-    BinanceTestnetEndpoints, BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError,
-    ExchangeHandle, ExchangeSymbol, ExchangeSymbolCatalog, HyperliquidPublicEndpoint,
-    HyperliquidPublicExchange, InstrumentRuleCatalog, PaperExchange, ReconcileScope,
-    RemoteHttpTransport, ReqwestHttpTransport, SubmissionDisposition, TradingReceipt,
-    hyperliquid_usdt_symbol_catalog,
+    BinanceExchangeInfoSymbol, BinanceHmacSha256Signer, BinanceMainnetReadEndpoints,
+    BinanceMainnetSpotAccountSnapshot, BinanceMainnetSpotExchange, BinanceMainnetSpotReadExchange,
+    BinanceMainnetTradeEndpoints, BinanceProduct, BinancePublicExchange, BinanceRequestSigner,
+    BinanceSpotMarketStreamEndpoint, BinanceSpotUserDataStreamEndpoint, BinanceTestnetEndpoints,
+    BinanceTestnetExchange, BinanceTestnetProtocol, ExchangeError, ExchangeHandle, ExchangeSymbol,
+    ExchangeSymbolCatalog, HyperliquidPublicEndpoint, HyperliquidPublicExchange,
+    InstrumentRuleCatalog, InstrumentRules, PaperExchange, ReconcileScope, RemoteHttpTransport,
+    ReqwestHttpTransport, SubmissionDisposition, TradingReceipt, hyperliquid_usdt_symbol_catalog,
 };
 use crypto_trading_runtime::{
     BinanceBookTickerStreamSource, BinancePollingRoute, BinancePublicPollingSource,
@@ -64,12 +65,12 @@ use tokio::{
 };
 
 use crate::cli::{
-    ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, MonitorArgs,
-    MonitorLiveTransport, MonitorMode, PaperBarArgs, PaperBarStrategyArgs, PaperCommand,
-    PaperMutationArgs, PaperOperation, PaperStartArgs, PaperStatusArgs, PaperTaskArgs,
-    TestnetLifecycleArgs, TestnetLifecycleExpected, TestnetLifecycleMarket, TestnetLifecycleSide,
-    TestnetLifecycleTimeInForce, TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs,
-    TestnetSoakMode,
+    ArbitrageArgs, CapabilitiesArgs, Cli, Command, ConfigCheckArgs, GridArgs, LiveLifecycleArgs,
+    LiveReconcileArgs, MonitorArgs, MonitorLiveTransport, MonitorMode, PaperBarArgs,
+    PaperBarStrategyArgs, PaperCommand, PaperMutationArgs, PaperOperation, PaperStartArgs,
+    PaperStatusArgs, PaperTaskArgs, TestnetLifecycleArgs, TestnetLifecycleExpected,
+    TestnetLifecycleMarket, TestnetLifecycleSide, TestnetLifecycleTimeInForce,
+    TestnetReconciliationArgs, TestnetSmokeArgs, TestnetSoakArgs, TestnetSoakMode,
 };
 use crate::continuous_monitor::{
     ContinuousMonitorTask, ContinuousMonitorTaskConfig, ContinuousMonitorTaskExit,
@@ -78,6 +79,11 @@ use crate::continuous_monitor::{
 use crate::continuous_testnet::{
     ContinuousTestnetOwner, ContinuousTestnetOwnerError, ContinuousTestnetOwnerPhase,
     ContinuousTestnetUserDataOutcome,
+};
+use crate::live_lifecycle::{
+    LIVE_LIFECYCLE_ACKNOWLEDGEMENT, LiveLifecycleConfig, LiveLifecycleExchangeVenue,
+    LiveLifecycleObservation, LiveLifecycleReport, live_lifecycle_kill_switch_latched,
+    live_lifecycle_requires_submission, live_lifecycle_wire_symbol, run_live_lifecycle,
 };
 use crate::monitor::{
     ArbitrageMonitorOutcome, ReadOnlyArbitrageMonitor, ReplayMarketDataClock,
@@ -128,6 +134,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::TestnetLifecycle(args) => run_testnet_lifecycle_command(&args).await,
         Command::TestnetReconcile(args) => run_testnet_reconciliation_command(&args).await,
         Command::TestnetSoak(args) => run_testnet_soak(&args).await,
+        Command::LiveReconcile(args) => run_live_reconcile(&args).await,
+        Command::LiveLifecycle(args) => run_live_lifecycle_command(&args).await,
         Command::ConfigCheck(args) => check_configs(&args),
         Command::Grid(args) => run_grid(args).await,
         Command::Arbitrage(args) => run_arbitrage(&args).await,
@@ -2084,6 +2092,410 @@ fn testnet_env_value(name: &str) -> Result<Option<String>> {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+    }
+}
+
+const BINANCE_MAINNET_SPOT_BASE_URL_ENV: &str = "CRYPTO_TRADING_BINANCE_MAINNET_SPOT_BASE_URL";
+/// Mainnet read credentials. Deliberately distinct variables from the
+/// Testnet `BINANCE_API_KEY`/`BINANCE_API_SECRET` pair and from the mainnet
+/// trade pair: a read command never gains trade authority by configuration.
+const BINANCE_MAINNET_READ_API_KEY_ENV: &str = "BINANCE_MAINNET_READ_API_KEY";
+const BINANCE_MAINNET_READ_API_SECRET_ENV: &str = "BINANCE_MAINNET_READ_API_SECRET";
+/// Mainnet trade credentials for the acknowledged one-shot lifecycle only.
+const BINANCE_MAINNET_TRADE_API_KEY_ENV: &str = "BINANCE_MAINNET_TRADE_API_KEY";
+const BINANCE_MAINNET_TRADE_API_SECRET_ENV: &str = "BINANCE_MAINNET_TRADE_API_SECRET";
+
+/// Loads one exact mainnet credential pair from the process environment.
+///
+/// The error text names only the missing variable; secret values never
+/// appear in any output path.
+fn load_binance_mainnet_credentials(
+    key_variable: &'static str,
+    secret_variable: &'static str,
+) -> Result<(String, String)> {
+    Ok((
+        required_mainnet_env_value(key_variable)?,
+        required_mainnet_env_value(secret_variable)?,
+    ))
+}
+
+fn required_mainnet_env_value(name: &'static str) -> Result<String> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => bail!("{name} must not be blank"),
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => {
+            bail!("authenticated Binance MAINNET commands require {name}")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+    }
+}
+
+fn binance_mainnet_read_endpoints() -> Result<BinanceMainnetReadEndpoints> {
+    match testnet_env_value(BINANCE_MAINNET_SPOT_BASE_URL_ENV)? {
+        None => Ok(BinanceMainnetReadEndpoints::official()),
+        Some(base) => BinanceMainnetReadEndpoints::loopback(&base)
+            .context("invalid Binance mainnet loopback endpoint override"),
+    }
+}
+
+fn binance_mainnet_trade_endpoints() -> Result<BinanceMainnetTradeEndpoints> {
+    match testnet_env_value(BINANCE_MAINNET_SPOT_BASE_URL_ENV)? {
+        None => Ok(BinanceMainnetTradeEndpoints::official()),
+        Some(base) => BinanceMainnetTradeEndpoints::loopback(&base)
+            .context("invalid Binance mainnet loopback endpoint override"),
+    }
+}
+
+fn build_binance_mainnet_spot_catalog(
+    spot: &Symbol,
+    wire_symbol: &str,
+) -> Result<ExchangeSymbolCatalog> {
+    Ok(ExchangeSymbolCatalog::new(vec![ExchangeSymbol::new(
+        "binance",
+        spot.clone(),
+        MarketType::Spot,
+        wire_symbol,
+    )?])?)
+}
+
+async fn fetch_binance_mainnet_spot_exchange_info(
+    transport: &(dyn RemoteHttpTransport + Send + Sync),
+    request: crypto_trading_exchange::RemoteHttpRequest,
+    symbol: Symbol,
+    wire_symbol: &str,
+) -> Result<BinanceExchangeInfoSymbol> {
+    let response = transport.send(request).await?;
+    if !response.is_success() {
+        return Err(BinanceTestnetProtocol::remote_failure_from_response(&response).into());
+    }
+    BinanceTestnetProtocol::parse_exchange_info_symbol(
+        BinanceProduct::Spot,
+        response.body(),
+        symbol,
+        wire_symbol,
+    )
+    .map_err(anyhow::Error::from)
+}
+
+/// Read-only mainnet report. This function constructs only the read
+/// adapter, which exposes no submit or cancel surface at the type level.
+async fn run_live_reconcile(args: &LiveReconcileArgs) -> Result<()> {
+    if args.timeout_ms == 0 {
+        bail!("live-reconcile requires --timeout-ms > 0");
+    }
+    let spot = Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?;
+    let (api_key, api_secret) = load_binance_mainnet_credentials(
+        BINANCE_MAINNET_READ_API_KEY_ENV,
+        BINANCE_MAINNET_READ_API_SECRET_ENV,
+    )?;
+    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+    let endpoints = binance_mainnet_read_endpoints()?;
+    let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
+        StdDuration::from_millis(args.timeout_ms),
+    )?);
+
+    let exchange_info = if args.include_exchange_info {
+        let request = BinanceMainnetSpotReadExchange::build_exchange_info_request(
+            &endpoints,
+            &args.wire_symbol,
+        )?;
+        Some(
+            fetch_binance_mainnet_spot_exchange_info(
+                &*transport,
+                request,
+                spot.clone(),
+                &args.wire_symbol,
+            )
+            .await
+            .context("failed to fetch authoritative Binance mainnet instrument metadata")?,
+        )
+    } else {
+        None
+    };
+    let rules = exchange_info.as_ref().map_or_else(
+        || Ok(InstrumentRuleCatalog::default()),
+        |info| InstrumentRuleCatalog::new(vec![info.rules.clone()]),
+    )?;
+    let catalog = build_binance_mainnet_spot_catalog(&spot, &args.wire_symbol)?;
+    let exchange = BinanceMainnetSpotReadExchange::new(
+        endpoints,
+        catalog,
+        rules,
+        signer,
+        Arc::clone(&transport),
+    )?;
+    let snapshot = exchange
+        .account_snapshot()
+        .await
+        .context("failed to sample complete Binance mainnet Spot account truth")?;
+    print_live_reconcile(
+        args,
+        &snapshot,
+        exchange_info.as_ref().map(|info| &info.rules),
+    )
+}
+
+fn live_reconcile_balances(snapshot: &BinanceMainnetSpotAccountSnapshot) -> Vec<Value> {
+    snapshot
+        .balances
+        .iter()
+        .filter(|balance| {
+            !balance.wallet_balance.is_zero()
+                || !balance.available_balance.is_zero()
+                || balance
+                    .locked_balance
+                    .is_some_and(|locked| !locked.is_zero())
+        })
+        .map(|balance| {
+            json!({
+                "asset": balance.asset,
+                "wallet": balance.wallet_balance.normalize().to_string(),
+                "available": balance.available_balance.normalize().to_string(),
+                "locked": balance
+                    .locked_balance
+                    .map(|locked| locked.normalize().to_string()),
+            })
+        })
+        .collect()
+}
+
+fn live_reconcile_rules_json(rules: &InstrumentRules) -> Value {
+    json!({
+        "price_tick": rules.price_tick().as_decimal().normalize().to_string(),
+        "quantity_step": rules.quantity_step().as_decimal().normalize().to_string(),
+        "min_quantity": rules.min_quantity().as_decimal().normalize().to_string(),
+        "min_notional": rules.min_notional().as_decimal().normalize().to_string(),
+        "max_notional": rules
+            .max_notional()
+            .map(|value| value.as_decimal().normalize().to_string()),
+    })
+}
+
+fn print_live_reconcile(
+    args: &LiveReconcileArgs,
+    snapshot: &BinanceMainnetSpotAccountSnapshot,
+    rules: Option<&InstrumentRules>,
+) -> Result<()> {
+    let balances = live_reconcile_balances(snapshot);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "exchange": "binance",
+                "authority": "mainnet-read",
+                "mutation_authority": false,
+                "product": "spot",
+                "spot_symbol": args.spot_symbol,
+                "wire_symbol": args.wire_symbol,
+                "balance_count": snapshot.balances.len(),
+                "nonzero_balances": balances,
+                "owned_order_count": snapshot.orders.len(),
+                "foreign_order_count": snapshot.foreign_orders.len(),
+                "observed_at": snapshot.observed_at,
+                "exchange_info": rules.map(live_reconcile_rules_json),
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "exchange=binance\nauthority=mainnet-read\nmutation_authority=false\nproduct=spot\nspot_symbol={}\nwire_symbol={}\nbalance_count={}\nowned_order_count={}\nforeign_order_count={}\nobserved_at={}",
+        args.spot_symbol,
+        args.wire_symbol,
+        snapshot.balances.len(),
+        snapshot.orders.len(),
+        snapshot.foreign_orders.len(),
+        snapshot.observed_at.to_rfc3339(),
+    );
+    for balance in balances {
+        println!(
+            "balance asset={} wallet={} available={} locked={}",
+            balance["asset"].as_str().unwrap_or("?"),
+            balance["wallet"].as_str().unwrap_or("?"),
+            balance["available"].as_str().unwrap_or("?"),
+            balance["locked"].as_str().unwrap_or("none"),
+        );
+    }
+    if let Some(rules) = rules {
+        println!(
+            "exchange_info price_tick={} quantity_step={} min_quantity={} min_notional={} max_notional={}",
+            rules.price_tick().as_decimal().normalize(),
+            rules.quantity_step().as_decimal().normalize(),
+            rules.min_quantity().as_decimal().normalize(),
+            rules.min_notional().as_decimal().normalize(),
+            rules.max_notional().map_or_else(
+                || "none".to_owned(),
+                |value| value.as_decimal().normalize().to_string()
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Builds the recovery-safe lifecycle configuration from validated CLI
+/// arguments. The required notional cap is enforced here, before any journal
+/// write, credential access, or network activity.
+fn live_lifecycle_config_from_args(
+    args: &LiveLifecycleArgs,
+    symbol: &Symbol,
+) -> Result<LiveLifecycleConfig> {
+    let side = match args.side {
+        TestnetLifecycleSide::Buy => Side::Buy,
+        TestnetLifecycleSide::Sell => Side::Sell,
+    };
+    let time_in_force = match args.time_in_force {
+        TestnetLifecycleTimeInForce::Gtc => TimeInForce::Gtc,
+        TestnetLifecycleTimeInForce::PostOnly => TimeInForce::PostOnly,
+    };
+    let expected_observation = match args.expected_observation {
+        TestnetLifecycleExpected::Open => LiveLifecycleObservation::Open,
+        TestnetLifecycleExpected::PartiallyFilled => LiveLifecycleObservation::PartiallyFilled,
+    };
+    let quantity = Quantity::new(args.quantity).context("invalid --quantity")?;
+    let price = Price::new(args.price).context("invalid --price")?;
+    let mut intent = OrderIntent::limit(
+        "binance",
+        symbol.clone(),
+        MarketType::Spot,
+        side,
+        quantity,
+        price,
+    );
+    intent.client_order_id = args.client_order_id;
+    intent.time_in_force = time_in_force;
+    Ok(LiveLifecycleConfig::new(
+        args.campaign_id.clone(),
+        intent,
+        args.wire_symbol.clone(),
+        expected_observation,
+        StdDuration::from_millis(args.poll_interval_ms),
+        args.maximum_queries,
+        args.max_notional,
+        args.allow_foreign_orders,
+    )?)
+}
+
+/// One acknowledged mainnet Spot LIMIT lifecycle. Gate order matters and is
+/// contract-tested: exact phrase, config caps (including the required
+/// notional cap), the journal kill latch for a fresh campaign, then mainnet
+/// TRADE credentials, and only then any network activity.
+async fn run_live_lifecycle_command(args: &LiveLifecycleArgs) -> Result<()> {
+    if args.acknowledge_live_lifecycle != LIVE_LIFECYCLE_ACKNOWLEDGEMENT {
+        bail!(
+            "live-lifecycle requires --acknowledge-live-lifecycle \"{LIVE_LIFECYCLE_ACKNOWLEDGEMENT}\""
+        );
+    }
+    if args.timeout_ms == 0 {
+        bail!("live-lifecycle requires --timeout-ms > 0");
+    }
+    let symbol = Symbol::new(args.spot_symbol.clone()).context("invalid --spot-symbol")?;
+    let config = live_lifecycle_config_from_args(args, &symbol)?;
+
+    let history = JsonlHistory::new(&args.history_path);
+    let durable_wire_symbol = live_lifecycle_wire_symbol(&config, &history)
+        .context("failed to recover the durable Binance mainnet lifecycle wire symbol")?;
+    let config = config.with_wire_symbol(durable_wire_symbol)?;
+    let requires_submission = live_lifecycle_requires_submission(&config, &history)
+        .context("failed to inspect durable Binance mainnet lifecycle state")?;
+    if requires_submission && live_lifecycle_kill_switch_latched(&history)? {
+        bail!(
+            "the live lifecycle kill switch is latched in {}; review the account and start a fresh journal before any new mainnet lifecycle",
+            args.history_path.display()
+        );
+    }
+    let (api_key, api_secret) = load_binance_mainnet_credentials(
+        BINANCE_MAINNET_TRADE_API_KEY_ENV,
+        BINANCE_MAINNET_TRADE_API_SECRET_ENV,
+    )?;
+    let signer = Arc::new(BinanceHmacSha256Signer::new(api_key, api_secret)?);
+    let endpoints = binance_mainnet_trade_endpoints()?;
+    let transport: Arc<dyn RemoteHttpTransport> = Arc::new(ReqwestHttpTransport::new(
+        StdDuration::from_millis(args.timeout_ms),
+    )?);
+    let (catalog, rules) = if requires_submission {
+        let request = BinanceMainnetSpotExchange::build_exchange_info_request(
+            &endpoints,
+            config.wire_symbol(),
+        )?;
+        let BinanceExchangeInfoSymbol {
+            symbol: exchange_symbol,
+            rules,
+        } = fetch_binance_mainnet_spot_exchange_info(
+            &*transport,
+            request,
+            symbol.clone(),
+            config.wire_symbol(),
+        )
+        .await
+        .context("failed to fetch authoritative Binance mainnet instrument metadata")?;
+        (
+            ExchangeSymbolCatalog::new(vec![exchange_symbol])?,
+            InstrumentRuleCatalog::new(vec![rules])?,
+        )
+    } else {
+        // Recovery is query/cancel-only: no admission, so no exchangeInfo.
+        (
+            build_binance_mainnet_spot_catalog(&symbol, config.wire_symbol())?,
+            InstrumentRuleCatalog::default(),
+        )
+    };
+    let exchange = BinanceMainnetSpotExchange::new(
+        endpoints,
+        catalog,
+        rules.clone(),
+        signer,
+        Arc::clone(&transport),
+    )?;
+    let venue = LiveLifecycleExchangeVenue::new(exchange, symbol)?;
+    let report = run_live_lifecycle(&config, &venue, &rules, &history).await?;
+    print_live_lifecycle_report(args, &report)
+}
+
+fn print_live_lifecycle_report(
+    args: &LiveLifecycleArgs,
+    report: &LiveLifecycleReport,
+) -> Result<()> {
+    let expected = live_observation_label(report.expected_observation);
+    let final_status = lifecycle_order_status_label(report.final_status);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "exchange": "binance",
+                "authority": "mainnet",
+                "product": "spot",
+                "one_shot": true,
+                "campaign_id": report.campaign_id,
+                "client_order_id": report.client_order_id,
+                "server_order_id": report.server_order_id,
+                "expected_observation": expected,
+                "final_status": final_status,
+                "query_count": report.query_count,
+                "recovered": report.recovered,
+                "max_notional": args.max_notional.normalize().to_string(),
+                "evidence_path": args.history_path,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "exchange=binance\nauthority=mainnet\nproduct=spot\none_shot=true\ncampaign_id={}\nclient_order_id={}\nserver_order_id={}\nexpected_observation={expected}\nfinal_status={final_status}\nquery_count={}\nrecovered={}\nmax_notional={}\nevidence_path={}",
+        report.campaign_id,
+        report.client_order_id,
+        report.server_order_id,
+        report.query_count,
+        report.recovered,
+        args.max_notional.normalize(),
+        args.history_path.display(),
+    );
+    Ok(())
+}
+
+const fn live_observation_label(observation: LiveLifecycleObservation) -> &'static str {
+    match observation {
+        LiveLifecycleObservation::Open => "open",
+        LiveLifecycleObservation::PartiallyFilled => "partially_filled",
     }
 }
 

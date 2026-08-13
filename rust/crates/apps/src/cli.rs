@@ -12,10 +12,12 @@ use uuid::Uuid;
     about = "Multi-exchange strategy kernel with deterministic paper execution and an auditable journal.",
     long_about = "Multi-exchange strategy kernel with deterministic paper execution and an \
                   auditable JSONL journal.\n\n\
-                  Mainnet trading is disabled and fails closed. The only path with order \
-                  authority is Binance Testnet, and it requires an exact acknowledgement \
-                  phrase. Run `capabilities --json` for the authoritative statement of what \
-                  this build is permitted to do."
+                  Autonomous mainnet trading is disabled and fails closed. The only mainnet \
+                  order authority is the operator-supervised one-shot `live-lifecycle` \
+                  Binance Spot command, which requires an exact acknowledgement phrase and a \
+                  --max-notional cap; `live-reconcile` is read-only. Binance Testnet keeps \
+                  its own acknowledged lifecycle. Run `capabilities --json` for the \
+                  authoritative statement of what this build is permitted to do."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -38,6 +40,12 @@ pub enum Command {
     /// Run, inspect, stop, or verify a durable Binance testnet soak campaign.
     #[command(name = "testnet-soak")]
     TestnetSoak(TestnetSoakArgs),
+    /// Print a read-only Binance Spot MAINNET balance and open-order report.
+    #[command(name = "live-reconcile")]
+    LiveReconcile(LiveReconcileArgs),
+    /// Run or recover one acknowledged Binance Spot MAINNET order lifecycle.
+    #[command(name = "live-lifecycle")]
+    LiveLifecycle(LiveLifecycleArgs),
     /// Run or inspect a grid strategy.
     Grid(GridArgs),
     /// Run the segmented arbitrage engine.
@@ -210,6 +218,86 @@ pub enum TestnetLifecycleTimeInForce {
 pub enum TestnetLifecycleExpected {
     Open,
     PartiallyFilled,
+}
+
+/// Read-only mainnet report arguments. This command carries no mutation
+/// authority at all: there is no submit, cancel, or apply switch to add.
+#[derive(Debug, Args)]
+pub struct LiveReconcileArgs {
+    /// Emit a machine-readable report.
+    #[arg(long)]
+    pub json: bool,
+    /// Standard spot symbol whose open orders are inspected.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub spot_symbol: String,
+    /// Exact Binance wire symbol mapped to the spot symbol.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Additionally fetch and report the symbol's exchangeInfo instrument rules.
+    #[arg(long)]
+    pub include_exchange_info: bool,
+    /// Total HTTP timeout for each signed remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
+}
+
+/// One human-authorized mainnet Spot LIMIT order lifecycle
+/// (submit -> poll query -> cancel -> final query).
+#[derive(Debug, Args)]
+pub struct LiveLifecycleArgs {
+    /// Emit the final durable proof as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Exact acknowledgement required before any MAINNET mutation.
+    #[arg(long, value_name = "PHRASE")]
+    pub acknowledge_live_lifecycle: String,
+    /// Stable campaign identity reused for recovery.
+    #[arg(long)]
+    pub campaign_id: String,
+    /// Stable UUID persisted before submission and reused for every query.
+    #[arg(long)]
+    pub client_order_id: Uuid,
+    /// Dedicated append-only JSONL evidence path.
+    #[arg(long)]
+    pub history_path: PathBuf,
+    /// Order side.
+    #[arg(long, value_enum)]
+    pub side: TestnetLifecycleSide,
+    /// Positive base-asset quantity that satisfies the venue instrument rule.
+    #[arg(long)]
+    pub quantity: Decimal,
+    /// Positive limit price that satisfies the venue instrument rule.
+    #[arg(long)]
+    pub price: Decimal,
+    /// REQUIRED hard cap on price*quantity in quote units; the lifecycle
+    /// refuses before any journal write or network call when exceeded.
+    #[arg(long)]
+    pub max_notional: Decimal,
+    /// GTC supports manual partial-fill evidence; post-only is the safer open-order default.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleTimeInForce::PostOnly)]
+    pub time_in_force: TestnetLifecycleTimeInForce,
+    /// Order state that a signed single-order query must prove before cancellation.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleExpected::Open)]
+    pub expected_observation: TestnetLifecycleExpected,
+    /// Proceed even when the symbol has open orders that do not belong to
+    /// this campaign. Refused by default.
+    #[arg(long)]
+    pub allow_foreign_orders: bool,
+    /// Standard spot symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub spot_symbol: String,
+    /// Exact Binance wire symbol used by the mainnet request.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Delay between authoritative single-order queries.
+    #[arg(long, default_value_t = 2_000)]
+    pub poll_interval_ms: u64,
+    /// Maximum signed single-order query attempts across the durable campaign.
+    #[arg(long, default_value_t = 30)]
+    pub maximum_queries: u16,
+    /// Total HTTP timeout for each remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Args)]

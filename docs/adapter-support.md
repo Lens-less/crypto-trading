@@ -21,7 +21,7 @@ Status meanings:
 <!-- adapter-matrix:start -->
 | Adapter | Public data | Testnet protocol | Authenticated | Reconcile | Live |
 | --- | --- | --- | --- | --- | --- |
-| Binance | implemented | implemented | implemented | implemented | unavailable |
+| Binance | implemented | implemented | implemented | implemented | implemented |
 | Hyperliquid | implemented | protocol-only | protocol-only | request-only | unavailable |
 | PaperExchange | not-applicable | not-applicable | not-applicable | implemented | not-applicable |
 <!-- adapter-matrix:end -->
@@ -40,9 +40,18 @@ submit-query-cancel/query-first recovery coverage, and its report-first account
 gate compares signed balances, open orders, and positions to one exact
 committed Paper reservation. Real credentialed Spot/USD-M reconciliation,
 open-order, partial-fill, restart, and 24-hour soak evidence remain external
-release gates. PaperExchange is process-local. Every external venue still
-reports `live: unavailable`, and the manifest validation rejects any live claim
-while `live_trading_enabled` is false.
+release gates. PaperExchange is process-local.
+
+Binance `live: implemented` means exactly one authority: the
+operator-acknowledged one-shot Spot LIMIT order lifecycle (`live-lifecycle`,
+which requires an exact acknowledgement phrase and a `--max-notional` cap)
+plus the read-only signed `live-reconcile` report over dedicated mainnet read
+credentials. There is no autonomous strategy live execution, no market
+orders, no margin, no USDⓈ-M product, and no multi-symbol owner loop;
+`ExecutionMode::Live` for grid/arbitrage keeps failing closed, and a
+credentialed supervised mainnet run remains external release evidence.
+Hyperliquid still reports `live: unavailable`, and manifest validation
+rejects any live claim whenever `live_trading_enabled` is false.
 
 Venues without an operator-supported Rust adapter path (for example Backpack,
 EdgeX, GRVT, Lighter, Paradex, OKX, and Variational) are out of scope for the

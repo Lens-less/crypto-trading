@@ -55,7 +55,9 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
     assert_eq!(first, second);
     assert_eq!(first.schema_version, CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION);
     assert_eq!(first.capabilities, *control_plane.capabilities());
-    assert!(!first.capabilities.live_trading_enabled);
+    // Live-manual posture: the manifest advertises the operator-supervised
+    // one-shot CLI lifecycle, but the web control plane stays paper-scoped.
+    assert!(first.capabilities.live_trading_enabled);
     let web = first.capabilities.capability("control-plane.web").unwrap();
     assert_eq!(web.level, CapabilityLevel::Available);
     assert_eq!(

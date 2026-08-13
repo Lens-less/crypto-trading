@@ -54,9 +54,9 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
 
     assert!(output.status.success(), "{output:?}");
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["schema_version"], 3);
-    assert_eq!(payload["release_stage"], "paper-only");
-    assert_eq!(payload["live_trading_enabled"], false);
+    assert_eq!(payload["schema_version"], 4);
+    assert_eq!(payload["release_stage"], "live-manual");
+    assert_eq!(payload["live_trading_enabled"], true);
     let adapters = payload["adapters"].as_array().unwrap();
     assert_eq!(adapters.len(), 3);
     assert!(adapters.iter().any(|entry| {
@@ -64,9 +64,11 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
             && entry["public_data"]["level"] == "implemented"
             && entry["testnet_protocol"]["level"] == "implemented"
             && entry["reconcile"]["level"] == "implemented"
-            && entry["live"]["level"] == "unavailable"
+            && entry["live"]["level"] == "implemented"
     }));
     let capabilities = payload["capabilities"].as_array().unwrap();
+    // Autonomous strategy live execution stays closed even though the
+    // operator-supervised one-shot lifecycle is available.
     assert!(capabilities.iter().any(|entry| {
         entry["id"] == "runtime.live"
             && entry["level"] == "unavailable"
@@ -74,6 +76,16 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
             && entry["scope"]["environments"]
                 .as_array()
                 .is_some_and(|environments| environments.iter().any(|mode| mode == "mainnet"))
+    }));
+    assert!(capabilities.iter().any(|entry| {
+        entry["id"] == "runtime.live-lifecycle"
+            && entry["level"] == "available"
+            && entry["scope"]["access"] == "mainnet-trading"
+    }));
+    assert!(capabilities.iter().any(|entry| {
+        entry["id"] == "runtime.live-reconcile"
+            && entry["level"] == "read-only"
+            && entry["scope"]["access"] == "mainnet-read-only"
     }));
     let research_backtest = capabilities
         .iter()
@@ -115,8 +127,8 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("capabilities schema=3")
-            && stdout.contains("release=paper-only live-trading=false"),
+        stdout.contains("capabilities schema=4")
+            && stdout.contains("release=live-manual live-trading=true"),
         "{stdout}"
     );
     assert!(
@@ -124,7 +136,7 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("binance\timplemented\timplemented\timplemented\timplemented\tunavailable"),
+        stdout.contains("binance\timplemented\timplemented\timplemented\timplemented\timplemented"),
         "{stdout}"
     );
     assert!(

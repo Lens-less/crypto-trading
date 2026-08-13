@@ -100,13 +100,23 @@ describe("systemResponseSchema", () => {
 
 describe("capabilityManifestSchema", () => {
   const valid = {
-    schema_version: 3,
-    release_stage: "paper-only",
-    live_trading_enabled: false,
+    schema_version: 4,
+    release_stage: "live-manual",
+    live_trading_enabled: true,
   };
 
-  it("接受 capability manifest(注意 schema_version 是 3)", () => {
+  it("接受 capability manifest(注意 schema_version 是 4)", () => {
     expect(capabilityManifestSchema.safeParse(valid).success).toBe(true);
+  });
+
+  it("接受历史 paper-only 判别值", () => {
+    expect(
+      capabilityManifestSchema.safeParse({
+        ...valid,
+        release_stage: "paper-only",
+        live_trading_enabled: false,
+      }).success,
+    ).toBe(true);
   });
 
   it("拒绝 API 的 schema_version 1(两个版本号不同源)", () => {

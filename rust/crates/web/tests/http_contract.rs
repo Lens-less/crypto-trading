@@ -36,8 +36,8 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
     assert_eq!(capabilities.status(), StatusCode::OK);
     assert_security_headers(&capabilities);
     let capabilities = response_json(capabilities).await;
-    assert_eq!(capabilities["live_trading_enabled"], false);
-    assert_eq!(capabilities["release_stage"], "paper-only");
+    assert_eq!(capabilities["live_trading_enabled"], true);
+    assert_eq!(capabilities["release_stage"], "live-manual");
     let web = capabilities["capabilities"]
         .as_array()
         .unwrap()
@@ -86,7 +86,7 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
     assert_eq!(system.status(), StatusCode::OK);
     assert_security_headers(&system);
     let system = response_json(system).await;
-    assert_eq!(system["live_trading_enabled"], false);
+    assert_eq!(system["live_trading_enabled"], true);
     assert_eq!(system["access_scope"], "loopback");
     assert_eq!(system["authentication_required"], false);
     assert_eq!(system["projection_status"], "complete");
@@ -685,7 +685,7 @@ async fn optional_auth_never_prints_the_token_and_protects_every_route() {
     assert_eq!(health.status(), StatusCode::OK);
     let health = response_json(health).await;
     assert_eq!(health["status"], "ready");
-    assert_eq!(health["live_trading_enabled"], false);
+    assert_eq!(health["live_trading_enabled"], true);
 
     let unauthorized = app.clone().oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -991,7 +991,7 @@ async fn readiness_probe_stays_unauthenticated_but_reads_no_operational_data() {
     assert_security_headers(&health);
     let body = response_json(health).await;
     assert_eq!(body["status"], "ready");
-    assert_eq!(body["live_trading_enabled"], false);
+    assert_eq!(body["live_trading_enabled"], true);
     assert_eq!(
         body.as_object().unwrap().len(),
         3,

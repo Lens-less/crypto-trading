@@ -53,7 +53,10 @@ describe("web-api fixture snapshots parse with the production zod schemas", () =
     const manifest = capabilityManifestSchema.parse(
       readFixture("capabilities.json"),
     );
-    expect(manifest.live_trading_enabled).toBe(false);
+    // live-manual:后端声明操作员监督的一次性 CLI lifecycle;
+    // 浏览器侧仍然只读,永不构造 live 权限。
+    expect(manifest.release_stage).toBe("live-manual");
+    expect(manifest.live_trading_enabled).toBe(true);
   });
 
   it("GET /api/v1/monitor → monitor.json(latest 非空)", () => {

@@ -13,7 +13,7 @@ use crate::{
     ExchangeOperationKey, ExchangeSymbol, ExchangeSymbolCatalog, ForeignOrder,
     InstrumentRuleCatalog, InstrumentRuleOptions, InstrumentRules, RemoteHttpMethod,
     RemoteHttpRequest, RemoteHttpResponse, RemoteHttpTransport, SubmissionDisposition,
-    TradingReceipt, sha256::HmacSha256Key,
+    TradingReceipt, endpoint::BinanceRestEndpointAuthority, sha256::HmacSha256Key,
 };
 
 const EXCHANGE: &str = "binance";
@@ -211,8 +211,12 @@ pub struct BinanceExchangeInfoSymbol {
 }
 
 /// Deterministic Binance Spot and USDⓈ-M testnet request protocol.
+///
+/// The same wire protocol serves the authority-typed Binance Spot mainnet
+/// adapters through crate-internal constructors; mainnet authority stays
+/// Spot-only and every USDⓈ-M route fails closed on a mainnet endpoint set.
 pub struct BinanceTestnetProtocol {
-    endpoints: BinanceTestnetEndpoints,
+    endpoints: BinanceRestEndpointAuthority,
     symbols: ExchangeSymbolCatalog,
     rules: InstrumentRuleCatalog,
     signer: Arc<dyn BinanceRequestSigner>,
@@ -393,6 +397,28 @@ impl BinanceTestnetProtocol {
     /// key. Secrets are retained only by the signer implementation.
     pub fn authenticated<S>(
         endpoints: BinanceTestnetEndpoints,
+        symbols: ExchangeSymbolCatalog,
+        rules: InstrumentRuleCatalog,
+        signer: Arc<S>,
+    ) -> Result<Self, ExchangeError>
+    where
+        S: BinanceRequestSigner + 'static,
+    {
+        Self::authenticated_with_authority(
+            BinanceRestEndpointAuthority::Testnet(endpoints),
+            symbols,
+            rules,
+            signer,
+        )
+    }
+
+    /// Builds an authenticated protocol over one authority-typed endpoint set.
+    ///
+    /// Crate-internal on purpose: outside callers must go through the concrete
+    /// testnet or mainnet adapter constructors so a generic URL can never
+    /// confer authority.
+    pub(crate) fn authenticated_with_authority<S>(
+        endpoints: BinanceRestEndpointAuthority,
         symbols: ExchangeSymbolCatalog,
         rules: InstrumentRuleCatalog,
         signer: Arc<S>,
@@ -911,6 +937,20 @@ impl BinanceTestnetProtocol {
     /// symbol is invalid.
     pub fn build_exchange_info_request(
         endpoints: &BinanceTestnetEndpoints,
+        product: BinanceProduct,
+        wire_symbol: &str,
+    ) -> Result<RemoteHttpRequest, ExchangeError> {
+        Self::build_exchange_info_request_with_authority(
+            &BinanceRestEndpointAuthority::Testnet(endpoints.clone()),
+            product,
+            wire_symbol,
+        )
+    }
+
+    /// Authority-typed variant of [`Self::build_exchange_info_request`] shared
+    /// with the mainnet Spot adapters.
+    pub(crate) fn build_exchange_info_request_with_authority(
+        endpoints: &BinanceRestEndpointAuthority,
         product: BinanceProduct,
         wire_symbol: &str,
     ) -> Result<RemoteHttpRequest, ExchangeError> {

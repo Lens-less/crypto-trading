@@ -3,7 +3,7 @@
  *
  * 后端事实来源:rust/crates/web/src/api.rs 与 rust/crates/runtime/src/capability.rs。
  * - /api/v1/health、/api/v1/system 顶层 `schema_version: 1`(API_SCHEMA_VERSION);
- * - /api/v1/capabilities 返回 CapabilityManifest,`schema_version: 3`
+ * - /api/v1/capabilities 返回 CapabilityManifest,`schema_version: 4`
  *   (CAPABILITY_SCHEMA_VERSION),注意与 API 版本不同;
  * - 错误响应统一为 `{ schema_version, error: { code, message } }`。
  *
@@ -13,7 +13,7 @@
 import { z } from "zod";
 
 export const API_SCHEMA_VERSION = 1;
-export const CAPABILITY_SCHEMA_VERSION = 3;
+export const CAPABILITY_SCHEMA_VERSION = 4;
 
 /* ---------------------------------------------------------------- 错误封套 */
 
@@ -52,7 +52,10 @@ export const healthResponseSchema = z.looseObject({
 /* -------------------------------------------------------- GET /api/v1/system */
 
 export type ProjectionStatus = "complete" | "windowed" | "degraded";
-export type ReleaseStage = "paper-only";
+// live-manual:后端唯一的 mainnet 下单权限是操作员亲自确认的一次性
+// live-lifecycle CLI 命令;自动策略 live 执行仍然关闭。浏览器永不构造
+// live 权限。
+export type ReleaseStage = "paper-only" | "live-manual";
 export type OperationalSignal =
   | "normal"
   | "engaged"
@@ -177,7 +180,7 @@ export interface CapabilityManifest {
 
 export const capabilityManifestSchema = z.looseObject({
   schema_version: z.literal(CAPABILITY_SCHEMA_VERSION),
-  release_stage: z.literal("paper-only"),
+  release_stage: z.enum(["paper-only", "live-manual"]),
   live_trading_enabled: z.boolean(),
 });
 

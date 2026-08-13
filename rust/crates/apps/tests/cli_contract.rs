@@ -13,12 +13,21 @@ fn top_level_help_has_readable_utf8_product_text() {
 
 #[test]
 fn long_help_states_the_authority_posture_before_any_subcommand_runs() {
-    // An operator reading `--help` must learn that mainnet is closed and where
-    // the authoritative answer lives, without having to find the README.
+    // An operator reading `--help` must learn exactly what mainnet authority
+    // exists (one acknowledged one-shot lifecycle), that autonomous trading
+    // stays closed, and where the authoritative answer lives.
     let long_help = Cli::command().render_long_help().to_string();
 
     assert!(
-        long_help.contains("Mainnet trading is disabled"),
+        long_help.contains("Autonomous mainnet trading is disabled"),
+        "{long_help}"
+    );
+    assert!(
+        long_help.contains("one-shot `live-lifecycle`"),
+        "{long_help}"
+    );
+    assert!(
+        long_help.contains("`live-reconcile` is read-only"),
         "{long_help}"
     );
     assert!(long_help.contains("Binance Testnet"), "{long_help}");
