@@ -24,8 +24,6 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const SHELL_PATHS: &[&str] = &[
     "/",
     "/overview",
-    "/scanner",
-    "/alerts",
     "/executions",
     "/integrations",
     "/strategies",

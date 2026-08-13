@@ -25,9 +25,9 @@ use axum::{
 use crypto_trading_control_plane::{
     AccountRiskReadModel, ArbitrageMonitorReadModel, CapabilityManifest, ControlPlaneEventsPage,
     ControlPlaneSnapshot, ExecutionBatchState, OperatorReadModel, PaperAccountReadModel,
-    PriceAlertReadModel, ProjectionStatus, ReadControlPlane, ReadFailureKind, ReadOnlyTaskPhase,
-    ReadOnlyTaskReadModel, ReadOnlyTaskRecovery, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
-    RecoveryDirective, ReleaseStage, VirtualGridScannerReadModel,
+    ProjectionStatus, ReadControlPlane, ReadFailureKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel,
+    ReadOnlyTaskRecovery, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase, RecoveryDirective,
+    ReleaseStage,
 };
 use crypto_trading_domain::{operational_metrics_snapshot, render_prometheus_metrics};
 use futures_util::{Stream, stream};
@@ -414,9 +414,7 @@ fn api_routes_with_optional_shutdown(
         .route("/system", get(system))
         .route("/capabilities", get(capabilities))
         .route("/monitor", get(monitor))
-        .route("/alerts", get(alerts))
         .route("/tasks", get(tasks))
-        .route("/scanner", get(scanner))
         .route("/risk", get(risk))
         .route("/settings", get(runtime_settings))
         .route("/executions", get(executions))
@@ -489,21 +487,9 @@ async fn monitor(
     Ok(Json(snapshot.monitor))
 }
 
-async fn alerts(State(state): State<ApiState>) -> Result<Json<PriceAlertReadModel>, ApiError> {
-    let snapshot = load_snapshot(&state).await?;
-    Ok(Json(snapshot.alerts))
-}
-
 async fn tasks(State(state): State<ApiState>) -> Result<Json<ReadOnlyTaskReadModel>, ApiError> {
     let snapshot = load_snapshot(&state).await?;
     Ok(Json(snapshot.tasks))
-}
-
-async fn scanner(
-    State(state): State<ApiState>,
-) -> Result<Json<VirtualGridScannerReadModel>, ApiError> {
-    let snapshot = load_snapshot(&state).await?;
-    Ok(Json(snapshot.scanner))
 }
 
 /// Combined risk projection: journal-backed paper-account exposure plus the
@@ -762,9 +748,7 @@ fn log_degraded_snapshot_once(degraded_logged: &AtomicBool, snapshot: &ControlPl
     let degraded = [
         snapshot.operator.projection_status,
         snapshot.monitor.projection_status,
-        snapshot.alerts.projection_status,
         snapshot.tasks.projection_status,
-        snapshot.scanner.projection_status,
         snapshot.paper_accounts.projection_status,
         snapshot.account_risk.projection_status,
     ]

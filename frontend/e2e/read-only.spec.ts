@@ -3,7 +3,7 @@
  * 浏览器存储纪律。
  *
  * 后端:嵌入 dist 的真实二进制 + rust/fixtures/web-api/journal.jsonl
- * (monitor / alerts / tasks / scanner / executions 均非空)。
+ * (monitor / tasks / executions 均非空)。
  */
 import { expect, test } from "@playwright/test";
 import { startBackend, WEB_API_JOURNAL, type Backend } from "./backend";
@@ -70,7 +70,7 @@ test("浏览器持久化存储的键集合 ⊆ {ct-theme}", async ({ page }) => 
   await expect(page.getByTestId("authority")).toContainText("PAPER");
 
   // 遍历数据页并切换主题,逼出所有可能的存储写入。
-  for (const label of ["执行", "预警", "设置"]) {
+  for (const label of ["执行", "设置"]) {
     await page.getByRole("link", { name: label, exact: true }).click();
   }
   await page.getByRole("button", { name: /主题:/ }).click();

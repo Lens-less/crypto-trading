@@ -1,5 +1,9 @@
 # 旧 UI 契约断言迁移映射(W5 定稿)
 
+> **历史文档(2026-08-13 起部分失效)**:alerts / scanner 页面及其读模型已在
+> live-trading 重聚焦 Wave A 中整体移除;涉及 alerts / scanner 的迁移落点
+> (S3 / S5 等)不再对应现存代码,仅作历史记录保留。
+
 来源:`git show e5fdbc8:rust/crates/web/tests/ui_contract.rs`(757 行,锁定已删除的
 `rust/crates/web/assets/{app.js,app.css,index.html}` 免构建原生 JS 前端)。
 该文件在 W1 重写为第一层合约(现 `rust/crates/web/tests/ui_contract.rs`,7 个测试,

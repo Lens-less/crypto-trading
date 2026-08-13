@@ -1,7 +1,6 @@
 //! Supervised runtime and process-local synchronized decision history.
 
 mod account_risk;
-mod alert_read_model;
 mod authority_state;
 mod binance_user_data;
 mod capability;
@@ -18,7 +17,6 @@ mod mode;
 mod monitor_read_model;
 mod paper_account;
 mod read_model;
-mod scanner_read_model;
 mod spread_history;
 mod spread_history_read_model;
 mod task_read_model;
@@ -28,11 +26,6 @@ pub use account_risk::{
     AccountRiskAuthority, AccountRiskCandidate, AccountRiskDirective, AccountRiskError,
     AccountRiskOpenPositionView, AccountRiskProjectionError, AccountRiskReadModel,
     AccountRiskStateView, MAX_ACCOUNT_RISK_SCOPE_POSITIONS, MAX_ACCOUNT_RISK_SCOPES,
-};
-pub use alert_read_model::{
-    AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView, AlertOccurrenceKind,
-    AlertOccurrenceView, MAX_ALERT_READ_MODEL_OCCURRENCES, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
-    PriceAlertReadModel,
 };
 pub use binance_user_data::{
     BinanceUserDataApply, BinanceUserDataBalanceState, BinanceUserDataOrderState,
@@ -114,12 +107,6 @@ pub use read_model::{
     ExecutionBatchState, ExecutionBatchView, ExecutionPhase, MAX_OPERATOR_READ_MODEL_BATCHES,
     MAX_OPERATOR_READ_MODEL_WARNINGS, OPERATOR_READ_MODEL_SCHEMA_VERSION, OperatorReadModel,
     ProjectionStatus, ReadModelError, ReadModelWarning, ReadModelWarningCode, RecoveryDirective,
-};
-pub use scanner_read_model::{
-    MAX_VIRTUAL_GRID_SCANNER_ROWS, ScannerAprEstimateAssumptionsView, ScannerAprEstimateKindView,
-    ScannerInstrumentView, ScannerPriorityView, ScannerRatingGradeView,
-    VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION, VirtualGridScanRowView, VirtualGridScanView,
-    VirtualGridScannerReadModel,
 };
 pub use spread_history::{
     DEFAULT_SPREAD_HISTORY_FILE, MAX_SPREAD_HISTORY_BATCH_RECORDS,

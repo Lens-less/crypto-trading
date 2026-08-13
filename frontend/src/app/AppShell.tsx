@@ -19,8 +19,6 @@ import {
 
 const NAV_ITEMS: ReadonlyArray<{ to: string; label: string }> = [
   { to: "/overview", label: "总览" },
-  { to: "/scanner", label: "扫描" },
-  { to: "/alerts", label: "预警" },
   { to: "/executions", label: "执行" },
   { to: "/integrations", label: "集成" },
   { to: "/strategies", label: "策略" },

@@ -6,7 +6,7 @@
 
 一个 Rust-first 的多交易所策略内核，专注于配置兼容、确定性策略计算、受控的 paper one-shot 执行，以及为人工恢复分析保留上下文的可审计 JSONL 运行记录。
 
-当前主线位于 [`rust/`](rust/README.md)。原 Python 项目已冻结到 [`archive/python-legacy/`](archive/python-legacy/)，只用于审计、行为对照和迁移参考。
+当前主线位于 [`rust/`](rust/README.md)。原 Python 项目已于 2026-08-13 从工作树移除，仅保留在 Git 历史中（见 [`archive/README.md`](archive/README.md)）。
 
 > [!WARNING]
 > **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、真实交易所账户风控真相（equity/margin/持仓）和多腿故障补偿尚未达到开放门槛；账户级风控权威目前仅覆盖 Paper 模拟账本。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 只计配置的同步 taker 手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。
@@ -23,15 +23,14 @@
 > project for wash trading, artificial volume, market manipulation, or any
 > activity that violates an exchange's terms of service.
 
-W3 maintenance-freeze note:
-- `scanner`, `price-alert`, and `volume-maker` remain replay-backed legacy
-  surfaces. They stay parseable and testable at their existing config paths,
-  but no new runtime investment is planned there. `volume-maker` is retained
-  only as a compatibility command name for offline Paper volume simulation; it
-  must never be connected to a real venue.
-- Config-only exchange-auth samples for Backpack, EdgeX, GRVT, Lighter, and
-  Paradex now live under [`rust/config/legacy/`](rust/config/legacy/README.md),
-  so the active `rust/config/exchanges/` surface only lists operator-supported
+Live-trading refocus note (2026-08-13):
+- The maintenance-frozen `scanner`, `price-alert`, and `volume-maker` commands
+  were removed entirely (strategy modules, config schemas, task hosts,
+  capability rows, web/API projections, and configs). They only exist in Git
+  history now.
+- Config-only exchange-auth samples for venues without an adapter (Backpack,
+  EdgeX, GRVT, Lighter, Paradex) were removed with `rust/config/legacy/`; the
+  active `rust/config/exchanges/` surface only lists operator-supported
   Binance and Hyperliquid profiles.
 
 ## 项目定位
@@ -48,7 +47,7 @@ W3 maintenance-freeze note:
 它暂时不适合：
 
 - 连接私有交易 API 或管理真实资产。
-- 启动 7×24 小时网格、套利监控、成交量仿真或价格提醒服务。
+- 启动 7×24 小时网格或套利监控服务。
 - 用 paper 成交结果推断真实交易收益或生产就绪程度。
 
 ## 当前能力
@@ -62,9 +61,6 @@ W3 maintenance-freeze note:
 | `paper grid`／`paper arbitrage` | 活跃 | 不适用 | 不适用 | 可用（Paper） | 不可用 | 通过 loopback trusted-submit 服务 `start/status/stop/cancel` replay-backed owner；状态只来自 journal/read model；完全成交的同步 taker 回执会写入精确 FIFO lot、手续费、已实现 PnL 与 settled equity，reduce-only 平仓额度在 reserve 与 settle 两处校验；Grid owner 会把配置启用的纯策略网格保护指令写成 `grid_protection` journal 事实并映射为受限 paper 动作；Arbitrage owner 可选 spread-history 自然价差门控，资金费率缺失时标注 `funding_degraded`；两个 owner 的开仓在 reservation 前都要通过 journal-backed 账户风控，拒绝会写成 `account_risk_rejected` 事实 |
 | `paper risk` | 活跃 | `--enable-paper-writes` 时必须提供 `--paper-account-risk-config` 共享限额 | 不适用 | 可用（Paper） | 不可用 | 通过同一 loopback trusted-submit 服务控制共享账户级风控权威：`pause`/`resume`（PaperOnly 确认）与 `kill-switch`（专属 `account_kill_switch_armed` 确认 + CLI 精确确认短语）；kill switch 闩锁不可解除，触发后所有新开仓拒绝，owner 会在有可信缓存盘口时以 reduce-only 平仓后停止；缺少盘口或平仓不完整时进入 `RecoveryRequired`，不得伪装为正常停止 |
 | `monitor` | 活跃 | 可解析并校验 | 不可用 | 可用（只读 replay / `--live`） | 不可用 | `serve/status/stop` 运行精确双源 monitor owner；`--live` 默认使用 Binance Spot Testnet `bookTicker` WebSocket + Hyperliquid 永续轮询，并将价差事实写入独立 spread-history journal；WebSocket 有有界队列、ping/pong、退避重连和 update-ID 回退门禁，只有显式 `--live-transport polling` 才将 Binance 降级为 REST；所有路径都拒绝超出配置 skew 的配对且不授予交易权限 |
-| `volume-maker` | 维护冻结 | 可解析并校验 | 不可用 | 可用（Paper replay） | 不可用 | 兼容命令名，仅表示离线 Paper 成交量仿真。默认 `--mode validate` 校验执行控制与策略配置（emergency stop 仍失败关闭）；`serve` 必须显式提供 `--paper-account-risk-config`，并运行单源 replay Paper owner：限价模式持有虚拟报价、盘口穿越后才执行单腿开仓，市价模式消费仿真盘口薄侧，平仓 reduce-only 市价，每笔操作独立 reservation 且先过账户级风控准入，小时统计与生命周期事实（`task_kind volume_maker`）写入 journal，真实外部行情源始终未开放 |
-| `price-alert` | 维护冻结 | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay price-alert task host，生命周期事实写入 journal，真实外部行情源仍未开放 |
-| `scanner` | 维护冻结 | 可解析并校验 | 不可用 | 可用（只读 replay） | 不可用 | 默认 `--mode validate` 校验后成功返回；`serve/status/stop` 运行单源 replay 虚拟网格扫描 task host，评级排名与生命周期事实写入 journal，真实实时行情发现仍未开放 |
 
 ### Binance Testnet 命令
 
@@ -193,17 +189,14 @@ crypto-trading testnet-soak --mode <serve|status|stop|verify> [OPTIONS]
 crypto-trading grid <CONFIG> [OPTIONS]
 crypto-trading arbitrage [OPTIONS]
 crypto-trading monitor [OPTIONS]
-crypto-trading volume-maker [CONFIG] [OPTIONS]
-crypto-trading price-alert [CONFIG] [OPTIONS]
-crypto-trading scanner [OPTIONS]
 crypto-trading config-check <PATHS>... [--json]
 ```
 
 > [!IMPORTANT]
-> `monitor` / `volume-maker` / `price-alert` / `scanner` / `testnet-soak` 的
-> `serve|status|stop` loopback control host 现在要求环境变量
-> `CRYPTO_TRADING_TASK_CONTROL_TOKEN`。该值不会出现在命令行参数里，且必须是
-> 32-512 字节的可打印非空白 ASCII secret；缺失、长度不符或 token 不匹配都会失败关闭。
+> `monitor` / `testnet-soak` 的 `serve|status|stop` loopback control host
+> 现在要求环境变量 `CRYPTO_TRADING_TASK_CONTROL_TOKEN`。该值不会出现在
+> 命令行参数里，且必须是 32-512 字节的可打印非空白 ASCII secret；缺失、
+> 长度不符或 token 不匹配都会失败关闭。
 
 ## Binance Testnet lifecycle
 
@@ -406,9 +399,7 @@ rust/config/
 ├── arbitrage/       # 套利策略、monitor companion 与迁移期配置
 ├── exchanges/       # 交易所字段映射和市场元数据
 ├── grid/            # 网格策略配置
-├── price_alert/     # 价格提醒配置
-├── scanner/         # 虚拟网格扫描器配置
-├── volume_maker/    # 冻结的 Paper 成交量仿真兼容配置
+├── paper/           # Paper 账户级风控共享限额示例
 ├── logging.yaml     # 迁移期辅助配置；Rust runtime 不读取
 └── symbol_conversion.yaml
 ```
@@ -421,20 +412,18 @@ rust/config/
 - Paper one-shot 只接受 `runtime-executable` strict schema；拼错或未消费字段会在写入 history 前失败。
 - 批量检查最多保留 512 条摘要，文本与 JSON 输出各有 `1 MiB` 预算。
 - 目录扫描或输出预算耗尽时会停止并非零退出，不会声称剩余文件已经检查。
-- `scanner` 配置使用 fail-closed 严格 schema：有界符号列表、虚拟网格几何与扫描窗口都会显式校验；`--mode validate` 成功后正常返回。
 
 Rust 程序只读取**进程环境变量**，不会自动加载 `.env`。例如：
 
 ```powershell
-$env:PARADEX_API_KEY = "..."
-$env:PARADEX_L2_ADDRESS = "..."
-$env:PARADEX_WALLET_ADDRESS = "..."
-cargo run --locked -- config-check config/legacy/exchanges/paradex_config.yaml
+$env:BINANCE_API_KEY = "..."
+$env:BINANCE_API_SECRET = "..."
+cargo run --locked -- config-check config/exchanges/binance_config.yaml
 ```
 
-凭证 loader 采用 `<EXCHANGE>_<FIELD>` 命名，可覆盖 `API_KEY`、`API_SECRET`、`API_PASSPHRASE`、`PRIVATE_KEY`、`JWT_TOKEN`、`API_KEY_PRIVATE_KEY`、`STARK_PRIVATE_KEY`、`WALLET_ADDRESS`、`SUB_ACCOUNT_ID`、`L2_ADDRESS`、`ACCOUNT_ID`、`ACCOUNT_INDEX` 和 `API_KEY_INDEX` 等字段。支持解析这些变量不代表对应 live adapter 已开放。
+凭证 loader 采用 `<EXCHANGE>_<FIELD>` 命名，可覆盖 `API_KEY`、`API_SECRET`、`PRIVATE_KEY` 和 `WALLET_ADDRESS` 字段。支持解析这些变量不代表对应 live adapter 已开放。
 
-不要把密钥、私钥、JWT、助记词或真实账户信息写入已跟踪的 `rust/config/exchanges/*.yaml`、`rust/config/legacy/exchanges/*.yaml`、日志、issue 或提交历史。`.gitignore` 已屏蔽常见 `.env`、密钥文件和本地运行数据，但这不能替代提交前的凭证扫描。
+不要把密钥、私钥、JWT、助记词或真实账户信息写入已跟踪的 `rust/config/exchanges/*.yaml`、日志、issue 或提交历史。`.gitignore` 已屏蔽常见 `.env`、密钥文件和本地运行数据，但这不能替代提交前的凭证扫描。
 
 ## 安全模型与 Paper 限制
 
@@ -537,15 +526,12 @@ crypto-trading/
 ├── deploy/                      # Compose 部署与备份/恢复演练脚本
 ├── Dockerfile                   # 单容器交付
 ├── archive/
-│   ├── README.md                # 归档来源与完整性说明
-│   └── python-legacy/           # 冻结的旧 Python tree
+│   └── README.md                # 已移除的 Python 归档的墓碑说明
 ├── SECURITY.md                  # 漏洞披露与威胁模型
 ├── CONTRIBUTING.md
 ├── CHANGELOG.md
 └── README.md
 ```
-
-`rust/config/` 与 `archive/python-legacy/config/` 所有权不同。当前代码只能读取前者；不要在归档中继续开发，也不要让新代码、测试或 CI 依赖归档文件。
 
 ## 开发与验证
 
@@ -575,7 +561,7 @@ CI 还会：
 
 ### 为什么配置校验成功，但命令仍然报 `runtime is unavailable`？
 
-配置解析与运行能力是两道独立门禁。无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor`、`volume-maker`、`price-alert` 和 `scanner` 是例外：它们的 `serve/status/stop` 模式可以运行，但只接受精确 replay 数据源（monitor 为双源，其余为单源），不接受真实外部源；`volume-maker`、`price-alert` 与 `scanner` 的默认 `--mode validate` 校验成功后正常返回（`volume-maker` 在配置 `emergency_stop: true` 时仍失败关闭）。
+配置解析与运行能力是两道独立门禁。无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor` 是例外：它的 `serve/status/stop` 模式可以运行，但只接受精确双源 replay 数据源（或显式 `--live` 只读行情），不授予交易权限。
 
 ### 为什么 `--live` 仍然无法下单？
 
@@ -605,7 +591,7 @@ CI 还会：
 完整的贡献规则、不可跨越的边界和本地门禁见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 要点：
 
-1. 只在 `rust/` 中开发当前功能；把 `archive/python-legacy/` 视为只读证据。
+1. 只在 `rust/` 中开发当前功能；旧 Python 实现仅存于 Git 历史，不得复活为运行入口。
 2. 新增行为时先补测试，并保持 live 路径失败关闭。
 3. 不引入二进制浮点交易计算，不在日志和诊断中暴露凭证。
 4. 运行“开发与验证”中的完整门禁。

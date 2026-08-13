@@ -13,8 +13,7 @@ use crypto_trading_runtime::{
     CapabilityEnvironment, CapabilityLevel, CursorError, ExecutionBatch, ExecutionBatchState,
     JournalPageBoundary, JournalSnapshot, JournalSnapshotSource, MAX_CURSOR_ANCHOR_SCAN_BYTES,
     MAX_JOURNAL_PAGE_EVENTS, MemoryJournalSnapshotSource, OperatorReadModel,
-    PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION, PaperAccountReadModel,
-    PriceAlertReadModel, ProjectionStatus, ReadOnlyTaskReadModel, VirtualGridScannerReadModel,
+    PAPER_ACCOUNT_SCHEMA_VERSION, PaperAccountReadModel, ProjectionStatus, ReadOnlyTaskReadModel,
     project_control_plane_state,
 };
 use serde_json::{Value, json};
@@ -74,11 +73,6 @@ fn snapshot_is_deterministic_and_never_expands_live_authority() {
             .iter()
             .any(|path| path == "rust/crates/web/tests/http_contract.rs")
     );
-    assert_eq!(
-        first.alerts.schema_version,
-        PRICE_ALERT_READ_MODEL_SCHEMA_VERSION
-    );
-    assert!(first.alerts.occurrences.is_empty());
     assert_eq!(
         first.paper_accounts.schema_version,
         PAPER_ACCOUNT_SCHEMA_VERSION
@@ -418,16 +412,8 @@ fn multi_page_snapshot_matches_legacy_models_with_one_shared_state_replay() {
         ArbitrageMonitorReadModel::from_legacy_snapshot(&expected).unwrap()
     );
     assert_eq!(
-        snapshot.alerts,
-        PriceAlertReadModel::from_legacy_snapshot(&expected).unwrap()
-    );
-    assert_eq!(
         snapshot.tasks,
         ReadOnlyTaskReadModel::from_legacy_snapshot(&expected).unwrap()
-    );
-    assert_eq!(
-        snapshot.scanner,
-        VirtualGridScannerReadModel::from_legacy_snapshot(&expected).unwrap()
     );
     assert_eq!(
         snapshot.paper_accounts,
@@ -458,16 +444,8 @@ fn multi_page_combined_read_keeps_events_separate_from_one_shared_state_replay()
         ArbitrageMonitorReadModel::from_legacy_snapshot(&expected).unwrap()
     );
     assert_eq!(
-        read.snapshot.alerts,
-        PriceAlertReadModel::from_legacy_snapshot(&expected).unwrap()
-    );
-    assert_eq!(
         read.snapshot.tasks,
         ReadOnlyTaskReadModel::from_legacy_snapshot(&expected).unwrap()
-    );
-    assert_eq!(
-        read.snapshot.scanner,
-        VirtualGridScannerReadModel::from_legacy_snapshot(&expected).unwrap()
     );
     assert_eq!(
         read.snapshot.paper_accounts,

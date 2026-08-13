@@ -33,8 +33,9 @@ cargo +1.89.0 build --release --workspace --all-features --locked
 
 ## 不可跨越的边界
 
-1. **`archive/python-legacy/` 是只读证据。** 它与来源提交逐文件校验一致，
-   不参与构建、测试、配置加载或运行。代码和测试都不得从中读取任何内容。
+1. **`archive/python-legacy/` 已于 2026-08-13 从工作树移除。** 该树仅存在于
+   此前的 Git 历史中([`archive/README.md`](archive/README.md) 为墓碑说明);
+   代码和测试都不得依赖或复活其中任何内容。
 2. **交易计算不使用二进制浮点。** 价格、数量、金额一律用 `rust_decimal`，
    关键算术使用 `checked_*`。
 3. **凭证不得离开进程环境。** 不进日志、`--json` 输出、错误信息、`Debug`

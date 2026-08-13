@@ -8,12 +8,10 @@ on:
   push:
     paths-ignore:
       - "**/*.md"
-      - "archive/**"
       - "design-previews/**"
   pull_request:
     paths-ignore:
       - "**/*.md"
-      - "archive/**"
       - "design-previews/**"
 
 concurrency:

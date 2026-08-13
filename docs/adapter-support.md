@@ -18,16 +18,12 @@ Status meanings:
 - `unavailable`: the current Rust system has no supported path for that facet.
 - `not-applicable`: the facet does not apply to the process-local paper model.
 
-W3 note: the operator-facing matrix now folds config-only and legacy-only venue
-rows into one `Unsupported venues` record to keep the supported surface small.
-
 <!-- adapter-matrix:start -->
 | Adapter | Public data | Testnet protocol | Authenticated | Reconcile | Live |
 | --- | --- | --- | --- | --- | --- |
 | Binance | implemented | implemented | implemented | implemented | unavailable |
 | Hyperliquid | implemented | protocol-only | protocol-only | request-only | unavailable |
 | PaperExchange | not-applicable | not-applicable | not-applicable | implemented | not-applicable |
-| Unsupported venues | unavailable | unavailable | unavailable | unavailable | unavailable |
 <!-- adapter-matrix:end -->
 
 `implemented` is not synonymous with production-ready. Binance public data has
@@ -48,12 +44,11 @@ release gates. PaperExchange is process-local. Every external venue still
 reports `live: unavailable`, and the manifest validation rejects any live claim
 while `live_trading_enabled` is false.
 
-The aggregated `Unsupported venues` row currently covers Backpack, EdgeX, GRVT,
-Lighter, Paradex, OKX, and Variational. The remaining checked-in venue samples
-for Backpack, EdgeX, GRVT, Lighter, and Paradex now live under
-`rust/config/legacy/exchanges/`; none has an operator-supported Rust adapter
-path, so the manifest fails closed with one summary row instead of advertising
-a wider venue matrix than the runtime can actually honor.
+Venues without an operator-supported Rust adapter path (for example Backpack,
+EdgeX, GRVT, Lighter, Paradex, OKX, and Variational) are out of scope for the
+live V1 effort: their configuration samples were removed from the working tree
+and the manifest no longer lists them, so documentation cannot advertise a
+wider venue matrix than the runtime can actually honor.
 
 The journal-backed Paper account above the adapter now settles fully filled
 synchronous taker receipts into exact FIFO lots, immediate fees, realized PnL,

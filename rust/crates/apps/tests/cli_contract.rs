@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
-use crypto_trading_cli::{Cli, Command, ExchangeChoice, LogLevel};
+use crypto_trading_cli::{Cli, Command};
 
 #[test]
 fn top_level_help_has_readable_utf8_product_text() {
@@ -30,7 +30,7 @@ fn grid_keeps_the_legacy_positional_config_and_debug_flag() {
     let cli = Cli::try_parse_from([
         "crypto-trading",
         "grid",
-        "config/grid/lighter-long-perp-btc.yaml",
+        "config/grid/hyperliquid-long-perp-btc.yaml",
         "--debug",
     ])
     .unwrap();
@@ -40,7 +40,7 @@ fn grid_keeps_the_legacy_positional_config_and_debug_flag() {
     };
     assert_eq!(
         args.config,
-        PathBuf::from("config/grid/lighter-long-perp-btc.yaml")
+        PathBuf::from("config/grid/hyperliquid-long-perp-btc.yaml")
     );
     assert!(args.debug);
     assert_eq!(
@@ -55,7 +55,7 @@ fn grid_price_and_once_are_an_atomic_cli_contract() {
         Cli::try_parse_from([
             "crypto-trading",
             "grid",
-            "config/grid/lighter-long-perp-btc.yaml",
+            "config/grid/hyperliquid-long-perp-btc.yaml",
             "--price",
             "100000",
         ])
@@ -65,7 +65,7 @@ fn grid_price_and_once_are_an_atomic_cli_contract() {
         Cli::try_parse_from([
             "crypto-trading",
             "grid",
-            "config/grid/lighter-long-perp-btc.yaml",
+            "config/grid/hyperliquid-long-perp-btc.yaml",
             "--once",
         ])
         .is_err()
@@ -74,7 +74,7 @@ fn grid_price_and_once_are_an_atomic_cli_contract() {
         Cli::try_parse_from([
             "crypto-trading",
             "grid",
-            "config/grid/lighter-long-perp-btc.yaml",
+            "config/grid/hyperliquid-long-perp-btc.yaml",
             "--price",
             "100000",
             "--once",
@@ -181,19 +181,6 @@ fn arbitrage_accepts_an_explicit_strategy_key_for_different_legs() {
         args.market.strategy_key.as_deref(),
         Some("LIGHTER_ETH_SPOT_PERP")
     );
-}
-
-#[test]
-fn scanner_rejects_unknown_exchanges_and_has_stable_defaults() {
-    let cli = Cli::try_parse_from(["crypto-trading", "scanner"]).unwrap();
-    let Command::Scanner(args) = cli.command else {
-        panic!("expected scanner command");
-    };
-    assert_eq!(args.exchange, ExchangeChoice::Lighter);
-    assert_eq!(args.log_level, LogLevel::Info);
-    assert!(args.duration.is_none());
-
-    assert!(Cli::try_parse_from(["crypto-trading", "scanner", "--exchange", "unknown"]).is_err());
 }
 
 #[test]

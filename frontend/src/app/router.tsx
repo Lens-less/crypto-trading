@@ -12,8 +12,6 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <Navigate to="/overview" replace /> },
       { path: "overview", lazy: () => import("../pages/overview") },
-      { path: "scanner", lazy: () => import("../pages/scanner") },
-      { path: "alerts", lazy: () => import("../pages/alerts") },
       { path: "executions", lazy: () => import("../pages/executions") },
       { path: "integrations", lazy: () => import("../pages/integrations") },
       { path: "strategies", lazy: () => import("../pages/strategies") },

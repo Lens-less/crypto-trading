@@ -1,14 +1,11 @@
 use std::str::FromStr;
 
 use chrono::{TimeZone, Utc};
-use crypto_trading_config::{
-    load_arbitrage_config_from_str, load_grid_config_from_str, load_price_alert_config_from_str,
-    load_volume_maker_config_from_str,
-};
+use crypto_trading_config::{load_arbitrage_config_from_str, load_grid_config_from_str};
 use crypto_trading_domain::{MarketSnapshot, MarketType, Price, Symbol};
 use crypto_trading_strategy::{
-    AlertKind, AlertState, AlertStrategy, ArbitrageState, ArbitrageStrategy, GridDirection,
-    GridPlanner, PairStrategyMachine, StrategyError, VolumeMakerMode, VolumeMakerPlanConfig,
+    ArbitrageState, ArbitrageStrategy, GridDirection, GridPlanner, PairStrategyMachine,
+    StrategyError,
 };
 use rust_decimal::Decimal;
 
@@ -396,68 +393,4 @@ symbol_configs:
     strategy
         .evaluate_pair(&ArbitrageState::default(), &left, &right)
         .unwrap();
-}
-
-#[test]
-fn alert_and_volume_yaml_construct_symbol_scoped_strategies() {
-    let alert_config = load_price_alert_config_from_str(
-        r"
-price_alert:
-  exchange: paper
-  symbols:
-    - symbol: BTCUSDT
-      market_type: perpetual
-      volatility_alert:
-        enabled: true
-        time_window: 60
-        threshold_percent: 5
-      price_alert:
-        enabled: true
-        upper_limit: 110
-        lower_limit: 90
-  alert:
-    cooldown_seconds: 30
-",
-    )
-    .unwrap();
-    let symbol = Symbol::new("BTCUSDT").unwrap();
-    let alert_strategy = AlertStrategy::from_config(&alert_config, &symbol).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 7, 14, 1, 0, 0).unwrap();
-    let mut snapshot = MarketSnapshot::new(
-        "paper",
-        symbol,
-        MarketType::Perpetual,
-        price("110"),
-        price("111"),
-        now,
-    )
-    .unwrap();
-    snapshot.last = Some(price("110"));
-    let alerts = alert_strategy
-        .evaluate(&AlertState::default(), &snapshot)
-        .unwrap();
-    assert_eq!(alerts.len(), 1);
-    assert_eq!(alerts[0].kind, AlertKind::UpperLimit);
-
-    let volume_config = load_volume_maker_config_from_str(
-        r"
-volume_maker:
-  exchange: paper
-  symbol: BTCUSDT
-  market_type: perpetual
-  order_quantity: 0.25
-  order_mode: market
-  emergency_stop: false
-  reverse_trading: true
-  advanced:
-    use_post_only: true
-",
-    )
-    .unwrap();
-    let plan = VolumeMakerPlanConfig::try_from(&volume_config).unwrap();
-
-    assert_eq!(plan.mode, VolumeMakerMode::MarketImbalance);
-    assert_eq!(plan.order_quantity.as_decimal(), decimal("0.25"));
-    assert!(plan.reverse_trading);
-    assert!(plan.post_only);
 }

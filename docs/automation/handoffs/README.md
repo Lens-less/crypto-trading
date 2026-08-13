@@ -1,8 +1,9 @@
 # Redirected G-Series Handoffs
 
-The completed G-series handoff set moved to
-[../../internal/history/g-series-2026-08-12/handoffs/](../../internal/history/g-series-2026-08-12/handoffs/)
-on 2026-08-12.
+The completed G-series handoff set was archived to
+`docs/internal/history/g-series-2026-08-12/handoffs/` on 2026-08-12, and that
+archived tree was removed from the working tree on 2026-08-13 (live-trading
+refocus Wave A). It remains available in Git history before this change.
 
 The files in this directory remain only as stable redirects for older links and
 reports. The only unarchived handoff location is

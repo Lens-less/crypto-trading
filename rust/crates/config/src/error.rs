@@ -18,6 +18,4 @@ pub enum ConfigError {
     Validation(String),
     #[error("missing required configuration field: {path}")]
     MissingRequiredField { path: &'static str },
-    #[error("environment variable {key} must be an unsigned integer")]
-    InvalidEnvironmentNumber { key: String },
 }

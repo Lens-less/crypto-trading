@@ -21,8 +21,6 @@ use axum::{
 const SEMANTIC_SHELL_PATHS: &[&str] = &[
     "/",
     "/overview",
-    "/scanner",
-    "/alerts",
     "/executions",
     "/integrations",
     "/strategies",

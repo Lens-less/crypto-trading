@@ -17,7 +17,7 @@ export const REPO_ROOT = resolve(process.cwd(), "..");
 /** e2e 固定 journal 代次;与 fixture 契约无关,只需稳定。 */
 export const E2E_JOURNAL_ID = "88888888-8888-4888-8888-888888888888";
 
-/** 只读 spec 共用的组合 journal(monitor/alerts/tasks/scanner 均非空)。 */
+/** 只读 spec 共用的组合 journal(monitor/tasks/executions 均非空)。 */
 export const WEB_API_JOURNAL = join(
   REPO_ROOT,
   "rust",

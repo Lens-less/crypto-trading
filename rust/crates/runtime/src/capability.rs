@@ -346,12 +346,7 @@ pub fn current_capability_manifest() -> CapabilityManifest {
 }
 
 fn adapter_support_matrix() -> Vec<AdapterSupport> {
-    vec![
-        binance_adapter(),
-        hyperliquid_adapter(),
-        paper_adapter(),
-        unsupported_venues_adapter(),
-    ]
+    vec![binance_adapter(), hyperliquid_adapter(), paper_adapter()]
 }
 
 fn binance_adapter() -> AdapterSupport {
@@ -483,38 +478,6 @@ fn paper_adapter() -> AdapterSupport {
             &["PaperExchange cannot create mainnet authority."],
             &paper_evidence,
         ),
-    }
-}
-
-fn unsupported_venues_adapter() -> AdapterSupport {
-    let evidence = [
-        "rust/crates/config/src/auth.rs",
-        "rust/crates/config/tests/config_compatibility.rs",
-        "rust/config/legacy/exchanges/backpack_config.yaml",
-        "rust/config/legacy/exchanges/edgex_config.yaml",
-        "rust/config/legacy/exchanges/grvt_config.yaml",
-        "rust/config/legacy/exchanges/lighter_config.yaml",
-        "rust/config/legacy/exchanges/paradex_config.yaml",
-        "docs/internal/research/upstream-repository-alignment.md",
-        "docs/internal/plans/2026-07-24-project-alignment-web-goal-plan.md",
-    ];
-    let unsupported = || {
-        adapter_facet(
-            AdapterSupportLevel::Unavailable,
-            &[
-                "Backpack, EdgeX, GRVT, Lighter, and Paradex still appear as compatibility-only venue configs, while OKX and Variational remain frozen legacy references; none of these venues has an operator-supported Rust market-data adapter, testnet protocol, authenticated private API, or reconciliation path.",
-            ],
-            &evidence,
-        )
-    };
-    AdapterSupport {
-        id: "unsupported-venues".to_owned(),
-        name: "Unsupported venues".to_owned(),
-        public_data: unsupported(),
-        testnet_protocol: unsupported(),
-        authenticated: unsupported(),
-        reconcile: unsupported(),
-        live: external_live_unavailable(),
     }
 }
 
@@ -937,96 +900,11 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/web/tests/ui_contract.rs",
             ],
         ),
-        capability(
-            "runtime.price-alert",
-            CapabilityArea::Runtime,
-            CapabilityLevel::ReadOnly,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Bounded multi-symbol price-alert evaluation with durable samples, cooldowns, acknowledgements, a stable read model, isolated local delivery adapters, and a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts.",
-            &[
-                "This surface is maintenance-frozen: keep the existing replay-backed evidence path available, but do not widen it with new venue, notification, or automation scope until the shared bar-driven strategy and realtime data seams land.",
-                "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the price-alert task host, and restart recovery projects prior facts without automatically resuming external sources.",
-                "The JSONL alert journal rotates through bounded sealed segments with no compaction by design; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
-            ],
-            &[
-                "rust/crates/apps/src/alert/mod.rs",
-                "rust/crates/apps/src/alert/journal.rs",
-                "rust/crates/apps/src/alert/notification.rs",
-                "rust/crates/apps/src/continuous_alert.rs",
-                "rust/crates/apps/tests/alert_runtime_contract.rs",
-                "rust/crates/apps/tests/alert_serve_cli_contract.rs",
-                "rust/crates/runtime/src/alert_read_model.rs",
-                "rust/crates/runtime/src/task_read_model.rs",
-                "rust/crates/runtime/tests/alert_read_model_contract.rs",
-                "rust/crates/runtime/tests/task_read_model_contract.rs",
-                "rust/crates/runtime/tests/history_rotation_contract.rs",
-                "rust/crates/control-plane/tests/alert_projection_contract.rs",
-                "rust/crates/web/tests/http_contract.rs",
-            ],
-        ),
-        scanner_capability(),
         testnet_lifecycle_capability(),
         testnet_reconciliation_capability(),
         testnet_reconciliation_apply_capability(),
         testnet_soak_capability(),
-        capability(
-            "runtime.volume-maker",
-            CapabilityArea::Runtime,
-            CapabilityLevel::Available,
-            scope(
-                &[CapabilityEnvironment::Paper],
-                CapabilityAccess::PaperTrading,
-            ),
-            "Validated volume-maker configuration plus a recoverable replay-backed paper owner: serve requires an explicit account-risk configuration; virtual maker quotes and imbalance market cycles become independent single-leg reservations with reduce-only closes, account-risk admission, durable hourly statistics facts, and a CLI validate/serve/status/stop task host.",
-            &[
-                "This surface is maintenance-frozen: keep the current replay-backed paper evidence intact, but do not widen venue coverage, automation, or execution scope until the shared strategy/runtime seam is refocused.",
-                "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the volume-maker task host, and no testnet/mainnet order authority is implied.",
-                "The owner keeps no resting orders: limit-mode quotes are virtual and execute only when a later observation crosses them, so legacy post-only resting semantics are simulated, not reproduced; each serve run plans a fresh paper account generation and restart on a foreign generation fails closed.",
-            ],
-            &[
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/paper_volume_maker_task.rs",
-                "rust/crates/apps/tests/paper_volume_maker_task_contract.rs",
-                "rust/crates/strategy/src/volume_maker.rs",
-                "rust/crates/strategy/tests/volume_maker.rs",
-                "rust/crates/config/src/supporting.rs",
-                "rust/crates/runtime/src/task_read_model.rs",
-                "rust/crates/runtime/tests/task_read_model_contract.rs",
-            ],
-        ),
     ]
-}
-
-fn scanner_capability() -> Capability {
-    capability(
-        "runtime.scanner",
-        CapabilityArea::Runtime,
-        CapabilityLevel::ReadOnly,
-        scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-        "Bounded deterministic virtual-grid replay with explicit benchmark/APR ranking, a validated scanner configuration schema, a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts, durable projection, and a read-only Web view.",
-        &[
-            "This surface is maintenance-frozen: preserve the deterministic replay/read-model contract, but do not widen it with new market discovery, scheduling, or venue scope until the shared research/runtime seam is rebuilt.",
-            "The CLI service bootstrap is replay-backed only: no real-time market discovery or external continuous market source is wired into the scanner task host, and no continuous supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
-            "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
-            "A sparse price jump credits every crossed virtual level as a deterministic fill; no order-book depth, queue priority, latency, partial-fill, or gap-liquidity model exists, so rankings are not execution-quality or profitability evidence.",
-            "The JSONL journal enforces a cross-process single-writer lease and rotates through bounded sealed segments with no compaction by design; a full segment chain still fails closed.",
-        ],
-        &[
-            "rust/crates/apps/src/scanner.rs",
-            "rust/crates/apps/src/continuous_scanner.rs",
-            "rust/crates/apps/tests/virtual_grid_scanner_contract.rs",
-            "rust/crates/apps/tests/scanner_cli_contract.rs",
-            "rust/crates/config/src/scanner.rs",
-            "rust/crates/strategy/src/virtual_grid.rs",
-            "rust/crates/runtime/src/scanner_read_model.rs",
-            "rust/crates/runtime/src/task_read_model.rs",
-            "rust/crates/runtime/tests/scanner_read_model_contract.rs",
-            "rust/crates/runtime/tests/history_rotation_contract.rs",
-            "rust/crates/control-plane/tests/scanner_projection_contract.rs",
-            "rust/crates/web/tests/http_contract.rs",
-            "rust/crates/web/tests/ui_contract.rs",
-        ],
-    )
 }
 
 fn testnet_lifecycle_capability() -> Capability {
@@ -1175,50 +1053,6 @@ fn strategy_capabilities() -> Vec<Capability> {
                 "rust/crates/strategy/tests/grid_protection.rs",
                 "rust/crates/apps/src/command.rs",
                 "rust/crates/apps/src/paper_grid_task.rs",
-            ],
-        ),
-        capability(
-            "strategy.price-alert",
-            CapabilityArea::Strategy,
-            CapabilityLevel::Available,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic price threshold evaluation without I/O.",
-            &[],
-            &[
-                "rust/crates/strategy/src/alert.rs",
-                "rust/crates/strategy/tests/price_alert.rs",
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/alert/mod.rs",
-            ],
-        ),
-        capability(
-            "strategy.scanner",
-            CapabilityArea::Strategy,
-            CapabilityLevel::Available,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic virtual-grid simulation and volatility scoring.",
-            &[
-                "Sparse price jumps deterministically fill every crossed pending level without depth, queue, latency, partial-fill, or gap-liquidity modeling; this scorer is not execution-quality or profitability evidence.",
-            ],
-            &[
-                "rust/crates/strategy/src/virtual_grid.rs",
-                "rust/crates/strategy/tests/virtual_grid_golden.rs",
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/scanner.rs",
-            ],
-        ),
-        capability(
-            "strategy.volume-maker",
-            CapabilityArea::Strategy,
-            CapabilityLevel::Available,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic maker-volume decisions without I/O.",
-            &[],
-            &[
-                "rust/crates/strategy/src/volume_maker.rs",
-                "rust/crates/strategy/tests/volume_maker.rs",
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/paper_volume_maker_task.rs",
             ],
         ),
     ]

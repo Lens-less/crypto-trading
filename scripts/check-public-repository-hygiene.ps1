@@ -18,7 +18,7 @@ try {
         }
     }
 
-    $absolutePaths = @(& git grep -n -I -E 'C:[\\/]+Users[\\/]' -- . ':(exclude)archive/python-legacy/**')
+    $absolutePaths = @(& git grep -n -I -E 'C:[\\/]+Users[\\/]' -- .)
     if ($LASTEXITCODE -notin @(0, 1)) {
         throw "git grep failed while checking local absolute paths"
     }

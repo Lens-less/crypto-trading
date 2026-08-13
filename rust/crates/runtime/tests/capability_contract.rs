@@ -146,36 +146,6 @@ fn continuous_capabilities_separate_monitor_market_reads_from_paper_owner_author
             .contains(&"rust/crates/web/tests/ui_contract.rs".to_owned())
     );
 
-    let price_alert = manifest.capability("runtime.price-alert").unwrap();
-    assert_eq!(price_alert.level, CapabilityLevel::ReadOnly);
-    assert_eq!(
-        price_alert.scope.environments,
-        vec![CapabilityEnvironment::Offline]
-    );
-    assert_eq!(price_alert.scope.access, CapabilityAccess::Local);
-    assert!(
-        price_alert
-            .evidence
-            .contains(&"rust/crates/runtime/src/alert_read_model.rs".to_owned())
-    );
-    assert!(
-        price_alert
-            .evidence
-            .contains(&"rust/crates/apps/tests/alert_serve_cli_contract.rs".to_owned())
-    );
-    assert!(
-        price_alert
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("replay-backed only"))
-    );
-    assert!(
-        !price_alert
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("not yet registered in the durable task lifecycle"))
-    );
-
     let continuous = manifest.capability("runtime.continuous").unwrap();
     assert_eq!(continuous.level, CapabilityLevel::Available);
     assert_eq!(continuous.scope.access, CapabilityAccess::PaperTrading);
@@ -556,170 +526,6 @@ fn journal_rotation_is_reflected_without_advertising_compaction() {
             .iter()
             .any(|blocker| blocker.contains("no compaction by design"))
     );
-
-    for id in ["runtime.price-alert", "runtime.scanner"] {
-        let capability = manifest.capability(id).unwrap();
-        assert!(
-            !capability
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("no rotation")),
-            "{id} must not claim the journal lacks rotation once sealed segments ship"
-        );
-        assert!(
-            capability
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("no compaction by design")),
-            "{id} must keep the no-compaction design decision explicit"
-        );
-        assert!(
-            capability
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("maintenance-frozen")),
-            "{id} must remain explicitly maintenance-frozen"
-        );
-        assert!(capability.evidence.contains(&rotation_evidence));
-    }
-}
-
-#[test]
-fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
-    let manifest = current_capability_manifest();
-    let scanner = manifest.capability("runtime.scanner").unwrap();
-
-    assert_eq!(scanner.level, CapabilityLevel::ReadOnly);
-    assert_eq!(
-        scanner.scope.environments,
-        vec![CapabilityEnvironment::Offline]
-    );
-    assert_eq!(scanner.scope.access, CapabilityAccess::Local);
-    for evidence in [
-        "rust/crates/apps/src/scanner.rs",
-        "rust/crates/apps/src/continuous_scanner.rs",
-        "rust/crates/apps/tests/scanner_cli_contract.rs",
-        "rust/crates/config/src/scanner.rs",
-        "rust/crates/runtime/src/scanner_read_model.rs",
-        "rust/crates/runtime/src/task_read_model.rs",
-        "rust/crates/web/tests/ui_contract.rs",
-    ] {
-        assert!(scanner.evidence.contains(&evidence.to_owned()));
-    }
-    assert!(
-        scanner.summary.contains("scanner configuration schema"),
-        "{}",
-        scanner.summary
-    );
-    assert!(
-        !scanner.blockers.iter().any(
-            |blocker| blocker.contains("not implemented; the existing CLI remains fail-closed")
-        ),
-        "the config-schema/CLI-bootstrap blocker must be gone once the task host ships"
-    );
-    assert!(
-        scanner
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("replay-backed only"))
-    );
-    assert!(
-        scanner
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("offline historical estimates"))
-    );
-    assert!(
-        scanner.blockers.iter().any(|blocker| {
-            blocker.contains("every crossed virtual level")
-                && blocker.contains("no order-book depth")
-                && blocker.contains("not execution-quality")
-        }),
-        "optimistic sparse-jump fill semantics must stay explicit"
-    );
-
-    let scanner_strategy = manifest.capability("strategy.scanner").unwrap();
-    assert!(
-        scanner_strategy.blockers.iter().any(|blocker| {
-            blocker.contains("every crossed pending level")
-                && blocker.contains("without depth")
-                && blocker.contains("not execution-quality")
-        }),
-        "the virtual-grid scorer must not be advertised as an execution simulator"
-    );
-    assert!(!manifest.live_trading_enabled);
-}
-
-#[test]
-fn volume_maker_paper_owner_is_available_without_external_or_resting_authority() {
-    let manifest = current_capability_manifest();
-
-    let strategy = manifest.capability("strategy.volume-maker").unwrap();
-    assert_eq!(strategy.level, CapabilityLevel::Available);
-    assert_eq!(
-        strategy.scope.environments,
-        vec![CapabilityEnvironment::Offline]
-    );
-
-    let runtime = manifest.capability("runtime.volume-maker").unwrap();
-    assert_eq!(runtime.level, CapabilityLevel::Available);
-    assert_eq!(
-        runtime.scope.environments,
-        vec![CapabilityEnvironment::Paper]
-    );
-    assert_eq!(runtime.scope.access, CapabilityAccess::PaperTrading);
-    for summary_term in [
-        "replay-backed paper owner",
-        "single-leg reservations",
-        "account-risk admission",
-        "hourly statistics facts",
-        "validate/serve/status/stop",
-    ] {
-        assert!(
-            runtime.summary.contains(summary_term),
-            "summary must state {summary_term}"
-        );
-    }
-    for evidence in [
-        "rust/crates/apps/src/paper_volume_maker_task.rs",
-        "rust/crates/apps/tests/paper_volume_maker_task_contract.rs",
-        "rust/crates/strategy/src/volume_maker.rs",
-        "rust/crates/runtime/src/task_read_model.rs",
-    ] {
-        assert!(
-            runtime.evidence.contains(&evidence.to_owned()),
-            "missing evidence {evidence}"
-        );
-    }
-    assert!(
-        runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("replay-backed only")
-                && blocker.contains("no testnet/mainnet order authority")),
-        "the replay-only and no-external-authority boundary must stay explicit"
-    );
-    assert!(
-        runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("no resting orders")),
-        "the virtual-quote simulation boundary must stay explicit"
-    );
-    assert!(
-        runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("maintenance-frozen")),
-        "the maintenance-frozen status must stay explicit"
-    );
-    assert!(
-        !runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("not implemented")),
-        "the unfinished-runtime blocker must be gone once the paper owner ships"
-    );
 }
 
 #[test]
@@ -753,10 +559,7 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         .iter()
         .map(|adapter| adapter.id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        ids,
-        ["binance", "hyperliquid", "paper", "unsupported-venues"]
-    );
+    assert_eq!(ids, ["binance", "hyperliquid", "paper"]);
 
     let binance = manifest.adapter("binance").unwrap();
     assert_eq!(binance.public_data.level, AdapterSupportLevel::Implemented);
@@ -783,35 +586,6 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
             .unwrap()
             .level,
         CapabilityLevel::Available
-    );
-
-    let unsupported = manifest.adapter("unsupported-venues").unwrap();
-    assert_eq!(
-        unsupported.public_data.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        unsupported.testnet_protocol.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        unsupported.authenticated.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        unsupported.reconcile.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(unsupported.live.level, AdapterSupportLevel::Unavailable);
-    assert!(
-        unsupported
-            .public_data
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("Backpack")
-                && blocker.contains("EdgeX")
-                && blocker.contains("OKX")),
-        "the aggregated unsupported venues row must enumerate the folded venues"
     );
 
     let paper = manifest.adapter("paper").unwrap();

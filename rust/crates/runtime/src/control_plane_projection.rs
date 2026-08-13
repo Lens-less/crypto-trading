@@ -4,11 +4,10 @@ use crate::{
     AccountRiskProjectionError, AccountRiskReadModel, ArbitrageMonitorReadModel,
     JournalPageBoundary, JournalSnapshot, LegacyJsonlJournalReader, OperatorReadModel,
     PaperAccountProjectionError, PaperAccountReadModel, ReadModelError, ReadOnlyTaskReadModel,
-    VirtualGridScannerReadModel, account_risk::ProjectionBuilder as AccountRiskProjectionBuilder,
-    alert_read_model::ProjectionBuilder as AlertProjectionBuilder,
+    account_risk::ProjectionBuilder as AccountRiskProjectionBuilder,
     monitor_read_model::MonitorProjectionBuilder, paper_account::ProjectionBuilder as PaperBuilder,
     read_model::ProjectionBuilder as OperatorProjectionBuilder,
-    scanner_read_model::ScannerProjectionBuilder, task_read_model::TaskProjectionBuilder,
+    task_read_model::TaskProjectionBuilder,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,9 +19,7 @@ pub struct ControlPlaneProjectionStats {
 pub struct ControlPlaneProjection {
     pub operator: OperatorReadModel,
     pub monitor: ArbitrageMonitorReadModel,
-    pub alerts: crate::PriceAlertReadModel,
     pub tasks: ReadOnlyTaskReadModel,
-    pub scanner: VirtualGridScannerReadModel,
     pub paper_accounts: PaperAccountReadModel,
     pub account_risk: AccountRiskReadModel,
     pub stats: ControlPlaneProjectionStats,
@@ -49,9 +46,7 @@ pub fn project_control_plane_state(
 ) -> Result<ControlPlaneProjection, ControlPlaneProjectionError> {
     let mut operator = OperatorProjectionBuilder::new(snapshot.journal_id());
     let mut monitor = MonitorProjectionBuilder::new(snapshot.journal_id());
-    let mut alerts = AlertProjectionBuilder::new(snapshot.journal_id());
     let mut tasks = TaskProjectionBuilder::new(snapshot.journal_id());
-    let mut scanner = ScannerProjectionBuilder::new(snapshot.journal_id());
     let mut paper_accounts = PaperBuilder::new(snapshot.journal_id());
     let mut account_risk = AccountRiskProjectionBuilder::new(snapshot.journal_id());
     let mut stats = ControlPlaneProjectionStats::default();
@@ -65,30 +60,24 @@ pub fn project_control_plane_state(
         for event in page.events() {
             operator.observe_event(event)?;
             monitor.observe_event(event);
-            alerts.observe_event(event);
             tasks.observe_event(event)?;
-            scanner.observe_event(event);
             paper_accounts.observe_event(event);
             account_risk.observe_event(event)?;
         }
 
         match page.boundary() {
             JournalPageBoundary::SnapshotEnd => {
-                alerts.observe_boundary(page.boundary());
                 break;
             }
             JournalPageBoundary::PartialTail { offset, bytes } => {
                 operator.mark_partial_tail(*offset, *bytes);
                 monitor.mark_partial_tail();
-                alerts.observe_boundary(page.boundary());
                 tasks.mark_partial_tail();
-                scanner.mark_partial_tail();
                 paper_accounts.mark_partial_tail();
                 account_risk.mark_partial_tail();
                 break;
             }
             JournalPageBoundary::PageLimit => {
-                alerts.observe_boundary(page.boundary());
                 let next = page
                     .next_cursor()
                     .cloned()
@@ -107,9 +96,7 @@ pub fn project_control_plane_state(
     Ok(ControlPlaneProjection {
         operator: operator.finish(),
         monitor: monitor.finish(),
-        alerts: alerts.finish(),
         tasks: tasks.finish(),
-        scanner: scanner.finish(),
         paper_accounts: paper_accounts.finish()?,
         account_risk: account_risk.finish(),
         stats,

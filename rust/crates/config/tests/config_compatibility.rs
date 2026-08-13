@@ -1,8 +1,8 @@
 use std::{collections::HashMap, fs, path::PathBuf, str::FromStr};
 
 use crypto_trading_config::{
-    ConfigError, EnvProvider, GridMode, load_arbitrage_config_from_str,
-    load_exchange_auth_from_str_with_env, load_grid_config_from_str, load_monitor_config_from_str,
+    EnvProvider, GridMode, load_arbitrage_config_from_str, load_exchange_auth_from_str_with_env,
+    load_grid_config_from_str, load_monitor_config_from_str,
 };
 use crypto_trading_domain::{MarketType, Symbol};
 use rust_decimal::Decimal;
@@ -18,17 +18,14 @@ impl EnvProvider for TestEnv {
 
 #[test]
 fn existing_follow_grid_yaml_loads_and_ignores_unknown_fields() {
-    let yaml = include_str!("../../../config/grid/lighter-long-perp-eth.yaml");
+    let yaml = include_str!("../../../config/grid/hyperliquid-long-perp-btc.yaml");
     let config = load_grid_config_from_str(yaml).unwrap();
 
-    assert_eq!(config.exchange, "lighter");
+    assert_eq!(config.exchange, "hyperliquid");
     assert_eq!(config.market_type, MarketType::Perpetual);
     assert_eq!(config.mode, GridMode::FollowLong);
     assert!(config.follow_grid_count.unwrap() > 0);
-    assert_eq!(
-        config.grid_interval.as_decimal(),
-        Decimal::from_str("0.89").unwrap()
-    );
+    assert_eq!(config.grid_interval.as_decimal(), Decimal::from(100));
 }
 
 #[test]
@@ -278,86 +275,52 @@ new_risk_knob: enabled
 fn exchange_auth_reads_flat_or_nested_yaml_and_environment_wins() {
     let mut env = TestEnv::default();
     env.0
-        .insert("LIGHTER_API_KEY_PRIVATE_KEY".into(), "env-secret".into());
-    env.0.insert("LIGHTER_ACCOUNT_INDEX".into(), "17".into());
+        .insert("HYPERLIQUID_PRIVATE_KEY".into(), "env-secret".into());
 
     let nested = r"
-exchange_id: lighter
+exchange_id: hyperliquid
 api_config:
   auth:
-    api_key_private_key: yaml-secret
-    account_index: 2
-    api_key_index: 3
+    private_key: yaml-secret
+    wallet_address: yaml-wallet
 ";
-    let auth = load_exchange_auth_from_str_with_env("lighter", nested, &env).unwrap();
-    assert_eq!(auth.api_key_private_key.expose_secret(), Some("env-secret"));
-    assert_eq!(auth.account_index, Some(17));
-    assert_eq!(auth.api_key_index, Some(3));
+    let auth = load_exchange_auth_from_str_with_env("hyperliquid", nested, &env).unwrap();
+    assert_eq!(auth.private_key.expose_secret(), Some("env-secret"));
+    assert_eq!(auth.wallet_address.as_deref(), Some("yaml-wallet"));
+    // Hyperliquid derives API credentials from the wallet private key.
+    assert_eq!(auth.api_key.expose_secret(), Some("env-secret"));
+    assert_eq!(auth.api_secret.expose_secret(), Some("env-secret"));
 
     let flat = r"
-paradex:
+binance:
   api_key: yaml-api-key
   extra_params:
-    jwt_token: yaml-jwt
-    l2_address: yaml-address
+    api_secret: yaml-api-secret
 ";
-    let auth = load_exchange_auth_from_str_with_env("paradex", flat, &TestEnv::default()).unwrap();
+    let auth = load_exchange_auth_from_str_with_env("binance", flat, &TestEnv::default()).unwrap();
     assert_eq!(auth.api_key.expose_secret(), Some("yaml-api-key"));
-    assert_eq!(auth.jwt_token.expose_secret(), Some("yaml-jwt"));
-    assert_eq!(auth.l2_address.as_deref(), Some("yaml-address"));
+    assert_eq!(auth.api_secret.expose_secret(), Some("yaml-api-secret"));
     assert!(!format!("{auth:?}").contains("yaml-api-key"));
-}
-
-#[test]
-fn exchange_auth_env_unsigned_integer_overrides_reject_invalid_numbers() {
-    let yaml = r"
-exchange_id: lighter
-api_config:
-  auth:
-    api_key_private_key: yaml-secret
-    account_index: 2
-    api_key_index: 3
-";
-
-    for (key, value) in [
-        ("LIGHTER_ACCOUNT_INDEX", "-1"),
-        ("LIGHTER_API_KEY_INDEX", "18446744073709551616"),
-    ] {
-        let mut env = TestEnv::default();
-        env.0.insert(key.into(), value.into());
-
-        let error = load_exchange_auth_from_str_with_env("lighter", yaml, &env).unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigError::InvalidEnvironmentNumber { key: ref actual_key } if actual_key == key
-        ));
-    }
 }
 
 #[test]
 fn exchange_auth_blank_environment_values_do_not_override_yaml() {
     let yaml = r"
-exchange_id: lighter
+exchange_id: hyperliquid
 api_config:
   auth:
-    api_key_private_key: yaml-secret
-    account_index: 2
-    api_key_index: 3
+    private_key: yaml-secret
+    wallet_address: yaml-wallet
 ";
 
     let mut env = TestEnv::default();
+    env.0.insert("HYPERLIQUID_PRIVATE_KEY".into(), "   ".into());
     env.0
-        .insert("LIGHTER_API_KEY_PRIVATE_KEY".into(), "   ".into());
-    env.0.insert("LIGHTER_ACCOUNT_INDEX".into(), "\t".into());
-    env.0.insert("LIGHTER_API_KEY_INDEX".into(), "\n".into());
+        .insert("HYPERLIQUID_WALLET_ADDRESS".into(), "\t".into());
 
-    let auth = load_exchange_auth_from_str_with_env("lighter", yaml, &env).unwrap();
-    assert_eq!(
-        auth.api_key_private_key.expose_secret(),
-        Some("yaml-secret")
-    );
-    assert_eq!(auth.account_index, Some(2));
-    assert_eq!(auth.api_key_index, Some(3));
+    let auth = load_exchange_auth_from_str_with_env("hyperliquid", yaml, &env).unwrap();
+    assert_eq!(auth.private_key.expose_secret(), Some("yaml-secret"));
+    assert_eq!(auth.wallet_address.as_deref(), Some("yaml-wallet"));
 }
 
 #[test]
@@ -374,17 +337,15 @@ fn every_checked_in_grid_configuration_loads() {
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         loaded += 1;
     }
-    assert!(loaded >= 10, "representative grid fixtures disappeared");
+    assert!(loaded >= 4, "representative grid fixtures disappeared");
 }
 
 #[test]
 fn checked_in_monitor_and_arbitrage_documents_load() {
     let root = repo_root();
     for relative in [
-        "config/arbitrage/monitor.yaml",
         "config/arbitrage/monitor_v2.yaml",
-        "config/arbitrage/monitor_lighter_eth_spot.yaml",
-        "config/arbitrage/monitor_lighter_gold.yaml",
+        "config/arbitrage/monitor-live-testnet.yaml",
     ] {
         let yaml = fs::read_to_string(root.join(relative)).unwrap();
         load_monitor_config_from_str(&yaml).unwrap_or_else(|error| panic!("{relative}: {error}"));

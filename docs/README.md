@@ -20,10 +20,6 @@
   `rust/crates/runtime/src/capability.rs`, held in sync by a contract test.
   The machine-readable authority is `crypto-trading capabilities --json`.
   `implemented` does not mean production-ready.
-- W3 maintenance freeze: `scanner`, `price-alert`, and `volume-maker` remain
-  replay-backed legacy surfaces at their existing config paths. Unsupported
-  exchange-auth samples moved under
-  [`../rust/config/legacy/`](../rust/config/legacy/README.md).
 - [`runbooks/production-candidate.md`](runbooks/production-candidate.md) — the
   deployment contract, the four release gates (Testnet order lifecycle, account
   reconciliation, 24-hour soak, backup/restore drill), and rollback.
@@ -63,6 +59,6 @@ executed or treated as current operator instructions.
   specifications.
 - [`internal/plans/`](internal/plans/) — milestone execution plans.
 - [`internal/research/`](internal/research/) — provenance evidence for the
-  frozen Python archive and upstream comparison.
-- [`internal/history/g-series-2026-08-12/`](internal/history/g-series-2026-08-12/)
-  — the completed G-series board, runbook, and handoffs archived by W3.
+  removed Python legacy archive and upstream comparison. The archive itself was
+  removed from the working tree on 2026-08-13 and remains in Git history; see
+  [`../archive/README.md`](../archive/README.md).
