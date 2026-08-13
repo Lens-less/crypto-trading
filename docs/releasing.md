@@ -82,7 +82,7 @@ shellcheck deploy/*.sh
 
 ## 3. Environment gates
 
-A tagged release additionally requires the four gates in
+A tagged release additionally requires the gates in
 [`runbooks/production-candidate.md`](runbooks/production-candidate.md), with
 their evidence archived:
 
@@ -96,12 +96,18 @@ their evidence archived:
       checksum manifest together.
 - [ ] Journal backup and restore drill. Treat it as a release gate, not an ad
       hoc maintenance task.
+- [ ] Binance Mainnet manual lifecycle: a `live-reconcile` shadow baseline and
+      one supervised `live-lifecycle` run on a dedicated minimal-notional
+      account, with redacted evidence archived. This gate runs only after all
+      four Testnet-side gates above have passed.
 
 A local deterministic harness does not substitute for credentialed Testnet
-evidence, backup/restore evidence, or the 24-hour soak. The release is still
-closed to mainnet and edge until all four external gates pass. Archive the
-candidate binary checksums, redacted command arguments, CLI JSON outputs, and
-journals. **Never archive credentials or an environment dump.**
+evidence, backup/restore evidence, or the 24-hour soak. Autonomous strategy
+live execution remains closed regardless of these gates; the only mainnet
+order authority in a release is the one-shot acknowledged `live-lifecycle`
+path. Archive the candidate binary checksums, redacted command arguments, CLI
+JSON outputs, and journals. **Never archive credentials or an environment
+dump.**
 
 ## 4. Tag and publish
 
@@ -122,9 +128,9 @@ Create the GitHub release from the tag with:
 ## 5. After release
 
 Verify the published artifacts reproduce the recorded checksums, and confirm
-the deployed image reports the expected `journal_id` and
-`live_trading_enabled: false` through the authenticated startup probe described
-in the runbook.
+the deployed image reports the expected `journal_id`,
+`release_stage: "live-manual"`, and `live_trading_enabled: true` through the
+authenticated startup probe described in the runbook.
 
 To roll back, keep the data volume and journal UUID unchanged, deploy the prior
 image digest, and repeat the system projection check. **Never roll back by

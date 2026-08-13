@@ -278,8 +278,9 @@ export function Component() {
                   }
                 />
                 <p className="text-xs text-muted-foreground">
-                  状态只表示配置完整性,不返回值;mainnet 凭据在 paper-only
-                  阶段不被接受。
+                  状态只表示配置完整性,不返回值;Web 控制台不接受 mainnet
+                  凭据——mainnet 凭据只作为专用环境变量提供给 CLI 的
+                  live-reconcile / live-lifecycle。
                 </p>
                 <DataAsOf updatedAt={settings.dataUpdatedAt} />
               </div>

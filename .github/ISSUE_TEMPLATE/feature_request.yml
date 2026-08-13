@@ -23,13 +23,14 @@ body:
       label: Does this expand trading authority?
       description: >
         Anything that lets the software submit, modify, or cancel orders on a
-        venue it cannot reach today — or that touches mainnet — expands
-        authority and is held to the release gates in the production-candidate
-        runbook.
+        venue it cannot reach today — or that widens the tightly gated mainnet
+        surface, which is currently limited to read-only reconciliation and
+        one acknowledged Spot LIMIT order lifecycle — expands authority and is
+        held to the release gates in the production-candidate runbook.
       options:
         - "No — read-only, offline, or paper-only"
         - "Yes — it reaches a new venue or a new product"
-        - "Yes — it involves mainnet"
+        - "Yes — it widens mainnet authority"
         - "Not sure"
     validations:
       required: true

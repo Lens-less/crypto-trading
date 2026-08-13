@@ -3,19 +3,28 @@
 这是仓库唯一的当前运行项目。Rust 源码、当前配置、构建输出和运行数据都位于本目录。旧 Python 项目已于 2026-08-13 从工作树移除（见 [`../archive/README.md`](../archive/README.md)），运行时从未依赖它。
 
 > [!WARNING]
-> **不得用于真实资金。** Live 适配器、真实交易所账户真值（equity、margin、持仓）和多腿故障补偿尚未达到开放门槛；`--live` 即使带确认短语也会失败关闭。唯一具备下单权限的路径是 Binance **Testnet**，需要精确确认短语。Paper 只计完全成交同步 taker 回执采用的配置手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。本项目按原样提供，不含任何担保，也不构成投资建议。
+> **这不是无人值守的实盘系统。** 具备外部下单权限的路径只有两条：Binance **Testnet** 的
+> `testnet-lifecycle`（精确确认短语），以及 Binance Spot **MAINNET** 的一次性
+> `live-lifecycle`（精确确认短语 `I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE` +
+> 专用 mainnet trade 凭证 + 必填 `--max-notional` 名义上限）。自动策略 live 执行
+> （`--live`／`ExecutionMode::Live`）对所有策略失败关闭：没有策略通过晋升门禁，真实账户
+> 风控真值（equity、margin、持仓）和多腿故障补偿仍未达到开放门槛。Paper 只计完全成交同步
+> taker 回执采用的配置手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级
+> 或跨进程持仓。本项目按原样提供，不含任何担保，也不构成投资建议。
 > 项目定位、安装与部署见[仓库根 README](../README.md)。
 
 ## 能力矩阵
 
 | 命令 | 演进状态 | 配置检查 | Paper 单次执行 | 连续运行 | Live 执行 | 当前行为 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `capabilities [--json]` | 活跃 | 不适用 | 不适用 | 不适用 | 否 | 输出版本化 capability manifest 与 adapter 支持矩阵；所有外部交易所的 Live 均失败关闭 |
+| `capabilities [--json]` | 活跃 | 不适用 | 不适用 | 不适用 | 见 manifest | 输出版本化 capability manifest（schema 4，`release_stage: live-manual`，`live_trading_enabled: true`）与 adapter 支持矩阵；唯一可用的 mainnet 下单权限是 `runtime.live-lifecycle`，自动策略 live（`runtime.live`）仍为 `unavailable` |
 | `config-check` | 活跃 | 是 | 不适用 | 不适用 | 不适用 | 在 512 条摘要和 1 MiB 输出预算内聚合检查；public path loaders、public `from_str` loaders 和 shared raw reader 共享 1 MiB / YAML 读入护栏；任一路径不受支持或预算耗尽时非零退出，并用终止错误明确标出未检查的剩余路径 |
 | `testnet-smoke` | 活跃 | 不适用 | 否 | 否 | 否 | 显式选择后执行 Binance Testnet Spot/USD-M 只读行情和鉴权对账探针；不会提交或撤销订单 |
-| `testnet-lifecycle` | 活跃 | 不适用 | 否 | 否 | 否 | 精确确认短语授权的 Binance Testnet submit-query-cancel owner；UUID 与 intent 先写 journal，恢复时 query-first，mainnet 始终关闭 |
+| `testnet-lifecycle` | 活跃 | 不适用 | 否 | 否 | 否 | 精确确认短语授权的 Binance Testnet submit-query-cancel owner；UUID 与 intent 先写 journal，恢复时 query-first；该命令自身没有 mainnet 开关，也从不读取 mainnet 凭证 |
 | `testnet-reconcile` | 活跃 | 不适用 | 否 | 否 | 否 | 默认只报告的 clean-account gate；将签名 Testnet 余额/挂单/持仓与 exact committed Paper reservation 比对，精确确认后才写 release/failure transition |
 | `testnet-soak` | 活跃 | 不适用 | 否 | 是（只读） | 否 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
+| `live-reconcile` | 活跃 | 不适用 | 否 | 否 | 只读 mainnet | 用 `BINANCE_MAINNET_READ_API_KEY/SECRET` 经权限类型化 read endpoints 输出 Binance Spot MAINNET 余额、挂单与可选 exchangeInfo 报告；只能构造 read-authority 适配器类型，submit/cancel 在类型层面不存在 |
+| `live-lifecycle` | 活跃 | 不适用 | 否 | 否 | **一次性 mainnet LIMIT** | 精确短语 + 必填 `--max-notional` 授权的一次 Binance Spot MAINNET submit→query→cancel；journal-first、提交前 venue-truth 准入（filters / spot-no-short / 外来挂单默认拒绝）、query-first 恢复、绝不盲目重提；不安全终态闩锁 journal 级 kill switch |
 | `grid` | 活跃 | 是 | 挂单模拟 | 否 | 否 | 只有同时提供 `--once --price` 才生成并提交 resting paper orders；无执行参数时仅检查配置 |
 | `arbitrage` | 活跃 | 是 | 是 | 否 | 否 | 单次执行要求显式价格与盘口深度，并校验启用开关、正的 `max_position_value`、监控白名单和 `symbol_configs` 策略键；`strategy_key` 是配置选择器，可与腿 symbol 不同 |
 | `paper grid/arbitrage` | 活跃 | 不适用 | 否 | 是（Paper） | 否 | 通过 loopback trusted-submit 服务启动、查询、停止或取消严格匹配的 replay-backed owner；状态只来自 journal/read model；Arbitrage owner 可选 `history_decision` 历史决策模式：以 spread-history journal 回填的自然价差（中位数）门控开仓，样本不足失败关闭、不下单，资金费率缺失时判定降级（`funding_degraded`）；两个 owner 的开仓在建立 reservation 前都要先通过账户级风控权威（单币种/全局敞口上限、总余额告警/强平线、UTC 午夜重置的当日次数上限、禁用/高风险名单、暂停位与闩锁 kill switch），拒绝写成 `account_risk_rejected` 事实并跳过该次开仓 |
@@ -68,8 +77,10 @@ cargo run -- capabilities --json
 ```
 
 人类可读的 adapter 投影见
-[`../docs/adapter-support.md`](../docs/adapter-support.md)。`implemented` 不等于生产可用；
-当前外部交易所 Live 权限仍全部为 `unavailable`。
+[`../docs/adapter-support.md`](../docs/adapter-support.md)。`implemented` 不等于生产可用：
+Binance 的 Live 面为 `implemented`，但其 blocker 明确限定为「一次操作员确认的一次性 Spot
+LIMIT lifecycle + 只读签名 reconcile」；Hyperliquid 的 Live 面仍为 `unavailable`，Paper
+不适用。凭真实凭证完成的受监督 mainnet lifecycle 留证仍属于操作员的外部证据，不在仓库内。
 
 只检查配置：
 
@@ -112,7 +123,12 @@ cargo run -- arbitrage `
 
 ## 凭证与环境变量
 
-当前 Rust 程序只读取进程环境变量，不会自动加载 `.env` 文件。PowerShell 示例：
+当前 Rust 程序只读取进程环境变量，不会自动加载 `.env` 文件。凭证按权限分族：
+`BINANCE_API_KEY` / `BINANCE_API_SECRET` 仅用于 Binance **Testnet** 命令；
+`BINANCE_MAINNET_READ_API_KEY` / `BINANCE_MAINNET_READ_API_SECRET` 仅用于只读的
+`live-reconcile`；`BINANCE_MAINNET_TRADE_API_KEY` / `BINANCE_MAINNET_TRADE_API_SECRET`
+仅用于一次性的 `live-lifecycle`。合约测试钉死分离语义：Testnet 凭证不赋予任何
+mainnet 权限，read 凭证不赋予 trade 权限。PowerShell 示例：
 
 ```powershell
 $env:BINANCE_API_KEY = "..."
@@ -120,7 +136,7 @@ $env:BINANCE_API_SECRET = "..."
 cargo run -- config-check config/exchanges/binance_config.yaml
 ```
 
-不要把密钥写入仓库。各 exchange YAML 仅用于字段映射；私有 live 适配器仍未开放。
+不要把密钥写入仓库。各 exchange YAML 仅用于字段映射，不承载凭证。
 
 ## Binance Testnet 订单生命周期
 
@@ -167,10 +183,52 @@ cargo run --locked -- testnet-soak --mode verify --help
 
 完整 PowerShell 命令见 [`../README.md`](../README.md#binance-testnet-soak)，Linux PID 捕获、kill/restart、验真和留证步骤见 [`../docs/runbooks/production-candidate.md`](../docs/runbooks/production-candidate.md#binance-testnet-24-hour-soak-gate)。本地 fixture 契约、缺失凭证或不足 24 小时的 journal 都不能满足发布门禁。
 
+## Binance Mainnet 只读对账
+
+`live-reconcile` 用 `BINANCE_MAINNET_READ_API_KEY` / `BINANCE_MAINNET_READ_API_SECRET`
+读取 Binance Spot **MAINNET** 的签名余额与指定 symbol 的全部挂单，可选
+`--include-exchange-info` 附带该 symbol 的 exchangeInfo 交易规则。命令只能构造
+read-authority 适配器类型（`BinanceMainnetReadEndpoints`），submit/cancel 方法在类型
+层面不存在，因此它无法下单或撤单：
+
+```powershell
+cargo run --locked -- live-reconcile --help
+```
+
+在任何 mainnet 变更操作前，先用它建立账户影子观测基线（余额、外来挂单、交易规则）。
+
+## Binance Mainnet 一次性订单生命周期
+
+`live-lifecycle` 在 Binance Spot **MAINNET** 上运行或恢复一次
+submit→query→cancel campaign，是当前唯一具备 mainnet 下单权限的路径。硬性护栏：
+
+- 必须提供精确确认短语 `I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE`
+  （`--acknowledge-live-lifecycle`），否则不写 journal、不发任何网络请求。
+- 必须提供 `--max-notional`：`price × quantity` 超过该上限时在任何 journal 写入或
+  网络调用之前拒绝。
+- 凭证仅从 `BINANCE_MAINNET_TRADE_API_KEY` / `BINANCE_MAINNET_TRADE_API_SECRET`
+  进程环境变量读取；Testnet 凭证与 mainnet read 凭证都无法进入该路径。
+- 提交前用 venue 真值准入：exchangeInfo filters（tick/step/minNotional）、签名余额
+  （SELL 必须有足额基础资产，spot-no-short）、symbol 上的外来挂单默认拒绝
+  （`--allow-foreign-orders` 才放行）。
+- journal-first：稳定 `--campaign-id` 与 `--client-order-id`（UUID）先以 PLANNED
+  写入 `--history-path`，任何 mainnet 变更都发生在持久化之后。
+- 含糊结果与恢复一律 query-first：先做签名单订单查询，绝不盲目重复提交。
+- 无法证明安全终态（如 cancel 后订单仍活跃）时写入 journal 级 kill-switch 闩锁，
+  同一 history 上的后续运行失败关闭，需人工按 runbook 处置。
+
+```powershell
+cargo run --locked -- live-lifecycle --help
+```
+
+完整操作程序（前置 Testnet 门禁、专用账户、最小名义、留证与回滚）见
+[`../docs/runbooks/production-candidate.md`](../docs/runbooks/production-candidate.md#binance-mainnet-manual-lifecycle-gate)。
+
 ## 安全边界
 
-- 默认不授予外部写权限；当前外部下单路径仅限精确确认短语授权的 Binance Testnet lifecycle，Paper 写入口限于显式 one-shot 和 bearer-protected、严格 profile 匹配的 replay-backed owner；mainnet 始终关闭。
-- 不受支持的外部连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行。
+- 默认不授予外部写权限；外部下单路径仅限两条精确确认短语授权的一次性 lifecycle（Binance Testnet `testnet-lifecycle` 与 Binance Spot MAINNET `live-lifecycle`，后者另需专用 trade 凭证和 `--max-notional` 上限），Paper 写入口限于显式 one-shot 和 bearer-protected、严格 profile 匹配的 replay-backed owner。
+- 凭证按权限分族：Testnet、mainnet read、mainnet trade 三族环境变量互不通用；`live-reconcile` 在类型层面只能构造只读适配器。
+- 不受支持的外部连续或 live 路径一律失败关闭，不会以成功状态伪装为已运行；自动策略 live 执行（`--live`）对 grid/arbitrage 均不可用。
 - 所有已实现路径都会校验自身的配置与市场产品身份；arbitrage 还必须通过 `monitor_only`、顶层 `enabled`、策略键开关、正的 `max_position_value`、显式盘口深度、市场数据新鲜度和 instrument 白名单后才会提交。
 - `max_position_value` 按精确的 `(exchange, symbol, market_type)` 投影持仓逐腿校验，不是单批总名义价值或账户总毛敞口门禁；连续 Paper owner 另由 journal-backed `AccountRiskAuthority` 使用 settled equity、剩余 FIFO lot 敞口和 pending admission 执行余额、单币种/全局上限、暂停位与 kill switch 门禁。两层门禁都不读取真实交易所 equity、保证金、挂单或持仓，也不能跨不同 journal 自动合并风险。
 - Grid one-shot 仍只验证网格规划与 paper 挂单语义；连续 Grid/Arbitrage owner 另行使用 journal-backed `PaperAccountAuthority` 做 pending/uncertain/committed 预留。连续 Grid owner 可按配置启用纯策略网格保护（止损 > 本金保护 > 价格锁定 > 止盈 > 剥头皮），其指令写入 `grid_protection` journal 事实并只作用于 owner 自身的虚拟持仓。以上都不代表真实交易所权益、保证金、持仓真相或 live 风控已经完成。

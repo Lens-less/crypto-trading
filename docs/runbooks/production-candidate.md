@@ -1,8 +1,14 @@
 # Production-candidate runbook
 
-This runbook packages the local operator control plane without enabling
-mainnet trading. The checked-in capability manifest remains the authority:
-`live_trading_enabled` must stay `false`.
+This runbook packages the local operator control plane and defines the
+release gates. The checked-in capability manifest remains the authority: it
+reports `release_stage: "live-manual"` and `live_trading_enabled: true`, and
+the only mainnet order authority it grants is the operator-supervised
+one-shot `live-lifecycle` command covered by the
+[mainnet manual lifecycle gate](#binance-mainnet-manual-lifecycle-gate) at
+the end of this runbook. The deployed Web control plane itself has no
+trading authority and does not accept mainnet credentials. Autonomous
+strategy live execution remains unavailable.
 
 ## Host contract
 
@@ -41,8 +47,9 @@ curl --fail \
 
 The unauthenticated `/api/v1/health` probe is deliberately data-free and
 reports liveness only. The authenticated startup probe must report
-`live_trading_enabled: false`, the expected `journal_id`, and a non-degraded
-projection before promotion.
+`release_stage: "live-manual"`, `live_trading_enabled: true`, the expected
+`journal_id`, and a non-degraded projection before promotion. Any other
+release stage or a manifest validation error is a release blocker.
 
 ## Operations
 
@@ -122,11 +129,13 @@ decisions can be replayed.
 
 ## Binance Testnet order-lifecycle gate
 
-Run this gate before the soak. It is the only candidate path with order
-authority, and that authority is limited to Binance Testnet. Each campaign
+Run this gate before the soak. It is the only candidate path with Binance
+Testnet order authority; mainnet order authority exists only in the separate
+[mainnet manual lifecycle gate](#binance-mainnet-manual-lifecycle-gate), which
+requires every Testnet gate in this runbook to pass first. Each campaign
 persists its UUID client order ID before submission, uses signed single-order
 queries as the recovery authority, cancels the order, and records the final
-cancelled state. There is no `--live` option.
+cancelled state. There is no `--live` option on this command.
 
 A fresh campaign first fetches the product-specific public `exchangeInfo` and
 requires an exact wire/base/quote/status/product identity plus only locally
@@ -332,7 +341,8 @@ and two matching authenticated REST reconciliations performed by that same
 `ContinuousTestnetOwner`. Read-only mode does not claim lifecycle-recovery
 evidence. The public stream uses
 `wss://stream.testnet.binance.vision`; the private stream uses
-`wss://ws-api.testnet.binance.vision`. Mainnet remains disabled.
+`wss://ws-api.testnet.binance.vision`. This gate grants no mainnet authority
+and reads only Testnet credentials.
 
 An AC-R3 campaign uses the optional exact lifecycle group. On a fresh journal,
 all fields and the existing acknowledgement are mandatory; the owner waits for
@@ -613,14 +623,151 @@ chrony/systemd-timesyncd service must be healthy. Disable mutation authority if
 either the host synchronization check or the exchange-skew alert fails; do not
 fix timestamp errors by widening `recvWindow`.
 
+## Binance Mainnet manual lifecycle gate
+
+This is the only gate with mainnet order authority. It proves one supervised
+Binance Spot MAINNET LIMIT order lifecycle — submit, signed query, cancel,
+final query — under real venue conditions, with real funds at risk up to the
+declared notional cap. It grants no strategy any authority and is not
+continuous operation.
+
+### Prerequisites
+
+Do not start this gate until all of the following hold:
+
+- Every Testnet gate above has passed on the same candidate binary: the three
+  order-lifecycle cases, both account-reconciliation products, the 24-hour
+  soak, and the backup/restore drill. The host time synchronization gate is
+  green.
+- A dedicated Binance mainnet account used only for this gate, funded with
+  only the minimal quote balance the lifecycle needs. Do not use an account
+  with existing positions, open orders, or unrelated balances.
+- A read-only shadow observation baseline captured with `live-reconcile`
+  (below) proving expected balances, zero open orders on the target symbol,
+  and the current exchangeInfo filters. The trade credentials must not exist
+  in the environment during this step.
+- A deliberately minimal order: a tick-aligned, non-marketable post-only
+  price derived from the current book, the smallest quantity that satisfies
+  the venue's minNotional, and a `--max-notional` cap set just above
+  `price × quantity` — never a generous round number.
+
+### Read-only shadow observation
+
+`live-reconcile` accepts only the read-only credential family and constructs
+an adapter type that cannot submit or cancel orders. Capture the baseline
+before, and a closing report after, the lifecycle:
+
+```sh
+export BINANCE_MAINNET_READ_API_KEY='...'
+export BINANCE_MAINNET_READ_API_SECRET='...'
+
+"$LIFECYCLE_BIN" live-reconcile \
+  --spot-symbol BTC-USDT-SPOT \
+  --wire-symbol BTCUSDT \
+  --include-exchange-info \
+  --timeout-ms 10000 \
+  --json > /srv/crypto-trading/evidence/live-reconcile-before.json
+```
+
+The baseline must show zero open orders on the symbol (the lifecycle refuses
+foreign open orders by default) and balances that match the dedicated
+account's expected funding. Use the reported exchangeInfo filters to derive
+the price, quantity, and notional cap; never reuse values from this document
+or from an earlier run.
+
+### The acknowledged lifecycle
+
+Run the lifecycle in the foreground with an operator watching. Credentials
+come only from the dedicated mainnet **trade** environment variables; the
+Testnet and mainnet-read families are not accepted on this path:
+
+```sh
+umask 077
+install -d -m 0700 /srv/crypto-trading/live
+
+export BINANCE_MAINNET_TRADE_API_KEY='...'
+export BINANCE_MAINNET_TRADE_API_SECRET='...'
+export LIVE_HISTORY='/srv/crypto-trading/live/binance-mainnet.jsonl'
+export LIVE_CAMPAIGN='binance-mainnet-spot-001'
+export LIVE_CLIENT_ID="$(uuidgen)"
+export LIVE_PRICE='<FILTER_VALID_POST_ONLY_PRICE>'
+export LIVE_QUANTITY='<FILTER_VALID_MINIMAL_QUANTITY>'
+export LIVE_MAX_NOTIONAL='<CAP_JUST_ABOVE_PRICE_TIMES_QUANTITY>'
+
+"$LIFECYCLE_BIN" live-lifecycle \
+  --acknowledge-live-lifecycle \
+  'I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE' \
+  --campaign-id "$LIVE_CAMPAIGN" \
+  --client-order-id "$LIVE_CLIENT_ID" \
+  --history-path "$LIVE_HISTORY" \
+  --side buy \
+  --quantity "$LIVE_QUANTITY" \
+  --price "$LIVE_PRICE" \
+  --max-notional "$LIVE_MAX_NOTIONAL" \
+  --time-in-force post-only \
+  --expected-observation open \
+  --spot-symbol BTC-USDT-SPOT \
+  --wire-symbol BTCUSDT \
+  --poll-interval-ms 2000 \
+  --maximum-queries 30 \
+  --timeout-ms 10000 \
+  --json \
+  | tee /srv/crypto-trading/live/lifecycle-result.json
+```
+
+The command refuses before any journal write or network call when the
+acknowledgement phrase is not exact or `price × quantity` exceeds
+`--max-notional`. Before submitting it re-derives venue truth: current
+exchangeInfo filters, signed balances (a SELL requires sufficient base-asset
+balance — there is no spot short), and the symbol's open orders.
+
+A passing run's journal contains, in order: `live_lifecycle_planned`,
+`live_lifecycle_admission_observed`, `live_lifecycle_submit_observed`, at
+least one `live_lifecycle_query_observed` proving the expected state,
+`live_lifecycle_cancel_planned`, `live_lifecycle_cancel_observed` (or
+`live_lifecycle_outcome_unknown` followed by the authoritative final
+cancelled query), and `live_lifecycle_completed`.
+
+Archive the candidate checksum, redacted command arguments (never the
+credentials or an environment dump), the CLI JSON output, the journal, and a
+closing `live-reconcile` report proving zero open orders and reconciled
+balances. Redact account identifiers before the bundle leaves the operator
+host.
+
+### Rollback and recovery
+
+- **Query-first, never resubmit.** After a crash, timeout, or ambiguous
+  response, rerun the *identical* command with the same campaign ID, client
+  UUID, and history path. The resumed invocation appends
+  `live_lifecycle_resumed` and issues a signed single-order query by the
+  persisted UUID before any mutation; it never submits a second order for
+  the campaign.
+- **Exhausted or ambiguous campaigns stay failed.** If the cumulative query
+  budget runs out or the final state cannot be proven, stop rerunning.
+  Reconcile the persisted client UUID through `live-reconcile` and, if an
+  order is still open, cancel it manually on the venue. Retain the
+  unresolved campaign journal as failed gate evidence; do not start a new
+  campaign until an authoritative query proves the old UUID has no order.
+- **The kill-switch latch is terminal for the history file.** An unsafe
+  terminal outcome appends `live_lifecycle_kill_switch_engaged`, and every
+  later campaign on the same history path fails closed. Never edit or
+  replace the journal to clear it. Resolve the venue state manually, record
+  the operator decision alongside the archived evidence, and only then start
+  a new campaign on a new history path.
+- Remove the trade credentials from the environment as soon as the run and
+  its closing reconcile are complete.
+
 ## Promotion and rollback
 
 Promotion requires all repository quality gates, healthy and non-degraded Web
 projections, the backup/restore drill, both credentialed Testnet reconciliation
 products, the three credentialed Testnet lifecycle cases above, and the 24-hour
 soak evidence. A local deterministic harness is not a substitute for
-credentialed Binance Testnet evidence or the 24-hour soak. Edge and mainnet
-remain closed until those external gates pass.
+credentialed Binance Testnet evidence or the 24-hour soak. The mainnet manual
+lifecycle gate builds on all of them and is the only mainnet order authority
+in the release; autonomous strategy live execution remains closed pending the
+strategy promotion gate and is not unlocked by passing any gate in this
+runbook.
 
 To roll back, keep the data volume and journal UUID unchanged, deploy the prior
 image digest, and repeat the system projection check. Never roll back by

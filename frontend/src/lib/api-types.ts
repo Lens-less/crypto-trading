@@ -119,6 +119,7 @@ export type CapabilityAccess =
   | "paper-trading"
   | "testnet-read-only"
   | "testnet-trading"
+  | "mainnet-read-only"
   | "mainnet-trading";
 
 export interface CapabilityScope {

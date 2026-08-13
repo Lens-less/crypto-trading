@@ -1,5 +1,18 @@
 # Live Trading V1 Specification — Binance Spot
 
+> **Status (2026-08-13, `live-v1` branch).** Implemented since this document
+> was frozen: authority-typed mainnet endpoints and adapters (read/trade
+> separated at the type level), the dedicated mainnet credential families,
+> the read-only `live-reconcile` command, the one-shot operator-acknowledged
+> `live-lifecycle` mainnet order owner (journal-first, query-first,
+> `--max-notional` cap, kill-switch latch), and the capability manifest
+> promotion to schema 4 with `release_stage: live-manual` and
+> `live_trading_enabled: true`. Not yet delivered: the credentialed external
+> evidence gates (continuous shadow observation, supervised canary evidence)
+> and the strategy promotion gate — automated strategy execution remains
+> unavailable. Statements below such as `release_stage=paper-only` describe
+> the runtime as of 2026-08-12 and are preserved unchanged.
+
 ## 1. Document Control
 
 | Field | Value |

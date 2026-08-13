@@ -11,18 +11,25 @@
 
 - [`internal/specs/LIVE_TRADING_V1_SPEC.md`](internal/specs/LIVE_TRADING_V1_SPEC.md)
   — implementation and promotion contract for the minimal Binance Spot live
-  runtime. Mainnet remains gated until its evidence requirements pass.
+  runtime. Its dated status header records which deliverables are implemented
+  on the `live-v1` branch and which evidence gates remain open.
 - [`automation/live-trading-v1/goal-automation-runbook.md`](automation/live-trading-v1/goal-automation-runbook.md)
-  — the canonical but currently dormant automation tree. Its local board is
+  — the automation tree that drove the live-trading-v1 waves; see its dated
+  status header for what has landed. Its local board is
   [`automation/live-trading-v1/goal-board.md`](automation/live-trading-v1/goal-board.md).
 - [`adapter-support.md`](adapter-support.md) — which exchange can do what. This
   is a human-readable projection of the capability manifest in
   `rust/crates/runtime/src/capability.rs`, held in sync by a contract test.
   The machine-readable authority is `crypto-trading capabilities --json`.
-  `implemented` does not mean production-ready.
+  `implemented` does not mean production-ready. The two mainnet commands are
+  documented in [`rust/README.md`](../rust/README.md): `live-reconcile`
+  (read-only Binance Spot MAINNET account report) and `live-lifecycle` (one
+  acknowledged mainnet Spot LIMIT order submit → query → cancel behind an
+  exact phrase and a required notional cap).
 - [`runbooks/production-candidate.md`](runbooks/production-candidate.md) — the
-  deployment contract, the four release gates (Testnet order lifecycle, account
-  reconciliation, 24-hour soak, backup/restore drill), and rollback.
+  deployment contract, the four Testnet release gates (order lifecycle, account
+  reconciliation, 24-hour soak, backup/restore drill), the mainnet manual
+  lifecycle gate built on top of them, and rollback.
 - [`reports/project-refocus-acceptance-2026-08-12.md`](reports/project-refocus-acceptance-2026-08-12.md)
   — the W0–W3 acceptance record, including the failed hourly data-admission
   result and the external gates that were deliberately not fabricated.

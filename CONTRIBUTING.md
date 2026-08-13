@@ -42,10 +42,16 @@ cargo +1.89.0 build --release --workspace --all-features --locked
    输出、journal、HTTP 响应或测试快照。新增的诊断输出要考虑这一点。
 4. **新的外部权限路径必须失败关闭，并附带契约测试。** 未实现的能力要在
    capability 清单、CLI 和 Web 三处一致地拒绝，而不是静默降级。
-5. **能力清单是权威。** [`docs/adapter-support.md`](docs/adapter-support.md)
+5. **live 路径的不变量不可削弱。** 任何触及 `live-lifecycle`、`live-reconcile`
+   或 mainnet 适配器（`rust/crates/exchange` 的 mainnet endpoints/adapter）的
+   改动都必须附带契约测试，并保持：journal-first（任何 mainnet 变更前先持久化
+   intent）、query-first（含糊结果与恢复先做签名查询，绝不盲目重提）、
+   fail-closed（确认短语、`--max-notional` 上限、凭证分族、kill-switch 闩锁
+   缺一即拒绝）。放宽任何一条门禁的 PR 需要在描述中单独论证并更新威胁模型。
+6. **能力清单是权威。** [`docs/adapter-support.md`](docs/adapter-support.md)
    是 `rust/crates/runtime/src/capability.rs` 中 manifest 的人类可读投影，
    由契约测试保持同步。不要手工编辑表格；改 manifest，让测试更新期望。
-6. **文档中的每个「可用」都要有测试或环境证据。** 没有证据时写「待验证」。
+7. **文档中的每个「可用」都要有测试或环境证据。** 没有证据时写「待验证」。
 
 ## 新增依赖
 

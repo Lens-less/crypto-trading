@@ -2,26 +2,37 @@
 
 [![Rust quality gates](https://github.com/Lens-less/crypto-trading/actions/workflows/rust.yml/badge.svg)](https://github.com/Lens-less/crypto-trading/actions/workflows/rust.yml)
 ![MSRV](https://img.shields.io/badge/Rust-1.89.0%2B-000000?logo=rust)
-![Execution status](https://img.shields.io/badge/execution-paper%20only-orange)
+![Execution status](https://img.shields.io/badge/execution-live--manual%20(gated)-orange)
 
-一个 Rust-first 的多交易所策略内核，专注于配置兼容、确定性策略计算、受控的 paper one-shot 执行，以及为人工恢复分析保留上下文的可审计 JSONL 运行记录。
+一个 Rust-first 的多交易所策略内核，专注于配置兼容、确定性策略计算、受控的 paper one-shot 执行、受监督的一次性 mainnet 订单生命周期，以及为人工恢复分析保留上下文的可审计 JSONL 运行记录。
 
 当前主线位于 [`rust/`](rust/README.md)。原 Python 项目已于 2026-08-13 从工作树移除，仅保留在 Git 历史中（见 [`archive/README.md`](archive/README.md)）。
 
 > [!WARNING]
-> **当前版本不是生产交易机器人，不得用于真实资金。** Live 适配器、真实交易所账户风控真相（equity/margin/持仓）和多腿故障补偿尚未达到开放门槛；账户级风控权威目前仅覆盖 Paper 模拟账本。即使提供 `--live` 和风险确认短语，程序也会失败关闭。Paper 只计配置的同步 taker 手续费，不代表交易所真实费率，也不包含资金费率、滑点、撮合队列优先级或跨进程持仓。
-> 唯一具备下单权限的路径是 Binance **Testnet**（模拟资金的真实外部环境），且需要精确确认短语。
+> **当前版本不是自动交易机器人，不得当作无人值守的实盘系统使用。**
+> 自 2026-08-13 起，系统具备一条受监督的 mainnet 路径：`live-lifecycle` 可以在操作员输入精确确认短语
+> `I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE`、通过专用 mainnet trade 环境变量提供凭证、
+> 并给出必填的 `--max-notional` 名义上限后，在 Binance Spot **MAINNET** 上执行一次
+> submit→query→cancel 的 LIMIT 订单生命周期；`live-reconcile` 提供只读的 mainnet 账户报告。
+> 除此之外仍然全部关闭：没有任何策略通过晋升门禁，自动策略 live 执行（`--live`／`ExecutionMode::Live`）
+> 对所有策略失败关闭；市价单、保证金、USD-M、多 symbol owner 循环均不可用。账户级风控权威仍仅覆盖
+> Paper 模拟账本；Paper 只计配置的同步 taker 手续费，不代表交易所真实费率，也不包含资金费率、滑点、
+> 撮合队列优先级或跨进程持仓。
 > 本项目按原样提供，不含任何担保，也不构成投资建议；使用后果由使用者自行承担。
 > 不得将本项目用于自成交、制造虚假成交量、市场操纵或任何违反交易所服务条款的活动。
 >
-> **This is not a production trading bot and must not be used with real funds.**
-> Live adapters, real exchange account truth (equity/margin/positions), and
-> multi-leg failure compensation all fail closed; the account-level risk
-> authority governs the paper ledger only. The only path with order
-> authority is Binance Testnet, behind an exact acknowledgement phrase.
-> Provided as is, without warranty; not investment advice. Do not use this
-> project for wash trading, artificial volume, market manipulation, or any
-> activity that violates an exchange's terms of service.
+> **This is not an autonomous trading bot.** Since 2026-08-13 the only mainnet
+> order authority is one operator-supervised Binance Spot LIMIT order
+> lifecycle (`live-lifecycle`) behind an exact acknowledgement phrase,
+> dedicated mainnet trade credentials, and a required `--max-notional` cap;
+> `live-reconcile` is a read-only account report. No strategy has passed the
+> promotion gate: autonomous live execution fails closed for every strategy,
+> and market orders, margin, USD-M, and multi-symbol owner loops are
+> unavailable. The account-level risk authority still governs the paper
+> ledger only. Provided as is, without warranty; not investment advice.
+> Do not use this project for wash trading, artificial volume,
+> market manipulation, or any activity that violates an exchange's terms of
+> service.
 
 Live-trading refocus note (2026-08-13):
 - The maintenance-frozen `scanner`, `price-alert`, and `volume-maker` commands
@@ -32,6 +43,12 @@ Live-trading refocus note (2026-08-13):
   EdgeX, GRVT, Lighter, Paradex) were removed with `rust/config/legacy/`; the
   active `rust/config/exchanges/` surface only lists operator-supported
   Binance and Hyperliquid profiles.
+- Genuine Binance Spot MAINNET support landed on the same day: authority-typed
+  read/trade endpoints and credentials, the read-only `live-reconcile` report,
+  and the operator-acknowledged one-shot `live-lifecycle` command. The
+  capability manifest moved from `paper-only` to `live-manual`
+  (`live_trading_enabled=true`); autonomous strategy live execution
+  (`runtime.live`) remains `unavailable` pending the strategy promotion gate.
 
 ## 项目定位
 
@@ -41,13 +58,16 @@ Live-trading refocus note (2026-08-13):
 - 对固定网格和分段套利策略进行确定性 paper one-shot 验证。
 - 在提交模拟订单前执行产品身份、行情新鲜度、盘口深度和单批风险检查。
 - 记录稳定批次 ID、client order ID、提交计划、回执和对账摘要。
+- 用 `live-reconcile` 只读采样 Binance Spot MAINNET 账户余额与挂单，用
+  `live-lifecycle` 在人工确认与名义上限之下执行一次受监督的 mainnet Spot
+  LIMIT 订单生命周期（submit→query→cancel）。
 - 开发并测试交易领域模型、策略、风险控制、交易所接口与运行时边界。
 - 在 workspace 内开发并测试 Decimal 指标与确定性事件带研究内核；这些 library-only crate 目前没有已出货的 CLI、HTTP 或二进制入口，不属于可用产品能力。
 
-它暂时不适合：
+它不适合：
 
-- 连接私有交易 API 或管理真实资产。
-- 启动 7×24 小时网格或套利监控服务。
+- 无人值守的自动实盘交易：没有策略通过晋升门禁，自动策略 live 执行失败关闭。
+- 启动 7×24 小时网格或套利实盘服务（连续运行仅限 Paper owner 与只读 monitor/soak）。
 - 用 paper 成交结果推断真实交易收益或生产就绪程度。
 
 ## 当前能力
@@ -76,21 +96,34 @@ Live-trading refocus note (2026-08-13):
 | `testnet-reconcile` | 无 | 不可用 | 不可用 | 默认只报告的 clean-account gate；把签名 Testnet 余额/挂单/持仓与 exact committed Paper reservation 比对，只有精确确认后才写 release/failure transition |
 | `testnet-soak` | 无 | 可用（只读） | 不可用 | journal-backed `serve/status/stop/verify` host；24 小时门禁要求三类探针覆盖、一次强制终止恢复演练和干净停止 |
 
-Lighter、Hyperliquid、Backpack、Binance、Paradex、EdgeX、GRVT、OKX 或 Variational
-出现在配置或冻结的 Python tree 中，只表示兼容/迁移范围，不表示对应私有交易适配器已经可以实盘下单。
+### Binance Mainnet 命令
+
+> [!CAUTION]
+> `live-lifecycle` 会用真实资金在 **Binance Spot MAINNET** 提交并撤销**一笔真实订单**。
+> 它是一次性的、人工授权的命令，不是策略执行；每次运行都需要精确确认短语、
+> 专用 mainnet trade 凭证和必填的 `--max-notional` 名义上限。
+
+| CLI 命令 | 订单权限 | 连续运行 | 当前行为 |
+| --- | --- | --- | --- |
+| `live-reconcile` | 无（只读） | 不可用 | 用专用只读凭证（`BINANCE_MAINNET_READ_API_KEY/SECRET`）经权限类型化的 read endpoints 输出 mainnet Spot 余额、挂单与可选 exchangeInfo 报告；该命令只能构造 read-authority 适配器类型，类型层面不存在 submit/cancel 面 |
+| `live-lifecycle` | **Mainnet 一次性 LIMIT 下单/撤单** | 不可用 | 精确短语 `I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE` + 必填 `--max-notional` 授权的一次 submit→query→cancel 生命周期；journal-first（任何网络变更前先写 `planned`），提交前执行 venue-truth 准入（exchangeInfo filters、签名余额 spot-no-short 检查、默认拒绝外来挂单），恢复严格 query-first、绝不盲目重提；不安全终态会闩锁 journal 级 kill switch，阻止同一 journal 上任何新的 lifecycle |
+
+当前 adapter 矩阵只包含 Binance（public／testnet／mainnet）、Hyperliquid（public 只读）
+和 Paper。配置文件中出现的其他交易所名称只是迁移期兼容字段，不代表适配器存在。
 权威状态来自 `cargo run --locked -- capabilities --json`；人类可读投影见
 [`docs/adapter-support.md`](docs/adapter-support.md)，其表格由合约测试与同一 manifest 保持一致。
 
 ## 核心特性
 
 - **精确领域类型**：价格、数量和金额使用 `rust_decimal`，关键算术使用受检操作，不以二进制浮点承担交易计算。
-- **纯策略内核**：固定/马丁网格、网格保护子系统（剥头皮、本金保护、止盈、价格锁定、止损，按固定优先级仲裁）、分段套利、价格提醒、Paper 成交量仿真和虚拟网格逻辑与 I/O 分离，便于确定性测试。
+- **纯策略内核**：固定/马丁网格、网格保护子系统（剥头皮、本金保护、止盈、价格锁定、止损，按固定优先级仲裁）、分段套利、bar 策略与虚拟网格逻辑与 I/O 分离，便于确定性测试。
+- **权限类型化的 Mainnet 适配器**：Binance Spot MAINNET 的读与写是两个不同的具体类型（`BinanceMainnetReadEndpoints`／`BinanceMainnetTradeEndpoints`），host 在构造时钉死为官方 `api.binance.com`／`ws-api.binance.com`／`stream.binance.com`，凭证族分离——持有 read 类型或 read 凭证在类型与配置两个层面都无法获得下单权限。
 - **可验证的 Paper 执行与账本**：`PaperExchange` 覆盖订单状态、顶层深度消耗、GTC/IOC/FOK、部分成交与撤单语义；journal-backed Paper account 对完全成交的同步 taker 回执记录 FIFO lot、即时手续费、已实现 PnL、settled equity 和 reduce-only 容量。尚不包含周期性 mark-to-market、资金费率、保证金/强平、真实排队延迟、多档冲击或 resting-maker 的持久成交回调。
 - **失败关闭的执行边界**：未授权模式、过期行情、产品身份不匹配、深度不足、风险超限和未实现适配器都在提交前拒绝。
 - **可审计执行历史**：先写入 `execution_planned`，再写入 `execution_completed`、`execution_partial` 或 `execution_incomplete`。
 - **有界资源使用**：配置、历史记录、批次、actor 队列、HTTP 响应和聚合输出都有显式上限。
 - **跨平台质量门禁**：CI 在 Windows 与 Ubuntu 上验证 MSRV 和 stable，并执行格式、Clippy、release build 与 RustSec audit。
-- **冻结的迁移证据**：旧 Python tree 保留原始 blob 与文件 mode，但不参与当前构建、测试、配置加载或运行。
+- **历史归档在 Git 历史中**：旧 Python tree 已于 2026-08-13 从工作树移除，完整内容与逐文件校验清单保留在 Git 历史中（[`archive/README.md`](archive/README.md) 为墓碑说明）；它从未参与 Rust 的构建、测试、配置加载或运行。
 
 ## 快速开始
 
@@ -186,6 +219,8 @@ crypto-trading testnet-smoke [OPTIONS]
 crypto-trading testnet-lifecycle [OPTIONS]
 crypto-trading testnet-reconcile [OPTIONS]
 crypto-trading testnet-soak --mode <serve|status|stop|verify> [OPTIONS]
+crypto-trading live-reconcile [--json] [OPTIONS]
+crypto-trading live-lifecycle --acknowledge-live-lifecycle <PHRASE> --max-notional <CAP> [OPTIONS]
 crypto-trading grid <CONFIG> [OPTIONS]
 crypto-trading arbitrage [OPTIONS]
 crypto-trading monitor [OPTIONS]
@@ -204,7 +239,8 @@ crypto-trading config-check <PATHS>... [--json]
 submit-query-cancel owner。它会在提交前持久化 campaign 与 UUID client order ID，
 在恢复时先按该 UUID 查询，确认 open 或 controlled partial fill 后撤单，并且只有最终
 查询到 `cancelled` 才报告完成。凭证只从 `BINANCE_API_KEY` /
-`BINANCE_API_SECRET` 进程环境变量读取；该命令没有 mainnet 开关。
+`BINANCE_API_SECRET` 进程环境变量读取；该命令没有 mainnet 开关——mainnet 权限只存在于
+独立的 `live-lifecycle` 命令及其专用凭证族。
 
 ```powershell
 cargo run --locked -- testnet-lifecycle --help
@@ -237,7 +273,7 @@ asset 余额必须为零，且 settlement asset 的可用余额必须等于该 r
 
 ## Binance Testnet soak
 
-该持久化 soak host 只读运行并保持 mainnet 关闭；每轮依次消费 Spot Testnet
+该持久化 soak host 只读运行，自身不具有任何 mainnet 权限；每轮依次消费 Spot Testnet
 `bookTicker` WebSocket、签名 User Data WebSocket API 和 Binance Testnet REST 鉴权对账。它不会提交或撤销订单，
 也不会把本地 fixture、离线时间或缺失凭证伪装成通过的 24 小时证据。
 
@@ -309,6 +345,39 @@ if ($LASTEXITCODE -ne 0) { throw "Binance Testnet soak evidence is not release-r
 `--debug`、`--debug-detail` 和 `--no-ui` 目前主要保留 CLI 兼容性，尚不会改变对应 handler 的行为。运行时日志过滤只由进程环境变量 `RUST_LOG` 控制；例如 PowerShell 可设置 `$env:RUST_LOG = "warn,crypto_trading_web_app=info,crypto_trading_runtime=info,crypto_trading_exchange=info"`。`rust/config/logging.yaml` 是迁移期辅助配置，Rust runtime 不会读取它。
 
 `testnet-smoke` 只在显式选择远端探针时才出网：`--call-book-ticker` 会分别调用 Binance Spot 与 USD-M testnet 的 `bookTicker`，`--call-reconcile` 会在此基础上用 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 调 Binance testnet 的开放订单和持仓对账路由。该命令只产生留证输出，不会提交新订单。
+
+## Binance Mainnet：live-reconcile 与 live-lifecycle
+
+`live-reconcile` 是只读的 mainnet Spot 账户报告：签名读取余额与配置 symbol 的挂单，
+可选 `--include-exchange-info` 附带该 symbol 的权威 instrument 规则。它只从
+`BINANCE_MAINNET_READ_API_KEY` / `BINANCE_MAINNET_READ_API_SECRET` 读取凭证，
+只能构造 read-authority 适配器类型——submit/cancel 在类型层面不存在，Testnet 凭证
+与 mainnet trade 凭证都不会赋予它任何权限：
+
+```powershell
+cargo run --locked -- live-reconcile --help
+```
+
+`live-lifecycle` 是唯一具有 mainnet 下单权限的命令：一次人工授权的 Spot LIMIT
+submit→query→cancel 生命周期。门禁顺序（有合约测试钉死）：精确确认短语
+`I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE` → 配置校验（含必填
+`--max-notional`，`price*quantity` 超限在写 journal 前拒绝）→ 该 journal 的
+kill-switch 闩锁检查 → 才读取 `BINANCE_MAINNET_TRADE_API_KEY` /
+`BINANCE_MAINNET_TRADE_API_SECRET` → 才产生网络活动。新 campaign 在 `planned`
+事实持久化之后、提交之前执行 venue-truth 准入：exchangeInfo filters 校验、按签名
+余额执行 spot-no-short（卖出不得超过可用 base、买入名义不得超过可用 quote），
+symbol 上存在不属于本 campaign 的挂单时默认拒绝（`--allow-foreign-orders` 才放行）。
+恢复严格 query-first：任何后续运行先按持久化的 UUID client order ID 查询，绝不盲目
+重提；订单出现意外终态（如在撤单前成交）会写入失败事实并闩锁 journal 级 kill
+switch——同一 journal 上所有新 lifecycle 都被阻止，直到人工核对账户并启用新 journal：
+
+```powershell
+cargo run --locked -- live-lifecycle --help
+```
+
+完整的前置条件（全部 Testnet 门禁、只读 shadow 观察、专用账户、最小名义）与留证
+步骤见
+[`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md#binance-mainnet-manual-lifecycle-gate)。
 
 需要独立二进制时：
 
@@ -421,13 +490,24 @@ $env:BINANCE_API_SECRET = "..."
 cargo run --locked -- config-check config/exchanges/binance_config.yaml
 ```
 
-凭证 loader 采用 `<EXCHANGE>_<FIELD>` 命名，可覆盖 `API_KEY`、`API_SECRET`、`PRIVATE_KEY` 和 `WALLET_ADDRESS` 字段。支持解析这些变量不代表对应 live adapter 已开放。
+凭证按权限分族，互不越界：
+
+| 环境变量 | 权限 | 消费者 |
+| --- | --- | --- |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | 仅 Binance **Testnet** | `testnet-lifecycle`、`testnet-reconcile`、`testnet-soak`、`testnet-smoke` |
+| `BINANCE_MAINNET_READ_API_KEY` / `BINANCE_MAINNET_READ_API_SECRET` | 仅 mainnet **只读** | `live-reconcile` |
+| `BINANCE_MAINNET_TRADE_API_KEY` / `BINANCE_MAINNET_TRADE_API_SECRET` | 仅 mainnet **一次性 lifecycle** | `live-lifecycle` |
+
+合约测试钉死了分离语义：Testnet 凭证不会赋予任何 mainnet 权限，read 凭证不会赋予
+trade 权限，`live-reconcile` 永不读取 trade 变量。通用凭证 loader 另采用
+`<EXCHANGE>_<FIELD>` 命名，可覆盖 `API_KEY`、`API_SECRET`、`PRIVATE_KEY` 和
+`WALLET_ADDRESS` 字段；支持解析这些变量不代表对应 live adapter 存在。
 
 不要把密钥、私钥、JWT、助记词或真实账户信息写入已跟踪的 `rust/config/exchanges/*.yaml`、日志、issue 或提交历史。`.gitignore` 已屏蔽常见 `.env`、密钥文件和本地运行数据，但这不能替代提交前的凭证扫描。
 
 ## 安全模型与 Paper 限制
 
-1. **Live 永远失败关闭**：风险确认短语只建立显式授权意图，不会绕过尚未完成的适配器、风控和对账门禁。
+1. **自动策略 live 失败关闭；人工 mainnet 路径有独立门禁**：`ExecutionMode::Live` 对所有策略失败关闭，风险确认短语不会绕过策略晋升门禁。唯一 mainnet 变更权限是 `live-lifecycle` 一次性命令，其自身门禁为：精确确认短语、专用 trade 凭证、必填名义上限、journal-first、venue-truth 准入、query-first 恢复与不可解除的 journal 级 kill-switch 闩锁。
 2. **Paper 真值仍不是交易所真值**：同一 journal generation 会跨重启重放 reservation、精确成交费用、FIFO lot 与 settled equity，并由共享账户风控消费；但它不读取真实余额、保证金、外部挂单或交易所仓位，也不能跨不同 journal 自动合并风险。
 3. **网格是挂单语义验证**：它根据一个显式参考价规划 resting orders，不代表真实撮合、账户风险或跨进程仓位已经验证。
 4. **套利使用显式顶层盘口**：调用方必须给出双边 bid/ask 和四侧可用数量；`strategy_key` 是配置选择器，不是腿 symbol 的别名；模型不等价于完整深度、延迟和滑点仿真。
@@ -462,15 +542,15 @@ Rust workspace 包含十一个 crate。依赖方向是单向的：`domain` 不�
 | --- | --- |
 | `domain` | Symbol、MarketSnapshot、Order、Position、Price、Quantity、Money 等领域类型 |
 | `config` | 有界文件读取、兼容反序列化、严格校验、环境变量覆盖与凭证脱敏 |
-| `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、风险、价格提醒、Paper 成交量仿真和虚拟网格算法 |
+| `strategy` | 网格（含马丁递增与纯状态机网格保护：剥头皮/本金保护/止盈/价格锁定/止损）、分段套利、bar 策略、账户风控与虚拟网格纯算法 |
 | `indicators` | workspace 内部的 Decimal 指标研究库；未链接到已出货 CLI/HTTP/二进制，manifest 中为 `Unavailable` |
 | `backtest` | workspace 内部的确定性事件带研究库；未链接到已出货 CLI/HTTP/二进制，manifest 中为 `Unavailable` |
-| `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、有界 actor 和 instrument rules |
+| `exchange` | 统一异步接口、PaperExchange、公开 Binance 行情适配器、Binance Testnet 协议、权限类型化的 Binance Spot MAINNET read/trade 适配器与钉死的官方 endpoints、有界 actor 和 instrument rules |
 | `runtime` | 执行模式、路由、批次、提交策略、部分结果对账、JSONL journal、operator read model 与 capability 清单 |
 | `control-plane` | journal 与各操作界面之间的最小权限读取/提交 seam |
 | `web` | HTTP API 与编译期嵌入的 React 操作台 bundle(`frontend/dist`) |
 | `web-app` | `crypto-trading-web` 二进制，只在 loopback 上提供只读控制面 |
-| `apps` | `crypto-trading` 二进制、CLI 参数、配置检查、one-shot 与 Testnet 编排 |
+| `apps` | `crypto-trading` 二进制、CLI 参数、配置检查、one-shot、Testnet 编排与 mainnet `live-reconcile`／`live-lifecycle` 编排 |
 
 `indicators` 与 `backtest` 当前只是 workspace 内部研究内核，不是已出货产品能力：没有受支持的 CLI/HTTP 入口，也没有生产二进制链接它们。`backtest` 仍是单标的模型，尚未接入生产 `MarketDataEvent`／`StrategyMachine` 适配层，也不模拟队列、延迟、资金费率、部分成交或多档深度。研究 crate 测试全绿不能解释为 paper/live 一致，更不能解释为策略盈利。
 
@@ -524,6 +604,7 @@ crypto-trading/
 │   ├── runbooks/                # 生产候选运维手册与发布门禁
 │   └── internal/                # 审计、规格、计划、研究（历史快照）
 ├── deploy/                      # Compose 部署与备份/恢复演练脚本
+├── scripts/                     # 仓库卫生检查与研究数据准备脚本
 ├── Dockerfile                   # 单容器交付
 ├── archive/
 │   └── README.md                # 已移除的 Python 归档的墓碑说明
@@ -563,9 +644,9 @@ CI 还会：
 
 配置解析与运行能力是两道独立门禁。无 `--once` 的 `arbitrage` 当前只验证输入，然后明确失败。`monitor` 是例外：它的 `serve/status/stop` 模式可以运行，但只接受精确双源 replay 数据源（或显式 `--live` 只读行情），不授予交易权限。
 
-### 为什么 `--live` 仍然无法下单？
+### 为什么策略的 `--live` 仍然无法下单？
 
-这是设计行为。真实账户风险事务、私有签名适配器、testnet 证据、权威 instrument metadata 和多腿恢复尚未全部完成。
+这是设计行为。`runtime.live`（grid/arbitrage 等所有 `ExecutionMode::Live` owner 循环）在 capability manifest 中仍为 `unavailable`：没有任何策略通过晋升门禁，按「不得由实现暗示策略权限」的不变量，唯一 mainnet 下单权限是人工授权的一次性 `live-lifecycle` 命令。想在 mainnet 上做一次受监督的订单生命周期，请使用 `live-lifecycle`（见上文与 runbook），而不是策略 `--live`。
 
 ### 为什么 YAML anchor/alias 被拒绝？
 
@@ -577,14 +658,23 @@ CI 还会：
 
 ## 路线图
 
-以下项目完成并提供验证证据前，Live 与连续运行仍保持 NO-GO：
+**当前已具备（live-manual 阶段）**：
 
-- 权威账户余额、持仓、挂单 reservation、kill switch 与跨进程风险事务。
-- 私有交易适配器的签名向量、testnet 下单/撤单和限流验证。
-- 多腿补偿、恢复锁、durable saga 和崩溃后续作。
-- 从权威交易所元数据加载 tick size、lot size 和最小名义价值。
-- resting-maker 手续费/返佣、资金费率、周期性 mark-to-market、延迟、队列优先级、多档滑点与更完整的 paper 撮合模型。
-- 历史轮转、跨进程日志协调、持续凭证扫描和许可证策略门禁。
+- Binance Spot MAINNET 权限类型化 read/trade 适配器与官方 endpoints（构造期钉死）。
+- `live-reconcile` 只读 mainnet 账户报告与 `live-lifecycle` 一次性人工订单生命周期（精确短语 + 名义上限 + journal-first + venue-truth 准入 + query-first 恢复 + kill-switch 闩锁），均有确定性合约测试。
+- Binance Testnet lifecycle／reconcile／soak 命令面与 journal 段轮转、跨进程 writer lease。
+
+**仍然开放的操作员留证门禁**（本仓库不签入真实凭据证据）：
+
+- 凭真实凭证完成的 Testnet open-order、controlled partial-fill、kill/restart 三类 campaign。
+- 凭真实凭证完成的 Testnet 账户对账（每个在范围内的产品）与 24 小时 soak（含一次强制终止恢复演练）。
+- mainnet 只读 shadow 观察与一次受监督的 mainnet lifecycle 留证。
+
+**策略晋升门禁（自动 live 执行开放前的硬条件）**：
+
+- 一个显式选定的策略通过预注册的离线证据、Paper 长期观察、Testnet 与 shadow 评估；当前全部离线候选均未通过。
+- 面向 live 的账户风险权威（真实余额/挂单/持仓真值，而非 Paper 账本）、多腿补偿与崩溃后续作。
+- resting-maker 手续费/返佣、资金费率、周期性 mark-to-market、延迟、队列优先级、多档滑点等更完整的成本与撮合模型。
 
 ## 参与贡献
 
@@ -592,7 +682,7 @@ CI 还会：
 要点：
 
 1. 只在 `rust/` 中开发当前功能；旧 Python 实现仅存于 Git 历史，不得复活为运行入口。
-2. 新增行为时先补测试，并保持 live 路径失败关闭。
+2. 新增行为时先补测试；改动 live-lifecycle／mainnet 适配器等 live 路径必须附合约测试，并保持 journal-first、query-first 与失败关闭不变量。
 3. 不引入二进制浮点交易计算，不在日志和诊断中暴露凭证。
 4. 运行“开发与验证”中的完整门禁。
 5. 在 PR 中说明安全边界、已验证内容和未覆盖风险。
@@ -605,7 +695,7 @@ CI 还会：
 
 - [`rust/README.md`](rust/README.md)：详细命令、配置分类和安全边界。
 - [`docs/adapter-support.md`](docs/adapter-support.md)：adapter 支持矩阵，由合约测试与 capability 清单保持一致。
-- [`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md)：部署契约、Testnet 发布门禁、备份恢复演练与回滚。
+- [`docs/runbooks/production-candidate.md`](docs/runbooks/production-candidate.md)：部署契约、Testnet 发布门禁、mainnet 人工 lifecycle 门禁、备份恢复演练与回滚。
 - [`SECURITY.md`](SECURITY.md)：威胁模型与漏洞私有披露流程。
 
 参与开发：

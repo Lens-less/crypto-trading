@@ -129,16 +129,35 @@ the software may do exactly what it could do before.
   the Rust matrix keeps Ubuntu MSRV/stable plus Windows MSRV, while docs-only
   and frozen-archive changes no longer trigger the full matrix.
 - Config-only and legacy-only venue rows are collapsed into one fail-closed
-  `unsupported-venues` capability, with compatibility samples moved under
-  `rust/config/legacy/exchanges/`. Volume maker, price alert, and scanner
-  remain available but are maintenance-frozen against scope expansion.
+  `unsupported-venues` capability. Volume maker, price alert, and scanner were
+  first maintenance-frozen and later removed entirely (see Removed); the
+  `rust/config/legacy/` compatibility samples were removed with them. The
+  adapter matrix now covers Binance (public/testnet/mainnet), Hyperliquid
+  (public), and Paper only.
 
 ### Added
 
 - A journal-backed account-risk authority durably records admission tickets,
   consumes or compensates them through explicit facts, and caches the replayed
-  projection for subsequent decisions. Grid, arbitrage, and volume-maker
-  owners use the same admission boundary before creating Paper reservations.
+  projection for subsequent decisions. Grid and arbitrage owners use the same
+  admission boundary before creating Paper reservations.
+- Binance Spot MAINNET support with authority separated at the type level:
+  `BinanceMainnetReadEndpoints` and `BinanceMainnetTradeEndpoints` (hosts
+  `api.binance.com`, `ws-api.binance.com`, `stream.binance.com`), read-only
+  and trade adapters, and dedicated credential families
+  (`BINANCE_MAINNET_READ_API_KEY/SECRET`, `BINANCE_MAINNET_TRADE_API_KEY/SECRET`;
+  `BINANCE_API_KEY/SECRET` stays Testnet-only).
+- `live-reconcile`: a read-only Binance Spot MAINNET balance, open-order, and
+  optional exchangeInfo report over the read-authority adapter, which cannot
+  submit or cancel orders at the type level.
+- `live-lifecycle`: one operator-acknowledged Binance Spot MAINNET LIMIT order
+  lifecycle (submit → query → cancel) behind the exact phrase
+  `I AUTHORIZE BINANCE MAINNET SPOT ORDER LIFECYCLE` and a required
+  `--max-notional` cap, with venue-truth admission from exchangeInfo filters
+  and signed balances, spot-no-short, foreign-open-order refusal by default,
+  journal-first PLANNED before any mutation, query-first recovery with zero
+  blind resubmits, and a journal-latched kill switch on unsafe terminal
+  states.
 - Cross-platform graceful shutdown covers Ctrl-C, Unix SIGTERM, and Windows
   console close/shutdown signals. Signals are registered before any owner can
   start, SSE streams terminate immediately, all owners drain concurrently
@@ -176,19 +195,34 @@ the software may do exactly what it could do before.
 - The unreferenced frontend placeholder component, unused design previews,
   duplicate backtest SHA-256 implementation, per-venue config-only capability
   rows, and duplicate active G-series automation tree.
+- The maintenance-frozen volume-maker, price-alert, and scanner surfaces:
+  their CLI commands, configs, task hosts, and read models. The
+  implementations remain in git history.
+- The frozen `archive/python-legacy/` evidence tree. `archive/README.md`
+  stays as a tombstone; git history is the archive.
+- `rust/config/legacy/` and dead-venue grid/arbitrage configuration samples,
+  plus the `docs/internal/history/g-series-2026-08-12` snapshot tree.
 
 ### Authority
 
+- **Widened: Binance Spot MAINNET manual lifecycle.** The capability manifest
+  (schema 4) now reports `release_stage: live-manual` and
+  `live_trading_enabled: true`. The only path with mainnet order authority is
+  the one-shot `live-lifecycle` command, gated by an exact acknowledgement
+  phrase, dedicated mainnet trade environment credentials, and a required
+  `--max-notional` cap; `live-reconcile` grants read-only mainnet observation
+  behind a separate read-only credential family. Autonomous strategy live
+  execution (`runtime.live` for grid/arbitrage) remains unavailable pending
+  the strategy promotion gate.
+- Narrowed: the volume-maker, price-alert, and scanner surfaces and their
+  Paper write paths were removed outright, and the Python legacy tree can no
+  longer be executed from the working copy.
 - Widened for Paper only: settling closed lots releases simulated capacity, so
   a Paper owner can complete more round trips under the same configured
-  exposure ceiling. External authority did not widen: mainnet remains disabled
-  in the capability manifest, and Binance Testnet behind an exact
-  acknowledgement phrase remains the only path that can place external orders.
+  exposure ceiling.
 - Testnet read authority widened to public and signed WebSocket observations;
-  no new mainnet or autonomous order authority was granted. The continuous
-  Testnet owner remains explicit, journaled, kill-switchable, and query-first,
-  and mainnet stays unavailable while the Edge and external 24-hour gates are
-  open.
+  the continuous Testnet owner remains explicit, journaled, kill-switchable,
+  and query-first.
 
 ## [0.1.0] — unreleased
 
