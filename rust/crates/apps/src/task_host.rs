@@ -272,6 +272,14 @@ async fn query_control_with_token_timeout(
         ))
     })??;
     match response.trim() {
+        // A clean EOF without any payload happens when the host tears down
+        // around the request (e.g. it is exiting after a prior stop). That is
+        // no confirmation of anything, so it stays a transport failure and
+        // callers fall back to their durable-journal projection.
+        "" => Err(TaskHostControlError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "task host control connection closed without a response",
+        ))),
         "error: unauthorized" => Err(TaskHostControlError::Unauthorized),
         message if message.starts_with("error: ") => {
             Err(TaskHostControlError::Protocol(message.to_owned()))
