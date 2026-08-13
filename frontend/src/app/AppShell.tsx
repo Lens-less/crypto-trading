@@ -28,7 +28,8 @@ const NAV_ITEMS: ReadonlyArray<{ to: string; label: string }> = [
 ];
 
 /**
- * 权限脊柱第一区:3 秒内可辨 PAPER / LIVE CLOSED。
+ * 权限脊柱第一区:3 秒内可辨 PAPER 与 live 授权状态
+ * (后端未声明 live 时显示 LIVE CLOSED)。
  * 权限态只从 /api/v1/capabilities 推导,浏览器永不构造 live 权限。
  */
 function AuthoritySection() {
