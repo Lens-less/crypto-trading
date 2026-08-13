@@ -90,6 +90,7 @@ The software is designed to run as one operator's local process:
 - Losses arising from trading decisions, strategy behaviour, or market
   conditions. This software carries no warranty and is not investment advice.
 - Deliberately documented limitations, including the absence of journal
-  rotation and the fact that paper results only account for configured fees
-  and exclude funding, slippage, and queue priority. See the warning in
-  [`README.md`](README.md).
+  compaction (sealed rotation segments are kept by design so the fact chain
+  stays replayable) and the fact that paper results only account for
+  configured fees and exclude funding, slippage, and queue priority. See the
+  warning in [`README.md`](README.md).
