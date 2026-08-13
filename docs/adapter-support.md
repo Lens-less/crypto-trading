@@ -18,16 +18,12 @@ Status meanings:
 - `unavailable`: the current Rust system has no supported path for that facet.
 - `not-applicable`: the facet does not apply to the process-local paper model.
 
-W3 note: the operator-facing matrix now folds config-only and legacy-only venue
-rows into one `Unsupported venues` record to keep the supported surface small.
-
 <!-- adapter-matrix:start -->
 | Adapter | Public data | Testnet protocol | Authenticated | Reconcile | Live |
 | --- | --- | --- | --- | --- | --- |
-| Binance | implemented | implemented | implemented | implemented | unavailable |
+| Binance | implemented | implemented | implemented | implemented | implemented |
 | Hyperliquid | implemented | protocol-only | protocol-only | request-only | unavailable |
 | PaperExchange | not-applicable | not-applicable | not-applicable | implemented | not-applicable |
-| Unsupported venues | unavailable | unavailable | unavailable | unavailable | unavailable |
 <!-- adapter-matrix:end -->
 
 `implemented` is not synonymous with production-ready. Binance public data has
@@ -44,16 +40,24 @@ submit-query-cancel/query-first recovery coverage, and its report-first account
 gate compares signed balances, open orders, and positions to one exact
 committed Paper reservation. Real credentialed Spot/USD-M reconciliation,
 open-order, partial-fill, restart, and 24-hour soak evidence remain external
-release gates. PaperExchange is process-local. Every external venue still
-reports `live: unavailable`, and the manifest validation rejects any live claim
-while `live_trading_enabled` is false.
+release gates. PaperExchange is process-local.
 
-The aggregated `Unsupported venues` row currently covers Backpack, EdgeX, GRVT,
-Lighter, Paradex, OKX, and Variational. The remaining checked-in venue samples
-for Backpack, EdgeX, GRVT, Lighter, and Paradex now live under
-`rust/config/legacy/exchanges/`; none has an operator-supported Rust adapter
-path, so the manifest fails closed with one summary row instead of advertising
-a wider venue matrix than the runtime can actually honor.
+Binance `live: implemented` means exactly one authority: the
+operator-acknowledged one-shot Spot LIMIT order lifecycle (`live-lifecycle`,
+which requires an exact acknowledgement phrase and a `--max-notional` cap)
+plus the read-only signed `live-reconcile` report over dedicated mainnet read
+credentials. There is no autonomous strategy live execution, no market
+orders, no margin, no USDⓈ-M product, and no multi-symbol owner loop;
+`ExecutionMode::Live` for grid/arbitrage keeps failing closed, and a
+credentialed supervised mainnet run remains external release evidence.
+Hyperliquid still reports `live: unavailable`, and manifest validation
+rejects any live claim whenever `live_trading_enabled` is false.
+
+Venues without an operator-supported Rust adapter path (for example Backpack,
+EdgeX, GRVT, Lighter, Paradex, OKX, and Variational) are out of scope for the
+live V1 effort: their configuration samples were removed from the working tree
+and the manifest no longer lists them, so documentation cannot advertise a
+wider venue matrix than the runtime can actually honor.
 
 The journal-backed Paper account above the adapter now settles fully filled
 synchronous taker receipts into exact FIFO lots, immediate fees, realized PnL,

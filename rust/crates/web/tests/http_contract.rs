@@ -36,8 +36,8 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
     assert_eq!(capabilities.status(), StatusCode::OK);
     assert_security_headers(&capabilities);
     let capabilities = response_json(capabilities).await;
-    assert_eq!(capabilities["live_trading_enabled"], false);
-    assert_eq!(capabilities["release_stage"], "paper-only");
+    assert_eq!(capabilities["live_trading_enabled"], true);
+    assert_eq!(capabilities["release_stage"], "live-manual");
     let web = capabilities["capabilities"]
         .as_array()
         .unwrap()
@@ -86,7 +86,7 @@ async fn capabilities_and_system_expose_fail_closed_truth_with_security_headers(
     assert_eq!(system.status(), StatusCode::OK);
     assert_security_headers(&system);
     let system = response_json(system).await;
-    assert_eq!(system["live_trading_enabled"], false);
+    assert_eq!(system["live_trading_enabled"], true);
     assert_eq!(system["access_scope"], "loopback");
     assert_eq!(system["authentication_required"], false);
     assert_eq!(system["projection_status"], "complete");
@@ -300,64 +300,6 @@ async fn monitor_endpoint_exposes_only_the_bounded_read_model() {
 }
 
 #[tokio::test]
-async fn alerts_endpoint_exposes_only_the_bounded_read_model_and_no_write_authority() {
-    let bytes = jsonl(&[
-        json!({
-            "timestamp": "2026-07-24T00:00:00Z",
-            "strategy": "price_alert",
-            "symbol": "BTC-USDT",
-            "decision": "price_alert_occurred",
-            "details": {
-                "schema_version": 1,
-                "sequence": 1,
-                "exchange": "binance",
-                "market_type": "spot",
-                "kind": "upper_limit",
-                "price": "101.25",
-                "change_percent": null,
-                "market_revision": 7,
-                "market_generation": 3,
-            },
-        }),
-        json!({
-            "timestamp": "2026-07-24T00:00:01Z",
-            "strategy": "unrelated",
-            "symbol": "BTC-USDT",
-            "decision": "hold",
-            "details": {
-                "api_key": "must-not-leak",
-                "message": "must-not-leak",
-            },
-        }),
-    ]);
-    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
-
-    let response = app.clone().oneshot(get("/api/v1/alerts")).await.unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_security_headers(&response);
-    let alerts = response_json(response).await;
-    assert_eq!(alerts["projection_status"], "complete");
-    assert_eq!(alerts["occurrences"][0]["kind"], "upper_limit");
-    assert_eq!(alerts["occurrences"][0]["price"], "101.25");
-    let encoded = serde_json::to_string(&alerts).unwrap();
-    assert!(!encoded.contains("api_key"));
-    assert!(!encoded.contains("must-not-leak"));
-
-    let write = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/alerts")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
-}
-
-#[tokio::test]
 async fn tasks_endpoint_exposes_durable_lifecycle_without_control_authority() {
     let bytes = jsonl(&[
         json!({
@@ -443,189 +385,6 @@ async fn tasks_endpoint_exposes_durable_lifecycle_without_control_authority() {
         .await
         .unwrap();
     assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
-}
-
-#[tokio::test]
-async fn scanner_endpoint_exposes_only_the_last_bounded_historical_ranking() {
-    let scanner_row = json!({
-        "rank": 1,
-        "activity": "active",
-        "priority": "benchmark",
-        "instrument": {
-            "exchange": "fixture",
-            "symbol": "BTC-USDC",
-            "market_type": "spot",
-        },
-        "started_at": "2026-07-25T00:00:00Z",
-        "last_observed_at": "2026-07-25T00:04:00Z",
-        "observation_count": 5,
-        "last_observation_sequence": 5,
-        "current_price": "100",
-        "lower_price": "95",
-        "upper_price": "105",
-        "pending_buy_price": "99",
-        "pending_sell_price": "101",
-        "grid_width_percent": "10",
-        "grid_interval_percent": "1",
-        "grid_count": 10,
-        "running_seconds": 300,
-        "buy_crosses": 2,
-        "sell_crosses": 2,
-        "total_crosses": 4,
-        "complete_cycles": 2,
-        "recent_five_minute_cycles": 2,
-        "cycles_per_hour": "10",
-        "estimated_apr": "500",
-        "estimated_apr_kind": "heuristic",
-        "volume_24h_usdc": "1000000",
-        "price_change_24h_percent": null,
-        "rating_grade": "s",
-        "rating_score": "95",
-    });
-    let bytes = jsonl(&[json!({
-        "timestamp": "2026-07-25T00:05:00Z",
-        "strategy": "virtual_grid_scanner",
-        "symbol": "control-plane",
-        "decision": "scanner_ranked",
-        "details": {
-            "schema_version": 2,
-            "run_id": "scan-web",
-            "ranking_policy": "explicit_benchmark_then_apr_desc",
-            "apr_window_seconds": 300,
-            "estimated_apr_kind": "heuristic",
-            "estimated_apr_assumptions": {
-                "order_notional_usdc": "100",
-                "round_trip_fee_percent": "0.2",
-            },
-            "min_complete_cycles": 0,
-            "row_limit": 50,
-            "candidate_count": 1,
-            "eligible_count": 1,
-            "filtered_by_cycles_count": 0,
-            "truncated": false,
-            "rows": [scanner_row],
-        },
-    })]);
-    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
-
-    let response = app.clone().oneshot(get("/api/v1/scanner")).await.unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_security_headers(&response);
-    let scanner = response_json(response).await;
-    assert_eq!(scanner["projection_status"], "complete");
-    assert_eq!(scanner["latest"]["run_id"], "scan-web");
-    assert_eq!(scanner["latest"]["estimated_apr_kind"], "heuristic");
-    assert_eq!(
-        scanner["latest"]["estimated_apr_assumptions"]["round_trip_fee_percent"],
-        "0.2"
-    );
-    assert_eq!(
-        scanner["latest"]["rows"][0]["instrument"]["symbol"],
-        "BTC-USDC"
-    );
-    assert_eq!(scanner["latest"]["rows"][0]["estimated_apr"], "500");
-    assert_eq!(
-        scanner["latest"]["rows"][0]["estimated_apr_kind"],
-        "heuristic"
-    );
-    let encoded = serde_json::to_string(&scanner).unwrap();
-    for forbidden in ["orders", "intents", "api_key", "authorization", "secret"] {
-        assert!(
-            !encoded.contains(forbidden),
-            "{forbidden} leaked in {encoded}"
-        );
-    }
-
-    let write = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/scanner")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(write.status(), StatusCode::METHOD_NOT_ALLOWED);
-}
-
-#[tokio::test]
-async fn scanner_endpoint_preserves_legacy_v1_unknown_apr_semantics() {
-    let scanner_row = json!({
-        "rank": 1,
-        "activity": "active",
-        "priority": "benchmark",
-        "instrument": {
-            "exchange": "fixture",
-            "symbol": "BTC-USDC",
-            "market_type": "spot",
-        },
-        "started_at": "2026-07-25T00:00:00Z",
-        "last_observed_at": "2026-07-25T00:04:00Z",
-        "observation_count": 5,
-        "last_observation_sequence": 5,
-        "current_price": "100",
-        "lower_price": "95",
-        "upper_price": "105",
-        "pending_buy_price": "99",
-        "pending_sell_price": "101",
-        "grid_width_percent": "10",
-        "grid_interval_percent": "1",
-        "grid_count": 10,
-        "running_seconds": 300,
-        "buy_crosses": 2,
-        "sell_crosses": 2,
-        "total_crosses": 4,
-        "complete_cycles": 2,
-        "recent_five_minute_cycles": 2,
-        "cycles_per_hour": "10",
-        "estimated_apr": "500",
-        "volume_24h_usdc": "1000000",
-        "price_change_24h_percent": null,
-        "rating_grade": "s",
-        "rating_score": "95",
-    });
-    let bytes = jsonl(&[json!({
-        "timestamp": "2026-07-25T00:05:00Z",
-        "strategy": "virtual_grid_scanner",
-        "symbol": "control-plane",
-        "decision": "scanner_ranked",
-        "details": {
-            "schema_version": 1,
-            "run_id": "scan-web-v1",
-            "ranking_policy": "explicit_benchmark_then_apr_desc",
-            "apr_window_seconds": 300,
-            "min_complete_cycles": 0,
-            "row_limit": 50,
-            "candidate_count": 1,
-            "eligible_count": 1,
-            "filtered_by_cycles_count": 0,
-            "truncated": false,
-            "rows": [scanner_row],
-        },
-    })]);
-    let app = fixture_app(bytes, WebAccessPolicy::loopback_open());
-
-    let response = app.clone().oneshot(get("/api/v1/scanner")).await.unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let scanner = response_json(response).await;
-    assert_eq!(scanner["projection_status"], "complete");
-    assert_eq!(scanner["latest"]["run_id"], "scan-web-v1");
-    assert_eq!(scanner["latest"]["estimated_apr_kind"], "unknown");
-    assert_eq!(
-        scanner["latest"]["estimated_apr_assumptions"]["order_notional_usdc"],
-        "10"
-    );
-    assert_eq!(
-        scanner["latest"]["estimated_apr_assumptions"]["round_trip_fee_percent"],
-        "0.004"
-    );
-    assert_eq!(
-        scanner["latest"]["rows"][0]["estimated_apr_kind"],
-        "unknown"
-    );
 }
 
 #[tokio::test]
@@ -926,7 +685,7 @@ async fn optional_auth_never_prints_the_token_and_protects_every_route() {
     assert_eq!(health.status(), StatusCode::OK);
     let health = response_json(health).await;
     assert_eq!(health["status"], "ready");
-    assert_eq!(health["live_trading_enabled"], false);
+    assert_eq!(health["live_trading_enabled"], true);
 
     let unauthorized = app.clone().oneshot(get("/api/v1/system")).await.unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -1232,7 +991,7 @@ async fn readiness_probe_stays_unauthenticated_but_reads_no_operational_data() {
     assert_security_headers(&health);
     let body = response_json(health).await;
     assert_eq!(body["status"], "ready");
-    assert_eq!(body["live_trading_enabled"], false);
+    assert_eq!(body["live_trading_enabled"], true);
     assert_eq!(
         body.as_object().unwrap().len(),
         3,

@@ -2,16 +2,10 @@ import { describe, expect, it } from "vitest";
 import type {
   ArbitrageMonitorReadModel,
   OperatorReadModel,
-  PriceAlertReadModel,
   ReadOnlyTaskReadModel,
   ReadOnlyTaskView,
 } from "./api-types";
-import {
-  alertBanners,
-  executionBanners,
-  monitorBanner,
-  taskBanners,
-} from "./banners";
+import { executionBanners, monitorBanner, taskBanners } from "./banners";
 
 function operator(overrides: Partial<OperatorReadModel> = {}): OperatorReadModel {
   return {
@@ -24,22 +18,6 @@ function operator(overrides: Partial<OperatorReadModel> = {}): OperatorReadModel
     batches_truncated: false,
     warnings: [],
     warnings_truncated: false,
-    ...overrides,
-  };
-}
-
-function alertModel(
-  overrides: Partial<PriceAlertReadModel> = {},
-): PriceAlertReadModel {
-  return {
-    schema_version: 1,
-    journal_id: "journal-a",
-    journal_head_sequence: 10,
-    boundary: { kind: "snapshot_end" },
-    projection_status: "complete",
-    occurrences: [],
-    occurrences_truncated: false,
-    invalid_event_count: 0,
     ...overrides,
   };
 }
@@ -79,76 +57,6 @@ describe("executionBanners(降级横幅出现条件)", () => {
   });
 });
 
-describe("alertBanners(窗口化 / 降级 / 未决)", () => {
-  it("可信 windowed:窗口化横幅(可信 / 已截断),而不是降级", () => {
-    const banners = alertBanners(
-      alertModel({ projection_status: "windowed", occurrences_truncated: true }),
-    );
-    expect(banners.map((banner) => banner.key)).toEqual(["alert-windowed"]);
-    expect(banners.at(0)?.tag).toBe("可信 / 已截断");
-  });
-
-  it("降级投影:danger 横幅,声明停止展示", () => {
-    const banners = alertBanners(alertModel({ projection_status: "degraded" }));
-    expect(banners.map((banner) => banner.key)).toEqual(["alert-degraded"]);
-    expect(banners.at(0)?.tone).toBe("danger");
-    expect(banners.at(0)?.tag).toBe("停止展示");
-  });
-
-  it("windowed 但与截断标志矛盾:按降级处理(契约不一致)", () => {
-    const banners = alertBanners(
-      alertModel({ projection_status: "windowed", occurrences_truncated: false }),
-    );
-    expect(banners.map((banner) => banner.key)).toEqual(["alert-degraded"]);
-  });
-
-  it("刷新失败且旧快照可信:保留旧快照横幅;不可信时不出现", () => {
-    expect(
-      alertBanners(alertModel(), { refreshFailed: true }).map((banner) => banner.key),
-    ).toContain("alert-refresh-failed");
-    expect(
-      alertBanners(alertModel({ projection_status: "degraded" }), {
-        refreshFailed: true,
-      }).map((banner) => banner.key),
-    ).not.toContain("alert-refresh-failed");
-  });
-
-  it("存在 pending 投递:未决通知横幅(历史事实 / 不保证重放)", () => {
-    const banners = alertBanners(
-      alertModel({
-        occurrences: [
-          {
-            source_sequence: 1,
-            event_id: "event-1",
-            alert_sequence: 1,
-            recorded_at: "2026-07-26T00:00:00Z",
-            exchange: "binance",
-            symbol: "BTCUSDT",
-            market_type: "spot",
-            kind: "upper_limit",
-            price: "50000",
-            change_percent: null,
-            acknowledged_at: null,
-            deliveries: [
-              {
-                adapter_id: "local",
-                status: "pending",
-                failure: null,
-                updated_at: "2026-07-26T00:00:00Z",
-              },
-            ],
-          },
-        ],
-      }),
-    );
-    const pending = banners.find(
-      (banner) => banner.key === "alert-pending-deliveries",
-    );
-    expect(pending?.tag).toBe("历史事实 / 不保证重放");
-    expect(pending?.message).toContain("1 条");
-  });
-});
-
 describe("monitorBanner", () => {
   const monitor = (
     status: ArbitrageMonitorReadModel["projection_status"],
@@ -172,7 +80,7 @@ describe("monitorBanner", () => {
 describe("taskBanners", () => {
   const task = (recovery: ReadOnlyTaskView["recovery"]): ReadOnlyTaskView => ({
     task_id: "task-1",
-    kind: "price_alert",
+    kind: "arbitrage_monitor",
     first_sequence: 1,
     last_sequence: 5,
     registered_at: "2026-07-26T00:00:00Z",

@@ -11,8 +11,6 @@
 
 Arbitrage paper one-shot 会把 `exchanges`/`symbols` 作为提交白名单，并把 `health_check.data_timeout` 作为每个 instrument 的市场数据新鲜度上限。`paper-monitor-eth.yaml` 只包含这些已建模 section，可作为 strict companion；包含 `spread_history`、`debug_cli` 等未消费 section 的历史 monitor 文件继续分类为 `legacy-parseable`，不能进入 one-shot 提交边界。
 
-`monitor_lighter_eth_spot.yaml` 与 `monitor_lighter_gold.yaml` 当前没有非空 `symbols`，会被明确分类为 `unsupported`；这不是解析器误报。补齐真实 universe 前不得用于执行。
-
 ```powershell
 cargo run -- config-check config/arbitrage/paper-monitor-eth.yaml --json
 ```

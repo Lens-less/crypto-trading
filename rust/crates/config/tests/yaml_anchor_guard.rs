@@ -1,8 +1,7 @@
 use crypto_trading_config::{
     ConfigError, ConfigResult, EnvProvider, load_arbitrage_config_from_str,
     load_exchange_auth_from_str, load_exchange_auth_from_str_with_env, load_grid_config_from_str,
-    load_monitor_config_from_str, load_price_alert_config_from_str,
-    load_symbol_conversions_from_str, load_volume_maker_config_from_str,
+    load_monitor_config_from_str, load_symbol_conversions_from_str,
     reject_yaml_anchors_and_aliases,
 };
 
@@ -34,9 +33,7 @@ fn every_public_yaml_from_str_loader_rejects_anchors_before_deserialization() {
     ));
     assert_anchor_rejected(load_grid_config_from_str(yaml));
     assert_anchor_rejected(load_monitor_config_from_str(yaml));
-    assert_anchor_rejected(load_price_alert_config_from_str(yaml));
     assert_anchor_rejected(load_symbol_conversions_from_str(yaml));
-    assert_anchor_rejected(load_volume_maker_config_from_str(yaml));
 }
 
 #[test]

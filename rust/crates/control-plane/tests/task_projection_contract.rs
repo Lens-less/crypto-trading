@@ -96,10 +96,6 @@ fn malformed_task_fact_degrades_only_the_task_projection() {
         snapshot.monitor.projection_status,
         ProjectionStatus::Complete
     );
-    assert_eq!(
-        snapshot.alerts.projection_status,
-        ProjectionStatus::Complete
-    );
 }
 
 #[test]

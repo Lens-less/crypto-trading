@@ -33,22 +33,17 @@ pub use submit::{
 
 pub use crypto_trading_runtime::{
     ACCOUNT_RISK_SCHEMA_VERSION, AccountRiskOpenPositionView, AccountRiskReadModel,
-    AccountRiskStateView, AlertDeliveryFailure, AlertDeliveryStatus, AlertDeliveryView,
-    AlertOccurrenceKind, AlertOccurrenceView, ArbitrageMonitorProjection,
-    ArbitrageMonitorReadModel, ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState,
-    MonitorContinuityState, MonitorFreshnessState, MonitorLegView, MonitorProjectionState,
-    OperatorReadModel, PAPER_ACCOUNT_SCHEMA_VERSION, PRICE_ALERT_READ_MODEL_SCHEMA_VERSION,
-    PaperAccountReadModel, PaperAccountSnapshot, PriceAlertReadModel, ProjectionStatus,
+    AccountRiskStateView, ArbitrageMonitorProjection, ArbitrageMonitorReadModel,
+    ArbitrageMonitorView, CapabilityManifest, ExecutionBatchState, MonitorContinuityState,
+    MonitorFreshnessState, MonitorLegView, MonitorProjectionState, OperatorReadModel,
+    PAPER_ACCOUNT_SCHEMA_VERSION, PaperAccountReadModel, PaperAccountSnapshot, ProjectionStatus,
     READ_ONLY_TASK_READ_MODEL_SCHEMA_VERSION, ReadOnlyTaskExit, ReadOnlyTaskFailure,
     ReadOnlyTaskKind, ReadOnlyTaskPhase, ReadOnlyTaskReadModel, ReadOnlyTaskRecovery,
     ReadOnlyTaskSourceExit, ReadOnlyTaskSourceHealth, ReadOnlyTaskSourcePhase,
     ReadOnlyTaskSourceView, ReadOnlyTaskView, RecoveryDirective, ReleaseStage,
-    ScannerInstrumentView, ScannerPriorityView, ScannerRatingGradeView,
-    VIRTUAL_GRID_SCANNER_READ_MODEL_SCHEMA_VERSION, VirtualGridScanRowView, VirtualGridScanView,
-    VirtualGridScannerReadModel,
 };
 
-pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+pub const CONTROL_PLANE_SNAPSHOT_SCHEMA_VERSION: u16 = 8;
 pub const CONTROL_PLANE_EVENTS_SCHEMA_VERSION: u16 = 1;
 
 /// Stable transport-independent classification for safe public error mapping.
@@ -335,9 +330,7 @@ fn control_plane_snapshot(
         capabilities,
         operator: projection.operator,
         monitor: projection.monitor,
-        alerts: projection.alerts,
         tasks: projection.tasks,
-        scanner: projection.scanner,
         paper_accounts: projection.paper_accounts,
         account_risk: projection.account_risk,
     }
@@ -383,9 +376,7 @@ pub struct ControlPlaneSnapshot {
     pub capabilities: CapabilityManifest,
     pub operator: OperatorReadModel,
     pub monitor: ArbitrageMonitorReadModel,
-    pub alerts: PriceAlertReadModel,
     pub tasks: ReadOnlyTaskReadModel,
-    pub scanner: VirtualGridScannerReadModel,
     pub paper_accounts: PaperAccountReadModel,
     pub account_risk: AccountRiskReadModel,
 }

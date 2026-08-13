@@ -87,13 +87,19 @@ fn replay_rejects_unknown_fields_without_touching_history() {
 
 #[test]
 fn replay_rejects_multi_exchange_configs_instead_of_silently_truncating_scope() {
+    let config = temp_path("monitor-replay-multi-exchange", "yaml");
     let history = temp_path("monitor-replay-multi-exchange-history", "jsonl");
+    std::fs::write(
+        &config,
+        "exchanges: [paper-left, paper-right, paper-third]\nsymbols: [BTC-USDC-PERP]\nthresholds:\n  min_spread_pct: 0.05\nhealth_check:\n  data_timeout: 30\n  max_pair_skew_ms: 1000\n",
+    )
+    .unwrap();
     let output = Command::new(binary())
         .current_dir(repo_root())
         .args([
             "monitor",
             "--config",
-            "config/arbitrage/monitor_lighter_multi_btc.yaml",
+            config.to_str().unwrap(),
             "--replay",
             "fixtures/m3-monitor-replay.jsonl",
             "--history-path",
@@ -109,6 +115,8 @@ fn replay_rejects_multi_exchange_configs_instead_of_silently_truncating_scope() 
         "{stderr}"
     );
     assert!(!history.exists());
+
+    std::fs::remove_file(config).unwrap();
 }
 
 #[test]

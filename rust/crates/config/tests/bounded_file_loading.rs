@@ -8,9 +8,8 @@ use crypto_trading_config::{
     ConfigError, ConfigResult, EnvProvider, load_arbitrage_config, load_arbitrage_config_from_str,
     load_exchange_auth, load_exchange_auth_from_str, load_exchange_auth_from_str_with_env,
     load_exchange_auth_with_env, load_grid_config, load_grid_config_from_str, load_monitor_config,
-    load_monitor_config_from_str, load_price_alert_config, load_price_alert_config_from_str,
-    load_symbol_conversions, load_symbol_conversions_from_str, load_volume_maker_config,
-    load_volume_maker_config_from_str, read_bounded_config,
+    load_monitor_config_from_str, load_symbol_conversions, load_symbol_conversions_from_str,
+    read_bounded_config,
 };
 
 const MAX_CONFIG_FILE_BYTES: usize = 1_048_576;
@@ -36,10 +35,8 @@ fn every_public_path_loader_rejects_files_over_one_mebibyte() {
         load_exchange_auth(&path, "paper").unwrap_err(),
         load_grid_config(&path).unwrap_err(),
         load_monitor_config(&path).unwrap_err(),
-        load_price_alert_config(&path).unwrap_err(),
         read_bounded_config(&path).unwrap_err(),
         load_symbol_conversions(&path).unwrap_err(),
-        load_volume_maker_config(&path).unwrap_err(),
     ];
 
     for error in errors {
@@ -101,7 +98,7 @@ fn path_with_contents(path: &Path, contents: &str) -> PathBuf {
 fn raw_bounded_reader_accepts_the_exact_byte_limit() {
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join("config/grid/lighter-long-perp-btc.yaml");
+        .join("config/grid/hyperliquid-long-perp-btc.yaml");
     let exact = pad_yaml_to_size(
         fs::read_to_string(&fixture_path).unwrap(),
         MAX_CONFIG_FILE_BYTES,
@@ -125,45 +122,35 @@ fn every_public_from_str_loader_matches_path_loader_size_boundaries() {
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "auth-from-str-boundary",
-        "config/legacy/exchanges/lighter_config.yaml",
-        |path| load_exchange_auth(path, "lighter").map(|_| ()),
-        |yaml| load_exchange_auth_from_str("lighter", yaml).map(|_| ()),
+        "config/exchanges/hyperliquid_config.yaml",
+        |path| load_exchange_auth(path, "hyperliquid").map(|_| ()),
+        |yaml| load_exchange_auth_from_str("hyperliquid", yaml).map(|_| ()),
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "auth-from-str-with-env-boundary",
-        "config/legacy/exchanges/lighter_config.yaml",
-        |path| load_exchange_auth_with_env(path, "lighter", &EmptyEnvironment).map(|_| ()),
-        |yaml| load_exchange_auth_from_str_with_env("lighter", yaml, &EmptyEnvironment).map(|_| ()),
+        "config/exchanges/hyperliquid_config.yaml",
+        |path| load_exchange_auth_with_env(path, "hyperliquid", &EmptyEnvironment).map(|_| ()),
+        |yaml| {
+            load_exchange_auth_from_str_with_env("hyperliquid", yaml, &EmptyEnvironment).map(|_| ())
+        },
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "grid-from-str-boundary",
-        "config/grid/lighter-long-perp-btc.yaml",
+        "config/grid/hyperliquid-long-perp-btc.yaml",
         |path| load_grid_config(path).map(|_| ()),
         |yaml| load_grid_config_from_str(yaml).map(|_| ()),
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "monitor-from-str-boundary",
-        "config/arbitrage/monitor.yaml",
+        "config/arbitrage/monitor_v2.yaml",
         |path| load_monitor_config(path).map(|_| ()),
         |yaml| load_monitor_config_from_str(yaml).map(|_| ()),
-    );
-    assert_path_and_from_str_loader_boundary_behavior(
-        "price-alert-from-str-boundary",
-        "config/price_alert/binance_alert.yaml",
-        |path| load_price_alert_config(path).map(|_| ()),
-        |yaml| load_price_alert_config_from_str(yaml).map(|_| ()),
     );
     assert_path_and_from_str_loader_boundary_behavior(
         "symbol-conversion-from-str-boundary",
         "config/symbol_conversion.yaml",
         |path| load_symbol_conversions(path).map(|_| ()),
         |yaml| load_symbol_conversions_from_str(yaml).map(|_| ()),
-    );
-    assert_path_and_from_str_loader_boundary_behavior(
-        "volume-maker-from-str-boundary",
-        "config/volume_maker/lighter_volume_maker.yaml",
-        |path| load_volume_maker_config(path).map(|_| ()),
-        |yaml| load_volume_maker_config_from_str(yaml).map(|_| ()),
     );
 }
 
@@ -181,10 +168,8 @@ fn every_public_path_loader_rejects_yaml_anchors_before_schema_parsing() {
         load_exchange_auth(&path, "paper").unwrap_err(),
         load_grid_config(&path).unwrap_err(),
         load_monitor_config(&path).unwrap_err(),
-        load_price_alert_config(&path).unwrap_err(),
         read_bounded_config(&path).unwrap_err(),
         load_symbol_conversions(&path).unwrap_err(),
-        load_volume_maker_config(&path).unwrap_err(),
     ];
 
     for error in errors {
@@ -232,37 +217,27 @@ fn every_public_path_loader_allows_literal_tokens_inside_block_scalars() {
     );
     assert_path_loader_allows_block_scalar(
         "auth-block",
-        "config/legacy/exchanges/lighter_config.yaml",
-        |path| load_exchange_auth_with_env(path, "lighter", &EmptyEnvironment),
+        "config/exchanges/hyperliquid_config.yaml",
+        |path| load_exchange_auth_with_env(path, "hyperliquid", &EmptyEnvironment),
     );
     assert_path_loader_allows_block_scalar(
         "grid-block",
-        "config/grid/lighter-long-perp-btc.yaml",
+        "config/grid/hyperliquid-long-perp-btc.yaml",
         |path| load_grid_config(path),
     );
     assert_path_loader_allows_block_scalar(
         "monitor-block",
-        "config/arbitrage/monitor.yaml",
+        "config/arbitrage/monitor_v2.yaml",
         |path| load_monitor_config(path),
     );
     assert_path_loader_allows_block_scalar(
-        "price-alert-block",
-        "config/price_alert/binance_alert.yaml",
-        |path| load_price_alert_config(path),
-    );
-    assert_path_loader_allows_block_scalar(
         "raw-reader-block",
-        "config/grid/lighter-long-perp-btc.yaml",
+        "config/grid/hyperliquid-long-perp-btc.yaml",
         |path| read_bounded_config(path),
     );
     assert_path_loader_allows_block_scalar(
         "symbol-conversion-block",
         "config/symbol_conversion.yaml",
         |path| load_symbol_conversions(path),
-    );
-    assert_path_loader_allows_block_scalar(
-        "volume-maker-block",
-        "config/volume_maker/lighter_volume_maker.yaml",
-        |path| load_volume_maker_config(path),
     );
 }

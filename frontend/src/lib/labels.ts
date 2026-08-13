@@ -34,20 +34,13 @@ const TOKEN_LABELS = new Map<string, string>([
   ["resolved_batch_evicted", "已完结批次被淘汰"],
   ["terminal_conflict", "终态冲突"],
   ["timestamp_regressed", "时间戳回退"],
-  // 预警
+  // 通用状态(订单 / 数据源 / 回执)
   ["pending", "最后记录:未决"],
   ["dropped", "已丢弃"],
   ["succeeded", "已送达"],
   ["timed_out", "已超时"],
-  ["volatility_up", "波动上破"],
-  ["volatility_down", "波动下破"],
-  ["upper_limit", "上沿提醒"],
-  ["lower_limit", "下沿提醒"],
   ["backpressure", "排队拥塞"],
-  ["adapter_closed", "适配器已关闭"],
-  ["device_unavailable", "设备不可用"],
   ["rejected", "已拒绝"],
-  ["worker_failed", "通知 worker 异常终止"],
   ["timeout", "超时"],
   // 市场与监控
   ["spot", "现货"],
@@ -98,9 +91,6 @@ const TOKEN_LABELS = new Map<string, string>([
   ["arbitrage_monitor", "套利监控"],
   ["arbitrage_paper", "Paper 套利"],
   ["grid_paper", "Paper 网格"],
-  ["price_alert", "价格预警"],
-  ["scanner", "扫描器"],
-  ["volume_maker", "Paper 成交量仿真"],
   // 能力等级
   ["available", "可用"],
   ["read-only", "只读"],
@@ -113,10 +103,6 @@ const TOKEN_LABELS = new Map<string, string>([
   ["request-only", "仅请求"],
   ["config-only", "仅配置"],
   ["not-applicable", "不适用"],
-  // scanner 排行
-  ["benchmark", "基准"],
-  ["standard", "标准"],
-  ["explicit_benchmark_then_apr_desc", "显式 benchmark 优先,按 APR 降序"],
   // settings 投影
   ["stdout_stderr", "标准输出 / 标准错误"],
   ["journal_projection", "journal 投影"],
@@ -161,7 +147,7 @@ export function credentialLabel(token: string | null | undefined): string {
 }
 
 /**
- * Paper 预留阶段专用文案:与预警投递的 "pending"(最后记录:未决)
+ * Paper 预留阶段专用文案:与通用状态表的 "pending"(最后记录:未决)
  * 语义分离,预留阶段是账户敞口状态而非通知状态。
  */
 const RESERVATION_PHASE_LABELS = new Map<string, string>([

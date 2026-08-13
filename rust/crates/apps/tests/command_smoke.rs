@@ -34,7 +34,7 @@ fn write_temp(label: &str, extension: &str, body: &str) -> PathBuf {
 fn config_check_validates_an_existing_grid_file() {
     let output = Command::new(binary())
         .current_dir(repo_root())
-        .args(["config-check", "config/grid/lighter-long-perp-btc.yaml"])
+        .args(["config-check", "config/grid/hyperliquid-long-perp-btc.yaml"])
         .output()
         .unwrap();
 
@@ -54,35 +54,21 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
 
     assert!(output.status.success(), "{output:?}");
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["schema_version"], 3);
-    assert_eq!(payload["release_stage"], "paper-only");
-    assert_eq!(payload["live_trading_enabled"], false);
+    assert_eq!(payload["schema_version"], 4);
+    assert_eq!(payload["release_stage"], "live-manual");
+    assert_eq!(payload["live_trading_enabled"], true);
     let adapters = payload["adapters"].as_array().unwrap();
-    assert_eq!(adapters.len(), 4);
+    assert_eq!(adapters.len(), 3);
     assert!(adapters.iter().any(|entry| {
         entry["id"] == "binance"
             && entry["public_data"]["level"] == "implemented"
             && entry["testnet_protocol"]["level"] == "implemented"
             && entry["reconcile"]["level"] == "implemented"
-            && entry["live"]["level"] == "unavailable"
-    }));
-    assert!(adapters.iter().any(|entry| {
-        entry["id"] == "unsupported-venues"
-            && entry["public_data"]["level"] == "unavailable"
-            && entry["authenticated"]["level"] == "unavailable"
-            && entry["public_data"]["blockers"]
-                .as_array()
-                .is_some_and(|blockers| {
-                    blockers.iter().any(|blocker| {
-                        blocker.as_str().is_some_and(|text| {
-                            text.contains("Backpack")
-                                && text.contains("Lighter")
-                                && text.contains("Variational")
-                        })
-                    })
-                })
+            && entry["live"]["level"] == "implemented"
     }));
     let capabilities = payload["capabilities"].as_array().unwrap();
+    // Autonomous strategy live execution stays closed even though the
+    // operator-supervised one-shot lifecycle is available.
     assert!(capabilities.iter().any(|entry| {
         entry["id"] == "runtime.live"
             && entry["level"] == "unavailable"
@@ -90,6 +76,16 @@ fn capabilities_json_reports_the_fail_closed_runtime_contract() {
             && entry["scope"]["environments"]
                 .as_array()
                 .is_some_and(|environments| environments.iter().any(|mode| mode == "mainnet"))
+    }));
+    assert!(capabilities.iter().any(|entry| {
+        entry["id"] == "runtime.live-lifecycle"
+            && entry["level"] == "available"
+            && entry["scope"]["access"] == "mainnet-trading"
+    }));
+    assert!(capabilities.iter().any(|entry| {
+        entry["id"] == "runtime.live-reconcile"
+            && entry["level"] == "read-only"
+            && entry["scope"]["access"] == "mainnet-read-only"
     }));
     let research_backtest = capabilities
         .iter()
@@ -131,8 +127,8 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains("capabilities schema=3")
-            && stdout.contains("release=paper-only live-trading=false"),
+        stdout.contains("capabilities schema=4")
+            && stdout.contains("release=live-manual live-trading=true"),
         "{stdout}"
     );
     assert!(
@@ -140,13 +136,7 @@ fn capabilities_text_reports_both_tables_and_the_closed_live_boundary() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("binance\timplemented\timplemented\timplemented\timplemented\tunavailable"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains(
-            "unsupported-venues\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable"
-        ),
+        stdout.contains("binance\timplemented\timplemented\timplemented\timplemented\timplemented"),
         "{stdout}"
     );
     assert!(
@@ -190,13 +180,6 @@ fn config_check_returns_nonzero_for_a_missing_file() {
 
 #[test]
 fn unfinished_commands_fail_closed_instead_of_reporting_success() {
-    // `price-alert`, `scanner`, and `volume-maker` are no longer in this
-    // list: their default validate modes now succeed on a clean config, and
-    // alert_serve_cli_contract.rs, scanner_cli_contract.rs, plus
-    // paper_volume_maker_task_contract.rs cover their serve/status/stop task
-    // hosts and the fail-closed no-replay paths. The checked-in volume-maker
-    // config still fails closed on its own `emergency_stop: true`, which
-    // volume_maker_cli_enforces_emergency_stop below pins explicitly.
     let cases = [vec!["monitor"], vec!["arbitrage"]];
 
     for args in cases {
@@ -214,67 +197,6 @@ fn unfinished_commands_fail_closed_instead_of_reporting_success() {
             "{args:?}: {stderr}"
         );
     }
-}
-
-#[test]
-fn volume_maker_cli_enforces_emergency_stop_before_unavailable_runtime() {
-    let config = write_temp(
-        "volume-maker-emergency-stop",
-        "yaml",
-        r"
-volume_maker:
-  exchange: paper
-  symbol: BTC-USDC-PERP
-  market_type: perpetual
-  order_mode: limit
-  order_size: 0.5
-  emergency_stop: true
-",
-    );
-
-    let output = Command::new(binary())
-        .current_dir(repo_root())
-        .arg("volume-maker")
-        .arg(&config)
-        .output()
-        .unwrap();
-
-    std::fs::remove_file(config).unwrap();
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("emergency stop"), "{stderr}");
-    assert!(!stderr.contains("runtime is unavailable"), "{stderr}");
-}
-
-#[test]
-fn scanner_checks_an_explicit_config_path_before_failing_closed() {
-    let output = Command::new(binary())
-        .current_dir(repo_root())
-        .args(["scanner", "--config", "config/does-not-exist.yaml"])
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("does-not-exist"), "{stderr}");
-}
-
-#[test]
-fn scanner_rejects_an_arbitrary_existing_file_through_schema_validation() {
-    let config = write_temp("scanner-arbitrary-config", "txt", "not scanner yaml\n");
-
-    let output = Command::new(binary())
-        .current_dir(repo_root())
-        .arg("scanner")
-        .arg("--config")
-        .arg(&config)
-        .output()
-        .unwrap();
-
-    std::fs::remove_file(config).unwrap();
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("failed to load scanner config"), "{stderr}");
 }
 
 #[test]
@@ -1529,15 +1451,12 @@ fn config_check_recognizes_every_supported_schema() {
         .current_dir(repo_root())
         .args([
             "config-check",
-            "config/grid/lighter-long-perp-btc.yaml",
+            "config/grid/hyperliquid-long-perp-btc.yaml",
             "config/arbitrage/arbitrage_segmented.yaml",
             "config/arbitrage/monitor_v2.yaml",
-            "config/volume_maker/backpack_btc_volume_maker.yaml",
-            "config/price_alert/binance_alert.yaml",
-            "config/scanner/binance_scanner.yaml",
             "config/paper/account-risk.example.yaml",
             "config/symbol_conversion.yaml",
-            "config/legacy/exchanges/paradex_config.example.yaml",
+            "config/exchanges/binance_config.yaml",
             "--json",
         ])
         .output()
@@ -1549,9 +1468,6 @@ fn config_check_recognizes_every_supported_schema() {
         "grid",
         "arbitrage",
         "monitor",
-        "volume-maker",
-        "price-alert",
-        "scanner",
         "account-risk",
         "symbol-conversion",
         "exchange-auth",
@@ -1601,7 +1517,7 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
     assert!(output.status.success(), "{output:?}");
     let summaries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let summaries = summaries.as_array().unwrap();
-    assert_eq!(summaries.len(), 63, "{summaries:#?}");
+    assert_eq!(summaries.len(), 21, "{summaries:#?}");
     for summary in summaries {
         assert!(summary["parseable"].is_boolean(), "{summary}");
         assert!(summary["executable"].is_boolean(), "{summary}");
@@ -1651,17 +1567,10 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
         "unavailable",
     );
     assert_status(
-        entry("config/grid/lighter-long-perp-btc.yaml"),
+        entry("config/grid/hyperliquid-long-perp-btc.yaml"),
         true,
         false,
         "partial",
-        "unavailable",
-    );
-    assert_status(
-        entry("config/scanner/binance_scanner.yaml"),
-        true,
-        false,
-        "parse-only",
         "unavailable",
     );
     assert_status(
@@ -1672,7 +1581,7 @@ fn config_check_directory_emits_a_complete_migration_ledger() {
         "paper-companion",
     );
     assert_status(
-        entry("config/legacy/exchanges/paradex_config.example.yaml"),
+        entry("config/exchanges/binance_config.yaml"),
         true,
         false,
         "parse-only",
@@ -1779,35 +1688,6 @@ grid_system:
 #[test]
 fn config_check_accepts_every_checked_in_exchange_yaml() {
     let exchange_dir = repo_root().join("config/exchanges");
-    let mut paths = std::fs::read_dir(&exchange_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "yaml")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    assert!(!paths.is_empty());
-
-    let output = Command::new(binary())
-        .current_dir(repo_root())
-        .arg("config-check")
-        .args(&paths)
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(
-        stdout.matches("legacy-parseable: exchange-auth").count(),
-        paths.len()
-    );
-}
-
-#[test]
-fn config_check_accepts_legacy_exchange_auth_profiles_explicitly() {
-    let exchange_dir = repo_root().join("config/legacy/exchanges");
     let mut paths = std::fs::read_dir(&exchange_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

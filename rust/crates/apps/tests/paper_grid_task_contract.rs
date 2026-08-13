@@ -1067,6 +1067,19 @@ async fn kill_switch_covers_an_owned_short_at_the_cached_best_ask() {
     .unwrap();
 
     wait_until(|| executor.intents.lock().unwrap().len() == 1).await;
+    // The entry fill must settle into the account and the risk clock before
+    // the kill switch engages; otherwise the drill races the in-flight
+    // operation and lands on the fail-closed uncertain-pending path instead
+    // of the clean cached-quote cover exercised here.
+    loop {
+        let snapshot = account.snapshot().await.unwrap();
+        let state = risk.state().await.unwrap();
+        if snapshot.open_lots.len() == 1 && state.open_positions.len() == 1 {
+            assert_eq!(snapshot.open_lots[0].side, Side::Sell);
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
     risk.engage_kill_switch("operator drill", base_time() + Duration::seconds(75))
         .await
         .unwrap();

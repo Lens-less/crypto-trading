@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CAPABILITY_SCHEMA_VERSION: u16 = 3;
+pub const CAPABILITY_SCHEMA_VERSION: u16 = 4;
 const MAX_CAPABILITIES: usize = 64;
 const MAX_ADAPTERS: usize = 16;
 const MAX_CAPABILITY_TEXT_BYTES: usize = 512;
@@ -13,12 +13,17 @@ const MAX_CAPABILITY_TEXT_BYTES: usize = 512;
 #[serde(rename_all = "kebab-case")]
 pub enum ReleaseStage {
     PaperOnly,
+    /// Operator-supervised manual live stage: the only mainnet order
+    /// authority is an explicitly acknowledged one-shot lifecycle command;
+    /// autonomous strategy live execution stays closed.
+    LiveManual,
 }
 
 impl fmt::Display for ReleaseStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::PaperOnly => "paper-only",
+            Self::LiveManual => "live-manual",
         })
     }
 }
@@ -107,6 +112,7 @@ pub enum CapabilityAccess {
     PaperTrading,
     TestnetReadOnly,
     TestnetTrading,
+    MainnetReadOnly,
     MainnetTrading,
 }
 
@@ -118,6 +124,7 @@ impl fmt::Display for CapabilityAccess {
             Self::PaperTrading => "paper-trading",
             Self::TestnetReadOnly => "testnet-read-only",
             Self::TestnetTrading => "testnet-trading",
+            Self::MainnetReadOnly => "mainnet-read-only",
             Self::MainnetTrading => "mainnet-trading",
         })
     }
@@ -273,7 +280,11 @@ impl CapabilityManifest {
             return Err(CapabilityError::UnsupportedSchema(self.schema_version));
         }
         validate_text("product_version", &self.product_version)?;
-        if self.release_stage == ReleaseStage::PaperOnly && self.live_trading_enabled {
+        let stage_coherent = match self.release_stage {
+            ReleaseStage::PaperOnly => !self.live_trading_enabled,
+            ReleaseStage::LiveManual => self.live_trading_enabled,
+        };
+        if !stage_coherent {
             return Err(CapabilityError::InconsistentReleaseStage);
         }
         if self.capabilities.is_empty() || self.capabilities.len() > MAX_CAPABILITIES {
@@ -282,6 +293,7 @@ impl CapabilityManifest {
         validate_adapters(self)?;
 
         let mut previous_id: Option<&str> = None;
+        let mut mainnet_trading_available = false;
         for capability in &self.capabilities {
             validate_capability_id(&capability.id)?;
             if previous_id.is_some_and(|previous| previous >= capability.id.as_str()) {
@@ -303,14 +315,26 @@ impl CapabilityManifest {
                 return Err(CapabilityError::MissingBlocker(capability.id.clone()));
             }
             validate_environments(capability)?;
-            if !self.live_trading_enabled
-                && capability.scope.access == CapabilityAccess::MainnetTrading
+            if capability.scope.access == CapabilityAccess::MainnetTrading
                 && capability.level != CapabilityLevel::Unavailable
             {
-                return Err(CapabilityError::LiveAuthorityAdvertised(
-                    capability.id.clone(),
-                ));
+                if !self.live_trading_enabled {
+                    return Err(CapabilityError::LiveAuthorityAdvertised(
+                        capability.id.clone(),
+                    ));
+                }
+                // Any live-capable capability must document its operator
+                // gates: what a human must do and what stays unavailable.
+                if capability.blockers.is_empty() {
+                    return Err(CapabilityError::MainnetCapabilityMissingOperatorGates(
+                        capability.id.clone(),
+                    ));
+                }
+                mainnet_trading_available = true;
             }
+        }
+        if self.live_trading_enabled && !mainnet_trading_available {
+            return Err(CapabilityError::LiveEnabledWithoutMainnetCapability);
         }
         validate_adapter_capability_alignment(self)
     }
@@ -336,8 +360,8 @@ pub fn current_capability_manifest() -> CapabilityManifest {
     let manifest = CapabilityManifest {
         schema_version: CAPABILITY_SCHEMA_VERSION,
         product_version: env!("CARGO_PKG_VERSION").to_owned(),
-        release_stage: ReleaseStage::PaperOnly,
-        live_trading_enabled: false,
+        release_stage: ReleaseStage::LiveManual,
+        live_trading_enabled: true,
         adapters,
         capabilities,
     };
@@ -346,12 +370,7 @@ pub fn current_capability_manifest() -> CapabilityManifest {
 }
 
 fn adapter_support_matrix() -> Vec<AdapterSupport> {
-    vec![
-        binance_adapter(),
-        hyperliquid_adapter(),
-        paper_adapter(),
-        unsupported_venues_adapter(),
-    ]
+    vec![binance_adapter(), hyperliquid_adapter(), paper_adapter()]
 }
 
 fn binance_adapter() -> AdapterSupport {
@@ -400,7 +419,23 @@ fn binance_adapter() -> AdapterSupport {
             &credentialed_evidence_blocker,
             &execution_evidence,
         ),
-        live: external_live_unavailable(),
+        live: adapter_facet(
+            AdapterSupportLevel::Implemented,
+            &[
+                "Mainnet authority is exactly one operator-acknowledged one-shot Spot LIMIT lifecycle (submit, query, cancel) with a required notional cap plus read-only signed reconcile; no autonomous strategy, no market orders, no margin, no USD-M product, and no multi-symbol owner loop.",
+                "A credentialed supervised mainnet lifecycle run and its external evidence gates remain with the operator and are not checked in.",
+            ],
+            &[
+                "rust/crates/exchange/src/endpoint.rs",
+                "rust/crates/exchange/src/binance_mainnet_exchange.rs",
+                "rust/crates/exchange/tests/mainnet_endpoint_contract.rs",
+                "rust/crates/exchange/tests/binance_mainnet_exchange_contract.rs",
+                "rust/crates/apps/src/live_lifecycle.rs",
+                "rust/crates/apps/src/command.rs",
+                "rust/crates/apps/tests/live_lifecycle_cli_contract.rs",
+                "rust/crates/apps/tests/live_reconcile_cli_contract.rs",
+            ],
+        ),
     }
 }
 
@@ -486,38 +521,6 @@ fn paper_adapter() -> AdapterSupport {
     }
 }
 
-fn unsupported_venues_adapter() -> AdapterSupport {
-    let evidence = [
-        "rust/crates/config/src/auth.rs",
-        "rust/crates/config/tests/config_compatibility.rs",
-        "rust/config/legacy/exchanges/backpack_config.yaml",
-        "rust/config/legacy/exchanges/edgex_config.yaml",
-        "rust/config/legacy/exchanges/grvt_config.yaml",
-        "rust/config/legacy/exchanges/lighter_config.yaml",
-        "rust/config/legacy/exchanges/paradex_config.yaml",
-        "docs/internal/research/upstream-repository-alignment.md",
-        "docs/internal/plans/2026-07-24-project-alignment-web-goal-plan.md",
-    ];
-    let unsupported = || {
-        adapter_facet(
-            AdapterSupportLevel::Unavailable,
-            &[
-                "Backpack, EdgeX, GRVT, Lighter, and Paradex still appear as compatibility-only venue configs, while OKX and Variational remain frozen legacy references; none of these venues has an operator-supported Rust market-data adapter, testnet protocol, authenticated private API, or reconciliation path.",
-            ],
-            &evidence,
-        )
-    };
-    AdapterSupport {
-        id: "unsupported-venues".to_owned(),
-        name: "Unsupported venues".to_owned(),
-        public_data: unsupported(),
-        testnet_protocol: unsupported(),
-        authenticated: unsupported(),
-        reconcile: unsupported(),
-        live: external_live_unavailable(),
-    }
-}
-
 fn external_live_unavailable() -> AdapterFacetSupport {
     adapter_facet(
         AdapterSupportLevel::Unavailable,
@@ -596,7 +599,7 @@ fn exchange_capabilities(adapters: &[AdapterSupport]) -> Vec<Capability> {
     let hyperliquid_public = adapter_cell(adapters, "hyperliquid", AdapterFacet::PublicData);
     let hyperliquid_testnet = adapter_cell(adapters, "hyperliquid", AdapterFacet::TestnetProtocol);
     let paper_reconcile = adapter_cell(adapters, "paper", AdapterFacet::Reconcile);
-    let external_live = adapter_cell(adapters, "binance", AdapterFacet::Live);
+    let binance_live = adapter_cell(adapters, "binance", AdapterFacet::Live);
     vec![
         adapter_capability(
             "exchange.binance-public",
@@ -649,14 +652,14 @@ fn exchange_capabilities(adapters: &[AdapterSupport]) -> Vec<Capability> {
             paper_reconcile,
         ),
         adapter_capability(
-            "exchange.private-live",
-            CapabilityLevel::Unavailable,
+            "exchange.binance-mainnet",
+            CapabilityLevel::Available,
             scope(
                 &[CapabilityEnvironment::Mainnet],
                 CapabilityAccess::MainnetTrading,
             ),
-            "Authenticated private exchange market, account, and trading adapters.",
-            external_live,
+            "Authority-typed Binance Spot MAINNET adapters: signed read-only reconcile plus the operator-acknowledged one-shot Spot LIMIT order lifecycle.",
+            binance_live,
         ),
     ]
 }
@@ -850,9 +853,9 @@ fn runtime_execution_capabilities() -> Vec<Capability> {
                 &[CapabilityEnvironment::Mainnet],
                 CapabilityAccess::MainnetTrading,
             ),
-            "Mainnet order authority.",
+            "Autonomous strategy mainnet order authority (grid, arbitrage, and every ExecutionMode::Live owner loop).",
             &[
-                "Mandatory account risk, private adapters, reconciliation, and recovery gates are incomplete.",
+                "ExecutionMode::Live fails closed for every strategy: the strategy promotion gate has not been passed, and per the no-strategy-by-implication invariant the only mainnet order authority is the operator-acknowledged one-shot live-lifecycle command.",
             ],
             &[
                 "rust/crates/runtime/src/mode.rs",
@@ -937,94 +940,57 @@ fn runtime_validation_capabilities() -> Vec<Capability> {
                 "rust/crates/web/tests/ui_contract.rs",
             ],
         ),
-        capability(
-            "runtime.price-alert",
-            CapabilityArea::Runtime,
-            CapabilityLevel::ReadOnly,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Bounded multi-symbol price-alert evaluation with durable samples, cooldowns, acknowledgements, a stable read model, isolated local delivery adapters, and a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts.",
-            &[
-                "This surface is maintenance-frozen: keep the existing replay-backed evidence path available, but do not widen it with new venue, notification, or automation scope until the shared bar-driven strategy and realtime data seams land.",
-                "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the price-alert task host, and restart recovery projects prior facts without automatically resuming external sources.",
-                "The JSONL alert journal rotates through bounded sealed segments with no compaction by design; delivery replay is intentionally disabled, and remote acknowledgement or sound output is not implemented.",
-            ],
-            &[
-                "rust/crates/apps/src/alert/mod.rs",
-                "rust/crates/apps/src/alert/journal.rs",
-                "rust/crates/apps/src/alert/notification.rs",
-                "rust/crates/apps/src/continuous_alert.rs",
-                "rust/crates/apps/tests/alert_runtime_contract.rs",
-                "rust/crates/apps/tests/alert_serve_cli_contract.rs",
-                "rust/crates/runtime/src/alert_read_model.rs",
-                "rust/crates/runtime/src/task_read_model.rs",
-                "rust/crates/runtime/tests/alert_read_model_contract.rs",
-                "rust/crates/runtime/tests/task_read_model_contract.rs",
-                "rust/crates/runtime/tests/history_rotation_contract.rs",
-                "rust/crates/control-plane/tests/alert_projection_contract.rs",
-                "rust/crates/web/tests/http_contract.rs",
-            ],
-        ),
-        scanner_capability(),
         testnet_lifecycle_capability(),
         testnet_reconciliation_capability(),
         testnet_reconciliation_apply_capability(),
         testnet_soak_capability(),
-        capability(
-            "runtime.volume-maker",
-            CapabilityArea::Runtime,
-            CapabilityLevel::Available,
-            scope(
-                &[CapabilityEnvironment::Paper],
-                CapabilityAccess::PaperTrading,
-            ),
-            "Validated volume-maker configuration plus a recoverable replay-backed paper owner: serve requires an explicit account-risk configuration; virtual maker quotes and imbalance market cycles become independent single-leg reservations with reduce-only closes, account-risk admission, durable hourly statistics facts, and a CLI validate/serve/status/stop task host.",
-            &[
-                "This surface is maintenance-frozen: keep the current replay-backed paper evidence intact, but do not widen venue coverage, automation, or execution scope until the shared strategy/runtime seam is refocused.",
-                "The CLI service bootstrap is replay-backed only: no external continuous market source is wired into the volume-maker task host, and no testnet/mainnet order authority is implied.",
-                "The owner keeps no resting orders: limit-mode quotes are virtual and execute only when a later observation crosses them, so legacy post-only resting semantics are simulated, not reproduced; each serve run plans a fresh paper account generation and restart on a foreign generation fails closed.",
-            ],
-            &[
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/paper_volume_maker_task.rs",
-                "rust/crates/apps/tests/paper_volume_maker_task_contract.rs",
-                "rust/crates/strategy/src/volume_maker.rs",
-                "rust/crates/strategy/tests/volume_maker.rs",
-                "rust/crates/config/src/supporting.rs",
-                "rust/crates/runtime/src/task_read_model.rs",
-                "rust/crates/runtime/tests/task_read_model_contract.rs",
-            ],
-        ),
+        live_lifecycle_capability(),
+        live_reconcile_capability(),
     ]
 }
 
-fn scanner_capability() -> Capability {
+fn live_lifecycle_capability() -> Capability {
     capability(
-        "runtime.scanner",
+        "runtime.live-lifecycle",
         CapabilityArea::Runtime,
-        CapabilityLevel::ReadOnly,
-        scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-        "Bounded deterministic virtual-grid replay with explicit benchmark/APR ranking, a validated scanner configuration schema, a replay-backed CLI serve/status/stop task host with durable task-lifecycle facts, durable projection, and a read-only Web view.",
+        CapabilityLevel::Available,
+        scope(
+            &[CapabilityEnvironment::Mainnet],
+            CapabilityAccess::MainnetTrading,
+        ),
+        "Operator-supervised one-shot Binance Spot MAINNET LIMIT lifecycle: journal-first planned facts, an exact acknowledgement phrase, a required max-notional cap, venue-truth admission (exchangeInfo filters, spot-no-short balances, foreign open orders), UUID query-first recovery, and a journal-scoped latching kill switch.",
         &[
-            "This surface is maintenance-frozen: preserve the deterministic replay/read-model contract, but do not widen it with new market discovery, scheduling, or venue scope until the shared research/runtime seam is rebuilt.",
-            "The CLI service bootstrap is replay-backed only: no real-time market discovery or external continuous market source is wired into the scanner task host, and no continuous supervisor, automatic restart, terminal UI, or 24-hour market enrichment is implemented.",
-            "Rankings are offline historical estimates, not current market freshness, investment advice, or trading authority.",
-            "A sparse price jump credits every crossed virtual level as a deterministic fill; no order-book depth, queue priority, latency, partial-fill, or gap-liquidity model exists, so rankings are not execution-quality or profitability evidence.",
-            "The JSONL journal enforces a cross-process single-writer lease and rotates through bounded sealed segments with no compaction by design; a full segment chain still fails closed.",
+            "Every run is human-authorized: the exact acknowledgement phrase and the --max-notional cap are mandatory, admission refusals and unsafe terminal outcomes fail closed, and a latched kill fact blocks every new lifecycle until an operator reviews the account and starts a fresh journal.",
+            "No autonomous strategy, market orders, margin, USD-M product, cancel-all, or multi-symbol owner loop; a credentialed supervised mainnet run remains external release evidence and is not checked in.",
         ],
         &[
-            "rust/crates/apps/src/scanner.rs",
-            "rust/crates/apps/src/continuous_scanner.rs",
-            "rust/crates/apps/tests/virtual_grid_scanner_contract.rs",
-            "rust/crates/apps/tests/scanner_cli_contract.rs",
-            "rust/crates/config/src/scanner.rs",
-            "rust/crates/strategy/src/virtual_grid.rs",
-            "rust/crates/runtime/src/scanner_read_model.rs",
-            "rust/crates/runtime/src/task_read_model.rs",
-            "rust/crates/runtime/tests/scanner_read_model_contract.rs",
-            "rust/crates/runtime/tests/history_rotation_contract.rs",
-            "rust/crates/control-plane/tests/scanner_projection_contract.rs",
-            "rust/crates/web/tests/http_contract.rs",
-            "rust/crates/web/tests/ui_contract.rs",
+            "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/src/live_lifecycle.rs",
+            "rust/crates/apps/tests/live_lifecycle_cli_contract.rs",
+            "rust/crates/exchange/src/binance_mainnet_exchange.rs",
+            "rust/crates/exchange/tests/binance_mainnet_exchange_contract.rs",
+        ],
+    )
+}
+
+fn live_reconcile_capability() -> Capability {
+    capability(
+        "runtime.live-reconcile",
+        CapabilityArea::Runtime,
+        CapabilityLevel::ReadOnly,
+        scope(
+            &[CapabilityEnvironment::Mainnet],
+            CapabilityAccess::MainnetReadOnly,
+        ),
+        "Read-only Binance Spot MAINNET balance, open-order, and optional exchangeInfo report over authority-typed read endpoints and dedicated read credentials.",
+        &[
+            "The command constructs only the read-authority adapter type, which has no submit or cancel surface; mainnet trade credentials are never read and no mutating route exists.",
+        ],
+        &[
+            "rust/crates/apps/src/command.rs",
+            "rust/crates/apps/tests/live_reconcile_cli_contract.rs",
+            "rust/crates/exchange/src/binance_mainnet_exchange.rs",
+            "rust/crates/exchange/tests/mainnet_endpoint_contract.rs",
         ],
     )
 }
@@ -1175,50 +1141,6 @@ fn strategy_capabilities() -> Vec<Capability> {
                 "rust/crates/strategy/tests/grid_protection.rs",
                 "rust/crates/apps/src/command.rs",
                 "rust/crates/apps/src/paper_grid_task.rs",
-            ],
-        ),
-        capability(
-            "strategy.price-alert",
-            CapabilityArea::Strategy,
-            CapabilityLevel::Available,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic price threshold evaluation without I/O.",
-            &[],
-            &[
-                "rust/crates/strategy/src/alert.rs",
-                "rust/crates/strategy/tests/price_alert.rs",
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/alert/mod.rs",
-            ],
-        ),
-        capability(
-            "strategy.scanner",
-            CapabilityArea::Strategy,
-            CapabilityLevel::Available,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic virtual-grid simulation and volatility scoring.",
-            &[
-                "Sparse price jumps deterministically fill every crossed pending level without depth, queue, latency, partial-fill, or gap-liquidity modeling; this scorer is not execution-quality or profitability evidence.",
-            ],
-            &[
-                "rust/crates/strategy/src/virtual_grid.rs",
-                "rust/crates/strategy/tests/virtual_grid_golden.rs",
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/scanner.rs",
-            ],
-        ),
-        capability(
-            "strategy.volume-maker",
-            CapabilityArea::Strategy,
-            CapabilityLevel::Available,
-            scope(&[CapabilityEnvironment::Offline], CapabilityAccess::Local),
-            "Deterministic maker-volume decisions without I/O.",
-            &[],
-            &[
-                "rust/crates/strategy/src/volume_maker.rs",
-                "rust/crates/strategy/tests/volume_maker.rs",
-                "rust/crates/apps/src/command.rs",
-                "rust/crates/apps/src/paper_volume_maker_task.rs",
             ],
         ),
     ]
@@ -1421,10 +1343,10 @@ fn validate_adapter_capability_alignment(
             CapabilityLevel::Available,
         ),
         (
-            "exchange.private-live",
+            "exchange.binance-mainnet",
             "binance",
             AdapterFacet::Live,
-            CapabilityLevel::Unavailable,
+            CapabilityLevel::Available,
         ),
     ];
 
@@ -1470,6 +1392,10 @@ pub enum CapabilityError {
     InvalidEnvironments(String),
     #[error("capability {0} advertises live authority while live is disabled")]
     LiveAuthorityAdvertised(String),
+    #[error("live trading is enabled but no mainnet-trading capability is available")]
+    LiveEnabledWithoutMainnetCapability,
+    #[error("mainnet capability {0} must document its operator gates as blockers")]
+    MainnetCapabilityMissingOperatorGates(String),
     #[error("adapter count {0} must be between 1 and {MAX_ADAPTERS}")]
     InvalidAdapterCount(usize),
     #[error("adapter IDs must be unique and sorted; found {0:?} out of order")]

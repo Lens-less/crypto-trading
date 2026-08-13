@@ -3,7 +3,7 @@
  * 浏览器存储纪律。
  *
  * 后端:嵌入 dist 的真实二进制 + rust/fixtures/web-api/journal.jsonl
- * (monitor / alerts / tasks / scanner / executions 均非空)。
+ * (monitor / tasks / executions 均非空)。
  */
 import { expect, test } from "@playwright/test";
 import { startBackend, WEB_API_JOURNAL, type Backend } from "./backend";
@@ -27,7 +27,7 @@ test.afterAll(async () => {
   await backend?.stop();
 });
 
-test("权限脊柱在 3 秒内可辨 PAPER 与 LIVE CLOSED,且服务的是嵌入 bundle", async ({
+test("权限脊柱在 3 秒内可辨 PAPER 与后端声明的 live 授权,且服务的是嵌入 bundle", async ({
   page,
 }) => {
   await page.goto(`${backend.baseUrl}/overview`);
@@ -35,9 +35,12 @@ test("权限脊柱在 3 秒内可辨 PAPER 与 LIVE CLOSED,且服务的是嵌入
   // 嵌入模式守卫:绝不允许 e2e 在占位 shell 上「通过」。
   await expect(page.locator("body")).not.toContainText("UI 资产未构建");
 
+  // live-manual 姿态:manifest 声明 live 授权,但 Web 界面保持只读,
+  // 浏览器永不构造 live 权限(权限态只来自 /api/v1/capabilities)。
   const authority = page.getByTestId("authority");
   await expect(authority).toContainText("PAPER");
-  await expect(authority).toContainText("LIVE CLOSED");
+  await expect(authority).toContainText("live 授权由后端声明");
+  await expect(authority).toContainText("本界面仍为只读");
 });
 
 test("总览 monitor 卡呈现 recorded_at(记录时间)与 market generation", async ({
@@ -70,7 +73,7 @@ test("浏览器持久化存储的键集合 ⊆ {ct-theme}", async ({ page }) => 
   await expect(page.getByTestId("authority")).toContainText("PAPER");
 
   // 遍历数据页并切换主题,逼出所有可能的存储写入。
-  for (const label of ["执行", "预警", "设置"]) {
+  for (const label of ["执行", "设置"]) {
     await page.getByRole("link", { name: label, exact: true }).click();
   }
   await page.getByRole("button", { name: /主题:/ }).click();

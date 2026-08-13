@@ -4,7 +4,6 @@ import {
   capabilityManifestSchema,
   healthResponseSchema,
   systemResponseSchema,
-  virtualGridScannerReadModelSchema,
 } from "./api-types";
 
 describe("healthResponseSchema", () => {
@@ -101,13 +100,23 @@ describe("systemResponseSchema", () => {
 
 describe("capabilityManifestSchema", () => {
   const valid = {
-    schema_version: 3,
-    release_stage: "paper-only",
-    live_trading_enabled: false,
+    schema_version: 4,
+    release_stage: "live-manual",
+    live_trading_enabled: true,
   };
 
-  it("接受 capability manifest(注意 schema_version 是 3)", () => {
+  it("接受 capability manifest(注意 schema_version 是 4)", () => {
     expect(capabilityManifestSchema.safeParse(valid).success).toBe(true);
+  });
+
+  it("接受历史 paper-only 判别值", () => {
+    expect(
+      capabilityManifestSchema.safeParse({
+        ...valid,
+        release_stage: "paper-only",
+        live_trading_enabled: false,
+      }).success,
+    ).toBe(true);
   });
 
   it("拒绝 API 的 schema_version 1(两个版本号不同源)", () => {
@@ -122,45 +131,6 @@ describe("capabilityManifestSchema", () => {
       capabilityManifestSchema.safeParse({ ...valid, release_stage: "live" })
         .success,
     ).toBe(false);
-  });
-});
-
-describe("virtualGridScannerReadModelSchema", () => {
-  const valid = {
-    schema_version: 1,
-    journal_id: "journal-scanner",
-    projection_status: "complete",
-    latest: {
-      run_id: "run-1",
-      estimated_apr_kind: "heuristic",
-      estimated_apr_assumptions: {
-        order_notional_usdc: "100",
-        round_trip_fee_percent: "0.2",
-      },
-      rows: [{ rank: 1, estimated_apr_kind: "heuristic" }],
-    },
-    invalid_event_count: 0,
-  };
-
-  it("要求 scanner 明示启发式 APR 及其假设", () => {
-    expect(virtualGridScannerReadModelSchema.safeParse(valid).success).toBe(true);
-    const { estimated_apr_assumptions: _assumptions, ...latest } = valid.latest;
-    expect(
-      virtualGridScannerReadModelSchema.safeParse({ ...valid, latest }).success,
-    ).toBe(false);
-  });
-
-  it("兼容旧版 v1 恢复出的 unknown APR 类型，但仍要求显式假设", () => {
-    expect(
-      virtualGridScannerReadModelSchema.safeParse({
-        ...valid,
-        latest: {
-          ...valid.latest,
-          estimated_apr_kind: "unknown",
-          rows: [{ rank: 1, estimated_apr_kind: "unknown" }],
-        },
-      }).success,
-    ).toBe(true);
   });
 });
 

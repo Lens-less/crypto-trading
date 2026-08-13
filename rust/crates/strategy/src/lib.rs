@@ -5,7 +5,6 @@
 //! decisions that the runtime may execute or record.
 
 mod account_risk;
-mod alert;
 mod arbitrage;
 mod arbitrage_history;
 mod bar;
@@ -14,7 +13,6 @@ mod grid;
 mod grid_protection;
 mod risk;
 mod virtual_grid;
-mod volume_maker;
 
 use crypto_trading_domain::{MarketSnapshot, OrderIntent};
 use thiserror::Error;
@@ -24,10 +22,6 @@ pub use account_risk::{
     AccountRiskPolicy, AccountRiskRejection, AccountRiskTimeout, AccountRiskWarning,
     MAX_ACCOUNT_RISK_OPEN_POSITIONS, MAX_ACCOUNT_RISK_POSITION_DURATION_SECONDS,
     MAX_ACCOUNT_RISK_SYMBOLS,
-};
-pub use alert::{
-    AlertConfig, AlertKind, AlertState, AlertStrategy, PriceAlert, PricePoint,
-    VolatilityAlertConfig,
 };
 pub use arbitrage::{
     ArbitrageDecision, ArbitrageDecisionKind, ArbitrageDirection, ArbitrageState,
@@ -57,9 +51,6 @@ pub use risk::{AccountRiskSnapshot, RiskDecision, RiskEngine, RiskLimits, RiskRe
 pub use virtual_grid::{
     AprCalculator, AprEstimateAssumptions, GridFill, Rating, RatingGrade, VirtualGrid,
     VirtualGridConfig, VirtualGridCross,
-};
-pub use volume_maker::{
-    VolumeMakerMode, VolumeMakerPlanConfig, VolumeMakerState, VolumeMakerStrategy,
 };
 
 /// Common seam for strategies driven by one market snapshot.

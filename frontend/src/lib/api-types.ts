@@ -3,7 +3,7 @@
  *
  * 后端事实来源:rust/crates/web/src/api.rs 与 rust/crates/runtime/src/capability.rs。
  * - /api/v1/health、/api/v1/system 顶层 `schema_version: 1`(API_SCHEMA_VERSION);
- * - /api/v1/capabilities 返回 CapabilityManifest,`schema_version: 3`
+ * - /api/v1/capabilities 返回 CapabilityManifest,`schema_version: 4`
  *   (CAPABILITY_SCHEMA_VERSION),注意与 API 版本不同;
  * - 错误响应统一为 `{ schema_version, error: { code, message } }`。
  *
@@ -13,7 +13,7 @@
 import { z } from "zod";
 
 export const API_SCHEMA_VERSION = 1;
-export const CAPABILITY_SCHEMA_VERSION = 3;
+export const CAPABILITY_SCHEMA_VERSION = 4;
 
 /* ---------------------------------------------------------------- 错误封套 */
 
@@ -52,7 +52,10 @@ export const healthResponseSchema = z.looseObject({
 /* -------------------------------------------------------- GET /api/v1/system */
 
 export type ProjectionStatus = "complete" | "windowed" | "degraded";
-export type ReleaseStage = "paper-only";
+// live-manual:后端唯一的 mainnet 下单权限是操作员亲自确认的一次性
+// live-lifecycle CLI 命令;自动策略 live 执行仍然关闭。浏览器永不构造
+// live 权限。
+export type ReleaseStage = "paper-only" | "live-manual";
 export type OperationalSignal =
   | "normal"
   | "engaged"
@@ -116,6 +119,7 @@ export type CapabilityAccess =
   | "paper-trading"
   | "testnet-read-only"
   | "testnet-trading"
+  | "mainnet-read-only"
   | "mainnet-trading";
 
 export interface CapabilityScope {
@@ -177,7 +181,7 @@ export interface CapabilityManifest {
 
 export const capabilityManifestSchema = z.looseObject({
   schema_version: z.literal(CAPABILITY_SCHEMA_VERSION),
-  release_stage: z.literal("paper-only"),
+  release_stage: z.enum(["paper-only", "live-manual"]),
   live_trading_enabled: z.boolean(),
 });
 
@@ -277,84 +281,12 @@ export const arbitrageMonitorReadModelSchema = z.looseObject({
   invalid_event_count: z.number(),
 });
 
-/* -------------------------------------------------------- GET /api/v1/alerts */
-
-/** 后端有界窗口:read model 最多保留 256 条 occurrence。 */
-export const MAX_ALERT_OCCURRENCES = 256;
-
-export type AlertOccurrenceKind =
-  | "volatility_up"
-  | "volatility_down"
-  | "upper_limit"
-  | "lower_limit";
-
-export type AlertDeliveryStatus =
-  | "pending"
-  | "dropped"
-  | "succeeded"
-  | "failed"
-  | "timed_out";
-
-export type AlertDeliveryFailure =
-  | "backpressure"
-  | "adapter_closed"
-  | "device_unavailable"
-  | "rejected"
-  | "worker_failed"
-  | "timeout";
-
-export interface AlertDeliveryView {
-  adapter_id: string;
-  status: AlertDeliveryStatus;
-  failure: AlertDeliveryFailure | null;
-  updated_at: string;
-}
-
-export interface AlertOccurrenceView {
-  source_sequence: number;
-  event_id: string;
-  alert_sequence: number;
-  recorded_at: string;
-  exchange: string;
-  symbol: string;
-  market_type: MarketType;
-  kind: AlertOccurrenceKind;
-  price: string;
-  change_percent: string | null;
-  acknowledged_at: string | null;
-  deliveries: AlertDeliveryView[];
-}
-
-export interface PriceAlertReadModel {
-  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
-  journal_id: string;
-  journal_head_sequence: number | null;
-  boundary: JournalPageBoundary;
-  projection_status: ProjectionStatus;
-  occurrences: AlertOccurrenceView[];
-  occurrences_truncated: boolean;
-  invalid_event_count: number;
-}
-
-export const priceAlertReadModelSchema = z.looseObject({
-  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
-  journal_id: z.string(),
-  projection_status: z.enum(["complete", "windowed", "degraded"]),
-  boundary: z.looseObject({ kind: z.string() }),
-  occurrences: z.array(z.looseObject({ alert_sequence: z.number() })),
-  occurrences_truncated: z.boolean(),
-  invalid_event_count: z.number(),
-});
-
 /* --------------------------------------------------------- GET /api/v1/tasks */
 
 export type ReadOnlyTaskKind =
   | "arbitrage_monitor"
   | "arbitrage_paper"
-  | "grid_paper"
-  | "price_alert"
-  | "scanner"
-  | "volume_maker";
+  | "grid_paper";
 
 export type ReadOnlyTaskPhase =
   | "registered"
@@ -536,113 +468,6 @@ export const controlPlaneEventsPageSchema = z.looseObject({
   journal_id: z.string(),
   events: z.array(z.looseObject({ sequence: z.number(), kind: z.string() })),
   next_cursor: z.string().nullable(),
-});
-
-/* ------------------------------------------------------ GET /api/v1/scanner */
-
-/** benchmark 是展示优先级,不是评分加成。 */
-export type ScannerPriority = "benchmark" | "standard";
-
-/** 评级是估算证据,不是安全状态;呈现时用中性/强调色而非安全色。 */
-export type ScannerRatingGrade = "s" | "a" | "b" | "c" | "d";
-
-/**
- * heuristic = 新版记录显式声明的启发式估算;
- * unknown = 旧版 v1 记录未声明类型,后端按固定公式恢复,仍然不是可交易收益。
- */
-export type ScannerAprEstimateKind = "heuristic" | "unknown";
-
-export interface ScannerAprEstimateAssumptions {
-  order_notional_usdc: string;
-  round_trip_fee_percent: string;
-}
-
-export interface ScannerInstrumentView {
-  exchange: string;
-  symbol: string;
-  market_type: MarketType;
-}
-
-/** 十进制数值保持后端给定的规范字符串,前端不做浮点转换。 */
-export interface VirtualGridScanRowView {
-  rank: number;
-  priority: ScannerPriority;
-  instrument: ScannerInstrumentView;
-  started_at: string;
-  last_observed_at: string;
-  observation_count: number;
-  last_observation_sequence: number;
-  current_price: string;
-  lower_price: string;
-  upper_price: string;
-  pending_buy_price: string;
-  pending_sell_price: string;
-  grid_width_percent: string;
-  grid_interval_percent: string;
-  grid_count: number;
-  running_seconds: number;
-  buy_crosses: number;
-  sell_crosses: number;
-  total_crosses: number;
-  complete_cycles: number;
-  recent_five_minute_cycles: number;
-  cycles_per_hour: string;
-  estimated_apr: string;
-  estimated_apr_kind: ScannerAprEstimateKind;
-  volume_24h_usdc: string;
-  price_change_24h_percent: string | null;
-  rating_grade: ScannerRatingGrade;
-  rating_score: string;
-}
-
-export interface VirtualGridScanView {
-  source_sequence: number;
-  event_id: string;
-  recorded_at: string;
-  run_id: string;
-  ranking_policy: string;
-  apr_window_seconds: number;
-  estimated_apr_kind: ScannerAprEstimateKind;
-  estimated_apr_assumptions: ScannerAprEstimateAssumptions;
-  min_complete_cycles: number;
-  row_limit: number;
-  candidate_count: number;
-  eligible_count: number;
-  filtered_by_cycles_count: number;
-  truncated: boolean;
-  rows: VirtualGridScanRowView[];
-}
-
-export interface VirtualGridScannerReadModel {
-  schema_version: typeof READ_MODEL_SCHEMA_VERSION;
-  journal_id: string;
-  journal_head_sequence: number | null;
-  projection_status: ProjectionStatus;
-  latest: VirtualGridScanView | null;
-  invalid_event_count: number;
-}
-
-export const virtualGridScannerReadModelSchema = z.looseObject({
-  schema_version: z.literal(READ_MODEL_SCHEMA_VERSION),
-  journal_id: z.string(),
-  projection_status: z.enum(["complete", "windowed", "degraded"]),
-  latest: z.nullable(
-    z.looseObject({
-      run_id: z.string(),
-      estimated_apr_kind: z.enum(["heuristic", "unknown"]),
-      estimated_apr_assumptions: z.looseObject({
-        order_notional_usdc: z.string(),
-        round_trip_fee_percent: z.string(),
-      }),
-      rows: z.array(
-        z.looseObject({
-          rank: z.number(),
-          estimated_apr_kind: z.enum(["heuristic", "unknown"]),
-        }),
-      ),
-    }),
-  ),
-  invalid_event_count: z.number(),
 });
 
 /* --------------------------------------------------------- GET /api/v1/risk */

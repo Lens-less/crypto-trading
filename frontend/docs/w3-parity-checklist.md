@@ -1,5 +1,10 @@
 # W3 Parity 清单:overview / executions / alerts(W4 已勾销)
 
+> **历史文档(2026-08-13 起部分失效)**:alerts / scanner 页面及其读模型已在
+> live-trading 重聚焦 Wave A 中整体移除(价格预警、扫描器、volume-maker 均已退役)。
+> 本清单保留为 W3/W4 迁移的历史记录;其中涉及 alerts / scanner 的条目不再对应
+> 现存代码。
+
 来源:`git show e5fdbc8:rust/crates/web/tests/ui_contract.rs`(757 行旧 UI 契约,锁定旧
 `rust/crates/web/assets/app.js` 的中文文案与行为)+ 对应 app.js 渲染逻辑。
 逐条提炼旧断言中属于三页(及三页共享的全局语义)的行为语义。

@@ -7,13 +7,13 @@ use crypto_trading_runtime::{
 };
 
 #[test]
-fn current_manifest_is_deterministic_valid_and_live_closed() {
+fn current_manifest_is_deterministic_valid_and_live_manual() {
     let manifest = current_capability_manifest();
 
     manifest.validate().unwrap();
-    assert_eq!(manifest.schema_version, 3);
-    assert_eq!(manifest.release_stage, ReleaseStage::PaperOnly);
-    assert!(!manifest.live_trading_enabled);
+    assert_eq!(manifest.schema_version, 4);
+    assert_eq!(manifest.release_stage, ReleaseStage::LiveManual);
+    assert!(manifest.live_trading_enabled);
 
     let ids = manifest
         .capabilities
@@ -26,19 +26,29 @@ fn current_manifest_is_deterministic_valid_and_live_closed() {
 
     for capability in &manifest.capabilities {
         if capability.scope.access == CapabilityAccess::MainnetTrading {
-            assert_eq!(
-                capability.level,
-                CapabilityLevel::Unavailable,
-                "{} must not advertise live authority",
-                capability.id
-            );
             assert!(
                 !capability.blockers.is_empty(),
-                "{} must explain why live remains closed",
+                "{} must document its operator gates and what stays closed",
                 capability.id
             );
         }
     }
+    // The only advertised mainnet order authority is the operator-supervised
+    // one-shot lifecycle plus its adapter; autonomous strategy execution
+    // (runtime.live) stays unavailable.
+    let advertised = manifest
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability.scope.access == CapabilityAccess::MainnetTrading
+                && capability.level != CapabilityLevel::Unavailable
+        })
+        .map(|capability| capability.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        advertised,
+        ["exchange.binance-mainnet", "runtime.live-lifecycle"]
+    );
 }
 
 #[test]
@@ -144,36 +154,6 @@ fn continuous_capabilities_separate_monitor_market_reads_from_paper_owner_author
         monitor_runtime
             .evidence
             .contains(&"rust/crates/web/tests/ui_contract.rs".to_owned())
-    );
-
-    let price_alert = manifest.capability("runtime.price-alert").unwrap();
-    assert_eq!(price_alert.level, CapabilityLevel::ReadOnly);
-    assert_eq!(
-        price_alert.scope.environments,
-        vec![CapabilityEnvironment::Offline]
-    );
-    assert_eq!(price_alert.scope.access, CapabilityAccess::Local);
-    assert!(
-        price_alert
-            .evidence
-            .contains(&"rust/crates/runtime/src/alert_read_model.rs".to_owned())
-    );
-    assert!(
-        price_alert
-            .evidence
-            .contains(&"rust/crates/apps/tests/alert_serve_cli_contract.rs".to_owned())
-    );
-    assert!(
-        price_alert
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("replay-backed only"))
-    );
-    assert!(
-        !price_alert
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("not yet registered in the durable task lifecycle"))
     );
 
     let continuous = manifest.capability("runtime.continuous").unwrap();
@@ -556,170 +536,6 @@ fn journal_rotation_is_reflected_without_advertising_compaction() {
             .iter()
             .any(|blocker| blocker.contains("no compaction by design"))
     );
-
-    for id in ["runtime.price-alert", "runtime.scanner"] {
-        let capability = manifest.capability(id).unwrap();
-        assert!(
-            !capability
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("no rotation")),
-            "{id} must not claim the journal lacks rotation once sealed segments ship"
-        );
-        assert!(
-            capability
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("no compaction by design")),
-            "{id} must keep the no-compaction design decision explicit"
-        );
-        assert!(
-            capability
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("maintenance-frozen")),
-            "{id} must remain explicitly maintenance-frozen"
-        );
-        assert!(capability.evidence.contains(&rotation_evidence));
-    }
-}
-
-#[test]
-fn scanner_read_only_facts_do_not_advertise_current_or_trading_authority() {
-    let manifest = current_capability_manifest();
-    let scanner = manifest.capability("runtime.scanner").unwrap();
-
-    assert_eq!(scanner.level, CapabilityLevel::ReadOnly);
-    assert_eq!(
-        scanner.scope.environments,
-        vec![CapabilityEnvironment::Offline]
-    );
-    assert_eq!(scanner.scope.access, CapabilityAccess::Local);
-    for evidence in [
-        "rust/crates/apps/src/scanner.rs",
-        "rust/crates/apps/src/continuous_scanner.rs",
-        "rust/crates/apps/tests/scanner_cli_contract.rs",
-        "rust/crates/config/src/scanner.rs",
-        "rust/crates/runtime/src/scanner_read_model.rs",
-        "rust/crates/runtime/src/task_read_model.rs",
-        "rust/crates/web/tests/ui_contract.rs",
-    ] {
-        assert!(scanner.evidence.contains(&evidence.to_owned()));
-    }
-    assert!(
-        scanner.summary.contains("scanner configuration schema"),
-        "{}",
-        scanner.summary
-    );
-    assert!(
-        !scanner.blockers.iter().any(
-            |blocker| blocker.contains("not implemented; the existing CLI remains fail-closed")
-        ),
-        "the config-schema/CLI-bootstrap blocker must be gone once the task host ships"
-    );
-    assert!(
-        scanner
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("replay-backed only"))
-    );
-    assert!(
-        scanner
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("offline historical estimates"))
-    );
-    assert!(
-        scanner.blockers.iter().any(|blocker| {
-            blocker.contains("every crossed virtual level")
-                && blocker.contains("no order-book depth")
-                && blocker.contains("not execution-quality")
-        }),
-        "optimistic sparse-jump fill semantics must stay explicit"
-    );
-
-    let scanner_strategy = manifest.capability("strategy.scanner").unwrap();
-    assert!(
-        scanner_strategy.blockers.iter().any(|blocker| {
-            blocker.contains("every crossed pending level")
-                && blocker.contains("without depth")
-                && blocker.contains("not execution-quality")
-        }),
-        "the virtual-grid scorer must not be advertised as an execution simulator"
-    );
-    assert!(!manifest.live_trading_enabled);
-}
-
-#[test]
-fn volume_maker_paper_owner_is_available_without_external_or_resting_authority() {
-    let manifest = current_capability_manifest();
-
-    let strategy = manifest.capability("strategy.volume-maker").unwrap();
-    assert_eq!(strategy.level, CapabilityLevel::Available);
-    assert_eq!(
-        strategy.scope.environments,
-        vec![CapabilityEnvironment::Offline]
-    );
-
-    let runtime = manifest.capability("runtime.volume-maker").unwrap();
-    assert_eq!(runtime.level, CapabilityLevel::Available);
-    assert_eq!(
-        runtime.scope.environments,
-        vec![CapabilityEnvironment::Paper]
-    );
-    assert_eq!(runtime.scope.access, CapabilityAccess::PaperTrading);
-    for summary_term in [
-        "replay-backed paper owner",
-        "single-leg reservations",
-        "account-risk admission",
-        "hourly statistics facts",
-        "validate/serve/status/stop",
-    ] {
-        assert!(
-            runtime.summary.contains(summary_term),
-            "summary must state {summary_term}"
-        );
-    }
-    for evidence in [
-        "rust/crates/apps/src/paper_volume_maker_task.rs",
-        "rust/crates/apps/tests/paper_volume_maker_task_contract.rs",
-        "rust/crates/strategy/src/volume_maker.rs",
-        "rust/crates/runtime/src/task_read_model.rs",
-    ] {
-        assert!(
-            runtime.evidence.contains(&evidence.to_owned()),
-            "missing evidence {evidence}"
-        );
-    }
-    assert!(
-        runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("replay-backed only")
-                && blocker.contains("no testnet/mainnet order authority")),
-        "the replay-only and no-external-authority boundary must stay explicit"
-    );
-    assert!(
-        runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("no resting orders")),
-        "the virtual-quote simulation boundary must stay explicit"
-    );
-    assert!(
-        runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("maintenance-frozen")),
-        "the maintenance-frozen status must stay explicit"
-    );
-    assert!(
-        !runtime
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("not implemented")),
-        "the unfinished-runtime blocker must be gone once the paper owner ships"
-    );
 }
 
 #[test]
@@ -733,16 +549,44 @@ fn mainnet_market_data_does_not_grant_live_trading_authority() {
         vec![CapabilityEnvironment::Mainnet]
     );
     assert_eq!(public_data.scope.access, CapabilityAccess::MarketData);
-    assert!(!manifest.live_trading_enabled);
+    // Market data stays read access even in the live-manual stage.
+    assert_eq!(public_data.scope.access, CapabilityAccess::MarketData);
+}
 
-    let mut invalid = manifest;
-    let live_runtime = invalid
+#[test]
+fn live_manual_posture_validation_fails_closed_in_every_direction() {
+    // Disabling live trading while a mainnet capability stays advertised must
+    // be rejected: the flag and the capability list cannot drift apart.
+    let mut disabled = current_capability_manifest();
+    disabled.live_trading_enabled = false;
+    disabled.release_stage = ReleaseStage::PaperOnly;
+    assert!(disabled.validate().is_err());
+
+    // A live-capable capability must document its operator gates.
+    let mut gateless = current_capability_manifest();
+    gateless
         .capabilities
         .iter_mut()
-        .find(|capability| capability.id == "runtime.live")
-        .unwrap();
-    live_runtime.level = CapabilityLevel::Available;
-    assert!(invalid.validate().is_err());
+        .find(|capability| capability.id == "runtime.live-lifecycle")
+        .unwrap()
+        .blockers
+        .clear();
+    assert!(gateless.validate().is_err());
+
+    // live_trading_enabled without any available mainnet-trading capability
+    // is an incoherent posture.
+    let mut hollow = current_capability_manifest();
+    for capability in &mut hollow.capabilities {
+        if capability.scope.access == CapabilityAccess::MainnetTrading {
+            capability.level = CapabilityLevel::Unavailable;
+        }
+    }
+    assert!(hollow.validate().is_err());
+
+    // The stage flag and the boolean must agree.
+    let mut incoherent = current_capability_manifest();
+    incoherent.live_trading_enabled = false;
+    assert!(incoherent.validate().is_err());
 }
 
 #[test]
@@ -753,10 +597,7 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         .iter()
         .map(|adapter| adapter.id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        ids,
-        ["binance", "hyperliquid", "paper", "unsupported-venues"]
-    );
+    assert_eq!(ids, ["binance", "hyperliquid", "paper"]);
 
     let binance = manifest.adapter("binance").unwrap();
     assert_eq!(binance.public_data.level, AdapterSupportLevel::Implemented);
@@ -769,7 +610,28 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         AdapterSupportLevel::Implemented
     );
     assert_eq!(binance.reconcile.level, AdapterSupportLevel::Implemented);
-    assert_eq!(binance.live.level, AdapterSupportLevel::Unavailable);
+    // Binance is the single live-capable adapter: exactly the acknowledged
+    // one-shot Spot lifecycle plus read reconcile, with the boundary spelled
+    // out in its blockers.
+    assert_eq!(binance.live.level, AdapterSupportLevel::Implemented);
+    assert!(
+        binance.live.blockers.iter().any(|blocker| {
+            blocker.contains("one-shot")
+                && blocker.contains("no autonomous strategy")
+                && blocker.contains("no market orders")
+                && blocker.contains("no margin")
+        }),
+        "the live facet must state exactly what stays closed: {:?}",
+        binance.live.blockers
+    );
+    assert!(
+        binance
+            .live
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not checked in")),
+        "external supervised-run evidence must stay an explicit operator gate"
+    );
     assert_eq!(
         manifest
             .capability("exchange.binance-public")
@@ -784,34 +646,12 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
             .level,
         CapabilityLevel::Available
     );
-
-    let unsupported = manifest.adapter("unsupported-venues").unwrap();
     assert_eq!(
-        unsupported.public_data.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        unsupported.testnet_protocol.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        unsupported.authenticated.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(
-        unsupported.reconcile.level,
-        AdapterSupportLevel::Unavailable
-    );
-    assert_eq!(unsupported.live.level, AdapterSupportLevel::Unavailable);
-    assert!(
-        unsupported
-            .public_data
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("Backpack")
-                && blocker.contains("EdgeX")
-                && blocker.contains("OKX")),
-        "the aggregated unsupported venues row must enumerate the folded venues"
+        manifest
+            .capability("exchange.binance-mainnet")
+            .unwrap()
+            .evidence,
+        binance.live.evidence
     );
 
     let paper = manifest.adapter("paper").unwrap();
@@ -823,18 +663,12 @@ fn adapter_matrix_separates_implementation_from_protocol_and_config_evidence() {
         paper.reconcile.evidence
     );
 
-    for adapter in manifest
-        .adapters
-        .iter()
-        .filter(|adapter| adapter.id != "paper")
-    {
-        assert_eq!(
-            adapter.live.level,
-            AdapterSupportLevel::Unavailable,
-            "{} must not advertise live support",
-            adapter.id
-        );
-    }
+    let hyperliquid = manifest.adapter("hyperliquid").unwrap();
+    assert_eq!(
+        hyperliquid.live.level,
+        AdapterSupportLevel::Unavailable,
+        "hyperliquid must not advertise live support"
+    );
 }
 
 #[test]
@@ -984,13 +818,15 @@ fn every_available_capability_names_a_shipped_application_boundary() {
 
 #[test]
 fn adapter_matrix_validation_fails_closed_for_live_or_evidence_drift() {
+    // With live trading disabled, no adapter may advertise a live facet.
     let mut live = current_capability_manifest();
-    live.adapters
-        .iter_mut()
-        .find(|adapter| adapter.id == "binance")
-        .unwrap()
-        .live
-        .level = AdapterSupportLevel::Implemented;
+    live.live_trading_enabled = false;
+    live.release_stage = ReleaseStage::PaperOnly;
+    for capability in &mut live.capabilities {
+        if capability.scope.access == CapabilityAccess::MainnetTrading {
+            capability.level = CapabilityLevel::Unavailable;
+        }
+    }
     assert!(live.validate().is_err());
 
     let mut evidence = current_capability_manifest();
@@ -1041,9 +877,9 @@ fn manifest_serialization_is_a_stable_machine_contract() {
     let manifest = current_capability_manifest();
     let value = serde_json::to_value(&manifest).unwrap();
 
-    assert_eq!(value["schema_version"], 3);
-    assert_eq!(value["release_stage"], "paper-only");
-    assert_eq!(value["live_trading_enabled"], false);
+    assert_eq!(value["schema_version"], 4);
+    assert_eq!(value["release_stage"], "live-manual");
+    assert_eq!(value["live_trading_enabled"], true);
     assert_eq!(
         value["capabilities"]
             .as_array()

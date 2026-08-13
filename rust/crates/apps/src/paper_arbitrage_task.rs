@@ -729,7 +729,7 @@ async fn run_owner(
         }
     };
     let mut in_flight: Option<InFlightOperation> = None;
-    let mut pending_opportunity = false;
+    let mut pending_reevaluation: Option<PlanScope> = None;
     let mut history_machine = config.history_decision.clone();
     let mut latest_history_sample: Option<SpreadSample> = None;
     let mut last_exact_pair: Option<ObservedMarketPair> = None;
@@ -959,8 +959,10 @@ async fn run_owner(
                 }
                 clear_active_operation_lease(&active_operation_lease);
                 drop(operation_lease);
-                if pending_opportunity && !*stop.borrow() && !*cancel.borrow() {
-                    pending_opportunity = false;
+                if let Some(scope) = pending_reevaluation.take()
+                    && !*stop.borrow()
+                    && !*cancel.borrow()
+                {
                     let gate_open = match history_gate(
                         history_machine.as_ref(),
                         latest_history_sample.as_ref(),
@@ -987,6 +989,7 @@ async fn run_owner(
                         &monitor,
                         saga.account(),
                         &state,
+                        scope,
                         &mut operation_sequence,
                         &active_operation_lease,
                     )
@@ -1114,6 +1117,21 @@ async fn run_owner(
                     monitor_event.outcome,
                     ArbitrageMonitorOutcome::Opportunity { .. }
                 );
+                // A converged (no-opportunity) update must also reach the
+                // strategy so an open position can plan its reduce-only close;
+                // opening stays gated on the monitor's opportunity verdict.
+                // Waiting and rejected outcomes carry no coherent pair and
+                // stay inert.
+                let event_plan_scope = if is_opportunity {
+                    Some(PlanScope::Full)
+                } else if matches!(
+                    monitor_event.outcome,
+                    ArbitrageMonitorOutcome::NoOpportunity { .. }
+                ) {
+                    Some(PlanScope::ReduceOnly)
+                } else {
+                    None
+                };
                 if history_machine.is_some() {
                     match history_sample_of(&monitor_event) {
                         Ok(Some(sample)) => {
@@ -1224,8 +1242,15 @@ async fn run_owner(
                         )
                         .await;
                     };
+                if let Some(scope) = event_plan_scope
+                    && in_flight.is_some()
+                {
+                    pending_reevaluation = Some(match pending_reevaluation {
+                        Some(PlanScope::Full) => PlanScope::Full,
+                        Some(PlanScope::ReduceOnly) | None => scope,
+                    });
+                }
                 if is_opportunity && in_flight.is_some() {
-                    pending_opportunity = true;
                     next.coalesced_opportunity_count =
                         match next.coalesced_opportunity_count.checked_add(1) {
                             Some(value) => value,
@@ -1358,7 +1383,11 @@ async fn run_owner(
                     }
                 }
 
-                if is_opportunity && in_flight.is_none() && !*stop.borrow() && !*cancel.borrow() {
+                if let Some(scope) = event_plan_scope
+                    && in_flight.is_none()
+                    && !*stop.borrow()
+                    && !*cancel.borrow()
+                {
                     let gate_open = match history_gate(
                         history_machine.as_ref(),
                         latest_history_sample.as_ref(),
@@ -1385,6 +1414,7 @@ async fn run_owner(
                         &monitor,
                         saga.account(),
                         &state,
+                        scope,
                         &mut operation_sequence,
                         &active_operation_lease,
                     )
@@ -1550,11 +1580,24 @@ async fn handle_account_risk_directive(
     Ok(Some(last_exact_pair))
 }
 
+/// Bounds which strategy decisions a planning pass may turn into an
+/// operation. Opening exposure stays gated on the monitor's opportunity
+/// verdict, while a converged (no-opportunity) update may still plan the
+/// reduce-only close of an open position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanScope {
+    /// Opportunity-triggered pass: any strategy decision may execute.
+    Full,
+    /// Convergence-triggered pass: only reducing decisions may execute.
+    ReduceOnly,
+}
+
 async fn plan_latest_operation(
     config: &ArbitragePaperTaskConfig,
     monitor: &ReadOnlyArbitrageMonitor,
     account: &PaperAccountAuthority,
     state: &ArbitrageState,
+    scope: PlanScope,
     operation_sequence: &mut u64,
     active_operation_lease: &ActiveOperationLease,
 ) -> Result<Option<PlannedOperation>, ArbitragePaperTaskError> {
@@ -1564,6 +1607,9 @@ async fn plan_latest_operation(
         .strategy
         .evaluate_pair(state, &pair.left, &pair.right)?;
     if decision.intents.is_empty() {
+        return Ok(None);
+    }
+    if scope == PlanScope::ReduceOnly && decision.kind != ArbitrageDecisionKind::Reduce {
         return Ok(None);
     }
     // Serialize the complete account operation lane before admission or any

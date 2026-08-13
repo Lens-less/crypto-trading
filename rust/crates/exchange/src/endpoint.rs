@@ -8,6 +8,10 @@ const BINANCE_SPOT_TESTNET_HOST: &str = "testnet.binance.vision";
 const BINANCE_USDM_TESTNET_HOST: &str = "demo-fapi.binance.com";
 const BINANCE_SPOT_TESTNET_STREAM_HOST: &str = "stream.testnet.binance.vision";
 const BINANCE_SPOT_TESTNET_WS_API_HOST: &str = "ws-api.testnet.binance.vision";
+const BINANCE_SPOT_MAINNET_HOST: &str = "api.binance.com";
+const BINANCE_SPOT_MAINNET_STREAM_HOST: &str = "stream.binance.com";
+const BINANCE_SPOT_MAINNET_STREAM_PORT: u16 = 9443;
+const BINANCE_SPOT_MAINNET_WS_API_HOST: &str = "ws-api.binance.com";
 const HYPERLIQUID_TESTNET_HOST: &str = "api.hyperliquid-testnet.xyz";
 const HYPERLIQUID_MAINNET_HOST: &str = "api.hyperliquid.xyz";
 
@@ -79,6 +83,167 @@ impl BinanceTestnetEndpoints {
             BinanceProduct::UsdM => &self.usdm,
         };
         fixed_api_url(base, path)
+    }
+}
+
+/// Binance Spot MAINNET endpoint selection for read-only signed authority.
+///
+/// This is a distinct concrete type from [`BinanceMainnetTradeEndpoints`] and
+/// from [`BinanceTestnetEndpoints`]: holding a value of this type must never
+/// confer order mutation authority, and a generic string URL must never confer
+/// any mainnet authority at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceMainnetReadEndpoints {
+    spot: Url,
+}
+
+impl BinanceMainnetReadEndpoints {
+    /// Returns the official Binance Spot mainnet REST endpoint.
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("https://api.binance.com") {
+            Ok(endpoints) => endpoints,
+            Err(_) => unreachable!("hard-coded Binance mainnet endpoint must be valid"),
+        }
+    }
+
+    /// Validates a caller-supplied URL against the exact official mainnet host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for testnet hosts, any
+    /// non-official host, explicit ports, credentials, query strings,
+    /// fragments, or non-root paths.
+    pub fn try_official(spot: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            spot: official_root(
+                spot,
+                BINANCE_SPOT_MAINNET_HOST,
+                "Binance Spot mainnet (read)",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline endpoint on a literal loopback address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless the URL is a root
+    /// `http`/`https` URL on a literal loopback IP address.
+    pub fn loopback(spot: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            spot: loopback_root(spot, "Binance Spot mainnet (read) offline endpoint")?,
+        })
+    }
+
+    /// Resolves a fixed Spot API path without allowing origin escape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for a relative, absolute-URL,
+    /// traversal, query-bearing, or fragment-bearing path.
+    pub fn rest_url(&self, path: &str) -> Result<Url, ExchangeError> {
+        fixed_api_url(&self.spot, path)
+    }
+}
+
+/// Binance Spot MAINNET endpoint selection for order mutation authority.
+///
+/// Constructing this type is a deliberate act separate from
+/// [`BinanceMainnetReadEndpoints`]; read-only code paths must never be handed
+/// a value of this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceMainnetTradeEndpoints {
+    spot: Url,
+}
+
+impl BinanceMainnetTradeEndpoints {
+    /// Returns the official Binance Spot mainnet REST endpoint.
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("https://api.binance.com") {
+            Ok(endpoints) => endpoints,
+            Err(_) => unreachable!("hard-coded Binance mainnet endpoint must be valid"),
+        }
+    }
+
+    /// Validates a caller-supplied URL against the exact official mainnet host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for testnet hosts, any
+    /// non-official host, explicit ports, credentials, query strings,
+    /// fragments, or non-root paths.
+    pub fn try_official(spot: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            spot: official_root(
+                spot,
+                BINANCE_SPOT_MAINNET_HOST,
+                "Binance Spot mainnet (trade)",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline endpoint on a literal loopback address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless the URL is a root
+    /// `http`/`https` URL on a literal loopback IP address.
+    pub fn loopback(spot: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            spot: loopback_root(spot, "Binance Spot mainnet (trade) offline endpoint")?,
+        })
+    }
+
+    /// Resolves a fixed Spot API path without allowing origin escape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] for a relative, absolute-URL,
+    /// traversal, query-bearing, or fragment-bearing path.
+    pub fn rest_url(&self, path: &str) -> Result<Url, ExchangeError> {
+        fixed_api_url(&self.spot, path)
+    }
+}
+
+/// Internal authority-typed Binance REST endpoint dispatch.
+///
+/// Wrapping the concrete endpoint types keeps the shared Binance Spot wire
+/// protocol implementation reusable while the mainnet variants stay Spot-only
+/// and fail closed for any USDⓈ-M route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BinanceRestEndpointAuthority {
+    Testnet(BinanceTestnetEndpoints),
+    MainnetRead(BinanceMainnetReadEndpoints),
+    MainnetTrade(BinanceMainnetTradeEndpoints),
+}
+
+impl BinanceRestEndpointAuthority {
+    pub(crate) fn rest_url(
+        &self,
+        product: BinanceProduct,
+        path: &str,
+    ) -> Result<Url, ExchangeError> {
+        match self {
+            Self::Testnet(endpoints) => endpoints.rest_url(product, path),
+            Self::MainnetRead(endpoints) => {
+                if product != BinanceProduct::Spot {
+                    return Err(ExchangeError::invalid(
+                        "Binance mainnet read authority is Spot-only; USD-M routes are unavailable",
+                    ));
+                }
+                endpoints.rest_url(path)
+            }
+            Self::MainnetTrade(endpoints) => {
+                if product != BinanceProduct::Spot {
+                    return Err(ExchangeError::invalid(
+                        "Binance mainnet trade authority is Spot-only; USD-M routes are unavailable",
+                    ));
+                }
+                endpoints.rest_url(path)
+            }
+        }
     }
 }
 
@@ -177,6 +342,120 @@ impl BinanceSpotUserDataStreamEndpoint {
     pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
         Ok(Self {
             base: loopback_websocket_root(base, "Binance Spot WS API offline endpoint")?,
+        })
+    }
+
+    /// Resolves the fixed Spot websocket-API route on the selected origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] if the selected origin is not
+    /// structurally safe for the fixed `/ws-api/v3` path.
+    pub fn websocket_url(&self) -> Result<Url, ExchangeError> {
+        fixed_websocket_path(&self.base, "/ws-api/v3")
+    }
+}
+
+/// Binance Spot MAINNET public websocket market stream endpoint selection.
+///
+/// Market streams are credential-free public data; this type carries no
+/// account or order authority. It exists so the mainnet stream host is pinned
+/// by construction exactly like the testnet one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceMainnetSpotMarketStreamEndpoint {
+    base: Url,
+}
+
+impl BinanceMainnetSpotMarketStreamEndpoint {
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("wss://stream.binance.com:9443") {
+            Ok(endpoint) => endpoint,
+            Err(_) => unreachable!("hard-coded Binance mainnet stream endpoint must be valid"),
+        }
+    }
+
+    /// Validates a caller-supplied Binance Spot mainnet public-stream origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is the exact
+    /// official mainnet `wss` origin on the documented 9443 port.
+    pub fn try_official(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: official_websocket_root_with_port(
+                base,
+                BINANCE_SPOT_MAINNET_STREAM_HOST,
+                Some(BINANCE_SPOT_MAINNET_STREAM_PORT),
+                "Binance Spot stream mainnet",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline public-stream websocket origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is a root
+    /// `ws`/`wss` URL on a literal loopback IP address.
+    pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: loopback_websocket_root(base, "Binance Spot mainnet stream offline endpoint")?,
+        })
+    }
+
+    /// Resolves one fixed raw-stream path on the selected websocket origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] when `stream_name` would
+    /// escape the selected origin or introduce query/fragment components.
+    pub fn stream_url(&self, stream_name: &str) -> Result<Url, ExchangeError> {
+        fixed_websocket_path(&self.base, &format!("/ws/{stream_name}"))
+    }
+}
+
+/// Binance Spot MAINNET websocket API endpoint selection for authenticated
+/// user-data subscriptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceMainnetSpotUserDataStreamEndpoint {
+    base: Url,
+}
+
+impl BinanceMainnetSpotUserDataStreamEndpoint {
+    #[must_use]
+    pub fn official() -> Self {
+        match Self::try_official("wss://ws-api.binance.com") {
+            Ok(endpoint) => endpoint,
+            Err(_) => unreachable!("hard-coded Binance mainnet WS API endpoint must be valid"),
+        }
+    }
+
+    /// Validates a caller-supplied Binance Spot mainnet websocket-API origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is the exact
+    /// official mainnet `wss` origin.
+    pub fn try_official(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: official_websocket_root(
+                base,
+                BINANCE_SPOT_MAINNET_WS_API_HOST,
+                "Binance Spot WS API mainnet",
+            )?,
+        })
+    }
+
+    /// Builds an explicitly offline websocket-API origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError::InvalidRequest`] unless `base` is a root
+    /// `ws`/`wss` URL on a literal loopback IP address.
+    pub fn loopback(base: &str) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            base: loopback_websocket_root(base, "Binance Spot mainnet WS API offline endpoint")?,
         })
     }
 
@@ -318,15 +597,25 @@ fn official_websocket_root(
     expected_host: &str,
     label: &str,
 ) -> Result<Url, ExchangeError> {
+    official_websocket_root_with_port(value, expected_host, None, label)
+}
+
+fn official_websocket_root_with_port(
+    value: &str,
+    expected_host: &str,
+    expected_port: Option<u16>,
+    label: &str,
+) -> Result<Url, ExchangeError> {
     let url = parse_root(value, label)?;
     if url.scheme() != "wss"
-        || url.port().is_some()
+        || url.port() != expected_port
         || !url
             .host_str()
             .is_some_and(|host| host.eq_ignore_ascii_case(expected_host))
     {
+        let port_suffix = expected_port.map_or_else(String::new, |port| format!(":{port}"));
         return Err(ExchangeError::invalid(format!(
-            "{label} must use wss://{expected_host}"
+            "{label} must use wss://{expected_host}{port_suffix}"
         )));
     }
     Ok(url)

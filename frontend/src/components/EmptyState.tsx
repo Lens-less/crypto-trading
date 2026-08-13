@@ -7,7 +7,7 @@ export function EmptyState({
   checkedFact,
 }: {
   message: string;
-  /** 已核对的事实来源说明(如「已检查 /api/v1/alerts 返回的 occurrences」)。 */
+  /** 已核对的事实来源说明(如「已检查 /api/v1/tasks 返回的 tasks」)。 */
   checkedFact: string;
 }) {
   return (

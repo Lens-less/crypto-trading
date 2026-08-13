@@ -7,7 +7,6 @@ import {
   capabilityManifestSchema,
   executionsResponseSchema,
   healthResponseSchema,
-  priceAlertReadModelSchema,
   readOnlyTaskReadModelSchema,
   systemResponseSchema,
   type ArbitrageMonitorReadModel,
@@ -15,14 +14,12 @@ import {
   type CapabilityManifest,
   type ExecutionsResponse,
   type HealthResponse,
-  type PriceAlertReadModel,
   type ProjectionStatus,
   type ReadOnlyTaskReadModel,
   type SystemResponse,
 } from "../lib/api-types";
 import { queryKeys } from "../lib/queryKeys";
-import { alertBanners, monitorBanner, taskBanners } from "../lib/banners";
-import { alertOccurrenceSeverity, visibleAlertOccurrences } from "../lib/alerts";
+import { monitorBanner, taskBanners } from "../lib/banners";
 import { errorPresentation } from "../lib/errorPresentation";
 import { formatDateTime, shortId } from "../lib/format";
 import { humanizeToken } from "../lib/labels";
@@ -347,69 +344,6 @@ function TasksCard({ tasks }: { tasks: UseQueryResult<ReadOnlyTaskReadModel> }) 
   );
 }
 
-const SIDEBAR_ALERT_COUNT = 8;
-
-function AlertsSidebarCard({
-  alerts,
-}: {
-  alerts: UseQueryResult<PriceAlertReadModel>;
-}) {
-  return (
-    <DataCard title="告警流" subtitle="/api/v1/alerts · 最近 occurrence,降级即停止展示">
-      <QueryStateBody query={alerts} skeletonRows={6}>
-        {(model) => {
-          const banners = alertBanners(model, { refreshFailed: alerts.isError });
-          const visible = visibleAlertOccurrences(model)
-            .slice(-SIDEBAR_ALERT_COUNT)
-            .reverse();
-          return (
-            <div className="space-y-2">
-              {banners.map((banner) => (
-                <DegradedBanner key={banner.key} banner={banner} />
-              ))}
-              {visible.length === 0 ? (
-                <EmptyState
-                  message="当前冻结快照中还没有可展示的价格预警。"
-                  checkedFact="已检查 /api/v1/alerts 返回的 occurrences;不可信投影不会展示可疑事实。"
-                />
-              ) : (
-                <ul className="space-y-2">
-                  {visible.map((occurrence) => {
-                    const severity = alertOccurrenceSeverity(occurrence);
-                    return (
-                      <li
-                        key={occurrence.alert_sequence}
-                        className="rounded-md border border-border px-3 py-2"
-                      >
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <StatusPill tone={severity.tone} label={severity.label} />
-                          <span className="text-xs">{humanizeToken(occurrence.kind)}</span>
-                        </div>
-                        <p className="numeric mt-1 text-xs">
-                          {occurrence.exchange}/{occurrence.symbol} · {occurrence.price}
-                        </p>
-                        <p className="numeric mt-0.5 text-xs text-muted-foreground">
-                          触发 {formatDateTime(occurrence.recorded_at)}
-                        </p>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-              <Link
-                to="/alerts"
-                className="inline-block text-xs text-primary underline-offset-2 hover:underline"
-              >
-                查看预警明细
-              </Link>
-            </div>
-          );
-        }}
-      </QueryStateBody>
-    </DataCard>
-  );
-}
-
 const SIDEBAR_BATCH_COUNT = 5;
 
 function ExecutionsSidebarCard({
@@ -518,15 +452,6 @@ export function Component() {
       }),
     refetchInterval: 30_000,
   });
-  const alerts = useQuery({
-    queryKey: queryKeys.alerts,
-    queryFn: ({ signal }) =>
-      request<PriceAlertReadModel>("/api/v1/alerts", {
-        schema: priceAlertReadModelSchema,
-        signal,
-      }),
-    refetchInterval: 30_000,
-  });
   const executions = useQuery({
     queryKey: queryKeys.executions(null),
     queryFn: ({ signal }) =>
@@ -553,8 +478,7 @@ export function Component() {
           <MonitorCard monitor={monitor} />
           <TasksCard tasks={tasks} />
         </div>
-        <aside aria-label="告警与执行侧栏" className="space-y-4">
-          <AlertsSidebarCard alerts={alerts} />
+        <aside aria-label="执行侧栏" className="space-y-4">
           <ExecutionsSidebarCard executions={executions} />
         </aside>
       </div>

@@ -1,12 +1,10 @@
 //! Unified command-line surface for the Rust runtime.
 
-pub mod alert;
 pub mod cli;
 pub mod command;
-pub mod continuous_alert;
 pub mod continuous_monitor;
-pub mod continuous_scanner;
 pub mod continuous_testnet;
+pub mod live_lifecycle;
 pub mod monitor;
 mod paper_admission;
 pub mod paper_arbitrage_saga;
@@ -15,16 +13,21 @@ pub mod paper_bar_task;
 pub mod paper_grid_task;
 pub mod paper_profile;
 pub mod paper_single_leg_saga;
-pub mod paper_volume_maker_task;
-pub mod scanner;
 pub mod shutdown;
 pub mod task_host;
 pub mod testnet_lifecycle;
 pub mod testnet_reconciliation;
 pub mod testnet_soak;
 
-pub use cli::{Cli, Command, ExchangeChoice, LogLevel};
+pub use cli::{Cli, Command};
 pub use command::run;
+pub use live_lifecycle::{
+    LIVE_LIFECYCLE_ACKNOWLEDGEMENT, LIVE_LIFECYCLE_SCHEMA_VERSION, LiveAdmissionRefusal,
+    LiveAdmissionTruth, LiveLifecycleConfig, LiveLifecycleError, LiveLifecycleExchangeVenue,
+    LiveLifecycleObservation, LiveLifecycleReport, LiveLifecycleVenue, LiveLifecycleVenueFuture,
+    live_lifecycle_kill_switch_latched, live_lifecycle_requires_submission,
+    live_lifecycle_wire_symbol, run_live_lifecycle,
+};
 pub use paper_arbitrage_saga::{
     DurablePaperArbitrageSaga, PaperArbitragePreservedOutcome, PaperArbitrageRecoveryStage,
     PaperArbitrageRequest, PaperArbitrageRun, PaperArbitrageSagaError,
@@ -49,12 +52,6 @@ pub use paper_profile::{
 };
 pub use paper_single_leg_saga::{
     DurablePaperSingleLegSaga, PaperSingleLegRequest, PaperSingleLegRun, PaperSingleLegSagaError,
-};
-pub use paper_volume_maker_task::{
-    VOLUME_MAKER_PAPER_TASK_STATUS_SCHEMA_VERSION, VOLUME_MAKER_STATISTICS_SCHEMA_VERSION,
-    VolumeMakerPaperExecutionFuture, VolumeMakerPaperExecutor, VolumeMakerPaperTask,
-    VolumeMakerPaperTaskConfig, VolumeMakerPaperTaskError, VolumeMakerPaperTaskExit,
-    VolumeMakerPaperTaskFailure, VolumeMakerPaperTaskPhase, VolumeMakerPaperTaskStatus,
 };
 pub use testnet_lifecycle::{
     TESTNET_LIFECYCLE_ACKNOWLEDGEMENT, TESTNET_LIFECYCLE_SCHEMA_VERSION, TestnetLifecycleConfig,

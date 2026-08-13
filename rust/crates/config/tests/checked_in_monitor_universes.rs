@@ -12,11 +12,7 @@ fn repository_config(relative: &str) -> PathBuf {
 #[test]
 fn checked_in_monitor_profiles_declare_pair_skew_explicitly() {
     for relative in [
-        "arbitrage/monitor.yaml",
-        "arbitrage/monitor_lighter_eth_spot.yaml",
-        "arbitrage/monitor_lighter_gold.yaml",
-        "arbitrage/monitor_lighter_multi_btc.yaml",
-        "arbitrage/monitor_paradex_lighter_btc.yaml",
+        "arbitrage/monitor-live-testnet.yaml",
         "arbitrage/monitor_v2.yaml",
         "arbitrage/paper-monitor-eth.yaml",
     ] {
@@ -38,8 +34,8 @@ fn checked_in_monitor_profiles_declare_pair_skew_explicitly() {
 #[test]
 fn specialized_monitor_configs_have_explicit_non_empty_universes() {
     for relative in [
-        "arbitrage/monitor_lighter_eth_spot.yaml",
-        "arbitrage/monitor_lighter_gold.yaml",
+        "arbitrage/monitor-live-testnet.yaml",
+        "arbitrage/paper-monitor-eth.yaml",
     ] {
         let path = repository_config(relative);
         let config = load_monitor_config(&path)

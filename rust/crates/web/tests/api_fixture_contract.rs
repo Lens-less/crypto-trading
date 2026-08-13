@@ -39,9 +39,7 @@ const SNAPSHOT_ENDPOINTS: &[(&str, &str)] = &[
     ("/api/v1/system", "system.json"),
     ("/api/v1/capabilities", "capabilities.json"),
     ("/api/v1/monitor", "monitor.json"),
-    ("/api/v1/alerts", "alerts.json"),
     ("/api/v1/tasks", "tasks.json"),
-    ("/api/v1/scanner", "scanner.json"),
     ("/api/v1/risk", "risk.json"),
     ("/api/v1/settings", "settings.json"),
     ("/api/v1/executions", "executions.json"),
@@ -112,20 +110,10 @@ async fn fixture_journal_projects_cleanly_and_populates_every_read_model() {
     assert_eq!(monitor["invalid_event_count"], 0);
     assert!(!monitor["latest"].is_null(), "monitor fixture is empty");
 
-    let alerts = get_json(&app, "/api/v1/alerts").await;
-    assert_eq!(alerts["projection_status"], "complete");
-    assert_eq!(alerts["invalid_event_count"], 0);
-    assert!(!alerts["occurrences"].as_array().unwrap().is_empty());
-
     let tasks = get_json(&app, "/api/v1/tasks").await;
     assert_eq!(tasks["projection_status"], "complete");
     assert_eq!(tasks["invalid_event_count"], 0);
     assert!(!tasks["tasks"].as_array().unwrap().is_empty());
-
-    let scanner = get_json(&app, "/api/v1/scanner").await;
-    assert_eq!(scanner["projection_status"], "complete");
-    assert_eq!(scanner["invalid_event_count"], 0);
-    assert!(!scanner["latest"]["rows"].as_array().unwrap().is_empty());
 
     let risk = get_json(&app, "/api/v1/risk").await;
     assert_eq!(risk["paper_accounts"]["projection_status"], "complete");

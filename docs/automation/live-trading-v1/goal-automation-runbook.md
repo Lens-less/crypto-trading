@@ -1,5 +1,18 @@
 # Goal Automation Runbook — Live Trading V1
 
+> **Status (2026-08-13, `live-v1` branch).** Several deliverables tracked by
+> this runbook are now implemented: authority-typed Binance Spot mainnet
+> endpoints (separate read and trade types), credential separation
+> (`BINANCE_MAINNET_READ_API_KEY/SECRET`, `BINANCE_MAINNET_TRADE_API_KEY/SECRET`;
+> `BINANCE_API_KEY/SECRET` remains Testnet-only), the read-only
+> `live-reconcile` report, the operator-acknowledged one-shot `live-lifecycle`
+> mainnet order owner, and the capability promotion to
+> `release_stage: live-manual`. Still open: the credentialed external evidence
+> gates (real mainnet shadow observation and a supervised lifecycle run with
+> archived redacted evidence) and the strategy promotion gate — autonomous
+> strategy live execution remains unavailable. The body below is preserved as
+> written on 2026-08-12 and is not updated to match later code.
+
 ## Source Documents
 
 - `docs/internal/specs/LIVE_TRADING_V1_SPEC.md` — normative product and safety spec

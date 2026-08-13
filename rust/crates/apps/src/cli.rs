@@ -12,10 +12,12 @@ use uuid::Uuid;
     about = "Multi-exchange strategy kernel with deterministic paper execution and an auditable journal.",
     long_about = "Multi-exchange strategy kernel with deterministic paper execution and an \
                   auditable JSONL journal.\n\n\
-                  Mainnet trading is disabled and fails closed. The only path with order \
-                  authority is Binance Testnet, and it requires an exact acknowledgement \
-                  phrase. Run `capabilities --json` for the authoritative statement of what \
-                  this build is permitted to do."
+                  Autonomous mainnet trading is disabled and fails closed. The only mainnet \
+                  order authority is the operator-supervised one-shot `live-lifecycle` \
+                  Binance Spot command, which requires an exact acknowledgement phrase and a \
+                  --max-notional cap; `live-reconcile` is read-only. Binance Testnet keeps \
+                  its own acknowledged lifecycle. Run `capabilities --json` for the \
+                  authoritative statement of what this build is permitted to do."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -38,20 +40,18 @@ pub enum Command {
     /// Run, inspect, stop, or verify a durable Binance testnet soak campaign.
     #[command(name = "testnet-soak")]
     TestnetSoak(TestnetSoakArgs),
+    /// Print a read-only Binance Spot MAINNET balance and open-order report.
+    #[command(name = "live-reconcile")]
+    LiveReconcile(LiveReconcileArgs),
+    /// Run or recover one acknowledged Binance Spot MAINNET order lifecycle.
+    #[command(name = "live-lifecycle")]
+    LiveLifecycle(LiveLifecycleArgs),
     /// Run or inspect a grid strategy.
     Grid(GridArgs),
     /// Run the segmented arbitrage engine.
     Arbitrage(Box<ArbitrageArgs>),
     /// Run the read-only arbitrage monitor.
     Monitor(MonitorArgs),
-    /// Run a maker-volume strategy.
-    #[command(name = "volume-maker")]
-    VolumeMaker(VolumeMakerArgs),
-    /// Run a price alert strategy.
-    #[command(name = "price-alert")]
-    PriceAlert(PriceAlertArgs),
-    /// Rank symbols with the virtual-grid scanner.
-    Scanner(ScannerArgs),
     /// Run one deterministic bar-driven paper owner over closed spot bars.
     #[command(name = "paper-bar")]
     PaperBar(PaperBarArgs),
@@ -218,6 +218,86 @@ pub enum TestnetLifecycleTimeInForce {
 pub enum TestnetLifecycleExpected {
     Open,
     PartiallyFilled,
+}
+
+/// Read-only mainnet report arguments. This command carries no mutation
+/// authority at all: there is no submit, cancel, or apply switch to add.
+#[derive(Debug, Args)]
+pub struct LiveReconcileArgs {
+    /// Emit a machine-readable report.
+    #[arg(long)]
+    pub json: bool,
+    /// Standard spot symbol whose open orders are inspected.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub spot_symbol: String,
+    /// Exact Binance wire symbol mapped to the spot symbol.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Additionally fetch and report the symbol's exchangeInfo instrument rules.
+    #[arg(long)]
+    pub include_exchange_info: bool,
+    /// Total HTTP timeout for each signed remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
+}
+
+/// One human-authorized mainnet Spot LIMIT order lifecycle
+/// (submit -> poll query -> cancel -> final query).
+#[derive(Debug, Args)]
+pub struct LiveLifecycleArgs {
+    /// Emit the final durable proof as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Exact acknowledgement required before any MAINNET mutation.
+    #[arg(long, value_name = "PHRASE")]
+    pub acknowledge_live_lifecycle: String,
+    /// Stable campaign identity reused for recovery.
+    #[arg(long)]
+    pub campaign_id: String,
+    /// Stable UUID persisted before submission and reused for every query.
+    #[arg(long)]
+    pub client_order_id: Uuid,
+    /// Dedicated append-only JSONL evidence path.
+    #[arg(long)]
+    pub history_path: PathBuf,
+    /// Order side.
+    #[arg(long, value_enum)]
+    pub side: TestnetLifecycleSide,
+    /// Positive base-asset quantity that satisfies the venue instrument rule.
+    #[arg(long)]
+    pub quantity: Decimal,
+    /// Positive limit price that satisfies the venue instrument rule.
+    #[arg(long)]
+    pub price: Decimal,
+    /// REQUIRED hard cap on price*quantity in quote units; the lifecycle
+    /// refuses before any journal write or network call when exceeded.
+    #[arg(long)]
+    pub max_notional: Decimal,
+    /// GTC supports manual partial-fill evidence; post-only is the safer open-order default.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleTimeInForce::PostOnly)]
+    pub time_in_force: TestnetLifecycleTimeInForce,
+    /// Order state that a signed single-order query must prove before cancellation.
+    #[arg(long, value_enum, default_value_t = TestnetLifecycleExpected::Open)]
+    pub expected_observation: TestnetLifecycleExpected,
+    /// Proceed even when the symbol has open orders that do not belong to
+    /// this campaign. Refused by default.
+    #[arg(long)]
+    pub allow_foreign_orders: bool,
+    /// Standard spot symbol mapped to the selected wire symbol.
+    #[arg(long, default_value = "BTC-USDT-SPOT")]
+    pub spot_symbol: String,
+    /// Exact Binance wire symbol used by the mainnet request.
+    #[arg(long, default_value = "BTCUSDT")]
+    pub wire_symbol: String,
+    /// Delay between authoritative single-order queries.
+    #[arg(long, default_value_t = 2_000)]
+    pub poll_interval_ms: u64,
+    /// Maximum signed single-order query attempts across the durable campaign.
+    #[arg(long, default_value_t = 30)]
+    pub maximum_queries: u16,
+    /// Total HTTP timeout for each remote request in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -531,151 +611,6 @@ pub enum MonitorLiveTransport {
 pub enum MonitorMode {
     #[default]
     Replay,
-    Serve,
-    Status,
-    Stop,
-}
-
-#[derive(Debug, Args)]
-pub struct VolumeMakerArgs {
-    #[arg(long, default_value_t = VolumeMakerRunMode::Validate, value_enum)]
-    pub mode: VolumeMakerRunMode,
-    #[arg(default_value = "config/volume_maker/backpack_btc_volume_maker.yaml")]
-    pub config: PathBuf,
-    /// Finite JSONL replay of validated top-of-book snapshots.
-    #[arg(long, value_name = "PATH")]
-    pub replay: Option<PathBuf>,
-    /// Service task identity for long-running volume-maker operations.
-    #[arg(long)]
-    pub task_id: Option<String>,
-    /// Append paper volume-maker facts to this JSONL journal.
-    #[arg(long, default_value = "var/history/volume-maker.jsonl")]
-    pub history_path: PathBuf,
-    /// Bounded account-level limits required by paper volume-maker serve mode.
-    #[arg(long, value_name = "PATH")]
-    pub paper_account_risk_config: Option<PathBuf>,
-    #[arg(long)]
-    pub debug: bool,
-    /// Local loopback control port override used by volume-maker serve/status/stop.
-    #[arg(long, hide = true)]
-    pub control_port: Option<u16>,
-    /// Serve-loop status polling interval used for bounded local tests.
-    #[arg(long, hide = true, default_value_t = 100)]
-    pub control_poll_interval_ms: u64,
-    /// Supervisor shutdown grace override for bounded local tests.
-    #[arg(long, hide = true)]
-    pub shutdown_grace_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, ValueEnum)]
-pub enum VolumeMakerRunMode {
-    #[default]
-    Validate,
-    Serve,
-    Status,
-    Stop,
-}
-
-#[derive(Debug, Args)]
-pub struct PriceAlertArgs {
-    #[arg(long, default_value_t = PriceAlertMode::Validate, value_enum)]
-    pub mode: PriceAlertMode,
-    #[arg(default_value = "config/price_alert/binance_alert.yaml")]
-    pub config: PathBuf,
-    /// Finite JSONL replay of validated top-of-book snapshots.
-    #[arg(long, value_name = "PATH")]
-    pub replay: Option<PathBuf>,
-    /// Service task identity for long-running price-alert operations.
-    #[arg(long)]
-    pub task_id: Option<String>,
-    /// Append read-only price-alert outcomes to this JSONL journal.
-    #[arg(long, default_value = "var/history/price-alert.jsonl")]
-    pub history_path: PathBuf,
-    #[arg(long)]
-    pub debug: bool,
-    /// Local loopback control port override used by price-alert serve/status/stop.
-    #[arg(long, hide = true)]
-    pub control_port: Option<u16>,
-    /// Serve-loop status polling interval used for bounded local tests.
-    #[arg(long, hide = true, default_value_t = 100)]
-    pub control_poll_interval_ms: u64,
-    /// Supervisor shutdown grace override for bounded local tests.
-    #[arg(long, hide = true)]
-    pub shutdown_grace_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, ValueEnum)]
-pub enum PriceAlertMode {
-    #[default]
-    Validate,
-    Serve,
-    Status,
-    Stop,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum ExchangeChoice {
-    #[default]
-    Lighter,
-    Hyperliquid,
-    Backpack,
-    Binance,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-pub enum LogLevel {
-    #[value(name = "DEBUG")]
-    Debug,
-    #[default]
-    #[value(name = "INFO")]
-    Info,
-    #[value(name = "WARNING")]
-    Warning,
-    #[value(name = "ERROR")]
-    Error,
-}
-
-#[derive(Debug, Args)]
-pub struct ScannerArgs {
-    #[arg(long, default_value_t = ScannerMode::Validate, value_enum)]
-    pub mode: ScannerMode,
-    /// Legacy exchange selector kept for CLI compatibility; the validated
-    /// scanner config file is the runtime source of truth.
-    #[arg(long, value_enum, default_value_t)]
-    pub exchange: ExchangeChoice,
-    /// Legacy duration hint kept for CLI compatibility; serve runs until stop.
-    #[arg(long)]
-    pub duration: Option<u64>,
-    /// Scanner YAML configuration validated by every mode that starts work.
-    #[arg(long, default_value = "config/scanner/binance_scanner.yaml")]
-    pub config: PathBuf,
-    #[arg(long, value_enum, default_value_t)]
-    pub log_level: LogLevel,
-    /// Finite JSONL replay of validated top-of-book snapshots.
-    #[arg(long, value_name = "PATH")]
-    pub replay: Option<PathBuf>,
-    /// Service task identity for long-running scanner operations.
-    #[arg(long)]
-    pub task_id: Option<String>,
-    /// Append read-only scanner outcomes to this JSONL journal.
-    #[arg(long, default_value = "var/history/scanner.jsonl")]
-    pub history_path: PathBuf,
-    /// Local loopback control port override used by scanner serve/status/stop.
-    #[arg(long, hide = true)]
-    pub control_port: Option<u16>,
-    /// Serve-loop status polling interval used for bounded local tests.
-    #[arg(long, hide = true, default_value_t = 100)]
-    pub control_poll_interval_ms: u64,
-    /// Supervisor shutdown grace override for bounded local tests.
-    #[arg(long, hide = true)]
-    pub shutdown_grace_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, ValueEnum)]
-pub enum ScannerMode {
-    #[default]
-    Validate,
     Serve,
     Status,
     Stop,
