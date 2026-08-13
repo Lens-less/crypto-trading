@@ -6997,11 +6997,38 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            tokio::time::timeout(StdDuration::from_secs(1), probe.next_user_stream_sample())
-                .await
-                .is_err()
-        );
+        // Cancellation must land while the submit POST hangs on the scripted
+        // pending action, so wait for the transport to record that POST
+        // instead of racing a fixed timeout on a loaded CI host; dropping the
+        // sample future then cancels exactly at the in-flight submit await.
+        {
+            let sample = probe.next_user_stream_sample();
+            tokio::pin!(sample);
+            let deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
+            tokio::select! {
+                _ = &mut sample => {
+                    panic!("the hanging submit must keep the user sample pending")
+                }
+                () = async {
+                    loop {
+                        let posted = http
+                            .requests
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .iter()
+                            .any(|request| request.method() == RemoteHttpMethod::Post);
+                        if posted {
+                            break;
+                        }
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the lifecycle never reached the durable planned -> submit boundary"
+                        );
+                        tokio::time::sleep(StdDuration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        }
         assert!(probe.pending_user_item.is_some());
         assert_eq!(
             http.requests
@@ -7014,7 +7041,7 @@ mod tests {
             "the cancelled attempt must reach the durable planned -> submit boundary"
         );
         assert_eq!(
-            tokio::time::timeout(StdDuration::from_secs(2), probe.next_user_stream_sample())
+            tokio::time::timeout(StdDuration::from_secs(10), probe.next_user_stream_sample())
                 .await
                 .expect("query-first recovery must be bounded")
                 .unwrap(),
