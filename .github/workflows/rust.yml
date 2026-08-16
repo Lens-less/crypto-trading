@@ -54,7 +54,7 @@ jobs:
         with:
           workspaces: "rust -> target"
           key: ${{ matrix.toolchain }}
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: frontend-dist
           path: frontend/dist
@@ -79,7 +79,7 @@ jobs:
         with:
           workspaces: "rust -> target"
           key: stable-quality
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: frontend-dist
           path: frontend/dist
@@ -120,7 +120,7 @@ jobs:
       - name: Assert the isolated target directory starts absent
         shell: bash
         run: test ! -e "$CARGO_TARGET_DIR"
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: frontend-dist
           path: frontend/dist
